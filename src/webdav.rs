@@ -1,0 +1,393 @@
+use axum::{
+    body::Body,
+    extract::{Path, State},
+    http::{header, HeaderMap, Method, StatusCode},
+    response::Response,
+};
+use futures_util::StreamExt;
+
+use crate::{
+    auth,
+    config::Share,
+    file_access::share_storage_path,
+    state::AppState,
+    storage::{FileResponseMode, ResolvedPath},
+    webdav_path::{
+        display_relative_path, is_write_method, join_relative, parse_destination, parse_share_path,
+        percent_encode,
+    },
+    webdav_xml,
+};
+
+pub async fn webdav_handler(
+    State(state): State<AppState>,
+    dav_path: Option<Path<String>>,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, StatusCode> {
+    if method == Method::OPTIONS {
+        return options_response();
+    }
+
+    let dav_path = dav_path.map(|path| path.0).unwrap_or_default();
+    let (share, sub_path) = match verify_share_access(&state, &dav_path, &headers, &method).await {
+        Ok(access) => access,
+        Err(StatusCode::UNAUTHORIZED) => return Ok(basic_auth_challenge()),
+        Err(status) => return Err(status),
+    };
+
+    let destination = headers
+        .get("destination")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    if method == Method::DELETE && sub_path.trim_matches('/').is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    match method.as_str() {
+        "PROPFIND" => handle_propfind(&state, &share, &sub_path, &headers).await,
+        "GET" => handle_get(&state, &share, &sub_path, &headers).await,
+        "HEAD" => handle_head(&state, &share, &sub_path, &headers).await,
+        "PUT" => handle_put(&state, &share, &sub_path, body).await,
+        "DELETE" => handle_delete(&state, &share, &sub_path).await,
+        "MKCOL" => handle_mkcol(&state, &share, &sub_path).await,
+        "MOVE" => {
+            handle_move_or_copy(&state, &share, &sub_path, destination, &headers, false).await
+        }
+        "COPY" => handle_move_or_copy(&state, &share, &sub_path, destination, &headers, true).await,
+        // [稳定 + 安全] DAV class-2 locks were removed because the previous
+        // implementation returned tokens without storing or enforcing them.
+        "LOCK" | "UNLOCK" | "PROPPATCH" => Err(StatusCode::NOT_IMPLEMENTED),
+        _ => Err(StatusCode::METHOD_NOT_ALLOWED),
+    }
+}
+
+async fn verify_share_access(
+    state: &AppState,
+    dav_path: &str,
+    headers: &HeaderMap,
+    method: &Method,
+) -> Result<(Share, String), StatusCode> {
+    let (share_name, sub_path) = parse_share_path(dav_path);
+    let share = {
+        let config = state.config_file.read().await;
+        config
+            .shares
+            .iter()
+            .find(|share| share.name == share_name)
+            .cloned()
+    }
+    .ok_or(StatusCode::NOT_FOUND)?;
+    if !share.webdav_enabled {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if !verify_share_basic_auth(state, &share, headers).await {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if share.readonly && is_write_method(method) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok((share, sub_path.to_string()))
+}
+
+async fn verify_share_basic_auth(state: &AppState, share: &Share, headers: &HeaderMap) -> bool {
+    let Some((username, password)) = auth::extract_basic_auth(headers) else {
+        return false;
+    };
+    if password.is_empty() || password.len() > 1_024 {
+        return false;
+    }
+    let (Some(expected_username), Some(password_hash)) =
+        (share.username.as_ref(), share.password_hash.as_ref())
+    else {
+        // Public, passwordless WebDAV is intentionally not supported.
+        return false;
+    };
+    username == *expected_username
+        && state
+            .passwords
+            .verify(password_hash.clone(), password)
+            .await
+}
+
+async fn handle_propfind(
+    state: &AppState,
+    share: &Share,
+    sub_path: &str,
+    headers: &HeaderMap,
+) -> Result<Response, StatusCode> {
+    let target = resolve_existing(state, share, sub_path).await?;
+    let metadata = state
+        .storage
+        .metadata(&target)
+        .await
+        .map_err(|error| error.status())?;
+    let base_url = format!("/dav/{}", percent_encode(&share.name));
+    let display_relative = display_relative_path(share, target.relative());
+    let mut responses = vec![propfind_entry(&target, &metadata, display_relative)];
+
+    let depth = headers
+        .get("depth")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("1");
+    if metadata.is_dir() && depth != "0" {
+        let mut directory = tokio::fs::read_dir(target.absolute())
+            .await
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        let mut count = 0;
+        while count < state.storage.max_list_entries() {
+            let Some(entry) = directory
+                .next_entry()
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            else {
+                break;
+            };
+            let metadata = entry
+                .metadata()
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let storage_relative =
+                join_relative(target.relative(), &entry.file_name().to_string_lossy());
+            let child = state
+                .storage
+                .resolve_existing(&storage_relative)
+                .await
+                .map_err(|error| error.status())?;
+            responses.push(propfind_entry(
+                &child,
+                &metadata,
+                display_relative_path(share, child.relative()),
+            ));
+            count += 1;
+        }
+    }
+
+    let xml = webdav_xml::build_multistatus(&responses, &base_url);
+    Response::builder()
+        .status(StatusCode::MULTI_STATUS)
+        .header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
+        .body(Body::from(xml))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn handle_get(
+    state: &AppState,
+    share: &Share,
+    sub_path: &str,
+    headers: &HeaderMap,
+) -> Result<Response, StatusCode> {
+    let target = resolve_existing(state, share, sub_path).await?;
+    state
+        .storage
+        .stream_file(&target, headers, FileResponseMode::WebDav)
+        .await
+        .map_err(|error| error.status())
+}
+
+async fn handle_head(
+    state: &AppState,
+    share: &Share,
+    sub_path: &str,
+    headers: &HeaderMap,
+) -> Result<Response, StatusCode> {
+    let mut response = handle_get(state, share, sub_path, headers).await?;
+    *response.body_mut() = Body::empty();
+    Ok(response)
+}
+
+async fn handle_put(
+    state: &AppState,
+    share: &Share,
+    sub_path: &str,
+    body: Body,
+) -> Result<Response, StatusCode> {
+    if sub_path.trim_matches('/').is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let storage_path = share_storage_path(share, sub_path);
+    let mut writer = state
+        .storage
+        .begin_atomic_write(&storage_path)
+        .await
+        .map_err(|error| error.status())?;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
+        writer
+            .write_chunk(&chunk)
+            .await
+            .map_err(|error| error.status())?;
+    }
+    writer.commit().await.map_err(|error| error.status())?;
+    empty_response(StatusCode::CREATED)
+}
+
+async fn handle_delete(
+    state: &AppState,
+    share: &Share,
+    sub_path: &str,
+) -> Result<Response, StatusCode> {
+    let target = resolve_existing(state, share, sub_path).await?;
+    state
+        .storage
+        .remove(&target)
+        .await
+        .map_err(|error| error.status())?;
+    empty_response(StatusCode::NO_CONTENT)
+}
+
+async fn handle_mkcol(
+    state: &AppState,
+    share: &Share,
+    sub_path: &str,
+) -> Result<Response, StatusCode> {
+    if sub_path.trim_matches('/').is_empty() {
+        return Err(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    let target = resolve_write(state, share, sub_path).await?;
+    state
+        .storage
+        .create_directory(&target)
+        .await
+        .map_err(|error| error.status())?;
+    empty_response(StatusCode::CREATED)
+}
+
+async fn handle_move_or_copy(
+    state: &AppState,
+    share: &Share,
+    sub_path: &str,
+    destination: Option<String>,
+    headers: &HeaderMap,
+    copy: bool,
+) -> Result<Response, StatusCode> {
+    if sub_path.trim_matches('/').is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let destination = destination.ok_or(StatusCode::BAD_REQUEST)?;
+    let destination_path =
+        parse_destination(&destination, &share.name).ok_or(StatusCode::FORBIDDEN)?;
+    let source = resolve_existing(state, share, sub_path).await?;
+    let target = resolve_write(state, share, &destination_path).await?;
+
+    // [稳定] Reject destructive overwrite. Clients can DELETE explicitly,
+    // making failure and recovery behavior observable instead of implicit.
+    if headers
+        .get("overwrite")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value != "F")
+        && tokio::fs::try_exists(target.absolute())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    if copy {
+        state
+            .storage
+            .copy_path(&source, &target)
+            .await
+            .map_err(|error| error.status())?;
+    } else {
+        state
+            .storage
+            .move_path(&source, &target)
+            .await
+            .map_err(|error| error.status())?;
+    }
+    empty_response(StatusCode::CREATED)
+}
+
+fn propfind_entry(
+    path: &ResolvedPath,
+    metadata: &std::fs::Metadata,
+    display_relative: String,
+) -> webdav_xml::PropfindResponseEntry {
+    let is_dir = metadata.is_dir();
+    webdav_xml::PropfindResponseEntry {
+        href: if display_relative.is_empty() {
+            "/".into()
+        } else {
+            format!("/{}", percent_encode(&display_relative))
+        },
+        displayname: path
+            .absolute()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string(),
+        is_dir,
+        content_length: if is_dir { 0 } else { metadata.len() },
+        last_modified: metadata
+            .modified()
+            .map(|modified| webdav_xml::to_rfc1123(&modified))
+            .unwrap_or_else(|_| webdav_xml::to_rfc1123(&std::time::SystemTime::UNIX_EPOCH)),
+        content_type: if is_dir {
+            "httpd/unix-directory".into()
+        } else {
+            mime_guess::from_path(path.absolute())
+                .first_or_octet_stream()
+                .to_string()
+        },
+    }
+}
+
+async fn resolve_existing(
+    state: &AppState,
+    share: &Share,
+    sub_path: &str,
+) -> Result<ResolvedPath, StatusCode> {
+    state
+        .storage
+        .resolve_existing(&share_storage_path(share, sub_path))
+        .await
+        .map_err(|error| error.status())
+}
+
+async fn resolve_write(
+    state: &AppState,
+    share: &Share,
+    sub_path: &str,
+) -> Result<ResolvedPath, StatusCode> {
+    state
+        .storage
+        .resolve_for_write(&share_storage_path(share, sub_path))
+        .await
+        .map_err(|error| error.status())
+}
+
+fn options_response() -> Result<Response, StatusCode> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("DAV", "1")
+        .header(
+            "Allow",
+            "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, MOVE, COPY",
+        )
+        .header("MS-Author-Via", "DAV")
+        .body(Body::empty())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn basic_auth_challenge() -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        axum::http::HeaderValue::from_static(
+            "Basic realm=\"Ycloud WebDAV\", charset=\"UTF-8\"",
+        ),
+    );
+    response
+}
+
+fn empty_response(status: StatusCode) -> Result<Response, StatusCode> {
+    Response::builder()
+        .status(status)
+        .body(Body::empty())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}

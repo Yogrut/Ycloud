@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Ycloud</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+  <button class="icon-btn theme-floating" type="button" data-theme-toggle><span class="theme-glyph" aria-hidden="true"></span></button>
+  <main class="login-shell">
+    <section class="login-panel glass">
+      <svg class="login-logo ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
+      <h1>Ycloud</h1>
+      <p>输入网页访问密码进入文件空间</p>
+      <form id="gateForm">
+        <input class="input" type="password" id="password" autocomplete="current-password" aria-label="网页访问密码" autofocus required>
+        <button class="btn btn-primary" id="enterButton">进入</button>
+      </form>
+      <div class="login-error" id="error" role="alert"></div>
+    </section>
+  </main>
+  <script src="/index.js" defer></script>
+</body>
+</html>

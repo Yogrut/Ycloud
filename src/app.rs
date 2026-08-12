@@ -1,0 +1,447 @@
+use std::{sync::Arc, time::Duration};
+
+use axum::{
+    error_handling::HandleErrorLayer,
+    extract::{DefaultBodyLimit, Request, State},
+    http::{header, HeaderName, StatusCode},
+    middleware,
+    response::{IntoResponse, Redirect, Response},
+    routing::{get, post, put},
+    BoxError, Router,
+};
+use tower::{timeout::TimeoutLayer, ServiceBuilder};
+use tower_http::{
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
+    trace::TraceLayer,
+};
+
+use crate::{
+    admin_api, api,
+    auth::{self, admin_auth_middleware, auth_middleware, me_handler, RateLimiter},
+    batch_api,
+    security::{csrf_middleware, security_headers_middleware},
+    state::AppState,
+    webdav,
+};
+
+pub fn build_router(state: AppState) -> Router {
+    let max_body_bytes = usize::try_from(state.config.max_upload_bytes)
+        .unwrap_or(usize::MAX)
+        .max(1);
+    let auth_limiter = Arc::new(RateLimiter::new(5, 60));
+    let unlock_limiter = Arc::new(RateLimiter::new(10, 60));
+
+    let auth_routes = Router::new()
+        .route("/login", post(auth::login_handler))
+        .route("/gate", post(auth::gate_handler))
+        .layer(DefaultBodyLimit::max(32 * 1024))
+        .layer(middleware::from_fn_with_state(
+            auth_limiter,
+            auth::rate_limit_middleware,
+        ));
+
+    let public_api = Router::new()
+        .route("/health", get(health_handler))
+        .route("/logout", post(auth::logout_handler))
+        .route("/me", get(me_handler))
+        .merge(auth_routes);
+
+    let unlock_route = Router::new()
+        .route("/folder/unlock", post(api::unlock_folder))
+        .layer(DefaultBodyLimit::max(32 * 1024))
+        .layer(middleware::from_fn_with_state(
+            unlock_limiter,
+            auth::rate_limit_middleware,
+        ));
+
+    let protected_api = Router::new()
+        .route("/files", get(api::list_files).delete(api::delete_file))
+        .route("/mkdir", post(api::create_directory))
+        .route("/upload", post(api::upload_file))
+        .route("/download", get(api::download_file))
+        .route("/rename", put(api::rename_file))
+        .route("/preview", get(api::preview_file))
+        .route("/batch/delete", post(batch_api::delete))
+        .route("/batch/move", put(batch_api::move_items))
+        .route("/batch/copy", post(batch_api::copy))
+        .merge(unlock_route)
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    let api_routes = Router::new()
+        .merge(public_api)
+        .merge(protected_api)
+        .layer(middleware::from_fn(csrf_middleware));
+
+    let admin_routes = Router::new()
+        .route("/info", get(admin_api::admin_info))
+        .route("/shares", post(admin_api::create_share))
+        .route(
+            "/shares/:id",
+            put(admin_api::update_share).delete(admin_api::delete_share),
+        )
+        .route("/account", put(admin_api::update_admin_account))
+        .route("/locks", post(admin_api::create_lock))
+        .route(
+            "/locks/:id",
+            put(admin_api::update_lock).delete(admin_api::delete_lock),
+        )
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth_middleware,
+        ))
+        .layer(middleware::from_fn(csrf_middleware));
+
+    let dav_router = Router::new()
+        .route("/dav/*rest", axum::routing::any(webdav::webdav_handler))
+        .layer(DefaultBodyLimit::max(max_body_bytes));
+
+    let request_id_header = HeaderName::from_static("x-request-id");
+    let middleware_stack = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(handle_service_error))
+        .layer(TimeoutLayer::new(Duration::from_secs(
+            state.config.request_timeout_secs,
+        )))
+        .layer(SetSensitiveRequestHeadersLayer::new([
+            header::AUTHORIZATION,
+            header::COOKIE,
+        ]))
+        .layer(SetSensitiveResponseHeadersLayer::new([header::SET_COOKIE]))
+        .layer(SetRequestIdLayer::new(
+            request_id_header.clone(),
+            MakeRequestUuid,
+        ))
+        .layer(PropagateRequestIdLayer::new(request_id_header))
+        .layer(TraceLayer::new_for_http());
+
+    Router::new()
+        .route("/", get(serve_index))
+        .route("/index.html", get(serve_index))
+        .route("/login", get(|| async { Redirect::to("/") }))
+        .route("/login.html", get(|| async { Redirect::to("/") }))
+        .route("/admin", get(serve_admin))
+        .route("/admin.html", get(serve_admin))
+        .route("/browse", get(serve_browser))
+        .route("/browser.html", get(serve_browser))
+        .route("/preview.html", get(serve_preview))
+        .route("/theme.css", get(serve_theme_css))
+        .route("/theme.js", get(serve_theme_js))
+        .route("/index.js", get(serve_index_js))
+        .route("/admin.js", get(serve_admin_js))
+        .route("/browser.js", get(serve_browser_js))
+        .route("/browser-dialog.js", get(serve_browser_dialog_js))
+        .route("/preview.js", get(serve_preview_js))
+        .nest("/api/admin", admin_routes)
+        .nest("/api", api_routes)
+        .merge(dav_router)
+        .fallback(not_found)
+        .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware_stack)
+        .with_state(state)
+}
+
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    if state.storage.ready().await {
+        (
+            StatusCode::OK,
+            axum::Json(JsonStatus {
+                status: "ok",
+                storage: "ready",
+            }),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(JsonStatus {
+                status: "degraded",
+                storage: "unavailable",
+            }),
+        )
+    }
+}
+
+#[derive(serde::Serialize)]
+struct JsonStatus {
+    status: &'static str,
+    storage: &'static str,
+}
+
+async fn handle_service_error(error: BoxError) -> impl IntoResponse {
+    if error.is::<tower::timeout::error::Elapsed>() {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "code": "request_timeout",
+                    "message": "Request exceeded the configured timeout"
+                }
+            })),
+        )
+    } else {
+        tracing::error!(%error, "unhandled middleware error");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "code": "middleware_error",
+                    "message": "Internal server error"
+                }
+            })),
+        )
+    }
+}
+
+macro_rules! embedded_handler {
+    ($name:ident, $content_type:literal, $path:literal) => {
+        async fn $name() -> Response {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, $content_type)],
+                &include_bytes!($path)[..],
+            )
+                .into_response()
+        }
+    };
+}
+
+embedded_handler!(
+    serve_index,
+    "text/html; charset=utf-8",
+    "../static/index.html"
+);
+async fn serve_admin(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    let is_admin = match auth::extract_session_token(&headers) {
+        Some(token) => state.sessions.validate(&token).await,
+        None => false,
+    };
+    if !is_admin {
+        return Redirect::to("/browse").into_response();
+    }
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        &include_bytes!("../static/admin.html")[..],
+    )
+        .into_response()
+}
+embedded_handler!(
+    serve_browser,
+    "text/html; charset=utf-8",
+    "../static/browser.html"
+);
+embedded_handler!(
+    serve_preview,
+    "text/html; charset=utf-8",
+    "../static/preview.html"
+);
+embedded_handler!(
+    serve_theme_css,
+    "text/css; charset=utf-8",
+    "../static/theme.css"
+);
+embedded_handler!(
+    serve_theme_js,
+    "application/javascript; charset=utf-8",
+    "../static/theme.js"
+);
+embedded_handler!(
+    serve_index_js,
+    "application/javascript; charset=utf-8",
+    "../static/index.js"
+);
+embedded_handler!(
+    serve_admin_js,
+    "application/javascript; charset=utf-8",
+    "../static/admin.js"
+);
+embedded_handler!(
+    serve_browser_js,
+    "application/javascript; charset=utf-8",
+    "../static/browser.js"
+);
+embedded_handler!(
+    serve_browser_dialog_js,
+    "application/javascript; charset=utf-8",
+    "../static/browser-dialog.js"
+);
+embedded_handler!(
+    serve_preview_js,
+    "application/javascript; charset=utf-8",
+    "../static/preview.js"
+);
+
+async fn not_found(_request: Request) -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, "Not Found")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_router;
+    use crate::{
+        config::{hash_password, Config, ConfigFile, Share},
+        state::AppState,
+    };
+    use axum::{
+        body::{to_bytes, Body},
+        extract::ConnectInfo,
+        http::{header, Request, StatusCode},
+    };
+    use std::{net::SocketAddr, sync::Arc};
+    use tokio::sync::RwLock;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn router_exposes_health_and_protects_storage_api() {
+        let root = std::env::temp_dir().join(format!("ycloud-app-{}", uuid::Uuid::new_v4()));
+        let state = AppState::new(
+            Config {
+                bind_address: std::net::IpAddr::from([127, 0, 0, 1]),
+                port: 3000,
+                storage_path: root.clone(),
+                config_path: root.join("config.json"),
+                max_upload_bytes: 1024,
+                io_concurrency: 2,
+                max_list_entries: 100,
+                request_timeout_secs: 30,
+                secure_cookies: false,
+            },
+            Arc::new(RwLock::new(ConfigFile {
+                admin_username: "admin".into(),
+                admin_password_hash: hash_password("test-password"),
+                global_web_password_hash: None,
+                folder_locks: Vec::new(),
+                shares: vec![Share {
+                    id: "test-share".into(),
+                    name: "open".into(),
+                    path: String::new(),
+                    username: Some("yogrut".into()),
+                    webdav_enabled: true,
+                    password_hash: Some(hash_password("webdav-password")),
+                    readonly: false,
+                }],
+            })),
+        )
+        .await
+        .unwrap();
+        let admin_token = state.sessions.create().await;
+        let app = build_router(state);
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(
+            health
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+
+        let webdav_challenge = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PROPFIND")
+                    .uri("/dav/open")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webdav_challenge.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            webdav_challenge
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .unwrap(),
+            "Basic realm=\"Ycloud WebDAV\", charset=\"UTF-8\""
+        );
+
+        let mut remote_gate_request = Request::builder()
+            .method("POST")
+            .uri("/api/gate")
+            .header(header::HOST, "ycloud.test")
+            .header(header::ORIGIN, "http://ycloud.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"username":"","password":""}"#))
+            .unwrap();
+        remote_gate_request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 168, 2, 10], 40_000))));
+        let remote_gate = app.clone().oneshot(remote_gate_request).await.unwrap();
+        let remote_gate_body = to_bytes(remote_gate.into_body(), 4096).await.unwrap();
+        let remote_gate_json: serde_json::Value =
+            serde_json::from_slice(&remote_gate_body).unwrap();
+        assert_eq!(remote_gate_json["success"], false);
+
+        let mut local_gate_request = Request::builder()
+            .method("POST")
+            .uri("/api/gate")
+            .header(header::HOST, "ycloud.test")
+            .header(header::ORIGIN, "http://ycloud.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"username":"","password":""}"#))
+            .unwrap();
+        local_gate_request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40_001))));
+        let local_gate = app.clone().oneshot(local_gate_request).await.unwrap();
+        let local_gate_body = to_bytes(local_gate.into_body(), 4096).await.unwrap();
+        let local_gate_json: serde_json::Value = serde_json::from_slice(&local_gate_body).unwrap();
+        assert_eq!(local_gate_json["success"], true);
+
+        let files = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/files")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(files.status(), StatusCode::UNAUTHORIZED);
+
+        let anonymous_admin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous_admin.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            anonymous_admin.headers().get(header::LOCATION).unwrap(),
+            "/browse"
+        );
+
+        let authenticated_admin = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authenticated_admin.status(), StatusCode::OK);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+}

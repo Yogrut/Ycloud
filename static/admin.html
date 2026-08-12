@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>管理 - Ycloud</title>
+  <script src="/theme.js"></script>
+  <link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
+      <span>Ycloud · 管理</span>
+    </div>
+    <div class="top-actions">
+      <button class="icon-btn" type="button" data-theme-toggle><span class="theme-glyph" aria-hidden="true"></span></button>
+      <a class="icon-btn" href="/browse" title="返回文件" aria-label="返回文件">
+        <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>
+      </a>
+    </div>
+  </header>
+
+  <main class="admin-page">
+    <section class="admin-card glass">
+      <div class="card-head"><span class="card-title">WebDAV 挂载</span><button class="btn btn-primary" id="newShare" type="button">+ 新建挂载</button></div>
+      <div class="card-body" id="list"><div class="empty-card">加载中…</div></div>
+    </section>
+
+    <section class="admin-card glass">
+      <div class="card-head"><span class="card-title">网页文件夹锁</span><button class="btn btn-primary" id="newLock" type="button">+ 新建锁</button></div>
+      <div class="card-body" id="lockList"><div class="empty-card">加载中…</div></div>
+    </section>
+
+    <section class="admin-card glass">
+      <div class="card-head"><span class="card-title">访问与管理员账户</span></div>
+      <div class="card-body">
+        <div class="form-grid">
+          <div class="field"><label for="adminUser">管理员用户名</label><input id="adminUser" autocomplete="username"></div>
+          <div class="field"><label for="adminPass">管理员密码</label><input type="password" id="adminPass" autocomplete="new-password"></div>
+          <div class="field"><label for="globalWebPass">网页访问密码</label><input type="password" id="globalWebPass" autocomplete="new-password"></div>
+        </div>
+        <div class="modal-actions"><button class="btn btn-primary" id="saveAccount" type="button">保存账户设置</button></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="overlay" id="dlg" role="dialog" aria-modal="true">
+    <form class="modal wide" id="shareForm">
+      <h3 id="dlgTitle">新建 WebDAV 挂载</h3>
+      <div class="field"><label for="dlgName">挂载名称 *</label><input id="dlgName" required maxlength="128"><div class="hint">连接地址：/dav/挂载名称</div></div>
+      <div class="field"><label for="dlgPath">存储路径</label><input id="dlgPath" placeholder="/ 表示存储根目录"><div class="hint">可填写 test、/test 或 /test/，保存后统一显示为 /test</div></div>
+      <div class="field"><label for="dlgUser">WebDAV 用户名</label><input id="dlgUser" autocomplete="username"></div>
+      <div class="field"><label for="dlgPwd">WebDAV 密码</label><input type="password" id="dlgPwd" autocomplete="new-password"><div class="password-status">启用 WebDAV 时必须设置用户名和密码</div></div>
+      <div class="check-row"><label class="check"><input type="checkbox" id="dlgDav" checked>启用 WebDAV</label><label class="check"><input type="checkbox" id="dlgRO">只读访问</label></div>
+      <p class="error hidden" id="shareError"></p>
+      <div class="modal-actions"><button type="button" class="btn btn-secondary" id="cancelShare">取消</button><button class="btn btn-primary" id="dlgBtn">创建</button></div>
+    </form>
+  </div>
+
+  <div class="overlay" id="lockDlg" role="dialog" aria-modal="true">
+    <form class="modal" id="lockForm">
+      <h3 id="lockDlgTitle">新建文件夹锁</h3>
+      <div class="field"><label for="lockDlgPath">网页文件夹路径 *</label><input id="lockDlgPath" required placeholder="例如 /test"><div class="hint">路径格式会自动统一；文件夹锁不影响 WebDAV</div></div>
+      <div class="field"><label for="lockDlgPwd">锁密码 *</label><input type="password" id="lockDlgPwd" autocomplete="new-password"><div class="password-status">不需要保护时请删除该锁</div></div>
+      <p class="error hidden" id="lockError"></p>
+      <div class="modal-actions"><button type="button" class="btn btn-secondary" id="cancelLock">取消</button><button class="btn btn-primary" id="lockDlgBtn">创建</button></div>
+    </form>
+  </div>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/browser-dialog.js" defer></script>
+  <script src="/admin.js" defer></script>
+</body>
+</html>

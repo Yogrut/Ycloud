@@ -1,0 +1,21 @@
+# Rust build output
+/target/
+
+# User data (contains personal files — do NOT version)
+/storage/*
+!/storage/.gitkeep
+
+# Runtime secrets and atomic-write backups
+/config.json
+/config.json.bak
+*.upload
+*.tmp
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

@@ -29,8 +29,8 @@ function preferredTheme() {
   try {
     const saved = localStorage.getItem(THEME_KEY);
     if (saved === 'light' || saved === 'dark') return saved;
-  } catch (_) { /* use the operating-system preference */ }
-  return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  } catch (_) { /* fall back to the product default */ }
+  return 'light';
 }
 
 function updateThemeButtons(theme) {

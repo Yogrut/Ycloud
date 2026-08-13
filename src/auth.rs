@@ -483,20 +483,35 @@ pub async fn admin_auth_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let headers = request.headers();
-
-    // Admin session
-    if let Some(token) = extract_session_token(headers) {
-        if state.sessions.validate(&token).await {
-            return Ok(next.run(request).await);
-        }
-    }
-
-    if valid_admin_basic_auth(&state, headers).await {
+    if is_admin_authenticated(&state, request.headers()).await {
         return Ok(next.run(request).await);
     }
 
     Err(StatusCode::UNAUTHORIZED)
+}
+
+/// Browser write APIs require administrator authentication. A valid web-gate
+/// session grants read access only and is deliberately insufficient here.
+pub async fn write_auth_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if is_admin_authenticated(&state, request.headers()).await {
+        return Ok(next.run(request).await);
+    }
+
+    Err(StatusCode::FORBIDDEN)
+}
+
+pub async fn is_admin_authenticated(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    if let Some(token) = extract_session_token(headers) {
+        if state.sessions.validate(&token).await {
+            return true;
+        }
+    }
+
+    valid_admin_basic_auth(state, headers).await
 }
 
 // ── General auth middleware ───────────────────────────────────────

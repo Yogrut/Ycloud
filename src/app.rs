@@ -17,7 +17,10 @@ use tower_http::{
 
 use crate::{
     admin_api, api, archive,
-    auth::{self, admin_auth_middleware, auth_middleware, me_handler, RateLimiter},
+    auth::{
+        self, admin_auth_middleware, auth_middleware, me_handler, write_auth_middleware,
+        RateLimiter,
+    },
     batch_api,
     security::{csrf_middleware, security_headers_middleware},
     state::AppState,
@@ -60,22 +63,33 @@ pub fn build_router(state: AppState) -> Router {
             auth::rate_limit_middleware,
         ));
 
-    let protected_api = Router::new()
-        .route("/files", get(api::list_files).delete(api::delete_file))
-        .route("/mkdir", post(api::create_directory))
-        .route("/upload", post(api::upload_file))
+    let read_api = Router::new()
+        .route("/files", get(api::list_files))
         .route("/download", get(api::download_file))
         .route(
             "/archive/prepare",
             post(archive::prepare_archive).layer(DefaultBodyLimit::max(128 * 1024)),
         )
         .route("/archive", get(archive::download_archive))
-        .route("/rename", put(api::rename_file))
         .route("/preview", get(api::preview_file))
+        .merge(unlock_route);
+
+    let write_api = Router::new()
+        .route("/files", axum::routing::delete(api::delete_file))
+        .route("/mkdir", post(api::create_directory))
+        .route("/upload", post(api::upload_file))
+        .route("/rename", put(api::rename_file))
         .route("/batch/delete", post(batch_api::delete))
         .route("/batch/move", put(batch_api::move_items))
         .route("/batch/copy", post(batch_api::copy))
-        .merge(unlock_route)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            write_auth_middleware,
+        ));
+
+    let protected_api = Router::new()
+        .merge(read_api)
+        .merge(write_api)
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -146,6 +160,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/browser.js", get(serve_browser_js))
         .route("/browser-dialog.js", get(serve_browser_dialog_js))
         .route("/preview.js", get(serve_preview_js))
+        .route("/favicon.svg", get(serve_favicon))
         .nest("/api/admin", admin_routes)
         .nest("/api", api_routes)
         .merge(dav_router)
@@ -290,6 +305,7 @@ embedded_handler!(
     "application/javascript; charset=utf-8",
     "../static/preview.js"
 );
+embedded_handler!(serve_favicon, "image/svg+xml", "../static/favicon.svg");
 
 async fn not_found(_request: Request) -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "Not Found")
@@ -347,6 +363,7 @@ mod tests {
         .await
         .unwrap();
         let admin_token = state.sessions.create().await;
+        let gate_token = state.gate_access.create("__gate__".into()).await;
         let app = build_router(state);
 
         let health = app
@@ -432,6 +449,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(files.status(), StatusCode::UNAUTHORIZED);
+
+        let gate_files = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/files")
+                    .header(header::COOKIE, format!("gate_access={gate_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gate_files.status(), StatusCode::OK);
+        let gate_files_body = to_bytes(gate_files.into_body(), 4096).await.unwrap();
+        let gate_files_json: serde_json::Value = serde_json::from_slice(&gate_files_body).unwrap();
+        assert_eq!(gate_files_json["can_write"], false);
+
+        let gate_write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mkdir")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("gate_access={gate_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"forbidden"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gate_write.status(), StatusCode::FORBIDDEN);
+
+        let admin_write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mkdir")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"allowed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_write.status(), StatusCode::OK);
+
+        let favicon = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/favicon.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(favicon.status(), StatusCode::OK);
+        assert_eq!(
+            favicon.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/svg+xml"
+        );
 
         let anonymous_admin = app
             .clone()

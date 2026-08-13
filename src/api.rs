@@ -201,7 +201,7 @@ pub async fn list_files(
         parent_path,
         entries,
         truncated,
-        can_write: !share.readonly,
+        can_write: !share.readonly && crate::auth::is_admin_authenticated(&state, &headers).await,
         max_upload_bytes: state.storage.max_upload_bytes(),
         max_archive_bytes: crate::archive::MAX_ARCHIVE_BYTES,
         max_archive_files: crate::archive::MAX_ARCHIVE_FILES,

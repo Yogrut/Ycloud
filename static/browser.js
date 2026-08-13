@@ -16,8 +16,7 @@ const state = {
   mkdirTarget: '',
   contextPath: '',
   contextIsDirectory: false,
-  uploading: false,
-  suppressNextClick: false
+  uploading: false
 };
 
 const elements = Object.fromEntries([
@@ -27,7 +26,8 @@ const elements = Object.fromEntries([
   'createFolderButton','pickerModal','pickerTitle','pickerPath','pickerList',
   'pickerConfirmButton','adminModal','adminUser','adminPass','adminError','adminLoginButton',
   'uploadModal','uploadSummary','uploadFileName','uploadPercent','uploadProgress',
-  'uploadProgressFill','uploadBytes','uploadSpeed','uploadStatus','uploadResults','uploadCloseButton'
+  'uploadProgressFill','uploadBytes','uploadSpeed','uploadStatus','uploadResults','uploadCloseButton',
+  'backToTopButton'
 ].map(id => [id, document.getElementById(id)]));
 
 async function request(url, options = {}) {
@@ -172,30 +172,16 @@ function createFileRow(entry) {
     createCell('cell right', entry.is_dir ? '-' : formatSize(entry.size))
   );
   row.addEventListener('click', () => {
-    if (state.suppressNextClick) {
-      state.suppressNextClick = false;
-      return;
-    }
     toggleSelection(entry.path);
   });
   row.addEventListener('dblclick', () => openEntry(entry));
-  row.addEventListener('contextmenu', event => showContextMenu(event, entry));
-  let longPressTimer = null;
-  row.addEventListener('pointerdown', event => {
-    if (event.pointerType === 'mouse') return;
-    const point = { x: event.clientX, y: event.clientY };
-    longPressTimer = setTimeout(() => {
-      state.suppressNextClick = true;
-      showContextMenu({ preventDefault() {}, clientX: point.x, clientY: point.y }, entry);
-      navigator.vibrate?.(18);
-    }, 520);
+  row.addEventListener('contextmenu', event => {
+    if (isMobileLayout()) {
+      event.preventDefault();
+      return;
+    }
+    showContextMenu(event, entry);
   });
-  for (const type of ['pointerup', 'pointercancel', 'pointermove']) {
-    row.addEventListener(type, () => {
-      clearTimeout(longPressTimer);
-      longPressTimer = null;
-    });
-  }
   return row;
 }
 
@@ -215,7 +201,7 @@ function renderFiles() {
 function applyCapabilities() {
   for (const control of document.querySelectorAll('.write-control')) {
     control.disabled = !state.canWrite || (state.uploading && control === elements.uploadButton);
-    control.title = state.canWrite ? '' : '当前共享为只读';
+    control.title = state.canWrite ? '' : '请先登录管理员账号；只读共享不可修改';
   }
 }
 
@@ -255,10 +241,27 @@ function toggleSelection(path) {
   updateSelectionControls();
 }
 
+function isMobileLayout() {
+  return window.matchMedia('(max-width: 760px)').matches;
+}
+
+function syncMobileSelectionMenu() {
+  const active = isMobileLayout() && state.selected.size > 0;
+  document.body.classList.toggle('has-mobile-selection', active);
+  if (!active) {
+    hideContextMenu();
+    return;
+  }
+  const selectedPath = state.selected.values().next().value;
+  const entry = state.entries.find(item => item.path === selectedPath);
+  if (entry) showContextMenu({ preventDefault() {}, clientX: 0, clientY: innerHeight }, entry);
+}
+
 function updateSelectionControls() {
   const entries = visibleEntries();
   const allSelected = entries.length > 0 && entries.every(entry => state.selected.has(entry.path));
   elements.selectAllButton.parentElement?.classList.toggle('selected', allSelected);
+  syncMobileSelectionMenu();
 }
 
 function toggleSelectAll() {
@@ -556,19 +559,40 @@ function addMenuItem(label, icon, action, danger = false) {
   text.textContent = label;
   button.append(svg, text);
   button.addEventListener('click', () => { hideContextMenu(); action(); });
-  elements.contextMenu.append(button);
+  menuActions().append(button);
+}
+
+function menuActions() {
+  let actions = elements.contextMenu.querySelector('.menu-actions');
+  if (!actions) {
+    actions = document.createElement('div');
+    actions.className = 'menu-actions';
+    elements.contextMenu.append(actions);
+  }
+  return actions;
 }
 
 function addMenuSeparator() {
   const separator = document.createElement('div');
   separator.className = 'menu-separator';
-  elements.contextMenu.append(separator);
+  menuActions().append(separator);
 }
 
-function addMenuCaption(count) {
+function addMenuCaption(count, mobileOnly = false) {
   const caption = document.createElement('div');
-  caption.className = 'menu-caption';
-  caption.textContent = `已选择 ${count} 项`;
+  caption.className = `menu-caption${mobileOnly ? ' mobile-only' : ''}`;
+  const text = document.createElement('span');
+  text.textContent = `已选择 ${count} 项`;
+  const clear = document.createElement('button');
+  clear.type = 'button';
+  clear.className = 'menu-clear';
+  clear.textContent = '清除';
+  clear.addEventListener('click', event => {
+    event.stopPropagation();
+    state.selected.clear();
+    renderFiles();
+  });
+  caption.append(text, clear);
   elements.contextMenu.append(caption);
 }
 
@@ -594,9 +618,10 @@ function showContextMenu(event, entry = null) {
         addMenuItem('移动', 'move', () => transfer('move', paths));
         addMenuItem('复制', 'copy', () => transfer('copy', paths));
         addMenuSeparator();
-        addMenuItem('删除', 'trash', () => deletePaths(paths), true);
+        addMenuItem(`删除 (${paths.length})`, 'trash', () => deletePaths(paths), true);
       }
     } else {
+      addMenuCaption(1, true);
       if (entry.is_dir) {
         addMenuItem('打开', 'open', () => openEntry(entry));
         addMenuItem('打包下载', 'archive', () => downloadArchive(paths));
@@ -672,7 +697,10 @@ elements.uploadCloseButton.addEventListener('click', () => {
 });
 elements.createFolderButton.addEventListener('click', createFolder);
 elements.folderName.addEventListener('keydown', event => { if (event.key === 'Enter') createFolder(); });
-elements.selectAllButton.addEventListener('click', toggleSelectAll);
+elements.selectAllButton.addEventListener('click', event => {
+  event.stopPropagation();
+  toggleSelectAll();
+});
 elements.searchInput.addEventListener('input', () => {
   clearTimeout(elements.searchInput.renderTimer);
   elements.searchInput.renderTimer = setTimeout(() => {
@@ -691,6 +719,11 @@ elements.adminButton.addEventListener('click', showAdmin);
 elements.adminLoginButton.addEventListener('click', adminLogin);
 elements.adminPass.addEventListener('keydown', event => { if (event.key === 'Enter') adminLogin(); });
 elements.logoutButton.addEventListener('click', logout);
+elements.backToTopButton.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+function updateBackToTop() {
+  elements.backToTopButton.classList.toggle('visible', isMobileLayout() && window.scrollY > 360);
+}
+window.addEventListener('scroll', updateBackToTop, { passive: true });
 document.querySelectorAll('[data-sort]').forEach(button => button.addEventListener('click', () => {
   const next = button.dataset.sort;
   state.ascending = state.sort === next ? !state.ascending : true;
@@ -701,10 +734,22 @@ document.querySelectorAll('[data-close]').forEach(button => button.addEventListe
   const modal = document.getElementById(button.dataset.close);
   if (modal) hideModal(modal);
 }));
-document.addEventListener('click', hideContextMenu);
+document.addEventListener('click', event => {
+  if (isMobileLayout() && state.selected.size > 0 && event.target.closest('.file-row, .context-menu, .back-to-top')) return;
+  hideContextMenu();
+});
 document.addEventListener('contextmenu', event => {
   if (event.target.closest('.context-menu')) return;
-  if (event.target.closest('.file-panel') && !event.target.closest('.file-row')) showContextMenu(event);
+  if (!event.target.closest('.file-panel')) return;
+  if (isMobileLayout()) {
+    event.preventDefault();
+    return;
+  }
+  if (!event.target.closest('.file-row')) showContextMenu(event);
+});
+window.matchMedia('(max-width: 760px)').addEventListener('change', () => {
+  syncMobileSelectionMenu();
+  updateBackToTop();
 });
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
@@ -716,4 +761,5 @@ document.addEventListener('keydown', event => {
   }
 });
 
+updateBackToTop();
 refresh();

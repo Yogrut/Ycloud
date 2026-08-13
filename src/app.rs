@@ -21,22 +21,16 @@ use crate::{
         self, admin_auth_middleware, auth_middleware, me_handler, write_auth_middleware,
         RateLimiter,
     },
-    batch_api,
-    security::{csrf_middleware, security_headers_middleware},
+    batch_operations,
+    security::{csrf_middleware, proxy_boundary_middleware, security_headers_middleware},
     state::AppState,
     webdav,
 };
 
 pub fn build_router(state: AppState) -> Router {
-    const MULTIPART_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
-    let max_body_bytes = usize::try_from(
-        state
-            .config
-            .max_upload_bytes
-            .saturating_add(MULTIPART_OVERHEAD_BYTES),
-    )
-    .unwrap_or(usize::MAX)
-    .max(1);
+    let max_body_bytes = usize::try_from(state.config.max_upload_bytes)
+        .unwrap_or(usize::MAX)
+        .max(1);
     let auth_limiter = Arc::new(RateLimiter::new(5, 60));
     let unlock_limiter = Arc::new(RateLimiter::new(10, 60));
 
@@ -77,11 +71,11 @@ pub fn build_router(state: AppState) -> Router {
     let write_api = Router::new()
         .route("/files", axum::routing::delete(api::delete_file))
         .route("/mkdir", post(api::create_directory))
-        .route("/upload", post(api::upload_file))
+        .route("/upload", put(api::upload_file))
         .route("/rename", put(api::rename_file))
-        .route("/batch/delete", post(batch_api::delete))
-        .route("/batch/move", put(batch_api::move_items))
-        .route("/batch/copy", post(batch_api::copy))
+        .route("/batch/delete", post(batch_operations::delete))
+        .route("/batch/move", put(batch_operations::move_items))
+        .route("/batch/copy", post(batch_operations::copy))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             write_auth_middleware,
@@ -96,22 +90,26 @@ pub fn build_router(state: AppState) -> Router {
             auth_middleware,
         ));
 
-    let api_routes = Router::new()
-        .merge(public_api)
-        .merge(protected_api)
-        .layer(middleware::from_fn(csrf_middleware));
+    let api_routes =
+        Router::new()
+            .merge(public_api)
+            .merge(protected_api)
+            .layer(middleware::from_fn_with_state(
+                state.config.clone(),
+                csrf_middleware,
+            ));
 
     let admin_routes = Router::new()
         .route("/info", get(admin_api::admin_info))
         .route("/shares", post(admin_api::create_share))
         .route(
-            "/shares/:id",
+            "/shares/{id}",
             put(admin_api::update_share).delete(admin_api::delete_share),
         )
         .route("/account", put(admin_api::update_admin_account))
         .route("/locks", post(admin_api::create_lock))
         .route(
-            "/locks/:id",
+            "/locks/{id}",
             put(admin_api::update_lock).delete(admin_api::delete_lock),
         )
         .layer(DefaultBodyLimit::max(64 * 1024))
@@ -119,10 +117,13 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             admin_auth_middleware,
         ))
-        .layer(middleware::from_fn(csrf_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.config.clone(),
+            csrf_middleware,
+        ));
 
     let dav_router = Router::new()
-        .route("/dav/*rest", axum::routing::any(webdav::webdav_handler))
+        .route("/dav/{*rest}", axum::routing::any(webdav::webdav_handler))
         .layer(DefaultBodyLimit::max(max_body_bytes));
 
     let request_id_header = HeaderName::from_static("x-request-id");
@@ -158,6 +159,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/index.js", get(serve_index_js))
         .route("/admin.js", get(serve_admin_js))
         .route("/browser.js", get(serve_browser_js))
+        .route("/browser-api.js", get(serve_browser_api_js))
+        .route("/browser-state.js", get(serve_browser_state_js))
         .route("/browser-dialog.js", get(serve_browser_dialog_js))
         .route("/preview.js", get(serve_preview_js))
         .route("/favicon.svg", get(serve_favicon))
@@ -165,12 +168,19 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api", api_routes)
         .merge(dav_router)
         .fallback(not_found)
-        .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.config.clone(),
+            security_headers_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             timeouts,
             request_timeout_middleware,
         ))
         .layer(middleware_stack)
+        .layer(middleware::from_fn_with_state(
+            state.config.clone(),
+            proxy_boundary_middleware,
+        ))
         .with_state(state)
 }
 
@@ -296,6 +306,16 @@ embedded_handler!(
     "../static/browser.js"
 );
 embedded_handler!(
+    serve_browser_api_js,
+    "application/javascript; charset=utf-8",
+    "../static/browser-api.js"
+);
+embedded_handler!(
+    serve_browser_state_js,
+    "application/javascript; charset=utf-8",
+    "../static/browser-state.js"
+);
+embedded_handler!(
     serve_browser_dialog_js,
     "application/javascript; charset=utf-8",
     "../static/browser-dialog.js"
@@ -343,8 +363,12 @@ mod tests {
                 upload_timeout_secs: 300,
                 disk_reserve_bytes: 0,
                 secure_cookies: false,
+                public_base_url: None,
+                public_host: None,
+                trusted_proxy_ips: Default::default(),
             },
             Arc::new(RwLock::new(ConfigFile {
+                schema_version: 2,
                 admin_username: "admin".into(),
                 admin_password_hash: hash_password("test-password"),
                 global_web_password_hash: None,
@@ -483,6 +507,23 @@ mod tests {
             .unwrap();
         assert_eq!(gate_write.status(), StatusCode::FORBIDDEN);
 
+        let basic_write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mkdir")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::AUTHORIZATION, "Basic YWRtaW46dGVzdC1wYXNzd29yZA==")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"basic-forbidden"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(basic_write.status(), StatusCode::UNAUTHORIZED);
+
         let admin_write = app
             .clone()
             .oneshot(
@@ -533,6 +574,7 @@ mod tests {
         );
 
         let authenticated_admin = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/admin")
@@ -543,6 +585,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authenticated_admin.status(), StatusCode::OK);
+
+        tokio::fs::write(root.join("duplicate-delete.txt"), b"data")
+            .await
+            .unwrap();
+        let partial_batch = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/batch/delete")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"paths":["duplicate-delete.txt","duplicate-delete.txt"]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(partial_batch.status(), StatusCode::MULTI_STATUS);
+        let partial_body = to_bytes(partial_batch.into_body(), 8192).await.unwrap();
+        let partial_json: serde_json::Value = serde_json::from_slice(&partial_body).unwrap();
+        assert_eq!(partial_json["success"], 1);
+        assert_eq!(partial_json["failed"], 1);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

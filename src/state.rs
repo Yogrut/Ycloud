@@ -1,10 +1,12 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 use crate::{
     archive::ArchiveTicketStore,
     auth::{
-        AccessTokenStore, PasswordService, SessionStore, SharedAccessTokenStore, SharedSessionStore,
+        AccessTokenStore, PasswordService, RateLimiter, SessionStore, SharedAccessTokenStore,
+        SharedSessionStore,
     },
     config::{save_config, Config, ConfigFile, SharedConfig},
     error::{AppError, AppResult},
@@ -21,6 +23,8 @@ pub struct AppState {
     pub passwords: PasswordService,
     pub storage: StorageService,
     pub archive_tickets: ArchiveTicketStore,
+    pub webdav_gate: Arc<Semaphore>,
+    pub webdav_failures: Arc<RateLimiter>,
     config_updates: Arc<Mutex<()>>,
 }
 
@@ -44,6 +48,8 @@ impl AppState {
             passwords: PasswordService::new(1),
             storage,
             archive_tickets: ArchiveTicketStore::new(),
+            webdav_gate: Arc::new(Semaphore::new(8)),
+            webdav_failures: Arc::new(RateLimiter::new(5, 60)),
             config_updates: Arc::new(Mutex::new(())),
         })
     }

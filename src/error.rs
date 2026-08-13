@@ -61,7 +61,7 @@ impl AppError {
         }
     }
 
-    fn public_message(&self) -> Cow<'static, str> {
+    pub(crate) fn public_message(&self) -> Cow<'static, str> {
         match self {
             Self::BadRequest(message)
             | Self::Conflict(message)

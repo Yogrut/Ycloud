@@ -4,7 +4,7 @@ Ycloud 是一个使用 Rust、Axum 和原生 HTML/CSS/JavaScript 构建的轻量
 
 项目以三个目标的平衡为长期原则：
 
-> 稳定、安全、高性能；不以明显牺牲另外两项为代价追求单项极致。
+> 安全 40%、性能 30%、稳定 30%；数据安全性与完整性并列优先。
 
 Ycloud 不是完整的企业网盘，也不打算用复杂的功能数量换取表面上的“全能”。当前版本更关注清晰的权限边界、可预测的文件操作和较低的运行维护成本。
 
@@ -53,15 +53,15 @@ cd Ycloud
 cargo run --release --locked
 ```
 
-首次启动会创建 `storage` 和 `config.json`，生成随机管理员密码并输出到终端。服务默认监听 `0.0.0.0:3000`，允许本机和网络可达设备连接。
+首次启动必须通过 `INITIAL_ADMIN_PASSWORD` 提供至少 12 字符的管理员密码。程序不会生成或打印明文凭据，默认只监听 `127.0.0.1:3000`。
 
-打开 `http://127.0.0.1:3000`，使用终端输出的初始凭据登录后台，并立即更换管理员密码。停止服务时按 `Ctrl+C`，程序会等待正在处理的请求结束。
+打开 `http://127.0.0.1:3000`，使用用户名 `admin` 和初始化密码登录后台。停止服务时按 `Ctrl+C`，程序会等待正在处理的请求结束。
 
 ### 默认值
 
 | 项目 | 默认值 |
 |---|---:|
-| 监听地址 | `0.0.0.0:3000` |
+| 监听地址 | `127.0.0.1:3000` |
 | 文件目录 | `./storage` |
 | 配置文件 | `./config.json` |
 | 单文件上传上限 | 5 GiB |
@@ -75,7 +75,7 @@ cargo run --release --locked
 | 磁盘安全余量 | 512 MiB |
 | Secure Cookie | 关闭 |
 
-默认监听所有网卡是为了让局域网 WebDAV 可以直接连接。只在本机使用时，建议将 `BIND_ADDRESS` 设置为 `127.0.0.1`。
+非回环监听被视为公网模式，缺少 HTTPS 公共来源、Secure Cookie 或可信代理列表时会拒绝启动。
 
 ## 配置
 
@@ -83,7 +83,7 @@ cargo run --release --locked
 
 | 环境变量 | 说明 | 默认值 |
 |---|---|---:|
-| `BIND_ADDRESS` | 监听 IP | `0.0.0.0` |
+| `BIND_ADDRESS` | 监听 IP | `127.0.0.1` |
 | `PORT` | HTTP 端口 | `3000` |
 | `STORAGE_PATH` | 文件存储路径 | `./storage` |
 | `CONFIG_PATH` | 运行配置路径 | `./config.json` |
@@ -94,6 +94,9 @@ cargo run --release --locked
 | `UPLOAD_TIMEOUT_SECS` | 网页上传和 WebDAV PUT 的超时秒数 | `21600` |
 | `DISK_RESERVE_BYTES` | 上传后必须保留的磁盘可用空间 | `536870912` |
 | `SECURE_COOKIES` | Cookie 是否仅通过 HTTPS 发送 | `false` |
+| `INITIAL_ADMIN_PASSWORD` | 首次创建配置时的管理员密码（至少 12 字符） | 首次启动必填 |
+| `PUBLIC_BASE_URL` | 公网 HTTPS 来源，例如 `https://cloud.example.com` | 公网模式必填 |
+| `TRUSTED_PROXY_IPS` | 可信反向代理连接 IP，逗号分隔的精确地址 | 公网模式必填 |
 
 PowerShell 示例：
 
@@ -102,13 +105,14 @@ $env:BIND_ADDRESS = "127.0.0.1"
 $env:PORT = "3000"
 $env:STORAGE_PATH = ".\storage"
 $env:CONFIG_PATH = ".\config.json"
+$env:INITIAL_ADMIN_PASSWORD = "replace-with-a-long-password"
 cargo run --release --locked
 ```
 
 Bash 示例：
 
 ```bash
-BIND_ADDRESS=127.0.0.1 PORT=3000 cargo run --release --locked
+INITIAL_ADMIN_PASSWORD='replace-with-a-long-password' cargo run --release --locked
 ```
 
 `config.example.json` 仅用于展示当前配置结构。不要将真实的 `config.json`、`config.json.bak` 或 `storage` 内容提交到 Git。
@@ -153,20 +157,26 @@ Ycloud 将四种权限明确分离：
 - 文件路径规范化后再访问磁盘，阻止父目录跳转和存储根目录逃逸。
 - WebDAV 不允许匿名访问；启用的挂载必须具备完整凭据。
 - 上传先写临时文件，完成后原子提交，降低中断造成损坏的概率。
+- `.ycloud-system` 保存事务清单、临时上传、复制和待删除数据；网页、API 与 WebDAV 均无法访问该保留区。
+- 上传替换只允许普通文件替换普通文件；移动、复制及目录操作不覆盖已有目标。
+- 管理员、网页访问或文件夹锁凭据变化时，相关旧会话和令牌立即失效。
+- 管理 API 只接受管理员 Cookie 会话；Basic Auth 仅用于独立 WebDAV 挂载。
 - 多文件由网页逐个请求上传，每个文件独立报告结果；单个失败不会中断后续文件。
 - 上传面板根据浏览器真实传输事件显示总进度、当前文件、已传容量、平均速度和成功/失败数量。
-- 多文件上传时，每个文件都有独立状态行；成功一个便立即刷新文件列表，失败项显示其具体原因，避免队列结束前看起来只上传了一个文件。
+- 多文件上传时，每个文件都有独立状态行；整批完成后只刷新一次目录，减少列表请求和界面抖动。
 - 上传前检查实际可用磁盘空间，并为并发上传预留容量；上传结束后仍保留配置的安全余量。
 
 ### 公网部署
 
-程序本身不终止 TLS。公网使用必须放在可信的 HTTPS 反向代理后，并设置：
+程序本身不终止 TLS。公网使用必须放在同机可信 HTTPS 反向代理后，并同时设置：
 
 ```text
 SECURE_COOKIES=true
+PUBLIC_BASE_URL=https://cloud.example.com
+TRUSTED_PROXY_IPS=127.0.0.1
 ```
 
-同时应限制防火墙、及时更新依赖并备份 `storage` 与 `config.json`。不要把明文 HTTP 直接暴露到互联网；WebDAV Basic 认证只有在 HTTPS 下才具备可接受的传输保护。
+反向代理必须覆盖为单一 `X-Forwarded-For` 并发送 `X-Forwarded-Proto: https`。Host 必须与 `PUBLIC_BASE_URL` 一致；非可信代理、HTTP 转发和多值代理头会被拒绝。还应让服务账户独占存储目录：Unix 使用专用用户，Windows 限制目录 ACL，避免本机其他用户制造链接替换竞态。
 
 ## 项目结构
 
@@ -180,17 +190,18 @@ Ycloud/
 │   ├── security.rs      # Cookie、同源校验和安全响应头
 │   ├── state.rs         # 共享状态和配置更新事务
 │   ├── config.rs        # 配置模型、迁移、校验、保存和恢复
-│   ├── storage.rs       # 安全路径、流式 I/O 和原子文件操作
+│   ├── storage.rs       # 路径边界、流式 I/O 和文件事务入口
+│   ├── storage_transaction.rs # 崩溃恢复、覆盖事务和内部保留区
 │   ├── archive.rs       # 打包预检、一次性票据和流式 ZIP 输出
 │   ├── file_access.rs   # 网页文件授权和文件夹锁判断
 │   ├── api.rs           # 单文件网页 API
-│   ├── batch_api.rs     # 批量删除、移动和复制
+│   ├── batch_operations.rs # 逐项原子的批量删除、移动和复制
 │   ├── admin_api.rs     # 账号、文件夹锁和 WebDAV 配置
 │   ├── webdav.rs        # WebDAV 方法与 Basic 认证
 │   ├── webdav_path.rs   # WebDAV 路径和 Destination 处理
 │   ├── webdav_xml.rs    # PROPFIND XML 响应
 │   └── error.rs         # 统一错误和 HTTP 响应
-├── static/              # 无构建步骤的网页、样式和脚本
+├── static/              # 无构建步骤的页面、CSS 与原生 ES Modules
 ├── storage/             # 默认运行时文件目录（内容不进入 Git）
 ├── config.example.json  # 配置结构示例
 ├── ARCHITECTURE.md      # 当前版本的详细设计与边界
@@ -203,7 +214,7 @@ Ycloud/
 
 - **部署简单**：一个 Rust 服务即可提供网页和 WebDAV，不依赖数据库与 Node.js。
 - **故障边界清晰**：认证通道互相独立，网页文件夹锁不会意外改变 WebDAV 权限。
-- **文件操作稳健**：流式 I/O、原子上传、配置串行写入和有效配置备份减少半成品状态。
+- **文件操作稳健**：事务清单、启动恢复、原子替换、隐藏目录复制、暂存删除和配置备份减少半成品状态。
 - **资源使用可控**：上传大小、目录条目、I/O 并发和请求时间均有明确上限。
 - **下载边界合理**：单文件下载不设大小上限；打包下载以 3 GiB 和 1,000 个文件双重限制控制遍历、元数据和持续 I/O 开销。
 - **适配轻量服务器**：默认按 1 vCPU、1 GiB 内存设计；最多同时执行一个打包流和一个打包预检，密码哈希并发为 1，避免突发任务争抢 CPU 与内存。
@@ -218,6 +229,7 @@ Ycloud/
 - WebDAV 仅实现常用 Class 1 子集，部分强依赖锁协议的客户端不兼容。
 - 当前没有数据库、用户系统、权限组、审计日志、文件历史或回收站。
 - 当前没有浏览器端分块、暂停续传或断点续传上传；网络中断后需要重新上传当前文件。
+- 永久删除不提供用户回收站；内部待删除区仅用于事务稳定性，不承诺物理安全擦除。
 - 当前目录搜索只过滤已经加载的目录，不递归扫描整个存储空间。
 - 单选文件显示普通下载且不限制文件大小；多选项目统一打包下载，展开后必须同时不超过 3 GiB 和 1,000 个文件。
 - 超过 `MAX_LIST_ENTRIES` 的目录会被截断，而不是分页返回。
@@ -231,7 +243,7 @@ Ycloud/
 | 现象 | 可能原因与处理方式 |
 |---|---|
 | 手机或其他电脑无法打开网页 | 确认使用服务器的局域网 IPv4 地址而不是 `127.0.0.1`；检查系统防火墙是否允许 TCP 3000；确认设备处于同一可互访网络。 |
-| 启动时提示 `SECURE_COOKIES is disabled` | 服务监听地址不止本机，但 Cookie 尚未限制为 HTTPS。这在可信局域网调试时是风险提示；公网部署必须配置 HTTPS 并启用 `SECURE_COOKIES=true`。 |
+| 非回环地址启动失败 | 同时设置 `SECURE_COOKIES=true`、HTTPS `PUBLIC_BASE_URL` 和精确的 `TRUSTED_PROXY_IPS`，并确认流量只来自该反向代理。 |
 | WebDAV 返回 `401 Unauthorized` | 使用了管理员或网页密码、挂载未启用、用户名/密码不匹配，或客户端保存了旧凭据。使用该挂载独立的用户名和密码并删除客户端缓存后重试。 |
 | WebDAV 地址存在但找不到文件 | 检查 URL 是否包含 `/dav/挂载名称/`，并确认后台配置的挂载路径指向预期目录。 |
 | WebDAV 客户端提示不支持锁 | 客户端依赖 Class 2 的 `LOCK`/`UNLOCK`；当前版本不支持，应关闭客户端锁要求或更换兼容 Class 1 的客户端。 |

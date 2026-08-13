@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ConnectInfo, Request},
+    extract::{Extension, Request},
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -8,9 +8,8 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 
@@ -18,6 +17,7 @@ pub use crate::state::AppState;
 use crate::{
     config,
     error::{AppError, AppResult},
+    security::ClientIp,
     security::{clear_cookie, session_cookie},
 };
 
@@ -66,16 +66,31 @@ impl RateLimiter {
         }
         true
     }
+
+    pub async fn is_blocked(&self, key: &str) -> bool {
+        let now = Instant::now();
+        self.entries
+            .read()
+            .await
+            .get(key)
+            .is_some_and(|(count, start)| {
+                now.duration_since(*start) < self.window && *count >= self.max_requests
+            })
+    }
+
+    pub async fn record_failure(&self, key: &str) {
+        let _ = self.check(key).await;
+    }
 }
 
 /// Rate-limit middleware: 5 req / 60 s per IP for auth endpoints.
 pub async fn rate_limit_middleware(
     axum::extract::State(limiter): axum::extract::State<Arc<RateLimiter>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let ip = addr.ip().to_string();
+    let ip = ip.to_string();
     if limiter.check(&ip).await {
         Ok(next.run(request).await)
     } else {
@@ -193,6 +208,9 @@ impl AccessTokenStore {
             .await
             .retain(|_, access| access.scope != scope);
     }
+    pub async fn clear(&self) {
+        self.accesses.write().await.clear();
+    }
     /// Remove all expired accesses; call periodically from a background task.
     pub async fn cleanup(&self) {
         let cutoff = chrono::Utc::now() - ACCESS_TOKEN_TTL;
@@ -223,6 +241,23 @@ impl PasswordService {
         tokio::task::spawn_blocking(move || config::verify_password(&hash, &password))
             .await
             .unwrap_or(false)
+    }
+
+    pub async fn verify_with_timeout(
+        &self,
+        hash: String,
+        password: String,
+        wait: Duration,
+    ) -> AppResult<bool> {
+        let permit = tokio::time::timeout(wait, self.gate.acquire())
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("Authentication service is busy".into()))?
+            .map_err(|_| AppError::ServiceUnavailable("Authentication is shutting down".into()))?;
+        let result = tokio::task::spawn_blocking(move || config::verify_password(&hash, &password))
+            .await
+            .map_err(|error| AppError::with_source("password verification task failed", error))?;
+        drop(permit);
+        Ok(result)
     }
 
     pub async fn hash(&self, password: String) -> AppResult<String> {
@@ -274,7 +309,7 @@ pub async fn login_handler(
             config.admin_password_hash.clone(),
         )
     };
-    let supplied_username = body.username.as_deref().unwrap_or("admin");
+    let supplied_username = body.username.as_deref().unwrap_or("");
     let authenticated = supplied_username == expected_username
         && valid_password_length(&body.password)
         && state.passwords.verify(password_hash, body.password).await;
@@ -387,7 +422,7 @@ pub async fn me_handler(
 
 pub async fn gate_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
+    client_ip: Option<Extension<ClientIp>>,
     Json(body): Json<LoginRequest>,
 ) -> Response {
     let password_hash = state
@@ -396,9 +431,9 @@ pub async fn gate_handler(
         .await
         .global_web_password_hash
         .clone();
-    let is_loopback = connect_info
-        .map(|ConnectInfo(address)| address.ip().is_loopback())
-        .unwrap_or(true);
+    let is_loopback = client_ip
+        .map(|Extension(ClientIp(address))| address.is_loopback())
+        .unwrap_or(false);
     let authenticated = match password_hash {
         Some(hash) if valid_password_length(&body.password) => {
             state.passwords.verify(hash, body.password).await
@@ -511,7 +546,7 @@ pub async fn is_admin_authenticated(state: &AppState, headers: &axum::http::Head
         }
     }
 
-    valid_admin_basic_auth(state, headers).await
+    false
 }
 
 // ── General auth middleware ───────────────────────────────────────
@@ -538,26 +573,9 @@ pub async fn auth_middleware(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-async fn valid_admin_basic_auth(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
-    let Some((username, password)) = extract_basic_auth(headers) else {
-        return false;
-    };
-    if !valid_password_length(&password) {
-        return false;
-    }
-    let (expected_username, password_hash) = {
-        let config = state.config_file.read().await;
-        (
-            config.admin_username.clone(),
-            config.admin_password_hash.clone(),
-        )
-    };
-    username == expected_username && state.passwords.verify(password_hash, password).await
-}
-
 #[cfg(test)]
 mod tests {
-    use super::extract_basic_auth;
+    use super::{extract_basic_auth, AccessTokenStore, SessionStore};
     use axum::http::{header, HeaderMap, HeaderValue};
 
     #[test]
@@ -577,5 +595,33 @@ mod tests {
             HeaderValue::from_static("Bearer eW9ncnV0OnNlY3JldA=="),
         );
         assert_eq!(extract_basic_auth(&headers), None);
+    }
+
+    #[tokio::test]
+    async fn credential_change_can_revoke_all_session_classes() {
+        let sessions = SessionStore::new();
+        let accesses = AccessTokenStore::new();
+        let session = sessions.create().await;
+        let gate = accesses.create("__gate__".into()).await;
+        assert!(sessions.validate(&session).await);
+        assert!(accesses.get_scope(&gate).await.is_some());
+
+        sessions.clear().await;
+        accesses.clear().await;
+        assert!(!sessions.validate(&session).await);
+        assert!(accesses.get_scope(&gate).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn folder_credential_change_revokes_only_matching_scope() {
+        let accesses = AccessTokenStore::new();
+        let changed = accesses.create("locked/a".into()).await;
+        let other = accesses.create("locked/b".into()).await;
+        accesses.remove_scope("locked/a").await;
+        assert!(accesses.get_scope(&changed).await.is_none());
+        assert_eq!(
+            accesses.get_scope(&other).await.as_deref(),
+            Some("locked/b")
+        );
     }
 }

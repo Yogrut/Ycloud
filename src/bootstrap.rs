@@ -16,13 +16,6 @@ pub async fn run() -> anyhow::Result<()> {
     let config_file = Arc::new(RwLock::new(config_file));
     let state = AppState::new(runtime.clone(), config_file).await?;
 
-    if !runtime.bind_address.is_loopback() && !runtime.secure_cookies {
-        tracing::warn!(
-            bind_address = %runtime.bind_address,
-            "server is reachable beyond localhost while SECURE_COOKIES is disabled"
-        );
-    }
-
     let (cleanup_stop, cleanup_signal) = watch::channel(false);
     let cleanup_task = spawn_cleanup_task(state.clone(), cleanup_signal);
     let router = app::build_router(state);

@@ -27,11 +27,14 @@ function media(tag) {
 
 async function textPreview() {
   try {
-    const response = await fetch(previewUrl, { credentials: 'same-origin' });
+    const response = await fetch(previewUrl, {
+      credentials: 'same-origin',
+      headers: { Range: 'bytes=0-2097151' }
+    });
     if (!response.ok) throw new Error(`预览失败 (${response.status})`);
     const text = await response.text();
     const pre = document.createElement('pre');
-    pre.textContent = text;
+    pre.textContent = text + (response.status === 206 ? '\n\n[预览已截断，仅显示前 2 MiB]' : '');
     content.replaceChildren(pre);
   } catch (error) {
     showMessage(name, error.message, true);

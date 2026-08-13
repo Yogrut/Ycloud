@@ -17,12 +17,18 @@ use futures_util::Stream;
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore},
 };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
-use crate::error::{AppError, AppResult};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+
+use crate::{
+    error::{AppError, AppResult},
+    storage_transaction::{remove_any, TransactionPaths, SYSTEM_DIR},
+};
 
 #[derive(Clone)]
 pub struct StorageService {
@@ -32,6 +38,9 @@ pub struct StorageService {
     max_list_entries: usize,
     disk_reserve_bytes: u64,
     reserved_upload_bytes: Arc<Mutex<u64>>,
+    transactions: Arc<TransactionPaths>,
+    mutation_gate: Arc<AsyncMutex<()>>,
+    trash_notify: Arc<Notify>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +85,16 @@ impl StorageService {
             .await
             .map_err(|error| AppError::with_source("failed to resolve storage directory", error))?;
 
+        let transactions = TransactionPaths::initialize(&root).await?;
+        let trash_notify = Arc::new(Notify::new());
+        let cleaner_notify = trash_notify.clone();
+        let trash = transactions.trash.clone();
+        tokio::spawn(async move {
+            loop {
+                cleaner_notify.notified().await;
+                purge_trash(&trash).await;
+            }
+        });
         Ok(Self {
             root: Arc::new(root),
             io_gate: Arc::new(Semaphore::new(io_concurrency.max(1))),
@@ -83,6 +102,9 @@ impl StorageService {
             max_list_entries: max_list_entries.max(1),
             disk_reserve_bytes,
             reserved_upload_bytes: Arc::new(Mutex::new(0)),
+            transactions: Arc::new(transactions),
+            mutation_gate: Arc::new(AsyncMutex::new(())),
+            trash_notify,
         })
     }
 
@@ -108,7 +130,7 @@ impl StorageService {
             match component {
                 "" | "." => {}
                 ".." => return Err(AppError::BadRequest("Path traversal is not allowed".into())),
-                value if value.contains(':') => {
+                value if value.contains(':') || value.eq_ignore_ascii_case(SYSTEM_DIR) => {
                     return Err(AppError::BadRequest("Invalid storage path".into()));
                 }
                 value => components.push(value),
@@ -143,7 +165,12 @@ impl StorageService {
         let mut existing_ancestor = absolute.clone();
         loop {
             match fs::symlink_metadata(&existing_ancestor).await {
-                Ok(_) => break,
+                Ok(metadata) => {
+                    if is_link_or_reparse_point(&metadata) {
+                        return Err(AppError::Forbidden);
+                    }
+                    break;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     if !existing_ancestor.pop() {
                         return Err(AppError::Forbidden);
@@ -177,8 +204,7 @@ impl StorageService {
     }
 
     pub async fn begin_atomic_write(&self, path: &str) -> AppResult<AtomicFileWriter> {
-        self.begin_atomic_write_with_expected(path, self.max_upload_bytes)
-            .await
+        self.begin_atomic_write_internal(path, None).await
     }
 
     pub async fn begin_atomic_write_with_expected(
@@ -186,6 +212,18 @@ impl StorageService {
         path: &str,
         expected_bytes: u64,
     ) -> AppResult<AtomicFileWriter> {
+        self.begin_atomic_write_internal(path, Some(expected_bytes))
+            .await
+    }
+
+    async fn begin_atomic_write_internal(
+        &self,
+        path: &str,
+        expected_bytes: Option<u64>,
+    ) -> AppResult<AtomicFileWriter> {
+        if expected_bytes.is_some_and(|bytes| bytes > self.max_upload_bytes) {
+            return Err(AppError::PayloadTooLarge);
+        }
         let destination = self.resolve_for_write(path).await?;
         if destination.is_root() {
             return Err(AppError::BadRequest(
@@ -196,9 +234,18 @@ impl StorageService {
             .absolute()
             .parent()
             .ok_or_else(|| AppError::BadRequest("Invalid destination path".into()))?;
-        fs::create_dir_all(parent).await.map_err(|error| {
-            AppError::with_source("failed to create destination directory", error)
-        })?;
+        let parent_metadata =
+            fs::symlink_metadata(parent)
+                .await
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        AppError::BadRequest("Destination directory does not exist".into())
+                    }
+                    _ => AppError::with_source("failed to inspect destination directory", error),
+                })?;
+        if !parent_metadata.is_dir() || is_link_or_reparse_point(&parent_metadata) {
+            return Err(AppError::Forbidden);
+        }
 
         // Re-check after directory creation so a concurrently swapped symlink
         // cannot silently redirect the final write outside the storage root.
@@ -209,7 +256,8 @@ impl StorageService {
             .await
             .map_err(|error| AppError::with_source("failed to inspect storage capacity", error))?
             .map_err(|error| AppError::with_source("failed to inspect storage capacity", error))?;
-        let required = expected_bytes.saturating_add(self.disk_reserve_bytes);
+        let initially_reserved = expected_bytes.unwrap_or(0);
+        let required = initially_reserved.saturating_add(self.disk_reserve_bytes);
         {
             let mut reserved = self
                 .reserved_upload_bytes
@@ -218,19 +266,17 @@ impl StorageService {
             if available < required.saturating_add(*reserved) {
                 return Err(AppError::InsufficientStorage);
             }
-            *reserved = reserved.saturating_add(expected_bytes);
+            *reserved = reserved.saturating_add(initially_reserved);
         }
         let reservation = UploadReservation {
             reserved_upload_bytes: self.reserved_upload_bytes.clone(),
-            remaining: expected_bytes,
+            remaining: initially_reserved,
+            root: self.root.clone(),
+            disk_reserve_bytes: self.disk_reserve_bytes,
         };
 
-        let file_name = destination
-            .absolute()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("upload");
-        let temporary = parent.join(format!(".{file_name}.{}.upload", Uuid::new_v4()));
+        let transaction_id = Uuid::new_v4().to_string();
+        let temporary = self.transactions.upload_path(&transaction_id);
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -249,10 +295,14 @@ impl StorageService {
             temporary,
             file: Some(file),
             bytes_written: 0,
+            expected_bytes,
             max_bytes: self.max_upload_bytes,
             committed: false,
             _permit: permit,
             reservation,
+            relative: destination.relative,
+            transactions: self.transactions.clone(),
+            mutation_gate: self.mutation_gate.clone(),
         })
     }
 
@@ -268,8 +318,21 @@ impl StorageService {
         }
 
         let total_length = metadata.len();
-        let (start, length, status) =
-            parse_range(request_headers, total_length).unwrap_or((0, total_length, StatusCode::OK));
+        let range = parse_range(request_headers, total_length);
+        let (start, length, status) = match range {
+            Ok(Some(range)) => range,
+            Ok(None) => (0, total_length, StatusCode::OK),
+            Err(()) => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{total_length}"))
+                    .header(header::CONTENT_LENGTH, 0)
+                    .body(Body::empty())
+                    .map_err(|error| {
+                        AppError::with_source("failed to build range response", error)
+                    });
+            }
+        };
         let mut file = File::open(path.absolute())
             .await
             .map_err(|error| AppError::with_source("failed to open file", error))?;
@@ -325,25 +388,21 @@ impl StorageService {
             ));
         }
         let _permit = self.acquire_io().await?;
-        let metadata = fs::symlink_metadata(path.absolute())
+        let _mutation = self.mutation_gate.lock().await;
+        fs::symlink_metadata(path.absolute())
             .await
             .map_err(|error| match error.kind() {
                 std::io::ErrorKind::NotFound => AppError::NotFound,
                 _ => AppError::with_source("failed to inspect path", error),
             })?;
-        if metadata.is_dir() {
-            fs::remove_dir_all(path.absolute())
-                .await
-                .map_err(|error| AppError::with_source("failed to remove directory", error))
-        } else {
-            fs::remove_file(path.absolute())
-                .await
-                .map_err(|error| AppError::with_source("failed to remove file", error))
-        }
+        self.transactions.stage_delete(path.absolute()).await?;
+        self.trash_notify.notify_one();
+        Ok(())
     }
 
     pub async fn create_directory(&self, path: &ResolvedPath) -> AppResult<()> {
         let _permit = self.acquire_io().await?;
+        let _mutation = self.mutation_gate.lock().await;
         fs::create_dir(path.absolute())
             .await
             .map_err(|error| match error.kind() {
@@ -351,7 +410,8 @@ impl StorageService {
                     AppError::Conflict("Destination already exists".into())
                 }
                 _ => AppError::with_source("failed to create directory", error),
-            })
+            })?;
+        sync_parent_directory(path.absolute()).await
     }
 
     pub async fn move_path(
@@ -360,21 +420,20 @@ impl StorageService {
         destination: &ResolvedPath,
     ) -> AppResult<()> {
         reject_root_or_descendant(source, destination)?;
+        let _permit = self.acquire_io().await?;
+        let _mutation = self.mutation_gate.lock().await;
         if fs::try_exists(destination.absolute())
             .await
             .map_err(|error| AppError::with_source("failed to inspect destination", error))?
         {
             return Err(AppError::Conflict("Destination already exists".into()));
         }
-        if let Some(parent) = destination.absolute().parent() {
-            fs::create_dir_all(parent).await.map_err(|error| {
-                AppError::with_source("failed to create destination directory", error)
-            })?;
-        }
-        let _permit = self.acquire_io().await?;
+        require_plain_directory(destination.absolute().parent()).await?;
         fs::rename(source.absolute(), destination.absolute())
             .await
-            .map_err(|error| AppError::with_source("failed to move path", error))
+            .map_err(|error| AppError::with_source("failed to move path", error))?;
+        sync_parent_directory(source.absolute()).await?;
+        sync_parent_directory(destination.absolute()).await
     }
 
     pub async fn copy_path(
@@ -383,6 +442,8 @@ impl StorageService {
         destination: &ResolvedPath,
     ) -> AppResult<()> {
         reject_root_or_descendant(source, destination)?;
+        let _permit = self.acquire_io().await?;
+        let _mutation = self.mutation_gate.lock().await;
         if fs::try_exists(destination.absolute())
             .await
             .map_err(|error| AppError::with_source("failed to inspect destination", error))?
@@ -390,21 +451,32 @@ impl StorageService {
             return Err(AppError::Conflict("Destination already exists".into()));
         }
 
-        let _permit = self.acquire_io().await?;
         let metadata = self.metadata(source).await?;
-        if metadata.is_dir() {
-            copy_directory_iterative(source.absolute(), destination.absolute()).await
+        let transaction_id = Uuid::new_v4().to_string();
+        let temporary = self.transactions.copy_path(&transaction_id);
+        let result = if metadata.is_dir() {
+            copy_directory_iterative(source.absolute(), &temporary).await
+        } else if metadata.is_file() {
+            copy_file_synced(source.absolute(), &temporary).await
         } else {
-            if let Some(parent) = destination.absolute().parent() {
-                fs::create_dir_all(parent).await.map_err(|error| {
-                    AppError::with_source("failed to create destination directory", error)
-                })?;
-            }
-            fs::copy(source.absolute(), destination.absolute())
-                .await
-                .map(|_| ())
-                .map_err(|error| AppError::with_source("failed to copy file", error))
+            Err(AppError::Forbidden)
+        };
+        if let Err(error) = result {
+            let _ = remove_any(&temporary).await;
+            return Err(error);
         }
+        require_plain_directory(destination.absolute().parent()).await?;
+        if fs::try_exists(destination.absolute())
+            .await
+            .unwrap_or(false)
+        {
+            let _ = remove_any(&temporary).await;
+            return Err(AppError::Conflict("Destination already exists".into()));
+        }
+        fs::rename(&temporary, destination.absolute())
+            .await
+            .map_err(|error| AppError::with_source("failed to publish copied path", error))?;
+        sync_parent_directory(destination.absolute()).await
     }
 
     pub async fn ready(&self) -> bool {
@@ -428,10 +500,14 @@ pub struct AtomicFileWriter {
     temporary: PathBuf,
     file: Option<File>,
     bytes_written: u64,
+    expected_bytes: Option<u64>,
     max_bytes: u64,
     committed: bool,
     _permit: OwnedSemaphorePermit,
     reservation: UploadReservation,
+    relative: String,
+    transactions: Arc<TransactionPaths>,
+    mutation_gate: Arc<AsyncMutex<()>>,
 }
 
 impl AtomicFileWriter {
@@ -440,6 +516,7 @@ impl AtomicFileWriter {
         if new_size > self.max_bytes {
             return Err(AppError::PayloadTooLarge);
         }
+        self.reservation.ensure(chunk.len() as u64).await?;
         let file = self
             .file
             .as_mut()
@@ -453,6 +530,14 @@ impl AtomicFileWriter {
     }
 
     pub async fn commit(mut self) -> AppResult<u64> {
+        if self
+            .expected_bytes
+            .is_some_and(|expected| expected != self.bytes_written)
+        {
+            return Err(AppError::BadRequest(
+                "Uploaded size does not match Content-Length".into(),
+            ));
+        }
         let file = self
             .file
             .take()
@@ -461,7 +546,10 @@ impl AtomicFileWriter {
             .await
             .map_err(|error| AppError::with_source("failed to flush upload", error))?;
         drop(file);
-        replace_with_backup(&self.temporary, &self.destination).await?;
+        let _mutation = self.mutation_gate.lock().await;
+        self.transactions
+            .commit_file(&self.relative, &self.temporary, &self.destination)
+            .await?;
         self.committed = true;
         Ok(self.bytes_written)
     }
@@ -479,9 +567,40 @@ impl Drop for AtomicFileWriter {
 struct UploadReservation {
     reserved_upload_bytes: Arc<Mutex<u64>>,
     remaining: u64,
+    root: Arc<PathBuf>,
+    disk_reserve_bytes: u64,
 }
 
 impl UploadReservation {
+    async fn ensure(&mut self, bytes: u64) -> AppResult<()> {
+        if self.remaining >= bytes {
+            return Ok(());
+        }
+        const CHUNK: u64 = 8 * 1024 * 1024;
+        let shortage = bytes - self.remaining;
+        let additional = shortage.saturating_add(CHUNK - 1) / CHUNK * CHUNK;
+        let root = self.root.clone();
+        let available = tokio::task::spawn_blocking(move || fs4::available_space(root.as_path()))
+            .await
+            .map_err(|error| AppError::with_source("failed to inspect storage capacity", error))?
+            .map_err(|error| AppError::with_source("failed to inspect storage capacity", error))?;
+        let mut reserved = self
+            .reserved_upload_bytes
+            .lock()
+            .map_err(|_| AppError::internal("upload reservation state is unavailable"))?;
+        if available
+            < self
+                .disk_reserve_bytes
+                .saturating_add(*reserved)
+                .saturating_add(additional)
+        {
+            return Err(AppError::InsufficientStorage);
+        }
+        *reserved = reserved.saturating_add(additional);
+        self.remaining = self.remaining.saturating_add(additional);
+        Ok(())
+    }
+
     fn consume(&mut self, bytes: u64) {
         let consumed = bytes.min(self.remaining);
         if let Ok(mut reserved) = self.reserved_upload_bytes.lock() {
@@ -513,33 +632,6 @@ where
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner).poll_next(context)
     }
-}
-
-async fn replace_with_backup(temporary: &Path, destination: &Path) -> AppResult<()> {
-    if !fs::try_exists(destination)
-        .await
-        .map_err(|error| AppError::with_source("failed to inspect destination", error))?
-    {
-        return fs::rename(temporary, destination)
-            .await
-            .map_err(|error| AppError::with_source("failed to commit file", error));
-    }
-
-    let backup = destination.with_extension(format!("replace-{}.bak", Uuid::new_v4()));
-    fs::rename(destination, &backup)
-        .await
-        .map_err(|error| AppError::with_source("failed to prepare file replacement", error))?;
-    if let Err(error) = fs::rename(temporary, destination).await {
-        let _ = fs::rename(&backup, destination).await;
-        return Err(AppError::with_source(
-            "failed to commit file replacement",
-            error,
-        ));
-    }
-    if let Err(error) = fs::remove_file(&backup).await {
-        tracing::warn!(path = %backup.display(), %error, "failed to remove replacement backup");
-    }
-    Ok(())
 }
 
 fn reject_root_or_descendant(source: &ResolvedPath, destination: &ResolvedPath) -> AppResult<()> {
@@ -577,48 +669,137 @@ async fn copy_directory_iterative(source: &Path, destination: &Path) -> AppResul
         {
             let source_path = entry.path();
             let destination_path = current_destination.join(entry.file_name());
-            let metadata = entry
-                .metadata()
+            let metadata = fs::symlink_metadata(&source_path)
                 .await
                 .map_err(|error| AppError::with_source("failed to inspect copied entry", error))?;
+            if is_link_or_reparse_point(&metadata) {
+                return Err(AppError::Forbidden);
+            }
             if metadata.is_dir() {
                 pending.push((source_path, destination_path));
             } else if metadata.is_file() {
-                fs::copy(&source_path, &destination_path)
-                    .await
-                    .map_err(|error| AppError::with_source("failed to copy file", error))?;
+                copy_file_synced(&source_path, &destination_path).await?;
             }
         }
     }
     Ok(())
 }
 
-fn parse_range(headers: &HeaderMap, total_length: u64) -> Option<(u64, u64, StatusCode)> {
-    let raw = headers.get(header::RANGE)?.to_str().ok()?;
-    let value = raw.strip_prefix("bytes=")?;
-    if value.contains(',') || total_length == 0 {
-        return None;
+async fn copy_file_synced(source: &Path, destination: &Path) -> AppResult<()> {
+    fs::copy(source, destination)
+        .await
+        .map_err(|error| AppError::with_source("failed to copy file", error))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)
+        .await
+        .map_err(|error| AppError::with_source("failed to open copied file", error))?;
+    file.sync_all()
+        .await
+        .map_err(|error| AppError::with_source("failed to flush copied file", error))
+}
+
+async fn purge_trash(trash: &Path) {
+    let mut entries = match fs::read_dir(trash).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(path = %trash.display(), %error, "failed to inspect staged deletions");
+            return;
+        }
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Err(error) = remove_any(&entry.path()).await {
+            tracing::warn!(path = %entry.path().display(), %error, "failed to purge staged deletion");
+        }
     }
-    let (start, end) = value.split_once('-')?;
+}
+
+#[cfg(unix)]
+async fn sync_parent_directory(path: &Path) -> AppResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::internal("path has no parent directory"))?;
+    let file = File::open(parent)
+        .await
+        .map_err(|error| AppError::with_source("failed to open parent directory", error))?;
+    file.sync_all()
+        .await
+        .map_err(|error| AppError::with_source("failed to flush parent directory", error))
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_path: &Path) -> AppResult<()> {
+    Ok(())
+}
+
+async fn require_plain_directory(parent: Option<&Path>) -> AppResult<()> {
+    let parent = parent.ok_or_else(|| AppError::BadRequest("Invalid destination path".into()))?;
+    let metadata = fs::symlink_metadata(parent)
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                AppError::BadRequest("Destination directory does not exist".into())
+            }
+            _ => AppError::with_source("failed to inspect destination directory", error),
+        })?;
+    if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
+pub(crate) fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn parse_range(
+    headers: &HeaderMap,
+    total_length: u64,
+) -> Result<Option<(u64, u64, StatusCode)>, ()> {
+    let Some(header_value) = headers.get(header::RANGE) else {
+        return Ok(None);
+    };
+    let raw = header_value.to_str().map_err(|_| ())?;
+    let value = raw.strip_prefix("bytes=").ok_or(())?;
+    if value.contains(',') || total_length == 0 {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
     let (start, end) = if start.is_empty() {
-        let suffix = end.parse::<u64>().ok()?.min(total_length);
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        let suffix = suffix.min(total_length);
         (total_length.saturating_sub(suffix), total_length - 1)
     } else {
-        let start = start.parse::<u64>().ok()?;
+        let start = start.parse::<u64>().map_err(|_| ())?;
         if start >= total_length {
-            return None;
+            return Err(());
         }
         let end = if end.is_empty() {
             total_length - 1
         } else {
-            end.parse::<u64>().ok()?.min(total_length - 1)
+            end.parse::<u64>().map_err(|_| ())?.min(total_length - 1)
         };
         if end < start {
-            return None;
+            return Err(());
         }
         (start, end)
     };
-    Some((start, end - start + 1, StatusCode::PARTIAL_CONTENT))
+    Ok(Some((start, end - start + 1, StatusCode::PARTIAL_CONTENT)))
 }
 
 fn content_type_for_mode(
@@ -708,6 +889,7 @@ pub(crate) fn attachment_header(path: &Path) -> HeaderValue {
 #[cfg(test)]
 mod tests {
     use super::{attachment_header, parse_range, StorageService};
+    use crate::storage_transaction::SYSTEM_DIR;
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
     use bytes::Bytes;
     use std::path::Path;
@@ -738,14 +920,19 @@ mod tests {
         headers.insert(header::RANGE, HeaderValue::from_static("bytes=10-19"));
         assert_eq!(
             parse_range(&headers, 100),
-            Some((10, 10, StatusCode::PARTIAL_CONTENT))
+            Ok(Some((10, 10, StatusCode::PARTIAL_CONTENT)))
         );
 
         headers.insert(header::RANGE, HeaderValue::from_static("bytes=-20"));
         assert_eq!(
             parse_range(&headers, 100),
-            Some((80, 20, StatusCode::PARTIAL_CONTENT))
+            Ok(Some((80, 20, StatusCode::PARTIAL_CONTENT)))
         );
+
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=100-200"));
+        assert_eq!(parse_range(&headers, 100), Err(()));
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=nope"));
+        assert_eq!(parse_range(&headers, 100), Err(()));
     }
 
     #[tokio::test]
@@ -754,6 +941,7 @@ mod tests {
         let storage = StorageService::new(root.clone(), 16, 2, 100, 0)
             .await
             .unwrap();
+        tokio::fs::create_dir(root.join("docs")).await.unwrap();
         let mut writer = storage
             .begin_atomic_write("docs/runbook.txt")
             .await
@@ -792,7 +980,9 @@ mod tests {
             .unwrap();
         drop(writer);
         assert!(!root.join("partial.bin").exists());
-        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        let mut entries = tokio::fs::read_dir(root.join(SYSTEM_DIR).join("uploads"))
+            .await
+            .unwrap();
         assert!(entries.next_entry().await.unwrap().is_none());
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
@@ -833,6 +1023,46 @@ mod tests {
                 .status(),
             StatusCode::CONFLICT
         );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserved_storage_area_is_not_addressable() {
+        let root = std::env::temp_dir().join(format!("ycloud-system-{}", uuid::Uuid::new_v4()));
+        let storage = StorageService::new(root.clone(), 1024, 2, 100, 0)
+            .await
+            .unwrap();
+        assert!(StorageService::normalize_relative(".ycloud-system/marker").is_err());
+        assert!(storage
+            .resolve_existing(".ycloud-system/marker")
+            .await
+            .is_err());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_never_replaces_a_directory() {
+        let root = std::env::temp_dir().join(format!("ycloud-type-{}", uuid::Uuid::new_v4()));
+        let storage = StorageService::new(root.clone(), 1024, 2, 100, 0)
+            .await
+            .unwrap();
+        tokio::fs::create_dir(root.join("target")).await.unwrap();
+        let mut writer = storage
+            .begin_atomic_write_with_expected("target", 4)
+            .await
+            .unwrap();
+        writer
+            .write_chunk(&Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.commit().await.unwrap_err().status(),
+            StatusCode::CONFLICT
+        );
+        assert!(tokio::fs::metadata(root.join("target"))
+            .await
+            .unwrap()
+            .is_dir());
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

@@ -23,11 +23,20 @@ pub fn display_relative_path(share: &Share, storage_relative: &str) -> String {
         .to_string()
 }
 
-pub fn parse_destination(destination: &str, share_name: &str) -> Option<String> {
-    let path = destination.split('?').next()?;
+pub fn parse_destination(
+    destination: &str,
+    share_name: &str,
+    request_host: Option<&str>,
+) -> Option<String> {
+    let uri: axum::http::Uri = destination.parse().ok()?;
+    if let Some(authority) = uri.authority() {
+        if Some(authority.as_str()) != request_host {
+            return None;
+        }
+    }
+    let path = uri.path();
     let marker = format!("/dav/{}", percent_encode(share_name));
-    let marker_index = path.find(&marker)?;
-    let remainder = &path[marker_index + marker.len()..];
+    let remainder = path.strip_prefix(&marker)?;
     if !remainder.is_empty() && !remainder.starts_with('/') {
         return None;
     }
@@ -89,12 +98,33 @@ mod tests {
         assert_eq!(
             parse_destination(
                 "http://localhost:3000/dav/Team%20Files/docs/runbook.md",
-                "Team Files"
+                "Team Files",
+                Some("localhost:3000")
             ),
             Some("docs/runbook.md".into())
         );
         assert_eq!(
-            parse_destination("http://localhost:3000/dav/Other/file", "Team Files"),
+            parse_destination(
+                "http://localhost:3000/dav/Other/file",
+                "Team Files",
+                Some("localhost:3000")
+            ),
+            None
+        );
+        assert_eq!(
+            parse_destination(
+                "http://evil.example/dav/Team%20Files/file",
+                "Team Files",
+                Some("localhost:3000")
+            ),
+            None
+        );
+        assert_eq!(
+            parse_destination(
+                "http://localhost:3000/prefix/dav/Team%20Files/file",
+                "Team Files",
+                Some("localhost:3000")
+            ),
             None
         );
     }

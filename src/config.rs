@@ -71,9 +71,9 @@ pub fn path_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
-    #[serde(default = "default_admin_username")]
+    #[serde(default)]
+    pub schema_version: u32,
     pub admin_username: String,
-    #[serde(default = "default_admin_hash")]
     pub admin_password_hash: String,
     #[serde(default)]
     pub global_web_password_hash: Option<String>,
@@ -96,6 +96,9 @@ pub struct Config {
     pub upload_timeout_secs: u64,
     pub disk_reserve_bytes: u64,
     pub secure_cookies: bool,
+    pub public_base_url: Option<String>,
+    pub public_host: Option<String>,
+    pub trusted_proxy_ips: HashSet<IpAddr>,
 }
 
 pub type SharedConfig = Arc<RwLock<ConfigFile>>;
@@ -106,28 +109,15 @@ fn default_admin_username() -> String {
     "admin".into()
 }
 
-fn default_admin_hash() -> String {
-    let password = initial_admin_password();
-    tracing::warn!(
-        username = "admin",
-        password = %password,
-        "generated a replacement administrator password"
-    );
-    hash_password(&password)
-}
-
 // ── ConfigFile ────────────────────────────────────────────────────
 
 impl Default for ConfigFile {
     fn default() -> Self {
-        let initial_password = initial_admin_password();
-        tracing::warn!(
-            username = "admin",
-            password = %initial_password,
-            "generated initial credentials; change them after first login"
-        );
-        let default_hash = hash_password(&initial_password);
+        let first = Uuid::new_v4().simple().to_string();
+        let second = Uuid::new_v4().simple().to_string();
+        let default_hash = hash_password(&format!("{}{}", &first[..12], &second[..12]));
         Self {
+            schema_version: 2,
             admin_username: default_admin_username(),
             admin_password_hash: default_hash.clone(),
             global_web_password_hash: Some(default_hash),
@@ -145,16 +135,13 @@ impl Default for ConfigFile {
     }
 }
 
-fn initial_admin_password() -> String {
-    std::env::var("INITIAL_ADMIN_PASSWORD").unwrap_or_else(|_| {
-        let first = Uuid::new_v4().simple().to_string();
-        let second = Uuid::new_v4().simple().to_string();
-        format!("{}{}", &first[..12], &second[..12])
-    })
-}
-
 impl ConfigFile {
     pub fn validate(&self) -> AppResult<()> {
+        if self.schema_version != 2 {
+            return Err(AppError::BadRequest(
+                "Unsupported configuration schema version".into(),
+            ));
+        }
         let username = self.admin_username.trim();
         if username.is_empty() || username.len() > 128 {
             return Err(AppError::BadRequest(
@@ -252,10 +239,11 @@ impl ConfigFile {
 fn validate_relative_config_path(path: &str) -> AppResult<()> {
     if path.contains('\\')
         || path.contains('\0')
-        || path
-            .trim_matches('/')
-            .split('/')
-            .any(|component| component == ".." || component.contains(':'))
+        || path.trim_matches('/').split('/').any(|component| {
+            component == ".."
+                || component.contains(':')
+                || component.eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR)
+        })
     {
         return Err(AppError::BadRequest(
             "Configured storage path is invalid".into(),
@@ -268,7 +256,7 @@ fn validate_relative_config_path(path: &str) -> AppResult<()> {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let bind_address = env_parse("BIND_ADDRESS", IpAddr::from([0, 0, 0, 0]))?;
+        let bind_address = env_parse("BIND_ADDRESS", IpAddr::from([127, 0, 0, 1]))?;
         let port = env_parse("PORT", 3000_u16)?;
         let storage_path =
             PathBuf::from(std::env::var("STORAGE_PATH").unwrap_or_else(|_| "./storage".into()));
@@ -281,6 +269,8 @@ impl Config {
         let upload_timeout_secs = env_parse("UPLOAD_TIMEOUT_SECS", 6_u64 * 60 * 60)?;
         let disk_reserve_bytes = env_parse("DISK_RESERVE_BYTES", 512_u64 * 1024 * 1024)?;
         let secure_cookies = env_parse("SECURE_COOKIES", false)?;
+        let (public_base_url, public_host, trusted_proxy_ips) =
+            public_proxy_config(bind_address, secure_cookies)?;
         Ok(Self {
             bind_address,
             port,
@@ -293,8 +283,61 @@ impl Config {
             upload_timeout_secs,
             disk_reserve_bytes,
             secure_cookies,
+            public_base_url,
+            public_host,
+            trusted_proxy_ips,
         })
     }
+
+    pub fn is_public_mode(&self) -> bool {
+        self.public_base_url.is_some()
+    }
+}
+
+fn public_proxy_config(
+    bind_address: IpAddr,
+    secure_cookies: bool,
+) -> anyhow::Result<(Option<String>, Option<String>, HashSet<IpAddr>)> {
+    if bind_address.is_loopback() {
+        return Ok((None, None, HashSet::new()));
+    }
+    if !secure_cookies {
+        anyhow::bail!("SECURE_COOKIES=true is required when BIND_ADDRESS is not loopback");
+    }
+    let raw_url = std::env::var("PUBLIC_BASE_URL")
+        .context("PUBLIC_BASE_URL=https://your-domain is required for public mode")?;
+    let uri: axum::http::Uri = raw_url
+        .parse()
+        .context("PUBLIC_BASE_URL must be a valid HTTPS origin")?;
+    if uri.scheme_str() != Some("https")
+        || uri.authority().is_none()
+        || !matches!(uri.path(), "" | "/")
+        || uri.query().is_some()
+    {
+        anyhow::bail!("PUBLIC_BASE_URL must be an HTTPS origin without a path or query");
+    }
+    let host = uri
+        .authority()
+        .expect("authority checked above")
+        .as_str()
+        .to_string();
+    let origin = format!("https://{host}");
+    let raw_proxies = std::env::var("TRUSTED_PROXY_IPS")
+        .context("TRUSTED_PROXY_IPS is required for public mode")?;
+    let trusted_proxy_ips: HashSet<IpAddr> = raw_proxies
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .with_context(|| format!("Invalid trusted proxy IP: {value}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if trusted_proxy_ips.is_empty() {
+        anyhow::bail!("TRUSTED_PROXY_IPS must contain at least one exact IP address");
+    }
+    Ok((Some(origin), Some(host), trusted_proxy_ips))
 }
 
 fn env_parse<T>(name: &str, default: T) -> anyhow::Result<T>
@@ -332,6 +375,12 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
 }
 
 pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .context("Failed to create configuration directory")?;
+        secure_directory_permissions(parent).await?;
+    }
     let backup_path = config_backup_path(path);
     if tokio::fs::try_exists(path).await? || tokio::fs::try_exists(&backup_path).await? {
         let content = match tokio::fs::read_to_string(path).await {
@@ -349,69 +398,27 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
                 tokio::fs::copy(&backup_path, path)
                     .await
                     .context("Failed to restore configuration backup")?;
+                secure_file_permissions(path).await?;
                 backup
             }
         };
 
-        // Migration: old HashMap format → new Vec<FolderLock>
         let mut raw: serde_json::Value =
             serde_json::from_str(&content).context("Failed to parse config.json")?;
         let mut migrated = false;
-        if let Some(locks) = raw.get_mut("folder_locks") {
-            if locks.is_object() {
-                let map: std::collections::HashMap<String, String> =
-                    serde_json::from_value(locks.clone()).unwrap_or_default();
-                let mut new_locks: Vec<serde_json::Value> = Vec::new();
-                for (p, h) in map {
-                    new_locks.push(serde_json::json!({
-                        "id": Uuid::new_v4().to_string(),
-                        "path": p,
-                        "password_hash": h
-                    }));
-                }
-                *locks = serde_json::json!(new_locks);
-                migrated = true;
-            }
+        let schema_version = raw
+            .get("schema_version")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        if schema_version > 2 {
+            anyhow::bail!(
+                "Configuration schema version {schema_version} is newer than this Ycloud build"
+            );
         }
-
-        if let Some(shares) = raw.get_mut("shares").and_then(|value| value.as_array_mut()) {
-            for share in shares {
-                if let Some(object) = share.as_object_mut() {
-                    if let Some(legacy_enabled) = object.remove("enabled") {
-                        migrated = true;
-                        if legacy_enabled.as_bool() == Some(false) {
-                            object.insert("webdav_enabled".into(), serde_json::json!(false));
-                        }
-                    }
-                    if object.remove("web_password_hash").is_some() {
-                        migrated = true;
-                    }
-                    let webdav_enabled = object
-                        .get("webdav_enabled")
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(false);
-                    let has_username = object
-                        .get("username")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|value| !value.trim().is_empty());
-                    let has_password = object
-                        .get("password_hash")
-                        .is_some_and(|value| value.is_string());
-                    if webdav_enabled && (!has_username || !has_password) {
-                        object.insert("webdav_enabled".into(), serde_json::json!(false));
-                        migrated = true;
-                        tracing::warn!(
-                            "disabled a legacy WebDAV mount without complete credentials"
-                        );
-                    }
-                }
-                if share.get("id").and_then(|value| value.as_str()).is_none() {
-                    share["id"] = serde_json::json!(Uuid::new_v4().to_string());
-                    migrated = true;
-                }
-            }
+        if schema_version < 2 {
+            raw["schema_version"] = serde_json::json!(2);
+            migrated = true;
         }
-
         let config: ConfigFile =
             serde_json::from_value(raw).context("Failed to parse config.json")?;
         config
@@ -425,12 +432,28 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
         }
         Ok(config)
     } else {
-        let config = ConfigFile::default();
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .context("Failed to create configuration directory")?;
+        let password = std::env::var("INITIAL_ADMIN_PASSWORD")
+            .context("INITIAL_ADMIN_PASSWORD is required when creating a new configuration")?;
+        if password.len() < 12 || password.len() > 1_024 {
+            anyhow::bail!("INITIAL_ADMIN_PASSWORD must contain 12-1024 bytes");
         }
+        let password_hash = hash_password(&password);
+        let config = ConfigFile {
+            schema_version: 2,
+            admin_username: default_admin_username(),
+            admin_password_hash: password_hash,
+            global_web_password_hash: None,
+            folder_locks: Vec::new(),
+            shares: vec![Share {
+                id: uuid_v4(),
+                name: "Default".into(),
+                path: String::new(),
+                username: Some("admin".into()),
+                webdav_enabled: false,
+                password_hash: None,
+                readonly: false,
+            }],
+        };
         save_config(path, &config).await?;
         Ok(config)
     }
@@ -447,6 +470,7 @@ pub async fn save_config(path: &Path, config: &ConfigFile) -> anyhow::Result<()>
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
+        .mode(0o600)
         .open(&temporary)
         .await
         .context("Failed to create temporary configuration")?;
@@ -473,10 +497,12 @@ pub async fn save_config(path: &Path, config: &ConfigFile) -> anyhow::Result<()>
             tokio::fs::rename(path, &backup)
                 .await
                 .context("Failed to rotate configuration backup")?;
+            secure_file_permissions(&backup).await?;
         }
         tokio::fs::rename(&temporary, path)
             .await
-            .context("Failed to commit configuration")
+            .context("Failed to commit configuration")?;
+        secure_file_permissions(path).await
     }
     .await;
     if let Err(error) = commit_result {
@@ -491,8 +517,53 @@ pub async fn save_config(path: &Path, config: &ConfigFile) -> anyhow::Result<()>
     Ok(())
 }
 
+#[cfg(unix)]
+async fn secure_directory_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .await
+        .context("Failed to restrict configuration directory permissions")
+}
+
+#[cfg(not(unix))]
+async fn secure_directory_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn secure_file_permissions(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .context("Failed to restrict configuration file permissions")
+}
+
+#[cfg(not(unix))]
+async fn secure_file_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
 fn config_backup_path(path: &Path) -> PathBuf {
     path.with_extension("json.bak")
+}
+
+trait SecureOpenOptions {
+    fn mode(&mut self, mode: u32) -> &mut Self;
+}
+
+#[cfg(unix)]
+impl SecureOpenOptions for OpenOptions {
+    fn mode(&mut self, mode: u32) -> &mut Self {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptionsExt::mode(self, mode)
+    }
+}
+
+#[cfg(not(unix))]
+impl SecureOpenOptions for OpenOptions {
+    fn mode(&mut self, _mode: u32) -> &mut Self {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +614,7 @@ mod tests {
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let path = directory.join("config.json");
         let mut config = ConfigFile {
+            schema_version: 2,
             admin_username: "first-admin".into(),
             admin_password_hash: hash_password("test-password"),
             global_web_password_hash: None,
@@ -564,23 +636,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_shares_receive_persisted_stable_ids() {
+    async fn stable_config_migrates_to_schema_v2() {
         let directory =
             std::env::temp_dir().join(format!("ycloud-migration-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let path = directory.join("config.json");
-        let legacy = serde_json::json!({
+        let stable = serde_json::json!({
             "admin_username": "admin",
             "admin_password_hash": hash_password("test-password"),
             "shares": [{
                 "name": "Legacy",
                 "path": "",
-                "enabled": true,
                 "webdav_enabled": false,
                 "readonly": false
             }]
         });
-        tokio::fs::write(&path, serde_json::to_vec(&legacy).unwrap())
+        tokio::fs::write(&path, serde_json::to_vec(&stable).unwrap())
             .await
             .unwrap();
 
@@ -591,6 +662,7 @@ mod tests {
         let persisted: ConfigFile =
             serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
         assert_eq!(persisted.shares[0].id, migrated.shares[0].id);
+        assert_eq!(persisted.schema_version, 2);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }

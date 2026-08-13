@@ -1,5 +1,5 @@
 use axum::{
-    extract::Request,
+    extract::{ConnectInfo, Request, State},
     http::{
         header::{self, HeaderName, HeaderValue},
         Method, StatusCode,
@@ -7,6 +7,12 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use std::net::{IpAddr, SocketAddr};
+
+use crate::config::Config;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClientIp(pub IpAddr);
 
 pub fn session_cookie(name: &str, value: &str, max_age: u64, secure: bool) -> String {
     let secure_attribute = if secure { "; Secure" } else { "" };
@@ -19,14 +25,77 @@ pub fn clear_cookie(name: &str, secure: bool) -> String {
     session_cookie(name, "", 0, secure)
 }
 
-pub async fn csrf_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
+pub async fn proxy_boundary_middleware(
+    State(config): State<Config>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(address)| address.ip())
+        .or_else(|| {
+            config
+                .bind_address
+                .is_loopback()
+                .then_some(config.bind_address)
+        })
+        .ok_or(StatusCode::FORBIDDEN)?;
+    let client_ip = validated_client_ip(&config, peer_ip, request.headers())?;
+    request.extensions_mut().insert(ClientIp(client_ip));
+    Ok(next.run(request).await)
+}
+
+fn validated_client_ip(
+    config: &Config,
+    peer_ip: IpAddr,
+    headers: &axum::http::HeaderMap,
+) -> Result<IpAddr, StatusCode> {
+    if !config.is_public_mode() {
+        return Ok(peer_ip);
+    }
+    if !config.trusted_proxy_ips.contains(&peer_ip) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let forwarded_for = single_header(headers, "x-forwarded-for")?;
+    let forwarded_proto = single_header(headers, "x-forwarded-proto")?;
+    let host = single_header(headers, header::HOST.as_str())?;
+    if forwarded_proto != "https" || Some(host) != config.public_host.as_deref() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    forwarded_for
+        .parse::<IpAddr>()
+        .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn single_header<'a>(
+    headers: &'a axum::http::HeaderMap,
+    name: &str,
+) -> Result<&'a str, StatusCode> {
+    let mut values = headers.get_all(name).iter();
+    let value = values
+        .next()
+        .ok_or(StatusCode::BAD_REQUEST)?
+        .to_str()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if values.next().is_some() || value.contains(',') || value.trim() != value || value.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(value)
+}
+
+pub async fn csrf_middleware(
+    State(config): State<Config>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
     if is_mutating(request.method()) && uses_cookie_auth(request.headers()) {
         let same_origin_fetch = request
             .headers()
             .get("sec-fetch-site")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value == "same-origin");
-        let origin_matches = origin_matches_host(request.headers());
+        let origin_matches = origin_matches(&config, request.headers());
         if !same_origin_fetch && !origin_matches {
             return Err(StatusCode::FORBIDDEN);
         }
@@ -34,13 +103,23 @@ pub async fn csrf_middleware(request: Request, next: Next) -> Result<Response, S
     Ok(next.run(request).await)
 }
 
-pub async fn security_headers_middleware(request: Request, next: Next) -> Response {
+pub async fn security_headers_middleware(
+    State(config): State<Config>,
+    request: Request,
+    next: Next,
+) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    if config.is_public_mode() {
+        headers.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         header::REFERRER_POLICY,
@@ -58,7 +137,7 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
             "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; \
-             form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             form-action 'self'; script-src 'self'; style-src 'self'; \
              img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self'",
         ),
     );
@@ -80,7 +159,13 @@ fn uses_cookie_auth(headers: &axum::http::HeaderMap) -> bool {
         })
 }
 
-fn origin_matches_host(headers: &axum::http::HeaderMap) -> bool {
+fn origin_matches(config: &Config, headers: &axum::http::HeaderMap) -> bool {
+    if let Some(expected) = config.public_base_url.as_deref() {
+        return headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|origin| origin == expected);
+    }
     let Some(host) = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -101,7 +186,8 @@ fn origin_matches_host(headers: &axum::http::HeaderMap) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_cookie, origin_matches_host, session_cookie};
+    use super::{clear_cookie, origin_matches, session_cookie, single_header, validated_client_ip};
+    use crate::config::Config;
     use axum::http::{header, HeaderMap, HeaderValue};
 
     #[test]
@@ -121,11 +207,70 @@ mod tests {
             header::ORIGIN,
             HeaderValue::from_static("http://cloud.local:3000"),
         );
-        assert!(origin_matches_host(&headers));
+        assert!(origin_matches(&local_config(), &headers));
         headers.insert(
             header::ORIGIN,
             HeaderValue::from_static("http://evil.cloud.local:3000"),
         );
-        assert!(!origin_matches_host(&headers));
+        assert!(!origin_matches(&local_config(), &headers));
+    }
+
+    #[test]
+    fn forwarded_headers_must_be_single_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        assert_eq!(
+            single_header(&headers, "x-forwarded-for").unwrap(),
+            "203.0.113.9"
+        );
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, 127.0.0.1"),
+        );
+        assert!(single_header(&headers, "x-forwarded-for").is_err());
+    }
+
+    #[test]
+    fn public_mode_rejects_untrusted_or_insecure_proxy_requests() {
+        let mut config = local_config();
+        config.public_base_url = Some("https://cloud.example".into());
+        config.public_host = Some("cloud.example".into());
+        config
+            .trusted_proxy_ips
+            .insert("127.0.0.1".parse().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("cloud.example"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+
+        assert_eq!(
+            validated_client_ip(&config, "127.0.0.1".parse().unwrap(), &headers).unwrap(),
+            "203.0.113.9".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(validated_client_ip(&config, "192.0.2.10".parse().unwrap(), &headers).is_err());
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert!(validated_client_ip(&config, "127.0.0.1".parse().unwrap(), &headers).is_err());
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert(header::HOST, HeaderValue::from_static("evil.example"));
+        assert!(validated_client_ip(&config, "127.0.0.1".parse().unwrap(), &headers).is_err());
+    }
+
+    fn local_config() -> Config {
+        Config {
+            bind_address: "127.0.0.1".parse().unwrap(),
+            port: 3000,
+            storage_path: "storage".into(),
+            config_path: "config.json".into(),
+            max_upload_bytes: 1,
+            io_concurrency: 1,
+            max_list_entries: 1,
+            request_timeout_secs: 1,
+            upload_timeout_secs: 1,
+            disk_reserve_bytes: 0,
+            secure_cookies: false,
+            public_base_url: None,
+            public_host: None,
+            trusted_proxy_ips: Default::default(),
+        }
     }
 }

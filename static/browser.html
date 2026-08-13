@@ -78,9 +78,7 @@
         <div><h3 id="uploadTitle">上传进度</h3><p id="uploadSummary">正在准备上传</p></div>
       </div>
       <div class="upload-file-line"><span id="uploadFileName">—</span><strong id="uploadPercent">0%</strong></div>
-      <div class="upload-progress-track" role="progressbar" aria-label="上传总进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="uploadProgress">
-        <span id="uploadProgressFill"></span>
-      </div>
+      <progress class="upload-progress-track" aria-label="上传总进度" max="100" value="0" id="uploadProgress"></progress>
       <div class="upload-metrics"><span id="uploadBytes">0 B / 0 B</span><span id="uploadSpeed">0 B/s</span></div>
       <p class="upload-status" id="uploadStatus">请保持页面打开，文件会逐个上传</p>
       <div class="upload-results" id="uploadResults"></div>
@@ -117,6 +115,6 @@
   </div>
 
   <script src="/browser-dialog.js" defer></script>
-  <script src="/browser.js" defer></script>
+  <script type="module" src="/browser.js"></script>
 </body>
 </html>

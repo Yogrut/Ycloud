@@ -1,15 +1,17 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::{header, HeaderMap, Method, StatusCode},
     response::Response,
 };
 use futures_util::StreamExt;
+use std::time::Duration;
 
 use crate::{
     auth,
     config::Share,
     file_access::share_storage_path,
+    security::ClientIp,
     state::AppState,
     storage::{FileResponseMode, ResolvedPath},
     webdav_path::{
@@ -21,21 +23,37 @@ use crate::{
 
 pub async fn webdav_handler(
     State(state): State<AppState>,
+    client_ip: Option<Extension<ClientIp>>,
     dav_path: Option<Path<String>>,
     method: Method,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, StatusCode> {
+    let _request_permit = state
+        .webdav_gate
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     if method == Method::OPTIONS {
         return options_response();
     }
+    let body = if method == Method::PUT {
+        body
+    } else {
+        axum::body::to_bytes(body, 64 * 1024)
+            .await
+            .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
+        Body::empty()
+    };
 
     let dav_path = dav_path.map(|path| path.0).unwrap_or_default();
-    let (share, sub_path) = match verify_share_access(&state, &dav_path, &headers, &method).await {
-        Ok(access) => access,
-        Err(StatusCode::UNAUTHORIZED) => return Ok(basic_auth_challenge()),
-        Err(status) => return Err(status),
-    };
+    let client_ip = client_ip.map(|Extension(client)| client.0);
+    let (share, sub_path) =
+        match verify_share_access(&state, &dav_path, &headers, &method, client_ip).await {
+            Ok(access) => access,
+            Err(StatusCode::UNAUTHORIZED) => return Ok(basic_auth_challenge()),
+            Err(status) => return Err(status),
+        };
 
     let destination = headers
         .get("destination")
@@ -68,6 +86,7 @@ async fn verify_share_access(
     dav_path: &str,
     headers: &HeaderMap,
     method: &Method,
+    client_ip: Option<std::net::IpAddr>,
 ) -> Result<(Share, String), StatusCode> {
     let (share_name, sub_path) = parse_share_path(dav_path);
     let share = {
@@ -82,8 +101,17 @@ async fn verify_share_access(
     if !share.webdav_enabled {
         return Err(StatusCode::FORBIDDEN);
     }
-    if !verify_share_basic_auth(state, &share, headers).await {
-        return Err(StatusCode::UNAUTHORIZED);
+    let failure_key = client_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    if state.webdav_failures.is_blocked(&failure_key).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if let Err(status) = verify_share_basic_auth(state, &share, headers).await {
+        if status == StatusCode::UNAUTHORIZED {
+            state.webdav_failures.record_failure(&failure_key).await;
+        }
+        return Err(status);
     }
     if share.readonly && is_write_method(method) {
         return Err(StatusCode::FORBIDDEN);
@@ -92,24 +120,35 @@ async fn verify_share_access(
     Ok((share, sub_path.to_string()))
 }
 
-async fn verify_share_basic_auth(state: &AppState, share: &Share, headers: &HeaderMap) -> bool {
+async fn verify_share_basic_auth(
+    state: &AppState,
+    share: &Share,
+    headers: &HeaderMap,
+) -> Result<(), StatusCode> {
     let Some((username, password)) = auth::extract_basic_auth(headers) else {
-        return false;
+        return Err(StatusCode::UNAUTHORIZED);
     };
     if password.is_empty() || password.len() > 1_024 {
-        return false;
+        return Err(StatusCode::UNAUTHORIZED);
     }
     let (Some(expected_username), Some(password_hash)) =
         (share.username.as_ref(), share.password_hash.as_ref())
     else {
         // Public, passwordless WebDAV is intentionally not supported.
-        return false;
+        return Err(StatusCode::UNAUTHORIZED);
     };
-    username == *expected_username
-        && state
-            .passwords
-            .verify(password_hash.clone(), password)
-            .await
+    if username != *expected_username {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    match state
+        .passwords
+        .verify_with_timeout(password_hash.clone(), password, Duration::from_secs(3))
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StatusCode::UNAUTHORIZED),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 async fn handle_propfind(
@@ -145,10 +184,19 @@ async fn handle_propfind(
             else {
                 break;
             };
-            let metadata = entry
-                .metadata()
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR)
+            {
+                continue;
+            }
+            let metadata = tokio::fs::symlink_metadata(entry.path())
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if crate::storage::is_link_or_reparse_point(&metadata) {
+                continue;
+            }
             let storage_relative =
                 join_relative(target.relative(), &entry.file_name().to_string_lossy());
             let child = state
@@ -212,13 +260,17 @@ async fn handle_put(
     let expected_bytes = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(state.config.max_upload_bytes);
-    let mut writer = state
-        .storage
-        .begin_atomic_write_with_expected(&storage_path, expected_bytes)
-        .await
-        .map_err(|error| error.status())?;
+        .and_then(|value| value.parse::<u64>().ok());
+    let mut writer = match expected_bytes {
+        Some(bytes) => {
+            state
+                .storage
+                .begin_atomic_write_with_expected(&storage_path, bytes)
+                .await
+        }
+        None => state.storage.begin_atomic_write(&storage_path).await,
+    }
+    .map_err(|error| error.status())?;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -274,8 +326,11 @@ async fn handle_move_or_copy(
         return Err(StatusCode::BAD_REQUEST);
     }
     let destination = destination.ok_or(StatusCode::BAD_REQUEST)?;
+    let request_host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok());
     let destination_path =
-        parse_destination(&destination, &share.name).ok_or(StatusCode::FORBIDDEN)?;
+        parse_destination(&destination, &share.name, request_host).ok_or(StatusCode::FORBIDDEN)?;
     let source = resolve_existing(state, share, sub_path).await?;
     let target = resolve_write(state, share, &destination_path).await?;
 

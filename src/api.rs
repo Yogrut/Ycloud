@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
 use axum::{
-    extract::{Multipart, Query, State},
+    body::Body,
+    extract::{Query, State},
     http::{header, HeaderMap},
     response::IntoResponse,
     Json,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
@@ -137,10 +139,17 @@ pub async fn list_files(
             break;
         };
         let name = entry.file_name().to_string_lossy().to_string();
-        let Ok(metadata) = entry.metadata().await else {
+        if name.eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(entry.path()).await else {
             tracing::warn!(path = %entry.path().display(), "skipping unreadable directory entry");
             continue;
         };
+        if crate::storage::is_link_or_reparse_point(&metadata) {
+            tracing::warn!(path = %entry.path().display(), "skipping symbolic link in storage directory");
+            continue;
+        }
         let is_dir = metadata.is_dir();
         let size = metadata.len();
         let modified = metadata
@@ -233,58 +242,46 @@ pub async fn upload_file(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<FileQuery>,
-    mut multipart: Multipart,
+    body: Body,
 ) -> AppResult<Json<serde_json::Value>> {
     let expected_bytes = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(state.config.max_upload_bytes);
+        .and_then(|value| value.parse::<u64>().ok());
     let share = resolve_share(&state, &headers, &query).await?;
     ensure_writable(&share)?;
-    let request_path = query.path.as_deref().unwrap_or("");
-    check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
-    let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| AppError::with_source("invalid multipart upload", error))?
-    else {
-        return Err(AppError::BadRequest("An upload file is required".into()));
-    };
-    let file_name = field
-        .file_name()
+    let file_request_path = query.path.as_deref().unwrap_or("").trim_matches('/');
+    ensure_non_root(file_request_path)?;
+    let file_name = file_request_path
+        .rsplit('/')
+        .next()
         .map(sanitize_name)
-        .unwrap_or_else(|| "unnamed".into());
-    if file_name.is_empty() {
-        return Err(AppError::BadRequest("A valid file name is required".into()));
+        .unwrap_or_default();
+    if file_name.is_empty() || file_name != file_request_path.rsplit('/').next().unwrap_or("") {
+        return Err(AppError::BadRequest(
+            "A valid target file path is required".into(),
+        ));
     }
-    let file_request_path = join_request_path(request_path, &file_name);
     check_folder_locks(
         &state,
         &headers,
-        &share_storage_path(&share, &file_request_path),
+        &share_storage_path(&share, file_request_path),
     )
     .await?;
-    let storage_path = share_storage_path(&share, &file_request_path);
-    let mut writer = state
-        .storage
-        .begin_atomic_write_with_expected(&storage_path, expected_bytes)
-        .await?;
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|error| AppError::with_source("failed to read upload", error))?
-    {
+    let storage_path = share_storage_path(&share, file_request_path);
+    let mut writer = match expected_bytes {
+        Some(bytes) => {
+            state
+                .storage
+                .begin_atomic_write_with_expected(&storage_path, bytes)
+                .await?
+        }
+        None => state.storage.begin_atomic_write(&storage_path).await?,
+    };
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| AppError::with_source("failed to read upload", error))?;
         writer.write_chunk(&chunk).await?;
-    }
-    drop(field);
-    if multipart
-        .next_field()
-        .await
-        .map_err(|error| AppError::with_source("invalid multipart upload", error))?
-        .is_some()
-    {
-        return Err(AppError::BadRequest("Upload one file per request".into()));
     }
     writer.commit().await?;
     Ok(Json(

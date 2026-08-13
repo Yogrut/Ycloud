@@ -214,7 +214,7 @@ async fn collect_files(
         let metadata = fs::symlink_metadata(&absolute)
             .await
             .map_err(|error| AppError::with_source("failed to inspect archive entry", error))?;
-        if metadata.file_type().is_symlink() {
+        if crate::storage::is_link_or_reparse_point(&metadata) {
             return Err(AppError::BadRequest(
                 "Archives cannot contain symbolic links".into(),
             ));
@@ -230,6 +230,9 @@ async fn collect_files(
                 .map_err(|error| AppError::with_source("failed to read archive entry", error))?
             {
                 let name = entry.file_name().to_string_lossy().to_string();
+                if name.eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR) {
+                    continue;
+                }
                 pending.push((entry.path(), join_path(&relative, &name)));
             }
             continue;
@@ -318,7 +321,7 @@ async fn write_archive(
     for file in files {
         let current = fs::symlink_metadata(&file.absolute).await?;
         let canonical = fs::canonicalize(&file.absolute).await?;
-        if current.file_type().is_symlink()
+        if crate::storage::is_link_or_reparse_point(&current)
             || !current.is_file()
             || current.len() != file.size
             || canonical != file.absolute

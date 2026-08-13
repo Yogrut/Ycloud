@@ -1,23 +1,7 @@
 'use strict';
 
-const state = {
-  path: '',
-  entries: [],
-  selected: new Set(),
-  query: '',
-  sort: 'name',
-  ascending: true,
-  canWrite: true,
-  maxUploadBytes: 0,
-  maxArchiveBytes: 0,
-  maxArchiveFiles: 0,
-  pickerPath: '',
-  pickerCallback: null,
-  mkdirTarget: '',
-  contextPath: '',
-  contextIsDirectory: false,
-  uploading: false
-};
+import { apiRequest, rawUpload } from './browser-api.js';
+import { formatSize, state } from './browser-state.js';
 
 const elements = Object.fromEntries([
   'adminButton','logoutButton','uploadButton','newFolderButton','searchInput',
@@ -26,23 +10,11 @@ const elements = Object.fromEntries([
   'createFolderButton','pickerModal','pickerTitle','pickerPath','pickerList',
   'pickerConfirmButton','adminModal','adminUser','adminPass','adminError','adminLoginButton',
   'uploadModal','uploadSummary','uploadFileName','uploadPercent','uploadProgress',
-  'uploadProgressFill','uploadBytes','uploadSpeed','uploadStatus','uploadResults','uploadCloseButton',
+  'uploadBytes','uploadSpeed','uploadStatus','uploadResults','uploadCloseButton',
   'backToTopButton'
 ].map(id => [id, document.getElementById(id)]));
 
-async function request(url, options = {}) {
-  const response = await fetch(url, { credentials: 'same-origin', ...options });
-  if (response.status === 401) {
-    location.href = '/';
-    throw new Error('登录已失效');
-  }
-  const type = response.headers.get('content-type') || '';
-  const body = type.includes('application/json') ? await response.json() : null;
-  if (!response.ok) {
-    throw new Error(body?.error?.message || body?.message || `请求失败 (${response.status})`);
-  }
-  return body;
-}
+const request = apiRequest;
 
 function fileApi(path = state.path) {
   return path ? `/api/files?path=${encodeURIComponent('/' + path)}` : '/api/files';
@@ -61,13 +33,6 @@ function showToast(message) {
 
 function showModal(element) { element.classList.add('active'); }
 function hideModal(element) { element.classList.remove('active'); }
-
-function formatSize(bytes) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
-  return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
-}
 
 function createFileIcon(entry) {
   const knownKinds = new Set(['image', 'video', 'audio', 'archive', 'pdf', 'code', 'doc']);
@@ -322,38 +287,14 @@ async function downloadArchive(paths) {
   } catch (error) { showToast(error.message); }
 }
 
-function uploadRequest(url, form, onProgress) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', url);
-    xhr.withCredentials = true;
-    xhr.upload.addEventListener('progress', event => {
-      if (event.lengthComputable) onProgress(event.loaded, event.total);
-    });
-    xhr.addEventListener('load', () => {
-      if (xhr.status === 401) {
-        location.href = '/';
-        reject(new Error('登录已失效'));
-        return;
-      }
-      let body = null;
-      try { body = JSON.parse(xhr.responseText || 'null'); } catch (_) {}
-      if (xhr.status >= 200 && xhr.status < 300) resolve(body);
-      else reject(new Error(body?.error?.message || body?.message || `上传失败 (${xhr.status})`));
-    });
-    xhr.addEventListener('error', () => reject(new Error('网络连接中断')));
-    xhr.addEventListener('abort', () => reject(new Error('上传已取消')));
-    xhr.send(form);
-  });
-}
+const uploadRequest = rawUpload;
 
 function updateUploadProgress(processedBytes, currentLoaded, totalBytes, startedAt) {
   const transferred = Math.min(totalBytes, processedBytes + currentLoaded);
   const percent = totalBytes ? Math.min(100, Math.round(transferred / totalBytes * 100)) : 100;
   const elapsedSeconds = Math.max(.1, (performance.now() - startedAt) / 1000);
   elements.uploadPercent.textContent = `${percent}%`;
-  elements.uploadProgressFill.style.width = `${percent}%`;
-  elements.uploadProgress.setAttribute('aria-valuenow', String(percent));
+  elements.uploadProgress.value = percent;
   elements.uploadBytes.textContent = `${formatSize(transferred)} / ${formatSize(totalBytes)}`;
   elements.uploadSpeed.textContent = `${formatSize(transferred / elapsedSeconds)}/s`;
 }
@@ -407,18 +348,16 @@ async function uploadFiles(files) {
       elements.uploadFileName.textContent = file.name;
       elements.uploadStatus.textContent = `正在上传 ${index + 1}/${queue.length}`;
       setUploadResult(resultRows[index], '', '上传中');
-      const form = new FormData();
-      form.append('file', file, file.name);
       let fileTransferred = 0;
       try {
-        await uploadRequest(actionApi('upload'), form, (loaded, requestTotal) => {
+        const targetPath = [state.path, file.name].filter(Boolean).join('/');
+        await uploadRequest(actionApi('upload', targetPath), file, (loaded, requestTotal) => {
           fileTransferred = requestTotal ? Math.min(file.size, loaded / requestTotal * file.size) : Math.min(file.size, loaded);
           updateUploadProgress(processedBytes, fileTransferred, totalBytes, startedAt);
         });
         fileTransferred = file.size;
         uploaded.push(file.name);
         setUploadResult(resultRows[index], 'success', '完成');
-        await refresh();
       } catch (error) {
         failed.push({ name: file.name, message: error.message });
         setUploadResult(resultRows[index], 'failed', error.message);
@@ -426,6 +365,7 @@ async function uploadFiles(files) {
       processedBytes += fileTransferred;
       updateUploadProgress(processedBytes, 0, totalBytes, startedAt);
     }
+    await refresh();
     if (!failed.length) {
       elements.uploadStatus.textContent = `上传完成：成功 ${uploaded.length} 个文件`;
     } else {
@@ -488,12 +428,12 @@ async function deletePaths(paths) {
   if (!paths.length || !state.canWrite) return;
   if (!await window._spConfirm(`永久删除 ${paths.length} 个项目？此操作无法撤销。`)) return;
   try {
-    await request('/api/batch/delete', {
+    const result = await request('/api/batch/delete', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ paths })
     });
-    showToast(`已删除 ${paths.length} 个项目`);
+    showToast(result.failed ? `已删除 ${result.success} 项，失败 ${result.failed} 项` : `已删除 ${paths.length} 个项目`);
     await refresh();
   } catch (error) { showToast(error.message); }
 }
@@ -535,12 +475,14 @@ async function transfer(operation, paths) {
   if (!paths.length || !state.canWrite) return;
   showPicker(`${operation === 'move' ? '移动' : '复制'} ${paths.length} 个项目到…`, async target => {
     try {
-      await request(`/api/batch/${operation}`, {
+      const result = await request(`/api/batch/${operation}`, {
         method: operation === 'move' ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ paths, target: '/' + target })
       });
-      showToast(operation === 'move' ? '移动成功' : '复制成功');
+      showToast(result.failed
+        ? `${operation === 'move' ? '移动' : '复制'}成功 ${result.success} 项，失败 ${result.failed} 项`
+        : (operation === 'move' ? '移动成功' : '复制成功'));
       await refresh();
     } catch (error) { showToast(error.message); }
   });
@@ -640,9 +582,6 @@ function showContextMenu(event, entry = null) {
     }
   }
   elements.contextMenu.classList.add('active');
-  const menuRect = elements.contextMenu.getBoundingClientRect();
-  elements.contextMenu.style.left = `${Math.max(8, Math.min(event.clientX, innerWidth - menuRect.width - 8))}px`;
-  elements.contextMenu.style.top = `${Math.max(8, Math.min(event.clientY, innerHeight - menuRect.height - 8))}px`;
 }
 
 function hideContextMenu() { elements.contextMenu.classList.remove('active'); }

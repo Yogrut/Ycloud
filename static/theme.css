@@ -280,7 +280,7 @@ a { color: inherit; }
 .picker-list { max-height: 310px; overflow: auto; }
 .picker-row { width: 100%; padding: 10px; border: 0; border-radius: 8px; color: var(--text); background: transparent; text-align: left; cursor: pointer; }
 .picker-row:hover { background: var(--panel-soft); }
-.context-menu { position: fixed; z-index: 90; display: none; width: 168px; min-width: 168px; padding: 4px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow); }
+.context-menu { position: fixed; z-index: 90; display: none; top: 72px; right: 12px; width: 168px; min-width: 168px; max-height: calc(100vh - 84px); overflow: auto; padding: 4px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); box-shadow: var(--shadow); }
 .context-menu.active { display: block; }
 .menu-actions { display: contents; }
 .menu-item { width: 100%; min-height: 30px; display: grid; grid-template-columns: 17px 1fr; align-items: center; gap: 8px; padding: 5px 8px; border: 0; border-radius: 5px; color: var(--text); background: transparent; text-align: left; font-size: 12px; cursor: pointer; }
@@ -324,8 +324,10 @@ a { color: inherit; }
 .upload-file-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 10px; }
 .upload-file-line span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 .upload-file-line strong { flex: 0 0 auto; color: var(--accent); font-size: 20px; font-variant-numeric: tabular-nums; }
-.upload-progress-track { height: 10px; overflow: hidden; border-radius: 999px; background: var(--panel-soft); box-shadow: inset 0 0 0 1px var(--line); }
-.upload-progress-track span { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--accent), #67c6ff); transition: width .15s ease; }
+.upload-progress-track { width: 100%; height: 10px; overflow: hidden; border: 0; border-radius: 999px; background: var(--panel-soft); box-shadow: inset 0 0 0 1px var(--line); }
+.upload-progress-track::-webkit-progress-bar { background: var(--panel-soft); }
+.upload-progress-track::-webkit-progress-value { border-radius: 999px; background: var(--accent); }
+.upload-progress-track::-moz-progress-bar { border-radius: 999px; background: var(--accent); }
 .upload-metrics { display: flex; justify-content: space-between; gap: 12px; margin-top: 9px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .upload-status { min-height: 20px; margin: 18px 0 0; color: var(--muted); font-size: 13px; }
 .upload-status.error { color: var(--danger); }

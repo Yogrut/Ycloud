@@ -17,6 +17,8 @@ pub enum AppError {
     NotFound,
     Conflict(Cow<'static, str>),
     PayloadTooLarge,
+    InsufficientStorage,
+    RequestTimeout,
     TooManyRequests,
     ServiceUnavailable(Cow<'static, str>),
     Internal {
@@ -51,6 +53,8 @@ impl AppError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
+            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -66,6 +70,10 @@ impl AppError {
             Self::Forbidden => "Access denied".into(),
             Self::NotFound => "Resource not found".into(),
             Self::PayloadTooLarge => "Payload exceeds the configured limit".into(),
+            Self::InsufficientStorage => {
+                "Storage does not have enough free space for this upload".into()
+            }
+            Self::RequestTimeout => "Request exceeded the configured timeout".into(),
             Self::TooManyRequests => "Too many requests".into(),
             Self::Internal { .. } => "Internal server error".into(),
         }
@@ -82,6 +90,8 @@ impl fmt::Display for AppError {
             Self::Forbidden => formatter.write_str("forbidden"),
             Self::NotFound => formatter.write_str("not found"),
             Self::PayloadTooLarge => formatter.write_str("payload too large"),
+            Self::InsufficientStorage => formatter.write_str("insufficient storage"),
+            Self::RequestTimeout => formatter.write_str("request timeout"),
             Self::TooManyRequests => formatter.write_str("too many requests"),
             Self::Internal { context, source } => {
                 write!(formatter, "{context}")?;
@@ -120,6 +130,8 @@ impl IntoResponse for AppError {
             Self::NotFound => "not_found",
             Self::Conflict(_) => "conflict",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::InsufficientStorage => "insufficient_storage",
+            Self::RequestTimeout => "request_timeout",
             Self::TooManyRequests => "too_many_requests",
             Self::ServiceUnavailable(_) => "service_unavailable",
             Self::Internal { .. } => "internal_error",
@@ -143,6 +155,8 @@ impl From<StatusCode> for AppError {
             StatusCode::NOT_FOUND => Self::NotFound,
             StatusCode::CONFLICT => Self::Conflict("Resource already exists".into()),
             StatusCode::PAYLOAD_TOO_LARGE => Self::PayloadTooLarge,
+            StatusCode::INSUFFICIENT_STORAGE => Self::InsufficientStorage,
+            StatusCode::REQUEST_TIMEOUT => Self::RequestTimeout,
             StatusCode::TOO_MANY_REQUESTS => Self::TooManyRequests,
             _ => Self::internal("request failed"),
         }

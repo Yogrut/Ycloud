@@ -9,11 +9,15 @@ const state = {
   ascending: true,
   canWrite: true,
   maxUploadBytes: 0,
+  maxArchiveBytes: 0,
+  maxArchiveFiles: 0,
   pickerPath: '',
   pickerCallback: null,
   mkdirTarget: '',
   contextPath: '',
-  contextIsDirectory: false
+  contextIsDirectory: false,
+  uploading: false,
+  suppressNextClick: false
 };
 
 const elements = Object.fromEntries([
@@ -21,7 +25,9 @@ const elements = Object.fromEntries([
   'limitNote','breadcrumb','selectAllButton','fileList',
   'emptyState','fileInput','toast','contextMenu','folderModal','folderName','folderError',
   'createFolderButton','pickerModal','pickerTitle','pickerPath','pickerList',
-  'pickerConfirmButton','adminModal','adminUser','adminPass','adminError','adminLoginButton'
+  'pickerConfirmButton','adminModal','adminUser','adminPass','adminError','adminLoginButton',
+  'uploadModal','uploadSummary','uploadFileName','uploadPercent','uploadProgress',
+  'uploadProgressFill','uploadBytes','uploadSpeed','uploadStatus','uploadResults','uploadCloseButton'
 ].map(id => [id, document.getElementById(id)]));
 
 async function request(url, options = {}) {
@@ -165,9 +171,31 @@ function createFileRow(entry) {
     createCell('cell right modified', entry.modified || '-'),
     createCell('cell right', entry.is_dir ? '-' : formatSize(entry.size))
   );
-  row.addEventListener('click', () => toggleSelection(entry.path));
+  row.addEventListener('click', () => {
+    if (state.suppressNextClick) {
+      state.suppressNextClick = false;
+      return;
+    }
+    toggleSelection(entry.path);
+  });
   row.addEventListener('dblclick', () => openEntry(entry));
   row.addEventListener('contextmenu', event => showContextMenu(event, entry));
+  let longPressTimer = null;
+  row.addEventListener('pointerdown', event => {
+    if (event.pointerType === 'mouse') return;
+    const point = { x: event.clientX, y: event.clientY };
+    longPressTimer = setTimeout(() => {
+      state.suppressNextClick = true;
+      showContextMenu({ preventDefault() {}, clientX: point.x, clientY: point.y }, entry);
+      navigator.vibrate?.(18);
+    }, 520);
+  });
+  for (const type of ['pointerup', 'pointercancel', 'pointermove']) {
+    row.addEventListener(type, () => {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+    });
+  }
   return row;
 }
 
@@ -186,7 +214,7 @@ function renderFiles() {
 
 function applyCapabilities() {
   for (const control of document.querySelectorAll('.write-control')) {
-    control.disabled = !state.canWrite;
+    control.disabled = !state.canWrite || (state.uploading && control === elements.uploadButton);
     control.title = state.canWrite ? '' : '当前共享为只读';
   }
 }
@@ -198,6 +226,8 @@ async function refresh() {
     state.entries = data.entries || [];
     state.canWrite = data.can_write !== false;
     state.maxUploadBytes = Number(data.max_upload_bytes || 0);
+    state.maxArchiveBytes = Number(data.max_archive_bytes || 0);
+    state.maxArchiveFiles = Number(data.max_archive_files || 0);
     state.selected.clear();
     elements.limitNote.textContent = data.truncated
       ? '目录内容超过服务器显示上限，当前仅显示部分项目'
@@ -262,21 +292,151 @@ async function unlockFolder(path) {
 function preview(path) { window.open(`/preview.html?path=${encodeURIComponent('/' + path)}`, '_blank', 'noopener'); }
 function download(path) { location.href = `/api/download?path=${encodeURIComponent('/' + path)}`; }
 
+async function downloadArchive(paths) {
+  try {
+    const response = await fetch('/api/archive/prepare', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths: paths.map(path => '/' + path) })
+    });
+    if (response.status === 401) {
+      location.href = '/';
+      return;
+    }
+    const result = await response.json();
+    if (!response.ok) {
+      if (response.status === 413) {
+        throw new Error('所选内容超过 3 GiB，不能打包；请逐个选择文件下载');
+      }
+      if (response.status === 400 && /1000 file|10000 entry/i.test(result?.error?.message || '')) {
+        throw new Error(`打包最多包含 ${state.maxArchiveFiles || 1000} 个文件，请拆分选择`);
+      }
+      throw new Error(result?.error?.message || `打包准备失败 (${response.status})`);
+    }
+    showToast(`正在打包 ${result.file_count} 个文件（${formatSize(result.total_bytes)}）`);
+    location.href = `/api/archive?ticket=${encodeURIComponent(result.ticket)}`;
+  } catch (error) { showToast(error.message); }
+}
+
+function uploadRequest(url, form, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.withCredentials = true;
+    xhr.upload.addEventListener('progress', event => {
+      if (event.lengthComputable) onProgress(event.loaded, event.total);
+    });
+    xhr.addEventListener('load', () => {
+      if (xhr.status === 401) {
+        location.href = '/';
+        reject(new Error('登录已失效'));
+        return;
+      }
+      let body = null;
+      try { body = JSON.parse(xhr.responseText || 'null'); } catch (_) {}
+      if (xhr.status >= 200 && xhr.status < 300) resolve(body);
+      else reject(new Error(body?.error?.message || body?.message || `上传失败 (${xhr.status})`));
+    });
+    xhr.addEventListener('error', () => reject(new Error('网络连接中断')));
+    xhr.addEventListener('abort', () => reject(new Error('上传已取消')));
+    xhr.send(form);
+  });
+}
+
+function updateUploadProgress(processedBytes, currentLoaded, totalBytes, startedAt) {
+  const transferred = Math.min(totalBytes, processedBytes + currentLoaded);
+  const percent = totalBytes ? Math.min(100, Math.round(transferred / totalBytes * 100)) : 100;
+  const elapsedSeconds = Math.max(.1, (performance.now() - startedAt) / 1000);
+  elements.uploadPercent.textContent = `${percent}%`;
+  elements.uploadProgressFill.style.width = `${percent}%`;
+  elements.uploadProgress.setAttribute('aria-valuenow', String(percent));
+  elements.uploadBytes.textContent = `${formatSize(transferred)} / ${formatSize(totalBytes)}`;
+  elements.uploadSpeed.textContent = `${formatSize(transferred / elapsedSeconds)}/s`;
+}
+
+function createUploadResult(file) {
+  const row = document.createElement('div');
+  row.className = 'upload-result';
+  const name = document.createElement('span');
+  name.className = 'upload-result-name';
+  name.textContent = file.name;
+  const status = document.createElement('span');
+  status.className = 'upload-result-state';
+  status.textContent = '等待';
+  row.append(name, status);
+  elements.uploadResults.append(row);
+  return { row, status };
+}
+
+function setUploadResult(result, stateName, message) {
+  result.row.className = `upload-result ${stateName}`;
+  result.status.textContent = message;
+}
+
 async function uploadFiles(files) {
   if (!state.canWrite || !files.length) return;
-  const total = [...files].reduce((sum, file) => sum + file.size, 0);
-  if (state.maxUploadBytes && total > state.maxUploadBytes) {
-    return showToast(`所选文件总大小超过 ${formatSize(state.maxUploadBytes)}`);
-  }
-  const form = new FormData();
-  [...files].forEach(file => form.append('file', file));
+  const queue = Array.from(files);
+  const uploaded = [];
+  const failed = [];
+  const accepted = queue.filter(file => !state.maxUploadBytes || file.size <= state.maxUploadBytes);
+  const totalBytes = accepted.reduce((total, file) => total + file.size, 0);
+  let processedBytes = 0;
+  const startedAt = performance.now();
+  state.uploading = true;
   elements.uploadButton.disabled = true;
+  elements.uploadCloseButton.disabled = true;
+  elements.uploadStatus.classList.remove('error');
+  elements.uploadResults.replaceChildren();
+  const resultRows = queue.map(createUploadResult);
+  elements.uploadSummary.textContent = `共 ${queue.length} 个文件，逐个安全上传`;
+  elements.uploadFileName.textContent = '正在准备…';
+  updateUploadProgress(0, 0, totalBytes, startedAt);
+  showModal(elements.uploadModal);
   try {
-    const result = await request(actionApi('upload'), { method: 'POST', body: form });
-    showToast(`已上传 ${result.uploaded?.length || files.length} 个文件`);
-    await refresh();
-  } catch (error) { showToast(error.message); }
-  finally { elements.uploadButton.disabled = !state.canWrite; elements.fileInput.value = ''; }
+    for (let index = 0; index < queue.length; index += 1) {
+      const file = queue[index];
+      if (state.maxUploadBytes && file.size > state.maxUploadBytes) {
+        failed.push({ name: file.name, message: `超过 ${formatSize(state.maxUploadBytes)}` });
+        setUploadResult(resultRows[index], 'failed', '超过上限');
+        continue;
+      }
+      elements.uploadFileName.textContent = file.name;
+      elements.uploadStatus.textContent = `正在上传 ${index + 1}/${queue.length}`;
+      setUploadResult(resultRows[index], '', '上传中');
+      const form = new FormData();
+      form.append('file', file, file.name);
+      let fileTransferred = 0;
+      try {
+        await uploadRequest(actionApi('upload'), form, (loaded, requestTotal) => {
+          fileTransferred = requestTotal ? Math.min(file.size, loaded / requestTotal * file.size) : Math.min(file.size, loaded);
+          updateUploadProgress(processedBytes, fileTransferred, totalBytes, startedAt);
+        });
+        fileTransferred = file.size;
+        uploaded.push(file.name);
+        setUploadResult(resultRows[index], 'success', '完成');
+        await refresh();
+      } catch (error) {
+        failed.push({ name: file.name, message: error.message });
+        setUploadResult(resultRows[index], 'failed', error.message);
+      }
+      processedBytes += fileTransferred;
+      updateUploadProgress(processedBytes, 0, totalBytes, startedAt);
+    }
+    if (!failed.length) {
+      elements.uploadStatus.textContent = `上传完成：成功 ${uploaded.length} 个文件`;
+    } else {
+      const first = failed[0];
+      elements.uploadStatus.textContent = `成功 ${uploaded.length} 个，失败 ${failed.length} 个：${first.name}（${first.message}）`;
+      elements.uploadStatus.classList.add('error');
+    }
+  }
+  finally {
+    state.uploading = false;
+    elements.uploadButton.disabled = !state.canWrite;
+    elements.uploadCloseButton.disabled = false;
+    elements.fileInput.value = '';
+  }
 }
 
 function openFolderModal(target = state.path) {
@@ -428,14 +588,19 @@ function showContextMenu(event, entry = null) {
     const paths = [...state.selected];
     if (paths.length > 1) {
       addMenuCaption(paths.length);
+      addMenuItem('打包下载', 'archive', () => downloadArchive(paths));
       if (state.canWrite) {
+        addMenuSeparator();
         addMenuItem('移动', 'move', () => transfer('move', paths));
         addMenuItem('复制', 'copy', () => transfer('copy', paths));
         addMenuSeparator();
         addMenuItem('删除', 'trash', () => deletePaths(paths), true);
       }
     } else {
-      if (entry.is_dir) addMenuItem('打开', 'open', () => openEntry(entry));
+      if (entry.is_dir) {
+        addMenuItem('打开', 'open', () => openEntry(entry));
+        addMenuItem('打包下载', 'archive', () => downloadArchive(paths));
+      }
       else {
         addMenuItem('下载', 'download', () => download(entry.path));
       }
@@ -502,6 +667,9 @@ async function logout() {
 elements.uploadButton.addEventListener('click', () => elements.fileInput.click());
 elements.newFolderButton.addEventListener('click', () => openFolderModal());
 elements.fileInput.addEventListener('change', event => uploadFiles(event.target.files));
+elements.uploadCloseButton.addEventListener('click', () => {
+  if (!state.uploading) hideModal(elements.uploadModal);
+});
 elements.createFolderButton.addEventListener('click', createFolder);
 elements.folderName.addEventListener('keydown', event => { if (event.key === 'Enter') createFolder(); });
 elements.selectAllButton.addEventListener('click', toggleSelectAll);
@@ -540,7 +708,9 @@ document.addEventListener('contextmenu', event => {
 });
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
-    document.querySelectorAll('.overlay.active').forEach(hideModal);
+    document.querySelectorAll('.overlay.active').forEach(modal => {
+      if (modal !== elements.uploadModal || !state.uploading) hideModal(modal);
+    });
     state.selected.clear();
     renderFiles();
   }

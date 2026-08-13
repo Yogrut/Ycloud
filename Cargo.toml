@@ -3,6 +3,7 @@ name = "ycloud"
 version = "0.1.0"
 edition = "2021"
 description = "Ycloud: a lightweight private file service with WebDAV support"
+publish = false
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "multipart"] }
@@ -21,5 +22,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 anyhow = "1"
 mime_guess = "2"
 bytes = "1"
-futures-util = "0.3"
+futures-util = { version = "0.3", features = ["io"] }
 tokio-util = { version = "0.7", features = ["io"] }
+async_zip = { version = "0.0.18", default-features = false, features = ["tokio"] }
+fs4 = { version = "1", features = ["sync"] }

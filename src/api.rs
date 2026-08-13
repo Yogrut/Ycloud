@@ -41,6 +41,8 @@ pub struct ListResponse {
     pub truncated: bool,
     pub can_write: bool,
     pub max_upload_bytes: u64,
+    pub max_archive_bytes: u64,
+    pub max_archive_files: usize,
 }
 
 #[derive(Deserialize)]
@@ -201,6 +203,8 @@ pub async fn list_files(
         truncated,
         can_write: !share.readonly,
         max_upload_bytes: state.storage.max_upload_bytes(),
+        max_archive_bytes: crate::archive::MAX_ARCHIVE_BYTES,
+        max_archive_files: crate::archive::MAX_ARCHIVE_FILES,
     }))
 }
 
@@ -231,44 +235,60 @@ pub async fn upload_file(
     Query(query): Query<FileQuery>,
     mut multipart: Multipart,
 ) -> AppResult<Json<serde_json::Value>> {
+    let expected_bytes = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(state.config.max_upload_bytes);
     let share = resolve_share(&state, &headers, &query).await?;
     ensure_writable(&share)?;
     let request_path = query.path.as_deref().unwrap_or("");
     check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
-    let mut uploaded = Vec::new();
-    while let Some(mut field) = multipart
+    let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|error| AppError::with_source("invalid multipart upload", error))?
-    {
-        let file_name = field
-            .file_name()
-            .map(sanitize_name)
-            .unwrap_or_else(|| "unnamed".into());
-        if file_name.is_empty() {
-            continue;
-        }
-        let file_request_path = join_request_path(request_path, &file_name);
-        check_folder_locks(
-            &state,
-            &headers,
-            &share_storage_path(&share, &file_request_path),
-        )
-        .await?;
-        let storage_path = share_storage_path(&share, &file_request_path);
-        let mut writer = state.storage.begin_atomic_write(&storage_path).await?;
-        while let Some(chunk) = field
-            .chunk()
-            .await
-            .map_err(|error| AppError::with_source("failed to read upload", error))?
-        {
-            writer.write_chunk(&chunk).await?;
-        }
-        writer.commit().await?;
-        uploaded.push(file_name);
+    else {
+        return Err(AppError::BadRequest("An upload file is required".into()));
+    };
+    let file_name = field
+        .file_name()
+        .map(sanitize_name)
+        .unwrap_or_else(|| "unnamed".into());
+    if file_name.is_empty() {
+        return Err(AppError::BadRequest("A valid file name is required".into()));
     }
+    let file_request_path = join_request_path(request_path, &file_name);
+    check_folder_locks(
+        &state,
+        &headers,
+        &share_storage_path(&share, &file_request_path),
+    )
+    .await?;
+    let storage_path = share_storage_path(&share, &file_request_path);
+    let mut writer = state
+        .storage
+        .begin_atomic_write_with_expected(&storage_path, expected_bytes)
+        .await?;
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|error| AppError::with_source("failed to read upload", error))?
+    {
+        writer.write_chunk(&chunk).await?;
+    }
+    drop(field);
+    if multipart
+        .next_field()
+        .await
+        .map_err(|error| AppError::with_source("invalid multipart upload", error))?
+        .is_some()
+    {
+        return Err(AppError::BadRequest("Upload one file per request".into()));
+    }
+    writer.commit().await?;
     Ok(Json(
-        serde_json::json!({ "success": true, "uploaded": uploaded }),
+        serde_json::json!({ "success": true, "uploaded": [file_name] }),
     ))
 }
 

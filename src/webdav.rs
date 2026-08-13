@@ -49,7 +49,7 @@ pub async fn webdav_handler(
         "PROPFIND" => handle_propfind(&state, &share, &sub_path, &headers).await,
         "GET" => handle_get(&state, &share, &sub_path, &headers).await,
         "HEAD" => handle_head(&state, &share, &sub_path, &headers).await,
-        "PUT" => handle_put(&state, &share, &sub_path, body).await,
+        "PUT" => handle_put(&state, &share, &sub_path, &headers, body).await,
         "DELETE" => handle_delete(&state, &share, &sub_path).await,
         "MKCOL" => handle_mkcol(&state, &share, &sub_path).await,
         "MOVE" => {
@@ -202,15 +202,21 @@ async fn handle_put(
     state: &AppState,
     share: &Share,
     sub_path: &str,
+    headers: &HeaderMap,
     body: Body,
 ) -> Result<Response, StatusCode> {
     if sub_path.trim_matches('/').is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
     let storage_path = share_storage_path(share, sub_path);
+    let expected_bytes = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(state.config.max_upload_bytes);
     let mut writer = state
         .storage
-        .begin_atomic_write(&storage_path)
+        .begin_atomic_write_with_expected(&storage_path, expected_bytes)
         .await
         .map_err(|error| error.status())?;
     let mut stream = body.into_data_stream();
@@ -378,9 +384,7 @@ fn basic_auth_challenge() -> Response {
     *response.status_mut() = StatusCode::UNAUTHORIZED;
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
-        axum::http::HeaderValue::from_static(
-            "Basic realm=\"Ycloud WebDAV\", charset=\"UTF-8\"",
-        ),
+        axum::http::HeaderValue::from_static("Basic realm=\"Ycloud WebDAV\", charset=\"UTF-8\""),
     );
     response
 }

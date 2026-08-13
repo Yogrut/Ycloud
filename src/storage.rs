@@ -1,7 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -30,6 +30,8 @@ pub struct StorageService {
     io_gate: Arc<Semaphore>,
     max_upload_bytes: u64,
     max_list_entries: usize,
+    disk_reserve_bytes: u64,
+    reserved_upload_bytes: Arc<Mutex<u64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +67,7 @@ impl StorageService {
         max_upload_bytes: u64,
         io_concurrency: usize,
         max_list_entries: usize,
+        disk_reserve_bytes: u64,
     ) -> AppResult<Self> {
         fs::create_dir_all(&root)
             .await
@@ -78,6 +81,8 @@ impl StorageService {
             io_gate: Arc::new(Semaphore::new(io_concurrency.max(1))),
             max_upload_bytes,
             max_list_entries: max_list_entries.max(1),
+            disk_reserve_bytes,
+            reserved_upload_bytes: Arc::new(Mutex::new(0)),
         })
     }
 
@@ -172,6 +177,15 @@ impl StorageService {
     }
 
     pub async fn begin_atomic_write(&self, path: &str) -> AppResult<AtomicFileWriter> {
+        self.begin_atomic_write_with_expected(path, self.max_upload_bytes)
+            .await
+    }
+
+    pub async fn begin_atomic_write_with_expected(
+        &self,
+        path: &str,
+        expected_bytes: u64,
+    ) -> AppResult<AtomicFileWriter> {
         let destination = self.resolve_for_write(path).await?;
         if destination.is_root() {
             return Err(AppError::BadRequest(
@@ -189,6 +203,27 @@ impl StorageService {
         // Re-check after directory creation so a concurrently swapped symlink
         // cannot silently redirect the final write outside the storage root.
         self.resolve_for_write(destination.relative()).await?;
+
+        let root = self.root.clone();
+        let available = tokio::task::spawn_blocking(move || fs4::available_space(root.as_path()))
+            .await
+            .map_err(|error| AppError::with_source("failed to inspect storage capacity", error))?
+            .map_err(|error| AppError::with_source("failed to inspect storage capacity", error))?;
+        let required = expected_bytes.saturating_add(self.disk_reserve_bytes);
+        {
+            let mut reserved = self
+                .reserved_upload_bytes
+                .lock()
+                .map_err(|_| AppError::internal("upload reservation state is unavailable"))?;
+            if available < required.saturating_add(*reserved) {
+                return Err(AppError::InsufficientStorage);
+            }
+            *reserved = reserved.saturating_add(expected_bytes);
+        }
+        let reservation = UploadReservation {
+            reserved_upload_bytes: self.reserved_upload_bytes.clone(),
+            remaining: expected_bytes,
+        };
 
         let file_name = destination
             .absolute()
@@ -217,6 +252,7 @@ impl StorageService {
             max_bytes: self.max_upload_bytes,
             committed: false,
             _permit: permit,
+            reservation,
         })
     }
 
@@ -378,7 +414,7 @@ impl StorageService {
             .unwrap_or(false)
     }
 
-    async fn acquire_io(&self) -> AppResult<OwnedSemaphorePermit> {
+    pub(crate) async fn acquire_io(&self) -> AppResult<OwnedSemaphorePermit> {
         self.io_gate
             .clone()
             .acquire_owned()
@@ -395,6 +431,7 @@ pub struct AtomicFileWriter {
     max_bytes: u64,
     committed: bool,
     _permit: OwnedSemaphorePermit,
+    reservation: UploadReservation,
 }
 
 impl AtomicFileWriter {
@@ -411,6 +448,7 @@ impl AtomicFileWriter {
             .await
             .map_err(|error| AppError::with_source("failed to write upload", error))?;
         self.bytes_written = new_size;
+        self.reservation.consume(chunk.len() as u64);
         Ok(())
     }
 
@@ -432,7 +470,31 @@ impl AtomicFileWriter {
 impl Drop for AtomicFileWriter {
     fn drop(&mut self) {
         if !self.committed {
+            self.file.take();
             let _ = std::fs::remove_file(&self.temporary);
+        }
+    }
+}
+
+struct UploadReservation {
+    reserved_upload_bytes: Arc<Mutex<u64>>,
+    remaining: u64,
+}
+
+impl UploadReservation {
+    fn consume(&mut self, bytes: u64) {
+        let consumed = bytes.min(self.remaining);
+        if let Ok(mut reserved) = self.reserved_upload_bytes.lock() {
+            *reserved = reserved.saturating_sub(consumed);
+        }
+        self.remaining -= consumed;
+    }
+}
+
+impl Drop for UploadReservation {
+    fn drop(&mut self) {
+        if let Ok(mut reserved) = self.reserved_upload_bytes.lock() {
+            *reserved = reserved.saturating_sub(self.remaining);
         }
     }
 }
@@ -596,7 +658,7 @@ fn content_type_for_mode(
     }
 }
 
-fn attachment_header(path: &Path) -> HeaderValue {
+pub(crate) fn attachment_header(path: &Path) -> HeaderValue {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -611,15 +673,53 @@ fn attachment_header(path: &Path) -> HeaderValue {
             }
         })
         .collect();
-    HeaderValue::from_str(&format!("attachment; filename=\"{ascii_name}\""))
-        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download\""))
+    let encoded_name = name
+        .as_bytes()
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric()
+                || matches!(
+                    *byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'&'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+            {
+                (*byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect::<String>();
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}"
+    ))
+    .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download\""))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_range, StorageService};
+    use super::{attachment_header, parse_range, StorageService};
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
     use bytes::Bytes;
+    use std::path::Path;
+
+    #[test]
+    fn attachment_header_preserves_utf8_file_names() {
+        let value = attachment_header(Path::new("游戏音乐.flac"));
+        assert_eq!(
+            value.to_str().unwrap(),
+            "attachment; filename=\"____.flac\"; filename*=UTF-8''%E6%B8%B8%E6%88%8F%E9%9F%B3%E4%B9%90.flac"
+        );
+    }
 
     #[test]
     fn normalizes_safe_relative_paths() {
@@ -650,9 +750,10 @@ mod tests {
 
     #[tokio::test]
     async fn atomic_writer_commits_streamed_chunks() {
-        let root =
-            std::env::temp_dir().join(format!("ycloud-storage-{}", uuid::Uuid::new_v4()));
-        let storage = StorageService::new(root.clone(), 16, 2, 100).await.unwrap();
+        let root = std::env::temp_dir().join(format!("ycloud-storage-{}", uuid::Uuid::new_v4()));
+        let storage = StorageService::new(root.clone(), 16, 2, 100, 0)
+            .await
+            .unwrap();
         let mut writer = storage
             .begin_atomic_write("docs/runbook.txt")
             .await
@@ -676,10 +777,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_atomic_writer_removes_partial_upload() {
+        let root = std::env::temp_dir().join(format!("ycloud-drop-{}", uuid::Uuid::new_v4()));
+        let storage = StorageService::new(root.clone(), 16, 2, 100, 0)
+            .await
+            .unwrap();
+        let mut writer = storage
+            .begin_atomic_write_with_expected("partial.bin", 8)
+            .await
+            .unwrap();
+        writer
+            .write_chunk(&Bytes::from_static(b"partial"))
+            .await
+            .unwrap();
+        drop(writer);
+        assert!(!root.join("partial.bin").exists());
+        let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn atomic_writer_rejects_upload_when_disk_reserve_cannot_be_kept() {
+        let root = std::env::temp_dir().join(format!("ycloud-space-{}", uuid::Uuid::new_v4()));
+        let storage = StorageService::new(root.clone(), 16, 2, 100, u64::MAX)
+            .await
+            .unwrap();
+        let error = match storage
+            .begin_atomic_write_with_expected("blocked.bin", 1)
+            .await
+        {
+            Ok(_) => panic!("upload should be rejected when the reserve cannot be kept"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status(), StatusCode::INSUFFICIENT_STORAGE);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn copy_rejects_destination_below_source() {
-        let root =
-            std::env::temp_dir().join(format!("ycloud-copy-{}", uuid::Uuid::new_v4()));
-        let storage = StorageService::new(root.clone(), 1024, 2, 100)
+        let root = std::env::temp_dir().join(format!("ycloud-copy-{}", uuid::Uuid::new_v4()));
+        let storage = StorageService::new(root.clone(), 1024, 2, 100, 0)
             .await
             .unwrap();
         tokio::fs::create_dir_all(root.join("source"))

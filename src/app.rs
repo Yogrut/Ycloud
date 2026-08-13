@@ -1,15 +1,14 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    error_handling::HandleErrorLayer,
     extract::{DefaultBodyLimit, Request, State},
-    http::{header, HeaderName, StatusCode},
+    http::{header, HeaderName, Method, StatusCode},
     middleware,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post, put},
-    BoxError, Router,
+    Router,
 };
-use tower::{timeout::TimeoutLayer, ServiceBuilder};
+use tower::ServiceBuilder;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
@@ -17,7 +16,7 @@ use tower_http::{
 };
 
 use crate::{
-    admin_api, api,
+    admin_api, api, archive,
     auth::{self, admin_auth_middleware, auth_middleware, me_handler, RateLimiter},
     batch_api,
     security::{csrf_middleware, security_headers_middleware},
@@ -26,9 +25,15 @@ use crate::{
 };
 
 pub fn build_router(state: AppState) -> Router {
-    let max_body_bytes = usize::try_from(state.config.max_upload_bytes)
-        .unwrap_or(usize::MAX)
-        .max(1);
+    const MULTIPART_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
+    let max_body_bytes = usize::try_from(
+        state
+            .config
+            .max_upload_bytes
+            .saturating_add(MULTIPART_OVERHEAD_BYTES),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
     let auth_limiter = Arc::new(RateLimiter::new(5, 60));
     let unlock_limiter = Arc::new(RateLimiter::new(10, 60));
 
@@ -60,6 +65,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mkdir", post(api::create_directory))
         .route("/upload", post(api::upload_file))
         .route("/download", get(api::download_file))
+        .route(
+            "/archive/prepare",
+            post(archive::prepare_archive).layer(DefaultBodyLimit::max(128 * 1024)),
+        )
+        .route("/archive", get(archive::download_archive))
         .route("/rename", put(api::rename_file))
         .route("/preview", get(api::preview_file))
         .route("/batch/delete", post(batch_api::delete))
@@ -103,10 +113,6 @@ pub fn build_router(state: AppState) -> Router {
 
     let request_id_header = HeaderName::from_static("x-request-id");
     let middleware_stack = ServiceBuilder::new()
-        .layer(HandleErrorLayer::new(handle_service_error))
-        .layer(TimeoutLayer::new(Duration::from_secs(
-            state.config.request_timeout_secs,
-        )))
         .layer(SetSensitiveRequestHeadersLayer::new([
             header::AUTHORIZATION,
             header::COOKIE,
@@ -118,6 +124,10 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .layer(PropagateRequestIdLayer::new(request_id_header))
         .layer(TraceLayer::new_for_http());
+    let timeouts = RequestTimeouts {
+        regular: Duration::from_secs(state.config.request_timeout_secs),
+        upload: Duration::from_secs(state.config.upload_timeout_secs),
+    };
 
     Router::new()
         .route("/", get(serve_index))
@@ -141,6 +151,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(dav_router)
         .fallback(not_found)
         .layer(middleware::from_fn(security_headers_middleware))
+        .layer(middleware::from_fn_with_state(
+            timeouts,
+            request_timeout_middleware,
+        ))
         .layer(middleware_stack)
         .with_state(state)
 }
@@ -171,28 +185,27 @@ struct JsonStatus {
     storage: &'static str,
 }
 
-async fn handle_service_error(error: BoxError) -> impl IntoResponse {
-    if error.is::<tower::timeout::error::Elapsed>() {
-        (
-            StatusCode::REQUEST_TIMEOUT,
-            axum::Json(serde_json::json!({
-                "error": {
-                    "code": "request_timeout",
-                    "message": "Request exceeded the configured timeout"
-                }
-            })),
-        )
+#[derive(Clone, Copy)]
+struct RequestTimeouts {
+    regular: Duration,
+    upload: Duration,
+}
+
+async fn request_timeout_middleware(
+    State(timeouts): State<RequestTimeouts>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let is_upload = request.uri().path() == "/api/upload"
+        || (request.method() == Method::PUT && request.uri().path().starts_with("/dav/"));
+    let duration = if is_upload {
+        timeouts.upload
     } else {
-        tracing::error!(%error, "unhandled middleware error");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({
-                "error": {
-                    "code": "middleware_error",
-                    "message": "Internal server error"
-                }
-            })),
-        )
+        timeouts.regular
+    };
+    match tokio::time::timeout(duration, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => crate::error::AppError::RequestTimeout.into_response(),
     }
 }
 
@@ -201,7 +214,10 @@ macro_rules! embedded_handler {
         async fn $name() -> Response {
             (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, $content_type)],
+                [
+                    (header::CONTENT_TYPE, $content_type),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
                 &include_bytes!($path)[..],
             )
                 .into_response()
@@ -308,6 +324,8 @@ mod tests {
                 io_concurrency: 2,
                 max_list_entries: 100,
                 request_timeout_secs: 30,
+                upload_timeout_secs: 300,
+                disk_reserve_bytes: 0,
                 secure_cookies: false,
             },
             Arc::new(RwLock::new(ConfigFile {

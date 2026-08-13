@@ -2,6 +2,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::{
+    archive::ArchiveTicketStore,
     auth::{
         AccessTokenStore, PasswordService, SessionStore, SharedAccessTokenStore, SharedSessionStore,
     },
@@ -19,6 +20,7 @@ pub struct AppState {
     pub folder_access: SharedAccessTokenStore,
     pub passwords: PasswordService,
     pub storage: StorageService,
+    pub archive_tickets: ArchiveTicketStore,
     config_updates: Arc<Mutex<()>>,
 }
 
@@ -29,6 +31,7 @@ impl AppState {
             config.max_upload_bytes,
             config.io_concurrency,
             config.max_list_entries,
+            config.disk_reserve_bytes,
         )
         .await?;
 
@@ -38,8 +41,9 @@ impl AppState {
             sessions: Arc::new(SessionStore::new()),
             gate_access: Arc::new(AccessTokenStore::new()),
             folder_access: Arc::new(AccessTokenStore::new()),
-            passwords: PasswordService::new(2),
+            passwords: PasswordService::new(1),
             storage,
+            archive_tickets: ArchiveTicketStore::new(),
             config_updates: Arc::new(Mutex::new(())),
         })
     }

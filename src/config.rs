@@ -93,6 +93,8 @@ pub struct Config {
     pub io_concurrency: usize,
     pub max_list_entries: usize,
     pub request_timeout_secs: u64,
+    pub upload_timeout_secs: u64,
+    pub disk_reserve_bytes: u64,
     pub secure_cookies: bool,
 }
 
@@ -272,10 +274,12 @@ impl Config {
             PathBuf::from(std::env::var("STORAGE_PATH").unwrap_or_else(|_| "./storage".into()));
         let config_path =
             PathBuf::from(std::env::var("CONFIG_PATH").unwrap_or_else(|_| "./config.json".into()));
-        let max_upload_bytes = env_parse("MAX_UPLOAD_BYTES", 512_u64 * 1024 * 1024)?;
-        let io_concurrency = env_parse("IO_CONCURRENCY", 8_usize)?;
+        let max_upload_bytes = env_parse("MAX_UPLOAD_BYTES", 5_u64 * 1024 * 1024 * 1024)?;
+        let io_concurrency = env_parse("IO_CONCURRENCY", 4_usize)?;
         let max_list_entries = env_parse("MAX_LIST_ENTRIES", 10_000_usize)?;
         let request_timeout_secs = env_parse("REQUEST_TIMEOUT_SECS", 300_u64)?;
+        let upload_timeout_secs = env_parse("UPLOAD_TIMEOUT_SECS", 6_u64 * 60 * 60)?;
+        let disk_reserve_bytes = env_parse("DISK_RESERVE_BYTES", 512_u64 * 1024 * 1024)?;
         let secure_cookies = env_parse("SECURE_COOKIES", false)?;
         Ok(Self {
             bind_address,
@@ -286,6 +290,8 @@ impl Config {
             io_concurrency,
             max_list_entries,
             request_timeout_secs,
+            upload_timeout_secs,
+            disk_reserve_bytes,
             secure_cookies,
         })
     }

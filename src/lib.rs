@@ -1,6 +1,7 @@
 pub mod admin_api;
 pub mod api;
 pub mod app;
+pub mod archive;
 pub mod auth;
 pub mod batch_api;
 pub mod bootstrap;

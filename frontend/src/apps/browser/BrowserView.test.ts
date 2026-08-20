@@ -138,7 +138,7 @@ describe('BrowserView', () => {
     vi.spyOn(rows[1]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 110, 380, 145))
 
     panel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 30, clientY: 60 }))
-    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 360, clientY: 95 }))
+    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1, clientX: 360, clientY: 95 }))
     await nextTick()
 
     expect(host.querySelector('.drag-selection-box')).toBeNull()
@@ -150,6 +150,36 @@ describe('BrowserView', () => {
     await nextTick()
     expect(host.querySelector('.drag-selection-box')).toBeNull()
     expect(rows[0]!.classList.contains('selected')).toBe(true)
+    app.unmount()
+  })
+
+  it('starts desktop drag selection from a row checkbox without toggling text selection', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: false }))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt', 'two.txt'])), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const panel = host.querySelector('.file-panel') as HTMLElement
+    const rows = [...host.querySelectorAll<HTMLElement>('.file-row')]
+    const checkbox = rows[0]!.querySelector('.select-box') as HTMLButtonElement
+    vi.spyOn(panel, 'getBoundingClientRect').mockReturnValue(domRect(0, 40, 400, 180))
+    vi.spyOn(rows[0]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 70, 380, 105))
+    vi.spyOn(rows[1]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 110, 380, 145))
+
+    const down = new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, buttons: 1, clientX: 30, clientY: 80 })
+    checkbox.dispatchEvent(down)
+    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, buttons: 1, clientX: 360, clientY: 130 }))
+    await nextTick()
+
+    expect(down.defaultPrevented).toBe(true)
+    expect(host.querySelectorAll('.file-row.selected')).toHaveLength(2)
+    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, button: 0, clientX: 360, clientY: 130 }))
     app.unmount()
   })
 
@@ -167,7 +197,7 @@ describe('BrowserView', () => {
     await nextTick()
     const panel = host.querySelector('.file-panel') as HTMLElement
     panel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 20, clientY: 20 }))
-    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 200, clientY: 100 }))
+    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1, clientX: 200, clientY: 100 }))
     window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
     await nextTick()
 
@@ -199,7 +229,7 @@ describe('BrowserView', () => {
     vi.spyOn(rows[1]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 110, 380, 145))
 
     panel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 30, clientY: 145 }))
-    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 360, clientY: 75 }))
+    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1, clientX: 360, clientY: 75 }))
     window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 360, clientY: 75 }))
     await nextTick()
 

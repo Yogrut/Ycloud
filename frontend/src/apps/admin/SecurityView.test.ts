@@ -55,7 +55,9 @@ describe('SecurityView', () => {
     const app = mountSecurity(host)
     await nextTick()
 
-    ;(host.querySelector('.security-action') as HTMLButtonElement).click()
+    const blockButton = host.querySelector('.security-action') as HTMLButtonElement
+    expect(blockButton.textContent).toContain('封禁此 IP')
+    blockButton.click()
     await nextTick()
     expect(host.textContent).toContain('确认封禁 IP')
     ;(host.querySelector('.modal .btn.danger') as HTMLButtonElement).click()
@@ -64,6 +66,7 @@ describe('SecurityView', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/security/block', expect.objectContaining({
       body: JSON.stringify({ entry: 'admin', ip: '192.0.2.10' }),
     }))
+    expect(host.querySelector('.security-tabs button:nth-child(2)')?.classList.contains('active')).toBe(true)
     app.unmount()
   })
 

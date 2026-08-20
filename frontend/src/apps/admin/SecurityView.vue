@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import type { LoginRecord } from '../../shared/api/admin'
-import { updateLoginRestriction } from '../../shared/api/admin'
+import { AdminApiError, updateLoginRestriction } from '../../shared/api/admin'
 
 type RecordKind = 'normal' | 'error'
 type RestrictionAction = 'block' | 'unblock'
@@ -69,9 +69,15 @@ async function confirmAction(): Promise<void> {
   try {
     await updateLoginRestriction(action, record.entry, record.ip)
     pending.value = undefined
+    if (action === 'block') {
+      kind.value = 'error'
+      page.value = 1
+    }
     emit('changed', action === 'block' ? `已限制 ${record.ip} 的${entryLabel(record.entry)}登录` : `已解除 ${record.ip} 的${entryLabel(record.entry)}限制`)
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '操作失败'
+    errorMessage.value = error instanceof AdminApiError && error.status === 404
+      ? '当前运行的后端尚未加载 IP 封禁接口，请重启 Ycloud 后端后重试'
+      : error instanceof Error ? error.message : '操作失败'
   } finally {
     submitting.value = false
   }
@@ -116,7 +122,7 @@ async function confirmAction(): Promise<void> {
             <div class="security-record-meta">最后成功 {{ formatTime(record.last_success_at) }}<template v-if="isBlocked(record)"> · 限制至 {{ formatTime(record.blocked_until) }}</template></div>
             <div class="security-user-agent">{{ record.user_agent || '未提供浏览器信息' }}</div>
           </div>
-          <button v-if="kind === 'normal'" class="btn secondary security-action" type="button" @click="ask('block', record)">封禁 IP</button>
+          <button v-if="kind === 'normal'" class="btn secondary security-action" type="button" :aria-label="`封禁 ${record.ip}`" @click="ask('block', record)">封禁此 IP</button>
           <button v-else class="btn secondary security-action" type="button" @click="ask('unblock', record)">解除限制</button>
         </article>
       </div>

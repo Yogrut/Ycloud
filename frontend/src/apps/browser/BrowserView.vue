@@ -176,7 +176,13 @@ function isMobileLayout(): boolean {
 
 function startDragSelection(event: MouseEvent): void {
   if (event.button !== 0 || isMobileLayout() || loading.value || !visibleEntries.value.length) return
-  if ((event.target as HTMLElement).closest('button, input, a')) return
+  const target = event.target as HTMLElement
+  const row = target.closest('.file-row')
+  if (target.closest('input, a') || (target.closest('button') && !row)) return
+  // Prevent the browser's native text/image drag before the movement threshold.
+  // Row checkboxes remain valid drag starting points; an ordinary click still
+  // reaches their click handler when no drag actually occurs.
+  event.preventDefault()
   dragSession = {
     startX: event.clientX,
     startY: event.clientY,
@@ -190,6 +196,10 @@ function updateDragSelection(event: MouseEvent): void {
   const session = dragSession
   const panel = filePanel.value
   if (!session || !panel) return
+  if ((event.buttons & 1) === 0) {
+    cancelDragSelection()
+    return
+  }
   if (!session.active && Math.hypot(event.clientX - session.startX, event.clientY - session.startY) < DRAG_THRESHOLD) return
 
   session.active = true

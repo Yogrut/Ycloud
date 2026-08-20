@@ -17,6 +17,7 @@ pub use crate::state::AppState;
 use crate::{
     config,
     error::{AppError, AppResult},
+    login_security::LoginEntry,
     security::ClientIp,
     security::{clear_cookie, session_cookie},
 };
@@ -300,8 +301,18 @@ pub struct MeResponse {
 
 pub async fn login_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    match state.login_security.is_blocked(LoginEntry::Admin, ip).await {
+        Ok(true) => return limited_login_response(LoginEntry::Admin),
+        Ok(false) => {}
+        Err(error) => return login_security_error(error),
+    }
     let (expected_username, password_hash) = {
         let config = state.config_file.read().await;
         (
@@ -315,6 +326,13 @@ pub async fn login_handler(
         && state.passwords.verify(password_hash, body.password).await;
 
     if authenticated {
+        if let Err(error) = state
+            .login_security
+            .record_success(LoginEntry::Admin, ip, user_agent)
+            .await
+        {
+            return login_security_error(error);
+        }
         let token = state.sessions.create().await;
         json_with_cookie(
             LoginResponse {
@@ -329,11 +347,14 @@ pub async fn login_handler(
             ),
         )
     } else {
-        Json(LoginResponse {
-            success: false,
-            message: "Invalid username or password".into(),
-        })
-        .into_response()
+        if let Err(error) = state
+            .login_security
+            .record_failure(LoginEntry::Admin, ip, user_agent)
+            .await
+        {
+            return login_security_error(error);
+        }
+        invalid_login_response(LoginEntry::Admin)
     }
 }
 
@@ -423,6 +444,7 @@ pub async fn me_handler(
 pub async fn gate_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     client_ip: Option<Extension<ClientIp>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
     let password_hash = state
@@ -434,6 +456,17 @@ pub async fn gate_handler(
     let is_loopback = client_ip
         .map(|Extension(ClientIp(address))| address.is_loopback())
         .unwrap_or(false);
+    let ip = client_ip
+        .map(|Extension(ClientIp(address))| address)
+        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok());
+    match state.login_security.is_blocked(LoginEntry::Web, ip).await {
+        Ok(true) => return limited_login_response(LoginEntry::Web),
+        Ok(false) => {}
+        Err(error) => return login_security_error(error),
+    }
     let authenticated = match password_hash {
         Some(hash) if valid_password_length(&body.password) => {
             state.passwords.verify(hash, body.password).await
@@ -442,11 +475,22 @@ pub async fn gate_handler(
         None => is_loopback,
     };
     if !authenticated {
-        return Json(LoginResponse {
-            success: false,
-            message: "Invalid password".into(),
-        })
-        .into_response();
+        if let Err(error) = state
+            .login_security
+            .record_failure(LoginEntry::Web, ip, user_agent)
+            .await
+        {
+            return login_security_error(error);
+        }
+        return invalid_login_response(LoginEntry::Web);
+    }
+
+    if let Err(error) = state
+        .login_security
+        .record_success(LoginEntry::Web, ip, user_agent)
+        .await
+    {
+        return login_security_error(error);
     }
 
     let token = state.gate_access.create("__gate__".into()).await;
@@ -464,8 +508,50 @@ pub async fn gate_handler(
     )
 }
 
+fn invalid_login_response(entry: LoginEntry) -> Response {
+    let message = match entry {
+        LoginEntry::Admin => "用户名或密码错误",
+        LoginEntry::Web => "访问密码错误",
+        LoginEntry::WebDav => "WebDAV 用户名或密码错误",
+    };
+    Json(LoginResponse {
+        success: false,
+        message: message.into(),
+    })
+    .into_response()
+}
+
+fn limited_login_response(entry: LoginEntry) -> Response {
+    let retry_after = entry.policy().1.to_string();
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(LoginResponse {
+            success: false,
+            message: "尝试次数过多，请在限制结束后重试".into(),
+        }),
+    )
+        .into_response();
+    if let Ok(value) = retry_after.parse() {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+fn login_security_error(error: anyhow::Error) -> Response {
+    tracing::error!(%error, "failed to update persistent login security state");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(LoginResponse {
+            success: false,
+            message: "登录安全状态暂时不可用".into(),
+        }),
+    )
+        .into_response()
+}
+
 fn valid_password_length(password: &str) -> bool {
-    !password.is_empty() && password.len() <= 1_024
+    let characters = password.chars().count();
+    (1..=1_024).contains(&characters) && password.len() <= 4_096
 }
 
 fn json_with_cookie<T: Serialize>(body: T, cookie: String) -> Response {
@@ -575,8 +661,12 @@ pub async fn auth_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_basic_auth, AccessTokenStore, SessionStore};
-    use axum::http::{header, HeaderMap, HeaderValue};
+    use super::{
+        extract_basic_auth, invalid_login_response, limited_login_response, AccessTokenStore,
+        SessionStore,
+    };
+    use crate::login_security::LoginEntry;
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 
     #[test]
     fn basic_auth_scheme_is_case_insensitive() {
@@ -595,6 +685,18 @@ mod tests {
             HeaderValue::from_static("Bearer eW9ncnV0OnNlY3JldA=="),
         );
         assert_eq!(extract_basic_auth(&headers), None);
+    }
+
+    #[test]
+    fn failed_and_limited_logins_have_distinct_http_states() {
+        assert_eq!(
+            invalid_login_response(LoginEntry::Admin).status(),
+            StatusCode::OK
+        );
+
+        let limited = limited_login_response(LoginEntry::Admin);
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(limited.headers().get(header::RETRY_AFTER).unwrap(), "3600");
     }
 
     #[tokio::test]

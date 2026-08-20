@@ -31,17 +31,12 @@ pub fn build_router(state: AppState) -> Router {
     let max_body_bytes = usize::try_from(state.config.max_upload_bytes)
         .unwrap_or(usize::MAX)
         .max(1);
-    let auth_limiter = Arc::new(RateLimiter::new(5, 60));
     let unlock_limiter = Arc::new(RateLimiter::new(10, 60));
 
     let auth_routes = Router::new()
         .route("/login", post(auth::login_handler))
         .route("/gate", post(auth::gate_handler))
-        .layer(DefaultBodyLimit::max(32 * 1024))
-        .layer(middleware::from_fn_with_state(
-            auth_limiter,
-            auth::rate_limit_middleware,
-        ));
+        .layer(DefaultBodyLimit::max(32 * 1024));
 
     let public_api = Router::new()
         .route("/health", get(health_handler))
@@ -107,6 +102,8 @@ pub fn build_router(state: AppState) -> Router {
             put(admin_api::update_share).delete(admin_api::delete_share),
         )
         .route("/account", put(admin_api::update_admin_account))
+        .route("/limits", put(admin_api::update_transfer_limits))
+        .route("/security/unblock", post(admin_api::unblock_login))
         .route("/locks", post(admin_api::create_lock))
         .route(
             "/locks/{id}",
@@ -353,16 +350,17 @@ mod tests {
         let state = AppState::new(
             Config {
                 bind_address: std::net::IpAddr::from([127, 0, 0, 1]),
-                port: 3000,
+                port: 18_473,
                 storage_path: root.clone(),
                 config_path: root.join("config.json"),
-                max_upload_bytes: 1024,
+                max_upload_bytes: 2 * 1024 * 1024,
                 io_concurrency: 2,
                 max_list_entries: 100,
                 request_timeout_secs: 30,
                 upload_timeout_secs: 300,
                 disk_reserve_bytes: 0,
                 secure_cookies: false,
+                allow_lan_http: false,
                 public_base_url: None,
                 public_host: None,
                 trusted_proxy_ips: Default::default(),
@@ -382,6 +380,9 @@ mod tests {
                     password_hash: Some(hash_password("webdav-password")),
                     readonly: false,
                 }],
+                max_upload_bytes: 1024 * 1024,
+                max_archive_bytes: 2 * 1024 * 1024,
+                max_archive_entries: 100,
             })),
         )
         .await
@@ -540,6 +541,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(admin_write.status(), StatusCode::OK);
+
+        let nested_admin_write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mkdir?path=%2Fallowed")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"nested"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nested_admin_write.status(), StatusCode::OK);
+        assert!(tokio::fs::metadata(root.join("allowed").join("nested"))
+            .await
+            .unwrap()
+            .is_dir());
+
+        let limits_update = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/admin/limits")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"max_upload_bytes":2097152,"max_archive_bytes":3145728,"max_archive_entries":2}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limits_update.status(), StatusCode::OK);
+
+        let limits_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/files")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limits_list.status(), StatusCode::OK);
+        let limits_body = to_bytes(limits_list.into_body(), 16 * 1024).await.unwrap();
+        let limits_json: serde_json::Value = serde_json::from_slice(&limits_body).unwrap();
+        assert_eq!(limits_json["max_upload_bytes"], 2_097_152);
+        assert_eq!(limits_json["max_archive_bytes"], 3_145_728);
+        assert_eq!(limits_json["max_archive_entries"], 2);
+
+        tokio::fs::write(
+            root.join("allowed").join("nested").join("file.txt"),
+            b"data",
+        )
+        .await
+        .unwrap();
+        let archive_entry_limit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/archive/prepare")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"paths":["/allowed"]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(archive_entry_limit.status(), StatusCode::BAD_REQUEST);
 
         let favicon = app
             .clone()

@@ -5,16 +5,17 @@ export const state = {
   query: '',
   sort: 'name',
   ascending: true,
-  canWrite: true,
+  canWrite: false,
   maxUploadBytes: 0,
   maxArchiveBytes: 0,
-  maxArchiveFiles: 0,
+  maxArchiveEntries: 0,
   pickerPath: '',
   pickerCallback: null,
   mkdirTarget: '',
   contextPath: '',
   contextIsDirectory: false,
-  uploading: false
+  uploading: false,
+  creatingFolder: false
 };
 
 export function formatSize(bytes) {

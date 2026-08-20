@@ -5,11 +5,11 @@ use tokio::sync::Semaphore;
 use crate::{
     archive::ArchiveTicketStore,
     auth::{
-        AccessTokenStore, PasswordService, RateLimiter, SessionStore, SharedAccessTokenStore,
-        SharedSessionStore,
+        AccessTokenStore, PasswordService, SessionStore, SharedAccessTokenStore, SharedSessionStore,
     },
     config::{save_config, Config, ConfigFile, SharedConfig},
     error::{AppError, AppResult},
+    login_security::LoginSecurity,
     storage::StorageService,
 };
 
@@ -24,20 +24,31 @@ pub struct AppState {
     pub storage: StorageService,
     pub archive_tickets: ArchiveTicketStore,
     pub webdav_gate: Arc<Semaphore>,
-    pub webdav_failures: Arc<RateLimiter>,
+    pub login_security: LoginSecurity,
     config_updates: Arc<Mutex<()>>,
 }
 
 impl AppState {
     pub async fn new(config: Config, config_file: SharedConfig) -> AppResult<Self> {
+        let max_upload_bytes = config_file.read().await.max_upload_bytes;
+        if max_upload_bytes > config.max_upload_bytes {
+            return Err(AppError::BadRequest(
+                "Persisted upload limit exceeds the deployment MAX_UPLOAD_BYTES envelope".into(),
+            ));
+        }
         let storage = StorageService::new(
             config.storage_path.clone(),
-            config.max_upload_bytes,
+            max_upload_bytes,
             config.io_concurrency,
             config.max_list_entries,
             config.disk_reserve_bytes,
         )
         .await?;
+        let login_security = LoginSecurity::load(&config.config_path)
+            .await
+            .map_err(|error| {
+                AppError::with_source("failed to load persistent login security state", error)
+            })?;
 
         Ok(Self {
             config,
@@ -49,7 +60,7 @@ impl AppState {
             storage,
             archive_tickets: ArchiveTicketStore::new(),
             webdav_gate: Arc::new(Semaphore::new(8)),
-            webdav_failures: Arc::new(RateLimiter::new(5, 60)),
+            login_security,
             config_updates: Arc::new(Mutex::new(())),
         })
     }
@@ -68,6 +79,7 @@ impl AppState {
         save_config(&self.config.config_path, &next)
             .await
             .map_err(|error| AppError::with_source("failed to persist configuration", error))?;
+        self.storage.set_max_upload_bytes(next.max_upload_bytes);
         *self.config_file.write().await = next;
         Ok(result)
     }

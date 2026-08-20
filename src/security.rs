@@ -51,6 +51,11 @@ fn validated_client_ip(
     peer_ip: IpAddr,
     headers: &axum::http::HeaderMap,
 ) -> Result<IpAddr, StatusCode> {
+    if config.allow_lan_http && !config.is_public_mode() {
+        return trusted_lan_client(peer_ip)
+            .then_some(peer_ip)
+            .ok_or(StatusCode::FORBIDDEN);
+    }
     if !config.is_public_mode() {
         return Ok(peer_ip);
     }
@@ -66,6 +71,20 @@ fn validated_client_ip(
     forwarded_for
         .parse::<IpAddr>()
         .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn trusted_lan_client(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unicast_link_local()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || ip.to_ipv4_mapped().is_some_and(|mapped| {
+                    mapped.is_loopback() || mapped.is_private() || mapped.is_link_local()
+                })
+        }
+    }
 }
 
 fn single_header<'a>(
@@ -186,7 +205,10 @@ fn origin_matches(config: &Config, headers: &axum::http::HeaderMap) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_cookie, origin_matches, session_cookie, single_header, validated_client_ip};
+    use super::{
+        clear_cookie, origin_matches, session_cookie, single_header, trusted_lan_client,
+        validated_client_ip,
+    };
     use crate::config::Config;
     use axum::http::{header, HeaderMap, HeaderValue};
 
@@ -202,15 +224,15 @@ mod tests {
     #[test]
     fn origin_must_match_host_exactly() {
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, HeaderValue::from_static("cloud.local:3000"));
+        headers.insert(header::HOST, HeaderValue::from_static("cloud.local:18473"));
         headers.insert(
             header::ORIGIN,
-            HeaderValue::from_static("http://cloud.local:3000"),
+            HeaderValue::from_static("http://cloud.local:18473"),
         );
         assert!(origin_matches(&local_config(), &headers));
         headers.insert(
             header::ORIGIN,
-            HeaderValue::from_static("http://evil.cloud.local:3000"),
+            HeaderValue::from_static("http://evil.cloud.local:18473"),
         );
         assert!(!origin_matches(&local_config(), &headers));
     }
@@ -255,10 +277,36 @@ mod tests {
         assert!(validated_client_ip(&config, "127.0.0.1".parse().unwrap(), &headers).is_err());
     }
 
+    #[test]
+    fn direct_lan_mode_accepts_only_non_public_peers() {
+        assert!(trusted_lan_client("127.0.0.1".parse().unwrap()));
+        assert!(trusted_lan_client("192.168.2.86".parse().unwrap()));
+        assert!(trusted_lan_client("10.0.0.8".parse().unwrap()));
+        assert!(trusted_lan_client("169.254.10.2".parse().unwrap()));
+        assert!(trusted_lan_client("fd00::8".parse().unwrap()));
+        assert!(!trusted_lan_client("203.0.113.8".parse().unwrap()));
+        assert!(!trusted_lan_client("2001:db8::8".parse().unwrap()));
+
+        let mut config = local_config();
+        config.bind_address = "0.0.0.0".parse().unwrap();
+        config.allow_lan_http = true;
+        let mut spoofed_headers = HeaderMap::new();
+        spoofed_headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.99"));
+        assert_eq!(
+            validated_client_ip(&config, "192.168.2.10".parse().unwrap(), &spoofed_headers)
+                .unwrap(),
+            "192.168.2.10".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert!(
+            validated_client_ip(&config, "203.0.113.8".parse().unwrap(), &HeaderMap::new())
+                .is_err()
+        );
+    }
+
     fn local_config() -> Config {
         Config {
             bind_address: "127.0.0.1".parse().unwrap(),
-            port: 3000,
+            port: 18_473,
             storage_path: "storage".into(),
             config_path: "config.json".into(),
             max_upload_bytes: 1,
@@ -268,6 +316,7 @@ mod tests {
             upload_timeout_secs: 1,
             disk_reserve_bytes: 0,
             secure_cookies: false,
+            allow_lan_http: false,
             public_base_url: None,
             public_host: None,
             trusted_proxy_ips: Default::default(),

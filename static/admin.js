@@ -3,9 +3,29 @@
 const MASK = '••••••';
 const state = {
   shares: [], locks: [], shareId: null, lockId: null,
-  hasGlobalWebPassword: false
+  hasGlobalWebPassword: false, loginSecurity: [],
+  maxUploadBytes: 0, maxArchiveBytes: 0, maxArchiveEntries: 0
 };
 const byId = id => document.getElementById(id);
+
+const ADMIN_SECTIONS = new Set(['webdav', 'locks', 'limits', 'account', 'security']);
+const GIB = 1024 ** 3;
+
+function activateSection(section, updateHistory = true) {
+  const selected = ADMIN_SECTIONS.has(section) ? section : 'webdav';
+  for (const item of document.querySelectorAll('[data-admin-section]')) {
+    const active = item.dataset.adminSection === selected;
+    item.classList.toggle('active', active);
+    if (active) item.setAttribute('aria-current', 'page');
+    else item.removeAttribute('aria-current');
+  }
+  for (const panel of document.querySelectorAll('[data-admin-panel]')) {
+    panel.hidden = panel.dataset.adminPanel !== selected;
+  }
+  if (updateHistory && location.hash !== `#${selected}`) {
+    history.replaceState(null, '', `#${selected}`);
+  }
+}
 
 async function request(url, options = {}) {
   const response = await fetch(url, { credentials: 'same-origin', ...options });
@@ -40,6 +60,14 @@ function normalizePath(value) {
 function displayPath(value) {
   const normalized = normalizePath(value);
   return normalized ? `/${normalized}` : '/';
+}
+
+function bytesToGiB(value) {
+  return Number((Number(value || 0) / GIB).toFixed(3));
+}
+
+function gibToBytes(value) {
+  return Math.round(Number(value) * GIB);
 }
 
 function setFormError(id, message = '') {
@@ -134,6 +162,10 @@ async function saveShare(event) {
     setFormError('shareError', '启用 WebDAV 必须设置用户名和密码。');
     return;
   }
+  if (password !== MASK && password.length > 0 && [...password].length < 12) {
+    setFormError('shareError', 'WebDAV 密码至少需要 12 位。');
+    return;
+  }
   try {
     await request(editing ? `/api/admin/shares/${encodeURIComponent(state.shareId)}` : '/api/admin/shares', {
       method: editing ? 'PUT' : 'POST',
@@ -188,6 +220,65 @@ function renderLocks() {
   }
 }
 
+function entryLabel(entry) {
+  return ({ admin: '管理员', web: '首页', web_dav: 'WebDAV' })[entry] || entry;
+}
+
+function formatSecurityTime(value) {
+  return value ? new Date(value * 1000).toLocaleString() : '—';
+}
+
+function renderLoginSecurity() {
+  const list = byId('securityList');
+  list.replaceChildren();
+  if (!state.loginSecurity.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-card';
+    empty.textContent = '暂无登录安全记录';
+    list.append(empty);
+    return;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  for (const record of state.loginSecurity) {
+    const row = document.createElement('div');
+    row.className = 'item security-item';
+    const info = document.createElement('div');
+    info.className = 'item-info';
+    const name = document.createElement('div');
+    name.className = 'item-name security-ip';
+    name.textContent = `${record.ip} · ${entryLabel(record.entry)}`;
+    const meta = document.createElement('div');
+    meta.className = 'item-meta security-meta';
+    const blocked = record.blocked_until && record.blocked_until > now;
+    meta.textContent = `结果：${record.last_result} · 失败 ${record.failed_attempts} 次 · 最后尝试 ${formatSecurityTime(record.last_attempt_at)} · 最后成功 ${formatSecurityTime(record.last_success_at)}${blocked ? ` · 限制至 ${formatSecurityTime(record.blocked_until)}` : ''}`;
+    if (record.user_agent) {
+      const agent = document.createElement('div');
+      agent.className = 'item-meta security-agent';
+      agent.textContent = record.user_agent;
+      info.append(name, meta, agent);
+    } else info.append(name, meta);
+    const actions = document.createElement('div');
+    actions.className = 'item-actions';
+    if (record.failed_attempts || blocked) {
+      actions.append(button('解除限制', 'btn-secondary', () => unblockLogin(record)));
+    }
+    row.append(info, tag(blocked ? '已限制' : '正常', blocked ? '' : 'on'), actions);
+    list.append(row);
+  }
+}
+
+async function unblockLogin(record) {
+  if (!await window._spConfirm(`解除 ${record.ip} 的${entryLabel(record.entry)}登录限制？`)) return;
+  try {
+    await request('/api/admin/security/unblock', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entry: record.entry, ip: record.ip })
+    });
+    await load(false);
+    toast('已解除该 IP 的登录限制');
+  } catch (error) { toast(error.message, true); }
+}
+
 function openLock(lock = null) {
   state.lockId = lock?.id || null;
   byId('lockDlgTitle').textContent = lock ? '编辑文件夹锁' : '新建文件夹锁';
@@ -207,6 +298,7 @@ async function saveLock(event) {
   if (!editing || password !== MASK) body.password = password;
   if (!body.path) return setFormError('lockError', '不能给存储根目录加锁，请选择具体文件夹。');
   if (!password) return setFormError('lockError', '文件夹锁必须有密码；若不需要保护，请删除该锁。');
+  if (password !== MASK && [...password].length < 8) return setFormError('lockError', '文件夹锁密码至少需要 8 位。');
   try {
     await request(editing ? `/api/admin/locks/${encodeURIComponent(state.lockId)}` : '/api/admin/locks', {
       method: editing ? 'PUT' : 'POST',
@@ -235,20 +327,49 @@ async function saveAccount() {
   const adminPasswordChanged = adminPassword !== MASK;
   if (adminPasswordChanged) {
     if (!adminPassword) return toast('管理员密码不能为空', true);
+    if ([...adminPassword].length < 12) return toast('管理员密码至少需要 12 位', true);
     body.password = adminPassword;
   }
+  if (webPassword !== MASK && webPassword && [...webPassword].length < 8) return toast('网页访问密码至少需要 8 位', true);
   if (webPassword !== MASK) body.global_web_password = webPassword;
   if (!webPassword && state.hasGlobalWebPassword) {
     const confirmed = await window._spConfirm('移除网页访问密码后，任何能连接服务器的人都可进入文件浏览界面。文件夹锁仍然有效。是否继续？');
     if (!confirmed) return;
   }
   try {
-    await request('/api/admin/account', {
+    const result = await request('/api/admin/account', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
     });
-    toast(adminPasswordChanged ? '账户已更新，请重新登录' : '账户设置已更新');
+    toast(result.warning || (adminPasswordChanged ? '账户已更新，请重新登录' : '账户设置已更新'), Boolean(result.warning));
     if (adminPasswordChanged) setTimeout(() => location.replace('/browse'), 700);
     else await load(true);
+  } catch (error) { toast(error.message, true); }
+}
+
+async function saveLimits() {
+  const maxUploadBytes = gibToBytes(byId('maxUploadGiB').value);
+  const maxArchiveBytes = gibToBytes(byId('maxArchiveGiB').value);
+  const maxArchiveEntries = Number(byId('maxArchiveEntries').value);
+  if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes < 1024 ** 2 || maxUploadBytes > 100 * GIB) {
+    return toast('单文件上传上限必须在 1 MiB 到 100 GiB 之间', true);
+  }
+  if (!Number.isSafeInteger(maxArchiveBytes) || maxArchiveBytes < 1024 ** 2 || maxArchiveBytes > 10 * GIB) {
+    return toast('打包源文件总大小上限必须在 1 MiB 到 10 GiB 之间', true);
+  }
+  if (!Number.isInteger(maxArchiveEntries) || maxArchiveEntries < 1 || maxArchiveEntries > 5000) {
+    return toast('打包条目数量上限必须在 1 到 5000 之间', true);
+  }
+  try {
+    await request('/api/admin/limits', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        max_upload_bytes: maxUploadBytes,
+        max_archive_bytes: maxArchiveBytes,
+        max_archive_entries: maxArchiveEntries
+      })
+    });
+    await load(false);
+    toast('传输限制已保存并立即生效');
   } catch (error) { toast(error.message, true); }
 }
 
@@ -257,6 +378,13 @@ async function load(resetAccount = true) {
   state.shares = info.shares || [];
   state.locks = info.folder_locks || [];
   state.hasGlobalWebPassword = Boolean(info.has_global_web_password);
+  state.loginSecurity = info.login_security || [];
+  state.maxUploadBytes = Number(info.max_upload_bytes || 0);
+  state.maxArchiveBytes = Number(info.max_archive_bytes || 0);
+  state.maxArchiveEntries = Number(info.max_archive_entries || 0);
+  byId('maxUploadGiB').value = bytesToGiB(state.maxUploadBytes);
+  byId('maxArchiveGiB').value = bytesToGiB(state.maxArchiveBytes);
+  byId('maxArchiveEntries').value = state.maxArchiveEntries;
   if (resetAccount) {
     byId('adminUser').value = info.username;
     byId('adminPass').value = MASK;
@@ -264,6 +392,7 @@ async function load(resetAccount = true) {
   }
   renderShares();
   renderLocks();
+  renderLoginSecurity();
 }
 
 byId('newShare').addEventListener('click', () => openShare());
@@ -273,6 +402,11 @@ byId('newLock').addEventListener('click', () => openLock());
 byId('cancelLock').addEventListener('click', () => byId('lockDlg').classList.remove('active'));
 byId('lockForm').addEventListener('submit', saveLock);
 byId('saveAccount').addEventListener('click', saveAccount);
+byId('saveLimits').addEventListener('click', saveLimits);
+for (const item of document.querySelectorAll('[data-admin-section]')) {
+  item.addEventListener('click', () => activateSection(item.dataset.adminSection));
+}
+window.addEventListener('hashchange', () => activateSection(location.hash.slice(1), false));
 for (const id of ['dlgPwd', 'lockDlgPwd', 'adminPass', 'globalWebPass']) {
   byId(id).addEventListener('focus', event => {
     if (event.target.value === MASK) event.target.select();
@@ -283,7 +417,9 @@ for (const overlay of [byId('dlg'), byId('lockDlg')]) {
     if (event.target === overlay) overlay.classList.remove('active');
   });
 }
+activateSection(location.hash.slice(1), false);
 load().catch(error => {
   byId('list').textContent = `加载失败：${error.message}`;
   byId('lockList').replaceChildren();
+  byId('securityList').replaceChildren();
 });

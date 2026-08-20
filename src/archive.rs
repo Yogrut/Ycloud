@@ -31,8 +31,6 @@ use crate::{
     storage::attachment_header,
 };
 
-pub const MAX_ARCHIVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
-pub const MAX_ARCHIVE_FILES: usize = 1_000;
 const MAX_ARCHIVE_VISITED_ENTRIES: usize = 10_000;
 const MAX_PENDING_TICKETS: usize = 32;
 const TICKET_TTL: Duration = Duration::from_secs(120);
@@ -126,8 +124,9 @@ pub struct PrepareArchiveResponse {
     ticket: String,
     total_bytes: u64,
     file_count: usize,
+    entry_count: usize,
     max_bytes: u64,
-    max_files: usize,
+    max_entries: usize,
 }
 
 #[derive(Deserialize)]
@@ -154,11 +153,16 @@ pub async fn prepare_archive(
             "The storage root cannot be archived".into(),
         ));
     }
+    let normalized = deduplicate_paths(normalized);
     let common_parent = common_parent(&normalized);
+    let (max_archive_bytes, max_archive_entries) = {
+        let config = state.config_file.read().await;
+        (config.max_archive_bytes, config.max_archive_entries)
+    };
     let mut files = Vec::new();
     let mut seen = HashSet::new();
     let mut total_bytes = 0_u64;
-    let mut visited_entries = 0_usize;
+    let mut entry_count = 0_usize;
     for path in &normalized {
         let storage_path = share_storage_path(&share, path);
         authorizer.ensure_access(&storage_path)?;
@@ -172,7 +176,9 @@ pub async fn prepare_archive(
             &mut files,
             &mut seen,
             &mut total_bytes,
-            &mut visited_entries,
+            &mut entry_count,
+            max_archive_bytes,
+            max_archive_entries,
         )
         .await?;
     }
@@ -186,8 +192,9 @@ pub async fn prepare_archive(
         ticket,
         total_bytes,
         file_count,
-        max_bytes: MAX_ARCHIVE_BYTES,
-        max_files: MAX_ARCHIVE_FILES,
+        entry_count,
+        max_bytes: max_archive_bytes,
+        max_entries: max_archive_entries,
     }))
 }
 
@@ -201,22 +208,38 @@ async fn collect_files(
     files: &mut Vec<ArchiveFile>,
     seen: &mut HashSet<PathBuf>,
     total_bytes: &mut u64,
-    visited_entries: &mut usize,
+    entry_count: &mut usize,
+    max_archive_bytes: u64,
+    max_archive_entries: usize,
 ) -> AppResult<()> {
     let mut pending = vec![(root, request_path)];
     while let Some((absolute, relative)) = pending.pop() {
-        *visited_entries = visited_entries.saturating_add(1);
-        if *visited_entries > MAX_ARCHIVE_VISITED_ENTRIES {
-            return Err(AppError::BadRequest(
-                "Archive traversal exceeds the 10000 entry safety limit".into(),
-            ));
-        }
         let metadata = fs::symlink_metadata(&absolute)
             .await
             .map_err(|error| AppError::with_source("failed to inspect archive entry", error))?;
         if crate::storage::is_link_or_reparse_point(&metadata) {
             return Err(AppError::BadRequest(
                 "Archives cannot contain symbolic links".into(),
+            ));
+        }
+        let canonical = fs::canonicalize(&absolute)
+            .await
+            .map_err(|error| AppError::with_source("failed to resolve archive entry", error))?;
+        if !canonical.starts_with(state.storage.root()) {
+            return Err(AppError::Forbidden);
+        }
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        *entry_count = entry_count.saturating_add(1);
+        if *entry_count > MAX_ARCHIVE_VISITED_ENTRIES {
+            return Err(AppError::BadRequest(
+                "Archive traversal exceeds the 10000 entry safety limit".into(),
+            ));
+        }
+        if *entry_count > max_archive_entries {
+            return Err(AppError::BadRequest(
+                format!("Archive exceeds the configured {max_archive_entries} entry limit").into(),
             ));
         }
         authorizer.ensure_access(&relative)?;
@@ -240,24 +263,10 @@ async fn collect_files(
         if !metadata.is_file() {
             continue;
         }
-        let canonical = fs::canonicalize(&absolute)
-            .await
-            .map_err(|error| AppError::with_source("failed to resolve archive entry", error))?;
-        if !canonical.starts_with(state.storage.root()) {
-            return Err(AppError::Forbidden);
-        }
-        if !seen.insert(canonical.clone()) {
-            continue;
-        }
-        if files.len() >= MAX_ARCHIVE_FILES {
-            return Err(AppError::BadRequest(
-                "Archive exceeds the 1000 file limit".into(),
-            ));
-        }
         *total_bytes = total_bytes
             .checked_add(metadata.len())
             .ok_or(AppError::PayloadTooLarge)?;
-        if *total_bytes > MAX_ARCHIVE_BYTES {
+        if *total_bytes > max_archive_bytes {
             return Err(AppError::PayloadTooLarge);
         }
         let zip_path = relative
@@ -387,27 +396,52 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
+fn deduplicate_paths(mut paths: Vec<String>) -> Vec<String> {
+    paths.sort_by(|left, right| {
+        left.split('/')
+            .count()
+            .cmp(&right.split('/').count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut unique = Vec::<String>::new();
+    for path in paths {
+        if unique
+            .iter()
+            .any(|ancestor| path == *ancestor || path.starts_with(&format!("{ancestor}/")))
+        {
+            continue;
+        }
+        unique.push(path);
+    }
+    unique
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        archive_name, common_parent, write_archive, ArchiveFile, MAX_ARCHIVE_BYTES,
-        MAX_ARCHIVE_FILES,
-    };
+    use super::{archive_name, common_parent, deduplicate_paths, write_archive, ArchiveFile};
     use crate::storage::StorageService;
     use futures_util::io::AsyncReadExt as FuturesAsyncReadExt;
     use tokio::io::AsyncReadExt;
-
-    #[test]
-    fn archive_limit_is_exactly_three_gibibytes() {
-        assert_eq!(MAX_ARCHIVE_BYTES, 3_221_225_472);
-        assert_eq!(MAX_ARCHIVE_FILES, 1_000);
-    }
 
     #[test]
     fn archive_paths_are_relative_to_the_selection_parent() {
         let paths = vec!["games/a.7z.001".into(), "games/a.7z.002".into()];
         assert_eq!(common_parent(&paths), "games");
         assert_eq!(archive_name(&paths), "Ycloud-打包下载.zip");
+    }
+
+    #[test]
+    fn archive_selection_removes_duplicates_and_descendants() {
+        assert_eq!(
+            deduplicate_paths(vec![
+                "games/part-1".into(),
+                "games".into(),
+                "games/part-2/file.bin".into(),
+                "docs/readme.md".into(),
+                "docs/readme.md".into(),
+            ]),
+            vec!["games".to_string(), "docs/readme.md".to_string()]
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,10 @@
 use std::{
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Context, Poll},
 };
 
@@ -34,7 +37,7 @@ use crate::{
 pub struct StorageService {
     root: Arc<PathBuf>,
     io_gate: Arc<Semaphore>,
-    max_upload_bytes: u64,
+    max_upload_bytes: Arc<AtomicU64>,
     max_list_entries: usize,
     disk_reserve_bytes: u64,
     reserved_upload_bytes: Arc<Mutex<u64>>,
@@ -98,7 +101,7 @@ impl StorageService {
         Ok(Self {
             root: Arc::new(root),
             io_gate: Arc::new(Semaphore::new(io_concurrency.max(1))),
-            max_upload_bytes,
+            max_upload_bytes: Arc::new(AtomicU64::new(max_upload_bytes)),
             max_list_entries: max_list_entries.max(1),
             disk_reserve_bytes,
             reserved_upload_bytes: Arc::new(Mutex::new(0)),
@@ -113,7 +116,12 @@ impl StorageService {
     }
 
     pub fn max_upload_bytes(&self) -> u64 {
+        self.max_upload_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn set_max_upload_bytes(&self, max_upload_bytes: u64) {
         self.max_upload_bytes
+            .store(max_upload_bytes, Ordering::Relaxed);
     }
 
     pub fn max_list_entries(&self) -> usize {
@@ -221,7 +229,8 @@ impl StorageService {
         path: &str,
         expected_bytes: Option<u64>,
     ) -> AppResult<AtomicFileWriter> {
-        if expected_bytes.is_some_and(|bytes| bytes > self.max_upload_bytes) {
+        let max_upload_bytes = self.max_upload_bytes();
+        if expected_bytes.is_some_and(|bytes| bytes > max_upload_bytes) {
             return Err(AppError::PayloadTooLarge);
         }
         let destination = self.resolve_for_write(path).await?;
@@ -296,7 +305,7 @@ impl StorageService {
             file: Some(file),
             bytes_written: 0,
             expected_bytes,
-            max_bytes: self.max_upload_bytes,
+            max_bytes: max_upload_bytes,
             committed: false,
             _permit: permit,
             reservation,

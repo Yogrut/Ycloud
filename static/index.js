@@ -36,7 +36,7 @@ form.addEventListener('submit', async event => {
       body: JSON.stringify({ password: password.value })
     });
     const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.success) throw new Error(data?.error?.message || '密码错误');
+    if (!response.ok || !data.success) throw new Error(data?.message || data?.error?.message || '访问密码错误');
     sessionStorage.removeItem('ycloud-stay-signed-out');
     location.replace('/browse');
   } catch (failure) {

@@ -5,7 +5,7 @@ import { formatSize, state } from './browser-state.js';
 
 const elements = Object.fromEntries([
   'adminButton','logoutButton','uploadButton','newFolderButton','searchInput',
-  'limitNote','breadcrumb','selectAllButton','fileList',
+  'breadcrumb','selectAllButton','fileList',
   'emptyState','fileInput','toast','contextMenu','folderModal','folderName','folderError',
   'createFolderButton','pickerModal','pickerTitle','pickerPath','pickerList',
   'pickerConfirmButton','adminModal','adminUser','adminPass','adminError','adminLoginButton',
@@ -87,19 +87,26 @@ function renderBreadcrumb() {
   root.className = 'crumb';
   root.type = 'button';
   root.textContent = '/';
+  root.title = '根目录';
   root.addEventListener('click', () => navigate(''));
   elements.breadcrumb.append(root);
   let accumulated = '';
-  for (const part of state.path.split('/').filter(Boolean)) {
+  const parts = state.path.split('/').filter(Boolean);
+  for (const part of parts) {
     accumulated = accumulated ? `${accumulated}/${part}` : part;
     const destination = accumulated;
+    const separator = document.createElement('span');
+    separator.className = 'crumb-separator';
+    separator.textContent = '›';
+    separator.setAttribute('aria-hidden', 'true');
     const button = document.createElement('button');
     button.className = 'crumb';
     button.type = 'button';
-    button.textContent = `${part}/`;
+    button.textContent = part;
     button.addEventListener('click', () => navigate(destination));
-    elements.breadcrumb.append(button);
+    elements.breadcrumb.append(separator, button);
   }
+  elements.breadcrumb.lastElementChild?.setAttribute('aria-current', 'location');
 }
 
 function createCell(className, text) {
@@ -165,8 +172,11 @@ function renderFiles() {
 
 function applyCapabilities() {
   for (const control of document.querySelectorAll('.write-control')) {
-    control.disabled = !state.canWrite || (state.uploading && control === elements.uploadButton);
-    control.title = state.canWrite ? '' : '请先登录管理员账号；只读共享不可修改';
+    const uploadBusy = state.uploading && control === elements.uploadButton;
+    control.disabled = uploadBusy;
+    control.classList.toggle('permission-required', !state.canWrite);
+    control.setAttribute('aria-disabled', String(!state.canWrite || uploadBusy));
+    control.title = state.canWrite ? '' : '登录管理员账号后可修改文件';
   }
 }
 
@@ -178,11 +188,9 @@ async function refresh() {
     state.canWrite = data.can_write !== false;
     state.maxUploadBytes = Number(data.max_upload_bytes || 0);
     state.maxArchiveBytes = Number(data.max_archive_bytes || 0);
-    state.maxArchiveFiles = Number(data.max_archive_files || 0);
+    state.maxArchiveEntries = Number(data.max_archive_entries || 0);
     state.selected.clear();
-    elements.limitNote.textContent = data.truncated
-      ? '目录内容超过服务器显示上限，当前仅显示部分项目'
-      : (state.maxUploadBytes ? `单次上传上限 ${formatSize(state.maxUploadBytes)}` : '');
+    if (data.truncated) showToast('目录内容超过服务器显示上限，当前仅显示部分项目');
     renderBreadcrumb();
     renderFiles();
     applyCapabilities();
@@ -275,14 +283,14 @@ async function downloadArchive(paths) {
     const result = await response.json();
     if (!response.ok) {
       if (response.status === 413) {
-        throw new Error('所选内容超过 3 GiB，不能打包；请逐个选择文件下载');
+        throw new Error(`所选文件总大小超过 ${formatSize(state.maxArchiveBytes)}，请拆分选择`);
       }
-      if (response.status === 400 && /1000 file|10000 entry/i.test(result?.error?.message || '')) {
-        throw new Error(`打包最多包含 ${state.maxArchiveFiles || 1000} 个文件，请拆分选择`);
+      if (response.status === 400 && /entry (?:limit|safety limit)|entry limit/i.test(result?.error?.message || '')) {
+        throw new Error(`打包最多包含 ${state.maxArchiveEntries || 1000} 个条目（文件与文件夹合计），请拆分选择`);
       }
       throw new Error(result?.error?.message || `打包准备失败 (${response.status})`);
     }
-    showToast(`正在打包 ${result.file_count} 个文件（${formatSize(result.total_bytes)}）`);
+    showToast(`正在打包 ${result.file_count} 个文件、${result.entry_count} 个条目（${formatSize(result.total_bytes)}）`);
     location.href = `/api/archive?ticket=${encodeURIComponent(result.ticket)}`;
   } catch (error) { showToast(error.message); }
 }
@@ -376,24 +384,31 @@ async function uploadFiles(files) {
   }
   finally {
     state.uploading = false;
-    elements.uploadButton.disabled = !state.canWrite;
+    applyCapabilities();
     elements.uploadCloseButton.disabled = false;
     elements.fileInput.value = '';
   }
 }
 
 function openFolderModal(target = state.path) {
-  if (!state.canWrite) return;
-  state.mkdirTarget = target;
+  if (!state.canWrite) {
+    showAdmin();
+    return;
+  }
+  state.mkdirTarget = String(target || '').replace(/^\/+|\/+$/g, '');
   elements.folderName.value = '';
+  elements.folderError.textContent = '';
   elements.folderError.classList.add('hidden');
   showModal(elements.folderModal);
-  elements.folderName.focus();
+  requestAnimationFrame(() => elements.folderName.focus());
 }
 
 async function createFolder() {
+  if (state.creatingFolder) return;
   const name = elements.folderName.value.trim();
   if (!name) return;
+  state.creatingFolder = true;
+  elements.createFolderButton.disabled = true;
   try {
     await request(actionApi('mkdir', state.mkdirTarget), {
       method: 'POST',
@@ -406,6 +421,9 @@ async function createFolder() {
   } catch (error) {
     elements.folderError.textContent = error.message;
     elements.folderError.classList.remove('hidden');
+  } finally {
+    state.creatingFolder = false;
+    elements.createFolderButton.disabled = false;
   }
 }
 
@@ -582,9 +600,26 @@ function showContextMenu(event, entry = null) {
     }
   }
   elements.contextMenu.classList.add('active');
+  if (!isMobileLayout()) {
+    const margin = 8;
+    const width = elements.contextMenu.offsetWidth;
+    const height = elements.contextMenu.offsetHeight;
+    const left = Math.max(margin, Math.min(event.clientX, window.innerWidth - width - margin));
+    const top = Math.max(margin, Math.min(event.clientY, window.innerHeight - height - margin));
+    elements.contextMenu.style.left = `${left}px`;
+    elements.contextMenu.style.top = `${top}px`;
+    elements.contextMenu.style.right = 'auto';
+    elements.contextMenu.style.bottom = 'auto';
+  }
 }
 
-function hideContextMenu() { elements.contextMenu.classList.remove('active'); }
+function hideContextMenu() {
+  elements.contextMenu.classList.remove('active');
+  elements.contextMenu.style.removeProperty('left');
+  elements.contextMenu.style.removeProperty('top');
+  elements.contextMenu.style.removeProperty('right');
+  elements.contextMenu.style.removeProperty('bottom');
+}
 
 async function showAdmin() {
   try {
@@ -628,7 +663,10 @@ async function logout() {
   }
 }
 
-elements.uploadButton.addEventListener('click', () => elements.fileInput.click());
+elements.uploadButton.addEventListener('click', () => {
+  if (!state.canWrite) showAdmin();
+  else elements.fileInput.click();
+});
 elements.newFolderButton.addEventListener('click', () => openFolderModal());
 elements.fileInput.addEventListener('change', event => uploadFiles(event.target.files));
 elements.uploadCloseButton.addEventListener('click', () => {

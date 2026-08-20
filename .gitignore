@@ -8,6 +8,9 @@
 # Runtime secrets and atomic-write backups
 /config.json
 /config.json.bak
+/initial-credentials.json
+/security-events.json
+/security-events.json.bak
 *.upload
 *.tmp
 

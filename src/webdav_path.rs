@@ -97,17 +97,17 @@ mod tests {
     fn destination_must_remain_in_the_same_share() {
         assert_eq!(
             parse_destination(
-                "http://localhost:3000/dav/Team%20Files/docs/runbook.md",
+                "http://localhost:18473/dav/Team%20Files/docs/runbook.md",
                 "Team Files",
-                Some("localhost:3000")
+                Some("localhost:18473")
             ),
             Some("docs/runbook.md".into())
         );
         assert_eq!(
             parse_destination(
-                "http://localhost:3000/dav/Other/file",
+                "http://localhost:18473/dav/Other/file",
                 "Team Files",
-                Some("localhost:3000")
+                Some("localhost:18473")
             ),
             None
         );
@@ -115,15 +115,15 @@ mod tests {
             parse_destination(
                 "http://evil.example/dav/Team%20Files/file",
                 "Team Files",
-                Some("localhost:3000")
+                Some("localhost:18473")
             ),
             None
         );
         assert_eq!(
             parse_destination(
-                "http://localhost:3000/prefix/dav/Team%20Files/file",
+                "http://localhost:18473/prefix/dav/Team%20Files/file",
                 "Team Files",
-                Some("localhost:3000")
+                Some("localhost:18473")
             ),
             None
         );

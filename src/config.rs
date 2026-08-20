@@ -6,13 +6,22 @@ use std::sync::Arc;
 use anyhow::Context;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
-use rand_core::OsRng;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+
+pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_ARCHIVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 1_000;
+pub const HARD_MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+pub const HARD_MAX_ARCHIVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const HARD_MAX_ARCHIVE_ENTRIES: usize = 5_000;
+const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
 
 // ── Data types ────────────────────────────────────────────────────
 
@@ -69,6 +78,36 @@ pub fn path_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
         && path_components[..ancestor_components.len()] == ancestor_components
 }
 
+/// WebDAV and browser folder-lock namespaces must never overlap. This includes
+/// either direction and treats the storage root as an ancestor of every path.
+pub fn paths_overlap(left: &str, right: &str) -> bool {
+    let left: Vec<&str> = left
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let right: Vec<&str> = right
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let shared = left.len().min(right.len());
+    left[..shared]
+        .iter()
+        .zip(&right[..shared])
+        .all(|(a, b)| path_component_eq(a, b))
+}
+
+#[cfg(windows)]
+fn path_component_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+#[cfg(not(windows))]
+fn path_component_eq(left: &str, right: &str) -> bool {
+    left == right
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
     #[serde(default)]
@@ -81,6 +120,12 @@ pub struct ConfigFile {
     pub folder_locks: Vec<FolderLock>,
     #[serde(default)]
     pub shares: Vec<Share>,
+    #[serde(default = "default_max_upload_bytes")]
+    pub max_upload_bytes: u64,
+    #[serde(default = "default_max_archive_bytes")]
+    pub max_archive_bytes: u64,
+    #[serde(default = "default_max_archive_entries")]
+    pub max_archive_entries: usize,
 }
 
 #[derive(Clone)]
@@ -96,6 +141,9 @@ pub struct Config {
     pub upload_timeout_secs: u64,
     pub disk_reserve_bytes: u64,
     pub secure_cookies: bool,
+    /// Allows direct HTTP access only from loopback, private, and link-local peers.
+    /// This is deliberately separate from the strict public HTTPS proxy mode.
+    pub allow_lan_http: bool,
     pub public_base_url: Option<String>,
     pub public_host: Option<String>,
     pub trusted_proxy_ips: HashSet<IpAddr>,
@@ -103,10 +151,31 @@ pub struct Config {
 
 pub type SharedConfig = Arc<RwLock<ConfigFile>>;
 
+const INITIAL_CREDENTIALS_FILE: &str = "initial-credentials.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InitialCredentials {
+    admin_username: String,
+    admin_password: String,
+    web_access_password: String,
+}
+
 // ── Serde defaults ────────────────────────────────────────────────
 
 fn default_admin_username() -> String {
     "admin".into()
+}
+
+const fn default_max_upload_bytes() -> u64 {
+    DEFAULT_MAX_UPLOAD_BYTES
+}
+
+const fn default_max_archive_bytes() -> u64 {
+    DEFAULT_MAX_ARCHIVE_BYTES
+}
+
+const fn default_max_archive_entries() -> usize {
+    DEFAULT_MAX_ARCHIVE_ENTRIES
 }
 
 // ── ConfigFile ────────────────────────────────────────────────────
@@ -131,6 +200,9 @@ impl Default for ConfigFile {
                 password_hash: None,
                 readonly: false,
             }],
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
+            max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
         }
     }
 }
@@ -158,6 +230,11 @@ impl ConfigFile {
                 "Configuration exceeds supported limits".into(),
             ));
         }
+        validate_transfer_limits(
+            self.max_upload_bytes,
+            self.max_archive_bytes,
+            self.max_archive_entries,
+        )?;
 
         let mut share_ids = HashSet::new();
         let mut share_names = HashSet::new();
@@ -232,8 +309,42 @@ impl ConfigFile {
                 ));
             }
         }
+        for share in self.shares.iter().filter(|share| share.webdav_enabled) {
+            if self
+                .folder_locks
+                .iter()
+                .any(|lock| paths_overlap(&share.path, &lock.path))
+            {
+                return Err(AppError::Conflict(
+                    "WebDAV 挂载不能与网页文件夹锁的父目录、当前目录或子目录重叠".into(),
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+pub fn validate_transfer_limits(
+    max_upload_bytes: u64,
+    max_archive_bytes: u64,
+    max_archive_entries: usize,
+) -> AppResult<()> {
+    if !(MIN_TRANSFER_BYTES..=HARD_MAX_UPLOAD_BYTES).contains(&max_upload_bytes) {
+        return Err(AppError::BadRequest(
+            "单文件上传上限必须在 1 MiB 到 100 GiB 之间".into(),
+        ));
+    }
+    if !(MIN_TRANSFER_BYTES..=HARD_MAX_ARCHIVE_BYTES).contains(&max_archive_bytes) {
+        return Err(AppError::BadRequest(
+            "打包源文件总大小上限必须在 1 MiB 到 10 GiB 之间".into(),
+        ));
+    }
+    if !(1..=HARD_MAX_ARCHIVE_ENTRIES).contains(&max_archive_entries) {
+        return Err(AppError::BadRequest(
+            "打包条目数量上限必须在 1 到 5000 之间".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_relative_config_path(path: &str) -> AppResult<()> {
@@ -257,20 +368,24 @@ fn validate_relative_config_path(path: &str) -> AppResult<()> {
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let bind_address = env_parse("BIND_ADDRESS", IpAddr::from([127, 0, 0, 1]))?;
-        let port = env_parse("PORT", 3000_u16)?;
+        let port = env_parse("PORT", 18_473_u16)?;
         let storage_path =
             PathBuf::from(std::env::var("STORAGE_PATH").unwrap_or_else(|_| "./storage".into()));
         let config_path =
             PathBuf::from(std::env::var("CONFIG_PATH").unwrap_or_else(|_| "./config.json".into()));
-        let max_upload_bytes = env_parse("MAX_UPLOAD_BYTES", 5_u64 * 1024 * 1024 * 1024)?;
+        // This is an absolute transport envelope. The administrator-facing,
+        // persisted upload limit is enforced by StorageService and can be
+        // changed without exposing concurrency/resource protection controls.
+        let max_upload_bytes = env_parse("MAX_UPLOAD_BYTES", HARD_MAX_UPLOAD_BYTES)?;
         let io_concurrency = env_parse("IO_CONCURRENCY", 4_usize)?;
         let max_list_entries = env_parse("MAX_LIST_ENTRIES", 10_000_usize)?;
         let request_timeout_secs = env_parse("REQUEST_TIMEOUT_SECS", 300_u64)?;
         let upload_timeout_secs = env_parse("UPLOAD_TIMEOUT_SECS", 6_u64 * 60 * 60)?;
         let disk_reserve_bytes = env_parse("DISK_RESERVE_BYTES", 512_u64 * 1024 * 1024)?;
         let secure_cookies = env_parse("SECURE_COOKIES", false)?;
+        let allow_lan_http = env_parse("ALLOW_LAN_HTTP", false)?;
         let (public_base_url, public_host, trusted_proxy_ips) =
-            public_proxy_config(bind_address, secure_cookies)?;
+            public_proxy_config(bind_address, secure_cookies, allow_lan_http)?;
         Ok(Self {
             bind_address,
             port,
@@ -283,6 +398,7 @@ impl Config {
             upload_timeout_secs,
             disk_reserve_bytes,
             secure_cookies,
+            allow_lan_http,
             public_base_url,
             public_host,
             trusted_proxy_ips,
@@ -297,8 +413,17 @@ impl Config {
 fn public_proxy_config(
     bind_address: IpAddr,
     secure_cookies: bool,
+    allow_lan_http: bool,
 ) -> anyhow::Result<(Option<String>, Option<String>, HashSet<IpAddr>)> {
     if bind_address.is_loopback() {
+        return Ok((None, None, HashSet::new()));
+    }
+    if allow_lan_http {
+        if secure_cookies {
+            anyhow::bail!(
+                "SECURE_COOKIES must be false for direct LAN HTTP; use public HTTPS proxy mode instead"
+            );
+        }
         return Ok((None, None, HashSet::new()));
     }
     if !secure_cookies {
@@ -430,19 +555,16 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
                 .await
                 .context("Failed to persist migrated configuration")?;
         }
+        warn_if_initial_credentials_remain(path).await?;
         Ok(config)
     } else {
-        let password = std::env::var("INITIAL_ADMIN_PASSWORD")
-            .context("INITIAL_ADMIN_PASSWORD is required when creating a new configuration")?;
-        if password.len() < 12 || password.len() > 1_024 {
-            anyhow::bail!("INITIAL_ADMIN_PASSWORD must contain 12-1024 bytes");
-        }
-        let password_hash = hash_password(&password);
+        let credentials_path = initial_credentials_path(path);
+        let credentials = load_or_create_initial_credentials(&credentials_path).await?;
         let config = ConfigFile {
             schema_version: 2,
-            admin_username: default_admin_username(),
-            admin_password_hash: password_hash,
-            global_web_password_hash: None,
+            admin_username: credentials.admin_username.clone(),
+            admin_password_hash: hash_password(&credentials.admin_password),
+            global_web_password_hash: Some(hash_password(&credentials.web_access_password)),
             folder_locks: Vec::new(),
             shares: vec![Share {
                 id: uuid_v4(),
@@ -453,9 +575,116 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
                 password_hash: None,
                 readonly: false,
             }],
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
+            max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
         };
         save_config(path, &config).await?;
+        tracing::warn!(
+            path = %credentials_path.display(),
+            "initial administrator and web access credentials were generated; read this file and change both passwords after signing in"
+        );
         Ok(config)
+    }
+}
+
+async fn warn_if_initial_credentials_remain(config_path: &Path) -> anyhow::Result<()> {
+    let path = initial_credentials_path(config_path);
+    if tokio::fs::try_exists(&path).await? {
+        tracing::warn!(
+            path = %path.display(),
+            "initial plaintext credentials still exist; change both passwords in the administrator page"
+        );
+    }
+    Ok(())
+}
+
+fn initial_credentials_path(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    parent.join(INITIAL_CREDENTIALS_FILE)
+}
+
+async fn load_or_create_initial_credentials(path: &Path) -> anyhow::Result<InitialCredentials> {
+    if tokio::fs::try_exists(path).await? {
+        let content = tokio::fs::read(path)
+            .await
+            .context("Failed to read initial credentials file")?;
+        let credentials: InitialCredentials =
+            serde_json::from_slice(&content).context("Initial credentials file is invalid")?;
+        validate_initial_credentials(&credentials)?;
+        secure_file_permissions(path).await?;
+        return Ok(credentials);
+    }
+
+    let credentials = InitialCredentials {
+        admin_username: default_admin_username(),
+        admin_password: random_password(9),
+        web_access_password: random_password(6),
+    };
+    let json = serde_json::to_vec_pretty(&credentials)?;
+    let temporary = path.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)
+        .await
+        .context("Failed to create temporary initial credentials file")?;
+    let prepare_result = async {
+        file.write_all(&json)
+            .await
+            .context("Failed to write initial credentials file")?;
+        file.sync_all()
+            .await
+            .context("Failed to flush initial credentials file")
+    }
+    .await;
+    drop(file);
+    if let Err(error) = prepare_result {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    if let Err(error) = tokio::fs::rename(&temporary, path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error).context("Failed to publish initial credentials file");
+    }
+    secure_file_permissions(path).await?;
+    Ok(credentials)
+}
+
+fn validate_initial_credentials(credentials: &InitialCredentials) -> anyhow::Result<()> {
+    if credentials.admin_username.trim().is_empty()
+        || credentials.admin_username.chars().count() > 128
+        || credentials.admin_password.chars().count() < 12
+        || credentials.web_access_password.chars().count() < 8
+        || credentials.admin_password.len() > 4_096
+        || credentials.web_access_password.len() > 4_096
+    {
+        anyhow::bail!("Initial credentials file does not satisfy the password policy");
+    }
+    Ok(())
+}
+
+fn random_password(bytes: usize) -> String {
+    let mut random = vec![0_u8; bytes];
+    OsRng.fill_bytes(&mut random);
+    URL_SAFE_NO_PAD.encode(random)
+}
+
+pub async fn remove_initial_credentials(config_path: &Path) -> anyhow::Result<bool> {
+    let path = initial_credentials_path(config_path);
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "Failed to remove initial credentials file {}",
+                path.display()
+            )
+        }),
     }
 }
 
@@ -569,8 +798,10 @@ impl SecureOpenOptions for OpenOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        config_backup_path, hash_password, load_config, path_is_same_or_descendant, save_config,
-        ConfigFile, FolderLock,
+        config_backup_path, hash_password, initial_credentials_path, load_config,
+        path_is_same_or_descendant, paths_overlap, remove_initial_credentials, save_config,
+        verify_password, ConfigFile, FolderLock, InitialCredentials, DEFAULT_MAX_ARCHIVE_BYTES,
+        DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_UPLOAD_BYTES,
     };
 
     #[test]
@@ -582,6 +813,15 @@ mod tests {
         ));
         assert!(!path_is_same_or_descendant("photos-old", "photos"));
         assert!(!path_is_same_or_descendant("photos", ""));
+    }
+
+    #[test]
+    fn webdav_and_folder_lock_paths_cannot_overlap_in_either_direction() {
+        assert!(paths_overlap("", "private"));
+        assert!(paths_overlap("games", "games/locked"));
+        assert!(paths_overlap("games/locked/child", "games/locked"));
+        assert!(!paths_overlap("games", "documents"));
+        assert!(!paths_overlap("test", "test-two"));
     }
 
     #[test]
@@ -607,6 +847,21 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
+    #[test]
+    fn transfer_limits_reject_values_outside_safe_envelope() {
+        let mut config = ConfigFile {
+            max_upload_bytes: 0,
+            ..ConfigFile::default()
+        };
+        assert!(config.validate().is_err());
+        config.max_upload_bytes = DEFAULT_MAX_UPLOAD_BYTES;
+        config.max_archive_bytes = 10 * 1024 * 1024 * 1024 + 1;
+        assert!(config.validate().is_err());
+        config.max_archive_bytes = DEFAULT_MAX_ARCHIVE_BYTES;
+        config.max_archive_entries = 5_001;
+        assert!(config.validate().is_err());
+    }
+
     #[tokio::test]
     async fn config_save_keeps_last_known_good_backup() {
         let directory =
@@ -620,6 +875,9 @@ mod tests {
             global_web_password_hash: None,
             folder_locks: Vec::new(),
             shares: Vec::new(),
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
+            max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
         };
         save_config(&path, &config).await.unwrap();
         config.admin_username = "second-admin".into();
@@ -658,11 +916,53 @@ mod tests {
         let migrated = load_config(&path).await.unwrap();
         assert_eq!(migrated.shares.len(), 1);
         assert!(!migrated.shares[0].id.is_empty());
+        assert_eq!(migrated.max_upload_bytes, DEFAULT_MAX_UPLOAD_BYTES);
+        assert_eq!(migrated.max_archive_bytes, DEFAULT_MAX_ARCHIVE_BYTES);
+        assert_eq!(migrated.max_archive_entries, DEFAULT_MAX_ARCHIVE_ENTRIES);
 
         let persisted: ConfigFile =
             serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
         assert_eq!(persisted.shares[0].id, migrated.shares[0].id);
         assert_eq!(persisted.schema_version, 2);
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_start_generates_recoverable_independent_credentials() {
+        let directory =
+            std::env::temp_dir().join(format!("ycloud-first-start-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let path = directory.join("config.json");
+
+        let first = load_config(&path).await.unwrap();
+        let credentials_path = initial_credentials_path(&path);
+        let credentials: InitialCredentials =
+            serde_json::from_slice(&tokio::fs::read(&credentials_path).await.unwrap()).unwrap();
+        assert_eq!(credentials.admin_username, "admin");
+        assert_ne!(credentials.admin_password, credentials.web_access_password);
+        assert_eq!(credentials.admin_password.chars().count(), 12);
+        assert_eq!(credentials.web_access_password.chars().count(), 8);
+        assert!(verify_password(
+            &first.admin_password_hash,
+            &credentials.admin_password
+        ));
+        assert!(verify_password(
+            first.global_web_password_hash.as_deref().unwrap(),
+            &credentials.web_access_password
+        ));
+
+        tokio::fs::remove_file(&path).await.unwrap();
+        let recovered = load_config(&path).await.unwrap();
+        assert!(verify_password(
+            &recovered.admin_password_hash,
+            &credentials.admin_password
+        ));
+        assert!(verify_password(
+            recovered.global_web_password_hash.as_deref().unwrap(),
+            &credentials.web_access_password
+        ));
+        assert!(remove_initial_credentials(&path).await.unwrap());
+        assert!(!tokio::fs::try_exists(credentials_path).await.unwrap());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }

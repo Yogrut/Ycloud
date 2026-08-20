@@ -44,7 +44,7 @@ pub struct ListResponse {
     pub can_write: bool,
     pub max_upload_bytes: u64,
     pub max_archive_bytes: u64,
-    pub max_archive_files: usize,
+    pub max_archive_entries: usize,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +205,10 @@ pub async fn list_files(
         .and_then(|p| p.to_str())
         .map(|s| s.to_string());
 
+    let (max_archive_bytes, max_archive_entries) = {
+        let config = state.config_file.read().await;
+        (config.max_archive_bytes, config.max_archive_entries)
+    };
     Ok(Json(ListResponse {
         current_path,
         parent_path,
@@ -212,8 +216,8 @@ pub async fn list_files(
         truncated,
         can_write: !share.readonly && crate::auth::is_admin_authenticated(&state, &headers).await,
         max_upload_bytes: state.storage.max_upload_bytes(),
-        max_archive_bytes: crate::archive::MAX_ARCHIVE_BYTES,
-        max_archive_files: crate::archive::MAX_ARCHIVE_FILES,
+        max_archive_bytes,
+        max_archive_entries,
     }))
 }
 

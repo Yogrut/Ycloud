@@ -4,8 +4,9 @@ use uuid::Uuid;
 
 use crate::{
     auth::AppState,
-    config::{FolderLock, Share},
+    config::{remove_initial_credentials, validate_transfer_limits, FolderLock, Share},
     error::{AppError, AppResult},
+    login_security::{LoginEntry, LoginRecord},
 };
 
 #[derive(Serialize)]
@@ -14,6 +15,10 @@ pub struct AdminInfo {
     pub has_global_web_password: bool,
     pub shares: Vec<ShareView>,
     pub folder_locks: Vec<FolderLockView>,
+    pub login_security: Vec<LoginRecord>,
+    pub max_upload_bytes: u64,
+    pub max_archive_bytes: u64,
+    pub max_archive_entries: usize,
 }
 
 /// [安全] Administrative responses expose password presence, never hashes.
@@ -88,17 +93,97 @@ pub struct UpdateAdminRequest {
 }
 
 pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
-    let config = state.config_file.read().await;
+    let (
+        username,
+        has_global_web_password,
+        shares,
+        folder_locks,
+        max_upload_bytes,
+        max_archive_bytes,
+        max_archive_entries,
+    ) = {
+        let config = state.config_file.read().await;
+        (
+            config.admin_username.clone(),
+            config.global_web_password_hash.is_some(),
+            config.shares.iter().map(ShareView::from).collect(),
+            config
+                .folder_locks
+                .iter()
+                .map(FolderLockView::from)
+                .collect(),
+            config.max_upload_bytes,
+            config.max_archive_bytes,
+            config.max_archive_entries,
+        )
+    };
     Json(AdminInfo {
-        username: config.admin_username.clone(),
-        has_global_web_password: config.global_web_password_hash.is_some(),
-        shares: config.shares.iter().map(ShareView::from).collect(),
-        folder_locks: config
-            .folder_locks
-            .iter()
-            .map(FolderLockView::from)
-            .collect(),
+        username,
+        has_global_web_password,
+        shares,
+        folder_locks,
+        login_security: state.login_security.snapshot().await,
+        max_upload_bytes,
+        max_archive_bytes,
+        max_archive_entries,
     })
+}
+
+#[derive(Deserialize)]
+pub struct UpdateTransferLimitsRequest {
+    pub max_upload_bytes: u64,
+    pub max_archive_bytes: u64,
+    pub max_archive_entries: usize,
+}
+
+pub async fn update_transfer_limits(
+    State(state): State<AppState>,
+    Json(body): Json<UpdateTransferLimitsRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    validate_transfer_limits(
+        body.max_upload_bytes,
+        body.max_archive_bytes,
+        body.max_archive_entries,
+    )?;
+    if body.max_upload_bytes > state.config.max_upload_bytes {
+        return Err(AppError::BadRequest(
+            "单文件上传上限超过部署环境允许的绝对上限；请调整 MAX_UPLOAD_BYTES 后重启服务".into(),
+        ));
+    }
+    state
+        .update_config(move |config| {
+            config.max_upload_bytes = body.max_upload_bytes;
+            config.max_archive_bytes = body.max_archive_bytes;
+            config.max_archive_entries = body.max_archive_entries;
+            Ok(())
+        })
+        .await?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+#[derive(Deserialize)]
+pub struct UnblockLoginRequest {
+    pub entry: LoginEntry,
+    pub ip: String,
+}
+
+pub async fn unblock_login(
+    State(state): State<AppState>,
+    Json(body): Json<UnblockLoginRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let ip = body
+        .ip
+        .parse()
+        .map_err(|_| AppError::BadRequest("IP 地址无效".into()))?;
+    let found = state
+        .login_security
+        .unblock(body.entry, ip)
+        .await
+        .map_err(|error| AppError::with_source("无法持久化登录安全状态", error))?;
+    if !found {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(serde_json::json!({ "success": true })))
 }
 
 pub async fn create_share(
@@ -206,14 +291,15 @@ pub async fn update_admin_account(
 ) -> AppResult<Json<serde_json::Value>> {
     let password_hash = match body.password {
         Some(password) if !password.is_empty() => {
-            validate_password(&password, 12, "Administrator")?;
+            validate_password(&password, 12, "管理员")?;
             Some(state.passwords.hash(password).await?)
         }
         _ => None,
     };
     let global_web_password_hash =
-        hash_changed_password(&state, body.global_web_password, 8, "Web access").await?;
-    let credentials_changed = password_hash.is_some()
+        hash_changed_password(&state, body.global_web_password, 8, "网页访问").await?;
+    let admin_password_changed = password_hash.is_some();
+    let credentials_changed = admin_password_changed
         || body
             .username
             .as_deref()
@@ -242,7 +328,19 @@ pub async fn update_admin_account(
     if gate_changed {
         state.gate_access.clear().await;
     }
-    Ok(Json(serde_json::json!({ "success": true })))
+    let mut initial_credentials_warning = None;
+    if admin_password_changed || gate_changed {
+        if let Err(error) = remove_initial_credentials(&state.config.config_path).await {
+            tracing::error!(%error, "failed to remove initial plaintext credentials after account update");
+            initial_credentials_warning = Some(
+                "账户已更新，但初始凭据文件删除失败；请在服务器配置目录手动删除 initial-credentials.json",
+            );
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "warning": initial_credentials_warning
+    })))
 }
 
 #[derive(Deserialize)]
@@ -261,7 +359,7 @@ pub async fn create_lock(
     State(state): State<AppState>,
     Json(body): Json<CreateLockRequest>,
 ) -> AppResult<Json<FolderLockView>> {
-    validate_password(&body.password, 8, "Folder lock")?;
+    validate_password(&body.password, 8, "文件夹锁")?;
     let lock = FolderLock {
         id: Uuid::new_v4().to_string(),
         path: body.path.trim_matches('/').to_string(),
@@ -292,7 +390,7 @@ pub async fn update_lock(
     let revoked_id = id.clone();
     let password_hash = match body.password {
         Some(password) if !password.is_empty() => {
-            validate_password(&password, 8, "Folder lock")?;
+            validate_password(&password, 8, "文件夹锁")?;
             Some(state.passwords.hash(password).await?)
         }
         _ => None,
@@ -378,11 +476,26 @@ async fn hash_changed_password(
 }
 
 fn validate_password(password: &str, minimum: usize, kind: &'static str) -> AppResult<()> {
-    if password.len() < minimum || password.len() > 1_024 {
+    let characters = password.chars().count();
+    if characters < minimum {
         Err(AppError::BadRequest(
-            format!("{kind} password must contain {minimum}-1024 bytes").into(),
+            format!("{kind}密码至少需要 {minimum} 位").into(),
         ))
+    } else if characters > 1_024 || password.len() > 4_096 {
+        Err(AppError::BadRequest(format!("{kind}密码过长").into()))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_password;
+
+    #[test]
+    fn password_policy_counts_unicode_characters_not_utf8_bytes() {
+        assert!(validate_password("密码安全", 4, "测试").is_ok());
+        assert!(validate_password("密码安全", 5, "测试").is_err());
+        assert!(validate_password("Dav密码-2026-安全", 12, "WebDAV").is_ok());
     }
 }

@@ -11,6 +11,7 @@ use crate::{
     auth,
     config::Share,
     file_access::share_storage_path,
+    login_security::LoginEntry,
     security::ClientIp,
     state::AppState,
     storage::{FileResponseMode, ResolvedPath},
@@ -101,18 +102,45 @@ async fn verify_share_access(
     if !share.webdav_enabled {
         return Err(StatusCode::FORBIDDEN);
     }
-    let failure_key = client_ip
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "unknown".into());
-    if state.webdav_failures.is_blocked(&failure_key).await {
+    let failure_key = client_ip.unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+    if state
+        .login_security
+        .is_blocked(LoginEntry::WebDav, failure_key)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     if let Err(status) = verify_share_basic_auth(state, &share, headers).await {
-        if status == StatusCode::UNAUTHORIZED {
-            state.webdav_failures.record_failure(&failure_key).await;
+        // A challenge without credentials is the normal first step of HTTP Basic
+        // authentication. Counting it as a failed password caused WebDAV clients
+        // with parallel discovery requests to lock themselves out before retrying.
+        if status == StatusCode::UNAUTHORIZED && headers.contains_key(header::AUTHORIZATION) {
+            state
+                .login_security
+                .record_failure(
+                    LoginEntry::WebDav,
+                    failure_key,
+                    headers
+                        .get(header::USER_AGENT)
+                        .and_then(|value| value.to_str().ok()),
+                )
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         }
         return Err(status);
     }
+    state
+        .login_security
+        .record_success(
+            LoginEntry::WebDav,
+            failure_key,
+            headers
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+        )
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     if share.readonly && is_write_method(method) {
         return Err(StatusCode::FORBIDDEN);
     }
@@ -128,7 +156,8 @@ async fn verify_share_basic_auth(
     let Some((username, password)) = auth::extract_basic_auth(headers) else {
         return Err(StatusCode::UNAUTHORIZED);
     };
-    if password.is_empty() || password.len() > 1_024 {
+    let password_characters = password.chars().count();
+    if password_characters == 0 || password_characters > 1_024 || password.len() > 4_096 {
         return Err(StatusCode::UNAUTHORIZED);
     }
     let (Some(expected_username), Some(password_hash)) =

@@ -10,7 +10,7 @@ const passwordInput = ref<HTMLInputElement>()
 
 function openBrowser(): void {
   sessionStorage.removeItem('ycloud-stay-signed-out')
-  window.location.replace('/browse')
+  window.location.replace('/v2/browse')
 }
 
 async function detectExistingAccess(): Promise<void> {

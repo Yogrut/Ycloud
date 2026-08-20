@@ -121,7 +121,7 @@ cargo deny --locked check
 cargo build --release --locked
 ```
 
-Vue 候选前端当前只迁移首页登录，旧前端仍是生产入口。并行开发时保持 Rust 服务运行，再执行：
+Vue 候选前端当前已迁移首页登录与文件浏览核心，旧前端仍是生产入口。并行开发时保持 Rust 服务运行，再执行：
 
 ```bash
 cd frontend

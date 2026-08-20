@@ -305,7 +305,7 @@ async function submitUnlock(): Promise<void> {
 
 async function openAdmin(): Promise<void> {
   if (canWrite.value) {
-    window.location.href = '/admin'
+    window.location.href = '/v2/admin/account'
     return
   }
   adminUser.value = ''
@@ -322,7 +322,7 @@ async function submitAdmin(): Promise<void> {
   try {
     const result = await adminLogin(adminUser.value.trim(), adminPassword.value)
     if (!result.success) throw new Error(result.message ?? '登录失败')
-    window.location.href = '/admin'
+    window.location.href = '/v2/admin/account'
   } catch (error) {
     adminError.value = error instanceof Error ? error.message : '登录失败'
   }

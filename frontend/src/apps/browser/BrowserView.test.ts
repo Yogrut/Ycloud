@@ -119,7 +119,7 @@ describe('BrowserView', () => {
     app.unmount()
   })
 
-  it('selects only intersecting rows with a desktop drag rectangle', async () => {
+  it('selects only intersecting rows without rendering a drag rectangle', async () => {
     vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: false }))
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt', 'two.txt'])), {
       status: 200,
@@ -141,7 +141,7 @@ describe('BrowserView', () => {
     window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 360, clientY: 95 }))
     await nextTick()
 
-    expect(host.querySelector('.drag-selection-box')).not.toBeNull()
+    expect(host.querySelector('.drag-selection-box')).toBeNull()
     expect(rows[0]!.classList.contains('selected')).toBe(true)
     expect(rows[1]!.classList.contains('selected')).toBe(false)
 
@@ -173,6 +173,38 @@ describe('BrowserView', () => {
 
     expect(host.querySelector('.drag-selection-box')).toBeNull()
     expect(host.querySelector('.file-row.selected')).toBeNull()
+    app.unmount()
+  })
+
+  it('removes intersecting selected rows when dragging upward', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: false }))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt', 'two.txt'])), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const panel = host.querySelector('.file-panel') as HTMLElement
+    const rows = [...host.querySelectorAll<HTMLElement>('.file-row')]
+    rows[0]!.click()
+    rows[1]!.click()
+    await nextTick()
+    expect(host.querySelectorAll('.file-row.selected')).toHaveLength(2)
+    vi.spyOn(panel, 'getBoundingClientRect').mockReturnValue(domRect(0, 40, 400, 180))
+    vi.spyOn(rows[0]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 70, 380, 105))
+    vi.spyOn(rows[1]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 110, 380, 145))
+
+    panel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 30, clientY: 145 }))
+    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 360, clientY: 75 }))
+    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 360, clientY: 75 }))
+    await nextTick()
+
+    expect(host.querySelector('.drag-selection-box')).toBeNull()
+    expect(host.querySelectorAll('.file-row.selected')).toHaveLength(0)
     app.unmount()
   })
 

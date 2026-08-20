@@ -261,14 +261,6 @@ input { font: inherit; }
 
 .file-panel { position: relative; overflow: hidden; padding: 18px 36px 20px; border-radius: 12px; user-select: none; }
 .file-panel.drag-selecting { cursor: crosshair; }
-.drag-selection-box {
-  position: fixed;
-  z-index: 40;
-  pointer-events: none;
-  background: var(--accent-soft);
-  border: 1px solid var(--accent);
-  border-radius: 4px;
-}
 .file-head,
 .file-row {
   display: grid;

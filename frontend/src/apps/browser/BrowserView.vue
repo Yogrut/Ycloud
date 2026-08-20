@@ -12,6 +12,10 @@ import FileIcon from './FileIcon.vue'
 import FolderPicker from './FolderPicker.vue'
 
 type SortKey = 'name' | 'time' | 'size'
+type SelectionBox = { left: number; top: number; width: number; height: number }
+type DragSession = { startX: number; startY: number; active: boolean }
+
+const DRAG_THRESHOLD = 6
 
 defineProps<{ theme: ThemeController }>()
 const path = ref('')
@@ -36,6 +40,7 @@ const adminUser = ref('')
 const adminPassword = ref('')
 const adminError = ref('')
 const fileInput = ref<HTMLInputElement>()
+const filePanel = ref<HTMLElement>()
 const showFolder = ref(false)
 const folderName = ref('')
 const folderError = ref('')
@@ -62,6 +67,10 @@ const operationError = ref('')
 const pickerOperation = ref<'move' | 'copy' | null>(null)
 const pickerPaths = ref<string[]>([])
 const batchResult = ref<BatchResponse | null>(null)
+const dragSelectionBox = ref<SelectionBox | null>(null)
+let dragSession: DragSession | null = null
+let suppressRowClick = false
+let suppressRowClickTimer: number | undefined
 
 const uploadPercent = computed(() => uploadTotal.value ? Math.min(100, Math.round(uploadProcessed.value / uploadTotal.value * 100)) : 0)
 
@@ -98,6 +107,16 @@ const crumbs = computed(() => {
 const allSelected = computed(() => visibleEntries.value.length > 0 && visibleEntries.value.every(entry => selected.value.has(entry.path)))
 const selectedPaths = computed(() => [...selected.value])
 const pickerTitle = computed(() => `${pickerOperation.value === 'move' ? '移动' : '复制'} ${pickerPaths.value.length} 个项目到…`)
+const dragSelectionStyle = computed(() => {
+  const box = dragSelectionBox.value
+  if (!box) return undefined
+  return {
+    left: `${box.left}px`,
+    top: `${box.top}px`,
+    width: `${box.width}px`,
+    height: `${box.height}px`,
+  }
+})
 
 function announce(message: string): void {
   notice.value = message
@@ -146,6 +165,15 @@ function toggleSelection(entryPath: string): void {
   syncMobileMenu(next)
 }
 
+function handleRowClick(entryPath: string): void {
+  if (suppressRowClick) {
+    suppressRowClick = false
+    if (suppressRowClickTimer !== undefined) window.clearTimeout(suppressRowClickTimer)
+    return
+  }
+  toggleSelection(entryPath)
+}
+
 function toggleSelectAll(): void {
   const next = new Set(selected.value)
   if (allSelected.value) visibleEntries.value.forEach(entry => next.delete(entry.path))
@@ -156,6 +184,62 @@ function toggleSelectAll(): void {
 
 function isMobileLayout(): boolean {
   return window.matchMedia('(max-width: 760px)').matches
+}
+
+function startDragSelection(event: MouseEvent): void {
+  if (event.button !== 0 || isMobileLayout() || loading.value || !visibleEntries.value.length) return
+  if ((event.target as HTMLElement).closest('button, input, a')) return
+  dragSession = { startX: event.clientX, startY: event.clientY, active: false }
+  closeContextMenu()
+}
+
+function updateDragSelection(event: MouseEvent): void {
+  const session = dragSession
+  const panel = filePanel.value
+  if (!session || !panel) return
+  if (!session.active && Math.hypot(event.clientX - session.startX, event.clientY - session.startY) < DRAG_THRESHOLD) return
+
+  session.active = true
+  event.preventDefault()
+  window.getSelection()?.removeAllRanges()
+  const panelRect = panel.getBoundingClientRect()
+  const currentX = Math.min(panelRect.right, Math.max(panelRect.left, event.clientX))
+  const currentY = Math.min(panelRect.bottom, Math.max(panelRect.top, event.clientY))
+  const left = Math.min(session.startX, currentX)
+  const top = Math.min(session.startY, currentY)
+  const right = Math.max(session.startX, currentX)
+  const bottom = Math.max(session.startY, currentY)
+  dragSelectionBox.value = { left, top, width: right - left, height: bottom - top }
+
+  const next = new Set<string>()
+  panel.querySelectorAll<HTMLElement>('.file-row[data-entry-path]').forEach(row => {
+    const rowRect = row.getBoundingClientRect()
+    const intersects = left < rowRect.right && right > rowRect.left && top < rowRect.bottom && bottom > rowRect.top
+    const entryPath = row.dataset.entryPath
+    if (intersects && entryPath) next.add(entryPath)
+  })
+  selected.value = next
+}
+
+function finishDragSelection(): void {
+  if (!dragSession) return
+  const wasActive = dragSession.active
+  dragSession = null
+  dragSelectionBox.value = null
+  if (!wasActive) return
+  suppressRowClick = true
+  suppressRowClickTimer = window.setTimeout(() => { suppressRowClick = false }, 0)
+}
+
+function cancelDragSelection(): void {
+  dragSession = null
+  dragSelectionBox.value = null
+}
+
+function blockExternalFileDrop(event: DragEvent): void {
+  if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return
+  event.preventDefault()
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'none'
 }
 
 function syncMobileMenu(paths: Set<string>): void {
@@ -473,10 +557,21 @@ onMounted(() => {
   void refresh()
   document.addEventListener('click', handleDocumentClick)
   document.addEventListener('keydown', handleEscape)
+  window.addEventListener('mousemove', updateDragSelection, { passive: false })
+  window.addEventListener('mouseup', finishDragSelection)
+  window.addEventListener('blur', cancelDragSelection)
+  window.addEventListener('dragover', blockExternalFileDrop)
+  window.addEventListener('drop', blockExternalFileDrop)
 })
 onBeforeUnmount(() => {
   document.removeEventListener('click', handleDocumentClick)
   document.removeEventListener('keydown', handleEscape)
+  window.removeEventListener('mousemove', updateDragSelection)
+  window.removeEventListener('mouseup', finishDragSelection)
+  window.removeEventListener('blur', cancelDragSelection)
+  window.removeEventListener('dragover', blockExternalFileDrop)
+  window.removeEventListener('drop', blockExternalFileDrop)
+  if (suppressRowClickTimer !== undefined) window.clearTimeout(suppressRowClickTimer)
 })
 </script>
 
@@ -506,7 +601,7 @@ onBeforeUnmount(() => {
       </template>
     </nav>
 
-    <section class="file-panel glass" :aria-busy="loading" @contextmenu="openBackgroundMenu">
+    <section ref="filePanel" class="file-panel glass" :class="{ 'drag-selecting': dragSelectionBox }" :aria-busy="loading" @mousedown="startDragSelection" @contextmenu="openBackgroundMenu">
       <div class="file-head">
         <button class="select-box" :class="{ checked: allSelected }" type="button" aria-label="全选" @click="toggleSelectAll"><span class="visually-hidden">全选</span></button>
         <button class="sort-btn" type="button" @click="changeSort('name')">名称 <span>{{ sort === 'name' ? (ascending ? '▲' : '▼') : '' }}</span></button>
@@ -521,7 +616,8 @@ onBeforeUnmount(() => {
           :key="entry.path"
           class="file-row"
           :class="{ selected: selected.has(entry.path) }"
-          @click="toggleSelection(entry.path)"
+          :data-entry-path="entry.path"
+          @click="handleRowClick(entry.path)"
           @dblclick="openEntry(entry)"
           @contextmenu.stop="openRowMenu($event, entry)"
         >
@@ -531,6 +627,7 @@ onBeforeUnmount(() => {
           <div class="cell right">{{ entry.is_dir ? '-' : formatSize(entry.size) }}</div>
         </div>
       </div>
+      <div v-if="dragSelectionBox" class="drag-selection-box" :style="dragSelectionStyle" aria-hidden="true" />
     </section>
     <p v-if="truncated" class="browser-warning">当前目录仅显示服务器允许的部分项目</p>
   </main>

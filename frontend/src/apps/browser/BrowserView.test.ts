@@ -15,6 +15,42 @@ function mountBrowser(host: HTMLElement) {
   return app
 }
 
+function listResponse(names: string[]) {
+  return {
+    current_path: '',
+    parent_path: null,
+    entries: names.map((name, index) => ({
+      name,
+      path: name,
+      is_dir: false,
+      size: index + 1,
+      modified: '',
+      mime: 'text/plain',
+      icon: 'code',
+      locked: false,
+    })),
+    truncated: false,
+    can_write: true,
+    max_upload_bytes: 1024,
+    max_archive_bytes: 1024,
+    max_archive_entries: 100,
+  }
+}
+
+function domRect(left: number, top: number, right: number, bottom: number): DOMRect {
+  return {
+    x: left,
+    y: top,
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+    toJSON: () => ({}),
+  }
+}
+
 describe('BrowserView', () => {
   it('renders a directory response without trusting HTML from file names', async () => {
     const response = {
@@ -80,6 +116,83 @@ describe('BrowserView', () => {
     expect(host.querySelector('.context-menu')).not.toBeNull()
     expect(host.textContent).toContain('已选择 1 项')
     expect(host.textContent).toContain('下载')
+    app.unmount()
+  })
+
+  it('selects only intersecting rows with a desktop drag rectangle', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: false }))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt', 'two.txt'])), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const panel = host.querySelector('.file-panel') as HTMLElement
+    const rows = [...host.querySelectorAll<HTMLElement>('.file-row')]
+    vi.spyOn(panel, 'getBoundingClientRect').mockReturnValue(domRect(0, 40, 400, 180))
+    vi.spyOn(rows[0]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 70, 380, 105))
+    vi.spyOn(rows[1]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 110, 380, 145))
+
+    panel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 30, clientY: 60 }))
+    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 360, clientY: 95 }))
+    await nextTick()
+
+    expect(host.querySelector('.drag-selection-box')).not.toBeNull()
+    expect(rows[0]!.classList.contains('selected')).toBe(true)
+    expect(rows[1]!.classList.contains('selected')).toBe(false)
+
+    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 360, clientY: 95 }))
+    rows[0]!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await nextTick()
+    expect(host.querySelector('.drag-selection-box')).toBeNull()
+    expect(rows[0]!.classList.contains('selected')).toBe(true)
+    app.unmount()
+  })
+
+  it('does not enable drag selection on mobile layouts', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt'])), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const panel = host.querySelector('.file-panel') as HTMLElement
+    panel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 20, clientY: 20 }))
+    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 200, clientY: 100 }))
+    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
+    await nextTick()
+
+    expect(host.querySelector('.drag-selection-box')).toBeNull()
+    expect(host.querySelector('.file-row.selected')).toBeNull()
+    app.unmount()
+  })
+
+  it('blocks external file drops without starting an upload', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse([])), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await nextTick()
+    const transfer = { types: ['Files'], dropEffect: 'copy' }
+    const drop = new Event('drop', { bubbles: true, cancelable: true })
+    Object.defineProperty(drop, 'dataTransfer', { value: transfer })
+
+    expect(window.dispatchEvent(drop)).toBe(false)
+    expect(drop.defaultPrevented).toBe(true)
+    expect(transfer.dropEffect).toBe('none')
     app.unmount()
   })
 })

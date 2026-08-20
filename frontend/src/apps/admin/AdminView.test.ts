@@ -2,9 +2,15 @@ import { createApp, nextTick, ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AdminView from './AdminView.vue'
 
+const adminInfo = {
+  username: 'admin', has_global_web_password: true, shares: [], folder_locks: [], login_security: [],
+  max_upload_bytes: 1024, max_archive_bytes: 1024, max_archive_entries: 100,
+}
+
 afterEach(() => {
   vi.unstubAllGlobals()
   document.body.replaceChildren()
+  window.history.replaceState(null, '', '/')
 })
 
 function mountAdmin(host: HTMLElement) {
@@ -32,10 +38,9 @@ describe('AdminView', () => {
   })
 
   it('keeps every administration section reachable during phased migration', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
-      username: 'admin', has_global_web_password: true, shares: [], folder_locks: [], login_security: [],
-      max_upload_bytes: 1024, max_archive_bytes: 1024, max_archive_entries: 100,
-    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    })))
     const host = document.createElement('div')
     document.body.append(host)
     const app = mountAdmin(host)
@@ -44,8 +49,24 @@ describe('AdminView', () => {
 
     const links = [...host.querySelectorAll<HTMLAnchorElement>('.admin-nav-item')]
     expect(links.map(link => link.getAttribute('href'))).toEqual([
-      '/admin#webdav', '/admin#locks', '/admin#limits', '/v2/admin/account', '/admin#security',
+      '/admin#webdav', '/admin#locks', '/admin#limits', '/v2/admin/account', '/v2/admin/security',
     ])
+    app.unmount()
+  })
+
+  it('renders the Vue login security page on its candidate route', async () => {
+    window.history.replaceState(null, '', '/v2/admin/security')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountAdmin(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('#security-title')?.textContent).toBe('登录安全')
+    expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('登录安全')
     app.unmount()
   })
 })

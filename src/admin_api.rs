@@ -162,14 +162,30 @@ pub async fn update_transfer_limits(
 }
 
 #[derive(Deserialize)]
-pub struct UnblockLoginRequest {
+pub struct LoginRestrictionRequest {
     pub entry: LoginEntry,
     pub ip: String,
 }
 
+pub async fn block_login(
+    State(state): State<AppState>,
+    Json(body): Json<LoginRestrictionRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let ip = body
+        .ip
+        .parse()
+        .map_err(|_| AppError::BadRequest("IP 地址无效".into()))?;
+    state
+        .login_security
+        .restrict(body.entry, ip)
+        .await
+        .map_err(|error| AppError::with_source("无法持久化登录安全状态", error))?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
 pub async fn unblock_login(
     State(state): State<AppState>,
-    Json(body): Json<UnblockLoginRequest>,
+    Json(body): Json<LoginRestrictionRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let ip = body
         .ip

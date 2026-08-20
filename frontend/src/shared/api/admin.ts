@@ -3,10 +3,23 @@ export interface AdminInfo {
   has_global_web_password: boolean
   shares: unknown[]
   folder_locks: unknown[]
-  login_security: unknown[]
+  login_security: LoginRecord[]
   max_upload_bytes: number
   max_archive_bytes: number
   max_archive_entries: number
+}
+
+export type LoginEntry = 'admin' | 'web' | 'web_dav'
+
+export interface LoginRecord {
+  entry: LoginEntry
+  ip: string
+  failed_attempts: number
+  blocked_until: number | null
+  last_attempt_at: number
+  last_success_at: number | null
+  last_result: string
+  user_agent: string | null
 }
 
 export interface UpdateAccountRequest {
@@ -70,5 +83,13 @@ export function updateAccount(body: UpdateAccountRequest): Promise<UpdateAccount
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+  })
+}
+
+export function updateLoginRestriction(action: 'block' | 'unblock', entry: LoginEntry, ip: string): Promise<{ success: boolean }> {
+  return adminRequest(`/api/admin/security/${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entry, ip }),
   })
 }

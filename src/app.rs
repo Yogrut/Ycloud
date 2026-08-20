@@ -103,6 +103,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/account", put(admin_api::update_admin_account))
         .route("/limits", put(admin_api::update_transfer_limits))
+        .route("/security/block", post(admin_api::block_login))
         .route("/security/unblock", post(admin_api::unblock_login))
         .route("/locks", post(admin_api::create_lock))
         .route(
@@ -599,6 +600,40 @@ mod tests {
         assert_eq!(limits_json["max_upload_bytes"], 2_097_152);
         assert_eq!(limits_json["max_archive_bytes"], 3_145_728);
         assert_eq!(limits_json["max_archive_entries"], 2);
+
+        let manual_block = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/security/block")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"entry":"admin","ip":"192.0.2.10"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manual_block.status(), StatusCode::OK);
+
+        let manual_unblock = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/security/unblock")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"entry":"admin","ip":"192.0.2.10"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(manual_unblock.status(), StatusCode::OK);
 
         tokio::fs::write(
             root.join("allowed").join("nested").join("file.txt"),

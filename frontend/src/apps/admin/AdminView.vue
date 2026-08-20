@@ -7,6 +7,7 @@ import ThemeToggle from '../../shared/components/ThemeToggle.vue'
 import type { ThemeController } from '../../shared/composables/useTheme'
 import AccountView from './AccountView.vue'
 import AdminNavIcon from './AdminNavIcon.vue'
+import SecurityView from './SecurityView.vue'
 
 defineProps<{ theme: ThemeController }>()
 
@@ -18,6 +19,7 @@ const password = ref('')
 const loginError = ref('')
 const loggingIn = ref(false)
 const notice = ref('')
+const activeSection = window.location.pathname.endsWith('/security') ? 'security' : 'account'
 
 const navigation = [
   { group: '存储与访问', items: [
@@ -27,7 +29,7 @@ const navigation = [
   ] },
   { group: '账户与安全', items: [
     { id: 'account', label: '账户与访问', href: '/v2/admin/account' },
-    { id: 'security', label: '登录安全', href: '/admin#security' },
+    { id: 'security', label: '登录安全', href: '/v2/admin/security' },
   ] },
 ] as const
 
@@ -99,10 +101,10 @@ onMounted(load)
           v-for="item in group.items"
           :key="item.id"
           class="admin-nav-item"
-          :class="{ active: item.id === 'account' }"
+          :class="{ active: item.id === activeSection }"
           :href="item.href"
-          :aria-current="item.id === 'account' ? 'page' : undefined"
-          :title="item.id === 'account' ? undefined : '在稳定后台打开，迁移完成后自动切换到新版'"
+          :aria-current="item.id === activeSection ? 'page' : undefined"
+          :title="['account', 'security'].includes(item.id) ? undefined : '在稳定后台打开，迁移完成后自动切换到新版'"
         >
           <AdminNavIcon :name="item.id" />
           <span>{{ item.label }}</span>
@@ -111,6 +113,7 @@ onMounted(load)
     </aside>
     <div class="admin-content">
       <div v-if="loading" class="admin-loading glass">正在加载…</div>
+      <SecurityView v-else-if="info && activeSection === 'security'" :records="info.login_security" @changed="showNotice" />
       <AccountView v-else-if="info" :info="info" @saved="showNotice" @expired="sessionExpired" />
       <div v-else class="admin-loading glass">{{ loginError || '管理后台暂时无法加载' }}</div>
     </div>

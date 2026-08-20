@@ -196,6 +196,18 @@ impl LoginSecurity {
         persist(&self.path, &data).await?;
         Ok(true)
     }
+
+    pub async fn restrict(&self, entry: LoginEntry, ip: IpAddr) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let (_, lock_seconds) = entry.policy();
+        let mut data = self.data.lock().await;
+        ensure_capacity(&mut data.records, entry, ip);
+        let record = get_or_insert(&mut data.records, entry, ip, now);
+        record.blocked_until = Some(now + lock_seconds);
+        record.last_attempt_at = now;
+        record.last_result = "管理员已限制".into();
+        persist(&self.path, &data).await
+    }
 }
 
 fn find_mut(
@@ -356,6 +368,17 @@ mod tests {
             .unwrap();
         assert_eq!(record.failed_attempts, 0);
         assert!(record.last_success_at.is_some());
+        reloaded.restrict(LoginEntry::Web, ip).await.unwrap();
+        assert!(reloaded.is_blocked(LoginEntry::Web, ip).await.unwrap());
+        let reloaded = LoginSecurity::load(&config).await.unwrap();
+        let restricted = reloaded
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|record| record.entry == LoginEntry::Web)
+            .unwrap();
+        assert_eq!(restricted.last_result, "管理员已限制");
+        assert!(restricted.blocked_until.is_some());
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

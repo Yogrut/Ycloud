@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { AdminApiError, getAdminInfo, updateAccount } from './admin'
+import { AdminApiError, getAdminInfo, updateAccount, updateLoginRestriction } from './admin'
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -27,6 +27,21 @@ describe('admin API', () => {
       method: 'PUT',
       credentials: 'same-origin',
       body: JSON.stringify({ password: 'new-administrator-password' }),
+    }))
+  })
+
+  it('uses a scoped administrator endpoint for a manual IP restriction', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await updateLoginRestriction('block', 'admin', '192.0.2.10')
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/security/block', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ entry: 'admin', ip: '192.0.2.10' }),
     }))
   })
 })

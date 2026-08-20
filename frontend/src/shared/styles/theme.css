@@ -318,6 +318,57 @@ input { font: inherit; }
 .admin-login-panel label { display: grid; gap: 7px; margin-top: 14px; color: var(--muted); text-align: left; font-size: 13px; font-weight: 650; }
 .admin-login-panel .input { text-align: left; }
 .admin-login-panel .btn { width: 100%; }
+.security-head { align-items: center; }
+.security-range { min-width: 164px; display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 650; }
+.security-range select {
+  height: 38px;
+  padding: 0 34px 0 11px;
+  color: var(--text);
+  background: var(--field);
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  outline: 0;
+}
+.security-range select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.security-body { padding-top: 24px; }
+.security-tabs { display: flex; gap: 6px; margin-bottom: 18px; }
+.security-tabs button {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 13px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  cursor: pointer;
+}
+.security-tabs button.active { color: var(--accent); background: var(--accent-soft); border-color: rgba(64, 158, 255, .3); font-weight: 700; }
+.security-tabs button span { min-width: 20px; padding: 1px 6px; color: inherit; text-align: center; background: var(--panel); border-radius: 999px; font-size: 11px; }
+.security-list { border-top: 1px solid var(--line); }
+.security-record {
+  min-height: 132px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 20px 0;
+  border-bottom: 1px solid var(--line);
+}
+.security-record-main { min-width: 0; }
+.security-record-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 7px; }
+.security-record-title strong { color: var(--text); font-size: 15px; overflow-wrap: anywhere; }
+.security-record-title > span:not(.status-pill) { color: var(--muted); font-size: 13px; }
+.status-pill { padding: 3px 8px; color: #25a86b; background: rgba(37, 168, 107, .1); border: 1px solid rgba(37, 168, 107, .25); border-radius: 999px; font-size: 11px; }
+.status-pill.danger { color: var(--danger); background: rgba(228, 86, 107, .1); border-color: rgba(228, 86, 107, .25); }
+.security-record-meta { margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.security-user-agent { margin-top: 5px; overflow: hidden; color: var(--muted-2); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.security-action { min-width: 92px; flex: 0 0 auto; }
+.security-empty { min-height: 220px; display: grid; place-items: center; color: var(--muted); text-align: center; }
+.security-pagination { display: flex; align-items: center; justify-content: center; gap: 14px; padding-top: 20px; }
+.security-pagination span { color: var(--muted); font-size: 12px; }
+.security-pagination .btn { min-height: 36px; padding: 6px 12px; }
 
 .browser-page { width: min(1280px, calc(100% - 32px)); margin: 0 auto; padding: 30px 0 54px; }
 .breadcrumb {
@@ -510,4 +561,12 @@ input { font: inherit; }
   .admin-save-row .btn { width: 100%; }
   .admin-login-shell { min-height: calc(100vh - 58px); padding: 16px; }
   .admin-login-panel { padding: 32px 22px; }
+  .security-head { display: grid; gap: 18px; }
+  .security-range { width: 100%; }
+  .security-body { padding-top: 18px; }
+  .security-tabs { display: grid; grid-template-columns: 1fr 1fr; }
+  .security-tabs button { justify-content: center; padding: 0 8px; font-size: 12px; }
+  .security-record { align-items: stretch; flex-direction: column; gap: 14px; padding: 18px 0; }
+  .security-user-agent { white-space: normal; overflow-wrap: anywhere; }
+  .security-action { width: 100%; }
 }

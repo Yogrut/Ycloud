@@ -61,6 +61,54 @@ export function listFiles(path: string): Promise<FileListResponse> {
   return apiRequest<FileListResponse>(fileApi(path))
 }
 
+function actionApi(action: string, path: string): string {
+  const clean = cleanPath(path)
+  return clean ? `/api/${action}?path=${encodeURIComponent(`/${clean}`)}` : `/api/${action}`
+}
+
+export function createFolder(path: string, name: string): Promise<{ success?: boolean; message?: string }> {
+  return apiRequest(actionApi('mkdir', path), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function uploadFile(path: string, file: File, onProgress: (loaded: number) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest()
+    request.open('PUT', actionApi('upload', path))
+    request.withCredentials = true
+    request.setRequestHeader('Content-Type', 'application/octet-stream')
+    request.upload.addEventListener('progress', event => {
+      if (event.lengthComputable) onProgress(Math.min(file.size, event.loaded))
+    })
+    request.addEventListener('load', () => {
+      if (request.status === 401) {
+        window.location.replace('/v2/')
+        reject(new Error('登录已失效'))
+        return
+      }
+      if (request.status >= 200 && request.status < 300) {
+        onProgress(file.size)
+        resolve()
+        return
+      }
+      let message = `上传失败 (${request.status})`
+      try {
+        const body = JSON.parse(request.responseText) as ErrorEnvelope
+        message = body.error?.message ?? body.message ?? message
+      } catch {
+        // Keep the status-based message for non-JSON proxy failures.
+      }
+      reject(new Error(message))
+    })
+    request.addEventListener('error', () => reject(new Error('网络连接中断')))
+    request.addEventListener('abort', () => reject(new Error('上传已取消')))
+    request.send(file)
+  })
+}
+
 export function unlockFolder(path: string, password: string): Promise<{ success: boolean; message?: string }> {
   return apiRequest('/api/folder/unlock', {
     method: 'POST',

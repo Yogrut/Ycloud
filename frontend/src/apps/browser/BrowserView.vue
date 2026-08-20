@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import type { FileEntry } from '../../shared/api/browser'
-import { adminLogin, listFiles, logout, unlockFolder } from '../../shared/api/browser'
+import { adminLogin, createFolder, listFiles, logout, unlockFolder, uploadFile } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import CloudIcon from '../../shared/components/icons/CloudIcon.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
@@ -19,6 +19,7 @@ const ascending = ref(true)
 const selected = ref(new Set<string>())
 const loading = ref(true)
 const canWrite = ref(false)
+const maxUploadBytes = ref(0)
 const truncated = ref(false)
 const notice = ref('')
 const showUnlock = ref(false)
@@ -29,6 +30,19 @@ const showAdmin = ref(false)
 const adminUser = ref('')
 const adminPassword = ref('')
 const adminError = ref('')
+const fileInput = ref<HTMLInputElement>()
+const showFolder = ref(false)
+const folderName = ref('')
+const folderError = ref('')
+const creatingFolder = ref(false)
+const showUpload = ref(false)
+const uploading = ref(false)
+const uploadCurrent = ref('')
+const uploadProcessed = ref(0)
+const uploadTotal = ref(0)
+const uploadSummary = ref('')
+
+const uploadPercent = computed(() => uploadTotal.value ? Math.min(100, Math.round(uploadProcessed.value / uploadTotal.value * 100)) : 0)
 
 const visibleEntries = computed(() => {
   const term = query.value.trim().toLocaleLowerCase()
@@ -74,6 +88,7 @@ async function refresh(): Promise<void> {
     path.value = data.current_path.replace(/^\/+|\/+$/g, '')
     entries.value = data.entries
     canWrite.value = data.can_write
+    maxUploadBytes.value = data.max_upload_bytes
     truncated.value = data.truncated
     selected.value = new Set()
     if (data.truncated) announce('目录内容超过显示上限，当前仅显示部分项目')
@@ -162,6 +177,83 @@ async function submitAdmin(): Promise<void> {
   }
 }
 
+function requireWrite(): boolean {
+  if (canWrite.value) return true
+  void openAdmin()
+  return false
+}
+
+function openFolderDialog(): void {
+  if (!requireWrite()) return
+  folderName.value = ''
+  folderError.value = ''
+  showFolder.value = true
+}
+
+async function submitFolder(): Promise<void> {
+  const name = folderName.value.trim()
+  if (!name || creatingFolder.value) return
+  creatingFolder.value = true
+  folderError.value = ''
+  try {
+    await createFolder(path.value, name)
+    showFolder.value = false
+    announce('文件夹已创建')
+    await refresh()
+  } catch (error) {
+    folderError.value = error instanceof Error ? error.message : '创建失败'
+  } finally {
+    creatingFolder.value = false
+  }
+}
+
+function chooseFiles(): void {
+  if (requireWrite()) fileInput.value?.click()
+}
+
+async function uploadFiles(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = ''
+  if (!files.length || !canWrite.value || uploading.value) return
+
+  const accepted = files.filter(file => !maxUploadBytes.value || file.size <= maxUploadBytes.value)
+  const rejected = files.length - accepted.length
+  uploadTotal.value = accepted.reduce((sum, file) => sum + file.size, 0)
+  uploadProcessed.value = 0
+  uploadCurrent.value = '正在准备…'
+  uploadSummary.value = `共 ${files.length} 个文件，逐个安全上传`
+  showUpload.value = true
+  uploading.value = true
+  let completedBytes = 0
+  let succeeded = 0
+  let failed = rejected
+
+  try {
+    for (const file of accepted) {
+      uploadCurrent.value = file.name
+      let currentLoaded = 0
+      try {
+        const target = [path.value, file.name].filter(Boolean).join('/')
+        await uploadFile(target, file, loaded => {
+          currentLoaded = loaded
+          uploadProcessed.value = completedBytes + loaded
+        })
+        succeeded += 1
+      } catch (error) {
+        failed += 1
+        announce(`${file.name}：${error instanceof Error ? error.message : '上传失败'}`)
+      }
+      completedBytes += currentLoaded
+      uploadProcessed.value = completedBytes
+    }
+    uploadSummary.value = failed ? `上传结束：成功 ${succeeded} 个，失败 ${failed} 个` : `上传完成：成功 ${succeeded} 个文件`
+    await refresh()
+  } finally {
+    uploading.value = false
+  }
+}
+
 async function signOut(): Promise<void> {
   try { await logout() } finally {
     sessionStorage.setItem('ycloud-stay-signed-out', '1')
@@ -180,10 +272,13 @@ onMounted(refresh)
       <input v-model="query" type="search" placeholder="搜索当前目录" aria-label="搜索当前目录">
     </label>
     <div class="top-actions">
-      <button class="icon-btn flat" type="button" title="管理员" aria-label="管理员" @click="openAdmin"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.2 1.2 0 0 1 1.52 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z" /><circle cx="12" cy="11" r="3" /></svg></button>
+      <button class="icon-btn flat" type="button" title="管理员" aria-label="管理员" @click="openAdmin"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.2 1.2 0 0 1 1.52 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z" /><circle cx="12" cy="11" r="3" /></svg></button>
+      <button class="icon-btn flat" type="button" title="新建文件夹" aria-label="新建文件夹" @click="openFolderDialog"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M12 11v6M9 14h6" /></svg></button>
+      <button class="icon-btn flat" type="button" title="上传文件" aria-label="上传文件" @click="chooseFiles"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5" /><path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4" /></svg></button>
       <ThemeToggle :theme="theme.current.value" class="flat" @toggle="theme.toggle" />
-      <button class="icon-btn flat" type="button" title="退出登录" aria-label="退出登录" @click="signOut"><svg class="ui-icon" viewBox="0 0 24 24"><path d="m16 17 5-5-5-5M21 12H9M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /></svg></button>
+      <button class="icon-btn flat" type="button" title="退出登录" aria-label="退出登录" @click="signOut"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m16 17 5-5-5-5M21 12H9M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /></svg></button>
     </div>
+    <input ref="fileInput" class="visually-hidden" type="file" multiple @change="uploadFiles">
   </header>
 
   <main class="browser-page">
@@ -242,5 +337,25 @@ onMounted(refresh)
       <p class="modal-error">{{ adminError }}</p>
       <div class="modal-actions"><button class="btn secondary" type="button" @click="showAdmin = false">取消</button><button class="btn" type="submit">登录</button></div>
     </form>
+  </div>
+
+  <div v-if="showFolder" class="overlay active" @click.self="showFolder = false">
+    <form class="modal" @submit.prevent="submitFolder">
+      <h2>新建文件夹</h2>
+      <label>名称<input v-model="folderName" class="input" autocomplete="off" autofocus></label>
+      <p class="modal-error">{{ folderError }}</p>
+      <div class="modal-actions"><button class="btn secondary" type="button" :disabled="creatingFolder" @click="showFolder = false">取消</button><button class="btn" type="submit" :disabled="creatingFolder">{{ creatingFolder ? '创建中…' : '创建' }}</button></div>
+    </form>
+  </div>
+
+  <div v-if="showUpload" class="overlay active" @click.self="!uploading && (showUpload = false)">
+    <section class="modal upload-modal" aria-labelledby="upload-title">
+      <h2 id="upload-title">上传文件</h2>
+      <p class="upload-current">{{ uploadCurrent }}</p>
+      <progress :value="uploadPercent" max="100">{{ uploadPercent }}%</progress>
+      <p>{{ uploadPercent }}% · {{ formatSize(uploadProcessed) }} / {{ formatSize(uploadTotal) }}</p>
+      <p class="upload-summary">{{ uploadSummary }}</p>
+      <div class="modal-actions"><button class="btn secondary" type="button" :disabled="uploading" @click="showUpload = false">关闭</button></div>
+    </section>
   </div>
 </template>

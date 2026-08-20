@@ -333,6 +333,9 @@ input { font: inherit; }
 .modal-actions .btn { min-width: 78px; }
 .btn.secondary { color: var(--text); background: var(--panel-soft); border-color: var(--line); }
 .btn.secondary:hover { background: var(--panel-soft); border-color: var(--line-strong); }
+.upload-current { overflow: hidden; color: var(--text) !important; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+.upload-modal progress { width: 100%; height: 12px; overflow: hidden; accent-color: var(--accent); border: 0; border-radius: 999px; }
+.upload-summary { min-height: 20px; }
 
 @media (max-width: 560px) {
   .theme-floating { top: 14px; right: 14px; }

@@ -10,6 +10,7 @@ const byId = id => document.getElementById(id);
 
 const ADMIN_SECTIONS = new Set(['webdav', 'locks', 'limits', 'account', 'security']);
 const MIGRATED_ADMIN_ROUTES = new Map([
+  ['limits', '/v2/admin/limits'],
   ['account', '/v2/admin/account'],
   ['security', '/v2/admin/security']
 ]);

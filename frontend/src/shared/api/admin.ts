@@ -33,6 +33,12 @@ export interface UpdateAccountResponse {
   warning?: string | null
 }
 
+export interface UpdateTransferLimitsRequest {
+  max_upload_bytes: number
+  max_archive_bytes: number
+  max_archive_entries: number
+}
+
 interface ErrorEnvelope {
   message?: string
   error?: { message?: string }
@@ -80,6 +86,14 @@ export function loginAdministrator(username: string, password: string): Promise<
 
 export function updateAccount(body: UpdateAccountRequest): Promise<UpdateAccountResponse> {
   return adminRequest('/api/admin/account', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function updateTransferLimits(body: UpdateTransferLimitsRequest): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/limits', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

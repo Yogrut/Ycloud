@@ -309,6 +309,15 @@ input { font: inherit; }
   transition: border-color .16s ease, box-shadow .16s ease;
 }
 .admin-field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.limits-field { min-height: 112px; }
+.limits-control { min-width: 0; display: grid; gap: 8px; }
+.limits-control > input,
+.input-with-unit { width: 100%; }
+.input-with-unit { position: relative; display: block; }
+.input-with-unit input { padding-right: 58px; }
+.input-with-unit > span { position: absolute; top: 50%; right: 14px; color: var(--muted); font-size: 12px; transform: translateY(-50%); pointer-events: none; }
+.limits-control small { color: var(--muted-2); font-size: 11px; line-height: 1.55; }
+.safety-note { margin-top: 20px; padding: 13px 15px; color: var(--muted); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; font-size: 12px; line-height: 1.65; }
 .admin-form-error { min-height: 20px; margin: 12px 0 0; color: var(--danger); font-size: 13px; }
 .admin-save-row { display: flex; justify-content: flex-end; padding-top: 4px; }
 .admin-loading { min-height: 240px; display: grid; place-items: center; padding: 32px; color: var(--muted); border-radius: 16px; }

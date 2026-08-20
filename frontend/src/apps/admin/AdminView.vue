@@ -8,6 +8,7 @@ import type { ThemeController } from '../../shared/composables/useTheme'
 import AccountView from './AccountView.vue'
 import AdminNavIcon from './AdminNavIcon.vue'
 import LimitsView from './LimitsView.vue'
+import LocksView from './LocksView.vue'
 import SecurityView from './SecurityView.vue'
 
 defineProps<{ theme: ThemeController }>()
@@ -22,12 +23,14 @@ const loggingIn = ref(false)
 const notice = ref('')
 const activeSection = window.location.pathname.endsWith('/security')
   ? 'security'
-  : window.location.pathname.endsWith('/limits') ? 'limits' : 'account'
+  : window.location.pathname.endsWith('/limits')
+    ? 'limits'
+    : window.location.pathname.endsWith('/locks') ? 'locks' : 'account'
 
 const navigation = [
   { group: '存储与访问', items: [
     { id: 'webdav', label: 'WebDAV', href: '/admin?return=v2#webdav' },
-    { id: 'locks', label: '文件夹锁', href: '/admin?return=v2#locks' },
+    { id: 'locks', label: '文件夹锁', href: '/v2/admin/locks' },
     { id: 'limits', label: '传输限制', href: '/v2/admin/limits' },
   ] },
   { group: '账户与安全', items: [
@@ -107,7 +110,7 @@ onMounted(load)
           :class="{ active: item.id === activeSection }"
           :href="item.href"
           :aria-current="item.id === activeSection ? 'page' : undefined"
-          :title="['account', 'security', 'limits'].includes(item.id) ? undefined : '在稳定后台打开，迁移完成后自动切换到新版'"
+          :title="['account', 'security', 'limits', 'locks'].includes(item.id) ? undefined : '在稳定后台打开，迁移完成后自动切换到新版'"
         >
           <AdminNavIcon :name="item.id" />
           <span>{{ item.label }}</span>
@@ -118,6 +121,7 @@ onMounted(load)
       <div v-if="loading" class="admin-loading glass">正在加载…</div>
       <SecurityView v-else-if="info && activeSection === 'security'" :records="info.login_security" @changed="showNotice" />
       <LimitsView v-else-if="info && activeSection === 'limits'" :info="info" @saved="showNotice" />
+      <LocksView v-else-if="info && activeSection === 'locks'" :locks="info.folder_locks" @changed="showNotice" />
       <AccountView v-else-if="info" :info="info" @saved="showNotice" @expired="sessionExpired" />
       <div v-else class="admin-loading glass">{{ loginError || '管理后台暂时无法加载' }}</div>
     </div>

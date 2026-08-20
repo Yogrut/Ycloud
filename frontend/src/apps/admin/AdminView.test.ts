@@ -49,7 +49,7 @@ describe('AdminView', () => {
 
     const links = [...host.querySelectorAll<HTMLAnchorElement>('.admin-nav-item')]
     expect(links.map(link => link.getAttribute('href'))).toEqual([
-      '/admin?return=v2#webdav', '/admin?return=v2#locks', '/v2/admin/limits', '/v2/admin/account', '/v2/admin/security',
+      '/admin?return=v2#webdav', '/v2/admin/locks', '/v2/admin/limits', '/v2/admin/account', '/v2/admin/security',
     ])
     app.unmount()
   })
@@ -67,6 +67,22 @@ describe('AdminView', () => {
 
     expect(host.querySelector('#limits-title')?.textContent).toBe('传输限制')
     expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('传输限制')
+    app.unmount()
+  })
+
+  it('renders the Vue folder locks page on its candidate route', async () => {
+    window.history.replaceState(null, '', '/v2/admin/locks')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountAdmin(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('#locks-title')?.textContent).toBe('网页文件夹锁')
+    expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('文件夹锁')
     app.unmount()
   })
 

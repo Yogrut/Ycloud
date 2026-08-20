@@ -318,6 +318,16 @@ input { font: inherit; }
 .input-with-unit > span { position: absolute; top: 50%; right: 14px; color: var(--muted); font-size: 12px; transform: translateY(-50%); pointer-events: none; }
 .limits-control small { color: var(--muted-2); font-size: 11px; line-height: 1.55; }
 .safety-note { margin-top: 20px; padding: 13px 15px; color: var(--muted); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; font-size: 12px; line-height: 1.65; }
+.locks-head { align-items: center; }
+.locks-body { padding-top: 22px; }
+.admin-empty { min-height: 190px; display: grid; place-items: center; color: var(--muted); text-align: center; }
+.locks-list { border-top: 1px solid var(--line); }
+.lock-record { min-height: 84px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 15px 0; border-bottom: 1px solid var(--line); }
+.lock-record-main { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.lock-record-main strong { overflow-wrap: anywhere; color: var(--text); font-size: 15px; }
+.lock-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.danger-outline { color: var(--danger); background: rgba(228, 86, 107, .06); border-color: rgba(228, 86, 107, .28); }
+.danger-outline:hover:not(:disabled) { background: rgba(228, 86, 107, .12); border-color: rgba(228, 86, 107, .4); }
 .admin-form-error { min-height: 20px; margin: 12px 0 0; color: var(--danger); font-size: 13px; }
 .admin-save-row { display: flex; justify-content: flex-end; padding-top: 4px; }
 .admin-loading { min-height: 240px; display: grid; place-items: center; padding: 32px; color: var(--muted); border-radius: 16px; }
@@ -482,6 +492,7 @@ input { font: inherit; }
 .modal h2 { margin: 0 0 18px; font-size: 21px; }
 .modal p { color: var(--muted); }
 .modal label { display: grid; gap: 7px; margin-top: 14px; color: var(--muted); font-size: 13px; font-weight: 650; }
+.field-hint { margin: 7px 0 0; color: var(--muted-2) !important; font-size: 11px; line-height: 1.55; }
 .modal .input { text-align: left; }
 .modal-error { min-height: 20px; margin: 10px 0 0; color: var(--danger) !important; font-size: 13px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
@@ -578,4 +589,8 @@ input { font: inherit; }
   .security-record { align-items: stretch; flex-direction: column; gap: 14px; padding: 18px 0; }
   .security-user-agent { white-space: normal; overflow-wrap: anywhere; }
   .security-action { width: 100%; }
+  .locks-head { align-items: stretch; flex-direction: column; }
+  .locks-head .btn { width: 100%; }
+  .lock-record { align-items: stretch; flex-direction: column; gap: 13px; }
+  .lock-actions { display: grid; grid-template-columns: 1fr 1fr; }
 }

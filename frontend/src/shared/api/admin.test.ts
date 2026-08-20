@@ -1,5 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { AdminApiError, getAdminInfo, updateAccount, updateLoginRestriction, updateTransferLimits } from './admin'
+import {
+  AdminApiError,
+  createFolderLock,
+  deleteFolderLock,
+  getAdminInfo,
+  updateAccount,
+  updateFolderLock,
+  updateLoginRestriction,
+  updateTransferLimits,
+} from './admin'
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -60,5 +69,29 @@ describe('admin API', () => {
       credentials: 'same-origin',
       body: JSON.stringify(body),
     }))
+  })
+
+  it('uses the scoped folder-lock endpoints and accepts an empty delete response', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 'lock-1', path: 'test' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 'lock-1', path: 'renamed' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await createFolderLock({ path: 'test', password: 'secure-lock-password' })
+    await updateFolderLock('lock-1', { path: 'renamed' })
+    await expect(deleteFolderLock('lock-1')).resolves.toBeUndefined()
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/admin/locks', expect.objectContaining({
+      method: 'POST', body: JSON.stringify({ path: 'test', password: 'secure-lock-password' }),
+    }))
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/admin/locks/lock-1', expect.objectContaining({
+      method: 'PUT', body: JSON.stringify({ path: 'renamed' }),
+    }))
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/admin/locks/lock-1', expect.objectContaining({ method: 'DELETE' }))
   })
 })

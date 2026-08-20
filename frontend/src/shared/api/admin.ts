@@ -2,11 +2,26 @@ export interface AdminInfo {
   username: string
   has_global_web_password: boolean
   shares: unknown[]
-  folder_locks: unknown[]
+  folder_locks: FolderLockView[]
   login_security: LoginRecord[]
   max_upload_bytes: number
   max_archive_bytes: number
   max_archive_entries: number
+}
+
+export interface FolderLockView {
+  id: string
+  path: string
+}
+
+export interface CreateFolderLockRequest {
+  path: string
+  password: string
+}
+
+export interface UpdateFolderLockRequest {
+  path?: string
+  password?: string
 }
 
 export type LoginEntry = 'admin' | 'web' | 'web_dav'
@@ -61,6 +76,7 @@ async function readJson<T>(response: Response): Promise<T | undefined> {
 
 async function adminRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(url, { credentials: 'same-origin', ...options })
+  if (response.status === 204) return undefined as T
   const body = await readJson<T & ErrorEnvelope>(response)
   if (!response.ok) {
     throw new AdminApiError(
@@ -98,6 +114,26 @@ export function updateTransferLimits(body: UpdateTransferLimitsRequest): Promise
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+export function createFolderLock(body: CreateFolderLockRequest): Promise<FolderLockView> {
+  return adminRequest('/api/admin/locks', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function updateFolderLock(id: string, body: UpdateFolderLockRequest): Promise<FolderLockView> {
+  return adminRequest(`/api/admin/locks/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function deleteFolderLock(id: string): Promise<void> {
+  return adminRequest(`/api/admin/locks/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
 export function updateLoginRestriction(action: 'block' | 'unblock', entry: LoginEntry, ip: string): Promise<{ success: boolean }> {

@@ -18,7 +18,7 @@ Ycloud 面向个人设备、家庭服务器和小规模私有部署，不以企�
 - 大文件流式上传、下载和 ZIP 打包，不把完整文件载入内存。
 - 原子上传、文件操作事务、配置备份和启动恢复。
 - 持久化登录失败限制和 IP 记录，管理员可在后台解除限制。
-- 静态资源编译进程序，运行时不需要 Node.js 或外部 CDN。
+- 生产静态资源编译进程序，运行时不需要 Node.js 或外部 CDN。
 
 网页访问密码只授予浏览、预览和下载权限；写入操作必须登录管理员。WebDAV 使用挂载自己的凭据，并且不能与网页文件夹锁保护的路径重叠。
 
@@ -102,6 +102,7 @@ Ycloud 适合单实例、少量明确权限边界和个人文件管理。目前�
 Ycloud/
 ├── src/                 # Axum 路由、认证、存储事务、API 与 WebDAV
 ├── static/              # 内嵌页面、CSS 和原生 ES Modules
+├── frontend/            # 分阶段替换中的 Vue 3.5 + TypeScript 候选前端
 ├── storage/             # 默认运行时文件目录，不提交内容
 ├── config.example.json  # 配置结构示例
 └── ARCHITECTURE.md      # 当前版本的完整设计与安全边界
@@ -119,6 +120,17 @@ cargo audit
 cargo deny --locked check
 cargo build --release --locked
 ```
+
+Vue 候选前端当前只迁移首页登录，旧前端仍是生产入口。并行开发时保持 Rust 服务运行，再执行：
+
+```bash
+cd frontend
+npm ci
+npm run check
+npm run dev
+```
+
+访问 `http://127.0.0.1:5173/v2/` 预览候选前端；依赖更新规则见 [frontend/README.md](frontend/README.md)。
 
 运行时配置、初始凭据、安全日志和 `storage` 内容不得提交到 Git。安全问题请勿在公开 Issue 中附带真实密码、配置或私人目录截图。
 

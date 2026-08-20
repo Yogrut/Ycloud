@@ -6,7 +6,9 @@
 
 ## 技术与部署边界
 
-Ycloud 是单进程 Rust 服务，使用 Tokio、Axum 0.8、Tower HTTP 0.6 和原生 HTML/CSS/JavaScript。网页资源编译进可执行文件，原生 ES Modules 由浏览器直接加载，不需要 Node、数据库或前端构建链。
+Ycloud 是单进程 Rust 服务，使用 Tokio、Axum 0.8 和 Tower HTTP 0.6。当前生产入口仍使用编译进可执行文件的原生 HTML/CSS/JavaScript，不需要 Node、数据库或外部 CDN。
+
+仓库的 `frontend/` 是分阶段迁移中的 Vue 3.5 + TypeScript 候选前端。目前只包含首页登录、主题和基础 API 层，通过 Vite 开发代理连接同一 Rust 服务；它尚未替换生产入口，旧前端保持完整可回退。依赖使用精确版本和 lockfile，更新由分组 PR 提醒并经静态检查、测试及构建验证后人工合并。
 
 默认绑定 `127.0.0.1:18473`。非回环监听只支持“同机可信 HTTPS 反向代理”模型，启动时强制要求：
 
@@ -112,6 +114,8 @@ WebDAV PUT 使用与网页相同的原子写入器和后台单文件上传上限
 | `browser-state.js` | 浏览器状态模型和纯格式化函数 |
 | `browser.js` | 文件列表、选择、上传队列、菜单和弹窗协调 |
 | `admin.js` | 左侧设置导航、WebDAV、文件夹锁、账户和登录安全界面 |
+| `frontend/src/apps/login` | Vue 候选首页登录入口，保持现有认证语义 |
+| `frontend/src/shared` | Vue 候选前端的同源 API、主题、图标与共享样式 |
 
 ## 资源模型与当前限制
 

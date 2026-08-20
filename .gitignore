@@ -22,3 +22,8 @@
 *~
 .DS_Store
 Thumbs.db
+
+# Vue development output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/coverage/

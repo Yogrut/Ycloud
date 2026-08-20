@@ -21,13 +21,13 @@ const notice = ref('')
 
 const navigation = [
   { group: '存储与访问', items: [
-    { id: 'webdav', label: 'WebDAV' },
-    { id: 'locks', label: '文件夹锁' },
-    { id: 'limits', label: '传输限制' },
+    { id: 'webdav', label: 'WebDAV', href: '/admin#webdav' },
+    { id: 'locks', label: '文件夹锁', href: '/admin#locks' },
+    { id: 'limits', label: '传输限制', href: '/admin#limits' },
   ] },
   { group: '账户与安全', items: [
-    { id: 'account', label: '账户与访问' },
-    { id: 'security', label: '登录安全' },
+    { id: 'account', label: '账户与访问', href: '/v2/admin/account' },
+    { id: 'security', label: '登录安全', href: '/admin#security' },
   ] },
 ] as const
 
@@ -95,19 +95,18 @@ onMounted(load)
     <aside class="admin-nav glass" aria-label="管理设置">
       <div v-for="group in navigation" :key="group.group" class="admin-nav-group">
         <div class="admin-nav-heading">{{ group.group }}</div>
-        <button
+        <a
           v-for="item in group.items"
           :key="item.id"
           class="admin-nav-item"
           :class="{ active: item.id === 'account' }"
-          type="button"
-          :disabled="item.id !== 'account'"
+          :href="item.href"
           :aria-current="item.id === 'account' ? 'page' : undefined"
-          :title="item.id === 'account' ? undefined : '后续阶段迁移'"
+          :title="item.id === 'account' ? undefined : '在稳定后台打开，迁移完成后自动切换到新版'"
         >
           <AdminNavIcon :name="item.id" />
           <span>{{ item.label }}</span>
-        </button>
+        </a>
       </div>
     </aside>
     <div class="admin-content">

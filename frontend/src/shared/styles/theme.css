@@ -262,6 +262,7 @@ input { font: inherit; }
   gap: 11px;
   padding: 0 12px;
   color: var(--muted);
+  text-decoration: none;
   text-align: left;
   background: transparent;
   border: 0;
@@ -269,9 +270,8 @@ input { font: inherit; }
   cursor: pointer;
   transition: color .16s ease, background .16s ease;
 }
-.admin-nav-item:hover:not(:disabled) { color: var(--text); background: var(--panel-soft); }
+.admin-nav-item:hover { color: var(--text); background: var(--panel-soft); }
 .admin-nav-item.active { color: var(--accent); background: var(--accent-soft); font-weight: 700; }
-.admin-nav-item:disabled:not(.active) { cursor: default; opacity: .72; }
 .admin-nav-item svg { width: 19px; height: 19px; flex: 0 0 auto; }
 .admin-content { min-width: 0; }
 .admin-pane { overflow: hidden; border-radius: 16px; }

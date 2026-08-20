@@ -9,6 +9,8 @@ export interface FileEntry {
   locked: boolean
 }
 
+import { appPath } from '../routes'
+
 export interface FileListResponse {
   current_path: string
   parent_path: string | null
@@ -60,7 +62,7 @@ async function readJson<T>(response: Response): Promise<T | undefined> {
 export async function apiRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(url, { credentials: 'same-origin', ...options })
   if (response.status === 401) {
-    window.location.replace('/v2/')
+    window.location.replace(appPath('/'))
     throw new Error('登录已失效')
   }
 
@@ -127,7 +129,7 @@ export async function batchOperation(operation: BatchOperation, paths: string[],
     body: JSON.stringify({ paths, target: target ? `/${cleanPath(target)}` : '' }),
   })
   if (response.status === 401) {
-    window.location.replace('/v2/')
+    window.location.replace(appPath('/'))
     throw new Error('登录已失效')
   }
 
@@ -148,7 +150,7 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
     })
     request.addEventListener('load', () => {
       if (request.status === 401) {
-        window.location.replace('/v2/')
+        window.location.replace(appPath('/'))
         reject(new Error('登录已失效'))
         return
       }

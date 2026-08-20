@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, OriginalUri, Request, State},
     http::{header, HeaderName, Method, StatusCode},
     middleware,
     response::{IntoResponse, Redirect, Response},
@@ -147,21 +147,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/index.html", get(serve_index))
         .route("/login", get(|| async { Redirect::to("/") }))
         .route("/login.html", get(|| async { Redirect::to("/") }))
-        .route("/admin", get(serve_admin))
-        .route("/admin.html", get(serve_admin))
-        .route("/browse", get(serve_browser))
-        .route("/browser.html", get(serve_browser))
-        .route("/preview.html", get(serve_preview))
-        .route("/theme.css", get(serve_theme_css))
-        .route("/theme.js", get(serve_theme_js))
-        .route("/index.js", get(serve_index_js))
-        .route("/admin.js", get(serve_admin_js))
-        .route("/browser.js", get(serve_browser_js))
-        .route("/browser-api.js", get(serve_browser_api_js))
-        .route("/browser-state.js", get(serve_browser_state_js))
-        .route("/browser-dialog.js", get(serve_browser_dialog_js))
-        .route("/preview.js", get(serve_preview_js))
+        .route("/browse", get(serve_index))
+        .route("/browser.html", get(serve_index))
+        .route("/admin", get(serve_index))
+        .route("/admin.html", get(serve_index))
+        .route("/admin/{*rest}", get(serve_index))
+        .route("/preview", get(serve_index))
+        .route("/preview.html", get(serve_index))
+        .route("/assets/app.css", get(serve_app_css))
+        .route("/assets/app.js", get(serve_app_js))
         .route("/favicon.svg", get(serve_favicon))
+        .route("/v2", get(redirect_legacy_vue_path))
+        .route("/v2/", get(redirect_legacy_vue_path))
+        .route("/v2/{*rest}", get(redirect_legacy_vue_path))
         .nest("/api/admin", admin_routes)
         .nest("/api", api_routes)
         .merge(dav_router)
@@ -251,79 +249,33 @@ macro_rules! embedded_handler {
 embedded_handler!(
     serve_index,
     "text/html; charset=utf-8",
-    "../static/index.html"
-);
-async fn serve_admin(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Response {
-    let is_admin = match auth::extract_session_token(&headers) {
-        Some(token) => state.sessions.validate(&token).await,
-        None => false,
-    };
-    if !is_admin {
-        return Redirect::to("/browse").into_response();
-    }
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        &include_bytes!("../static/admin.html")[..],
-    )
-        .into_response()
-}
-embedded_handler!(
-    serve_browser,
-    "text/html; charset=utf-8",
-    "../static/browser.html"
+    "../static/app/index.html"
 );
 embedded_handler!(
-    serve_preview,
-    "text/html; charset=utf-8",
-    "../static/preview.html"
-);
-embedded_handler!(
-    serve_theme_css,
+    serve_app_css,
     "text/css; charset=utf-8",
-    "../static/theme.css"
+    "../static/app/assets/app.css"
 );
 embedded_handler!(
-    serve_theme_js,
+    serve_app_js,
     "application/javascript; charset=utf-8",
-    "../static/theme.js"
-);
-embedded_handler!(
-    serve_index_js,
-    "application/javascript; charset=utf-8",
-    "../static/index.js"
-);
-embedded_handler!(
-    serve_admin_js,
-    "application/javascript; charset=utf-8",
-    "../static/admin.js"
-);
-embedded_handler!(
-    serve_browser_js,
-    "application/javascript; charset=utf-8",
-    "../static/browser.js"
-);
-embedded_handler!(
-    serve_browser_api_js,
-    "application/javascript; charset=utf-8",
-    "../static/browser-api.js"
-);
-embedded_handler!(
-    serve_browser_state_js,
-    "application/javascript; charset=utf-8",
-    "../static/browser-state.js"
-);
-embedded_handler!(
-    serve_browser_dialog_js,
-    "application/javascript; charset=utf-8",
-    "../static/browser-dialog.js"
-);
-embedded_handler!(
-    serve_preview_js,
-    "application/javascript; charset=utf-8",
-    "../static/preview.js"
+    "../static/app/assets/app.js"
 );
 embedded_handler!(serve_favicon, "image/svg+xml", "../static/favicon.svg");
+
+async fn redirect_legacy_vue_path(OriginalUri(uri): OriginalUri) -> Response {
+    let path = uri.path().strip_prefix("/v2").unwrap_or(uri.path());
+    let mut target = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path.to_string()
+    };
+    if let Some(query) = uri.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    Redirect::permanent(&target).into_response()
+}
 
 async fn not_found(_request: Request) -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "Not Found")
@@ -684,11 +636,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(anonymous_admin.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            anonymous_admin.headers().get(header::LOCATION).unwrap(),
-            "/browse"
-        );
+        assert_eq!(anonymous_admin.status(), StatusCode::OK);
 
         let authenticated_admin = app
             .clone()
@@ -702,6 +650,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authenticated_admin.status(), StatusCode::OK);
+
+        let app_asset = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(app_asset.status(), StatusCode::OK);
+        assert_eq!(
+            app_asset.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+
+        let legacy_vue = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/admin/security")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_vue.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            legacy_vue.headers().get(header::LOCATION).unwrap(),
+            "/admin/security"
+        );
 
         tokio::fs::write(root.join("duplicate-delete.txt"), b"data")
             .await

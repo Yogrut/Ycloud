@@ -11,6 +11,7 @@ import LimitsView from './LimitsView.vue'
 import LocksView from './LocksView.vue'
 import SecurityView from './SecurityView.vue'
 import WebDavView from './WebDavView.vue'
+import { appPath } from '../../shared/routes'
 
 defineProps<{ theme: ThemeController }>()
 
@@ -32,13 +33,13 @@ const activeSection = window.location.pathname.endsWith('/security')
 
 const navigation = [
   { group: '存储与访问', items: [
-    { id: 'webdav', label: 'WebDAV', href: '/v2/admin/webdav' },
-    { id: 'locks', label: '文件夹锁', href: '/v2/admin/locks' },
-    { id: 'limits', label: '传输限制', href: '/v2/admin/limits' },
+    { id: 'webdav', label: 'WebDAV', href: appPath('/admin/webdav') },
+    { id: 'locks', label: '文件夹锁', href: appPath('/admin/locks') },
+    { id: 'limits', label: '传输限制', href: appPath('/admin/limits') },
   ] },
   { group: '账户与安全', items: [
-    { id: 'account', label: '账户与访问', href: '/v2/admin/account' },
-    { id: 'security', label: '登录安全', href: '/v2/admin/security' },
+    { id: 'account', label: '账户与访问', href: appPath('/admin/account') },
+    { id: 'security', label: '登录安全', href: appPath('/admin/security') },
   ] },
 ] as const
 
@@ -85,7 +86,7 @@ function showNotice(message: string): void {
 }
 
 function sessionExpired(): void {
-  window.setTimeout(() => window.location.replace('/v2/browse'), 700)
+  window.setTimeout(() => window.location.replace(appPath('/browse')), 700)
 }
 
 onMounted(load)
@@ -96,7 +97,7 @@ onMounted(load)
     <div class="brand"><CloudIcon /><span>Ycloud · 管理</span></div>
     <div class="top-actions">
       <ThemeToggle :theme="theme.current.value" class="flat" @toggle="theme.toggle" />
-      <a class="icon-btn flat" href="/v2/browse" title="返回文件" aria-label="返回文件">
+      <a class="icon-btn flat" :href="appPath('/browse')" title="返回文件" aria-label="返回文件">
         <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2" /></svg>
       </a>
     </div>

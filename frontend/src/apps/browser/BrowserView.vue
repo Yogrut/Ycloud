@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { BatchOperation, BatchResponse, FileEntry } from '../../shared/api/browser'
 import { adminLogin, batchOperation, createFolder, downloadUrl, listFiles, logout, prepareArchive, renameItem, unlockFolder, uploadFile } from '../../shared/api/browser'
+import { appPath } from '../../shared/routes'
 import { formatSize } from '../../shared/format'
 import CloudIcon from '../../shared/components/icons/CloudIcon.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
@@ -298,7 +299,7 @@ function openEntry(entry: FileEntry): void {
     } else void navigate(entry.path)
     return
   }
-  window.open(`/preview.html?path=${encodeURIComponent(`/${entry.path}`)}`, '_blank', 'noopener')
+  window.open(`${appPath('/preview')}?path=${encodeURIComponent(`/${entry.path}`)}`, '_blank', 'noopener')
 }
 
 async function submitUnlock(): Promise<void> {
@@ -315,7 +316,7 @@ async function submitUnlock(): Promise<void> {
 
 async function openAdmin(): Promise<void> {
   if (canWrite.value) {
-    window.location.href = '/v2/admin/account'
+    window.location.href = appPath('/admin/account')
     return
   }
   adminUser.value = ''
@@ -332,7 +333,7 @@ async function submitAdmin(): Promise<void> {
   try {
     const result = await adminLogin(adminUser.value.trim(), adminPassword.value)
     if (!result.success) throw new Error(result.message ?? '登录失败')
-    window.location.href = '/v2/admin/account'
+    window.location.href = appPath('/admin/account')
   } catch (error) {
     adminError.value = error instanceof Error ? error.message : '登录失败'
   }
@@ -545,7 +546,7 @@ function handleMenuAction(action: BrowserAction): void {
 async function signOut(): Promise<void> {
   try { await logout() } finally {
     sessionStorage.setItem('ycloud-stay-signed-out', '1')
-    window.location.replace('/v2/')
+    window.location.replace(appPath('/'))
   }
 }
 

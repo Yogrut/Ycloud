@@ -5,7 +5,7 @@ const backend = 'http://127.0.0.1:18473'
 
 export default defineConfig({
   plugins: [vue()],
-  base: '/v2/',
+  base: '/',
   server: {
     port: 5173,
     strictPort: true,
@@ -29,9 +29,15 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: 'dist',
+    outDir: '../static/app',
     emptyOutDir: true,
-    manifest: true,
+    rollupOptions: {
+      output: {
+        entryFileNames: 'assets/app.js',
+        chunkFileNames: 'assets/[name].js',
+        assetFileNames: asset => asset.name?.endsWith('.css') ? 'assets/app.css' : 'assets/[name][extname]',
+      },
+    },
     sourcemap: false,
   },
   test: {

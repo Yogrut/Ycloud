@@ -1,6 +1,6 @@
 # Ycloud
 
-Ycloud 是一个使用 Rust、Axum 和原生 HTML/CSS/JavaScript 构建的轻量级私有文件服务，将网页文件管理、目录访问控制和 WebDAV 挂载整合在单个可执行程序中。
+Ycloud 是一个使用 Rust、Axum、Vue 3.5 和 TypeScript 构建的轻量级私有文件服务，将网页文件管理、目录访问控制和 WebDAV 挂载整合在单个可执行程序中。
 
 项目长期按照以下权重维护：
 
@@ -101,8 +101,8 @@ Ycloud 适合单实例、少量明确权限边界和个人文件管理。目前�
 ```text
 Ycloud/
 ├── src/                 # Axum 路由、认证、存储事务、API 与 WebDAV
-├── static/              # 内嵌页面、CSS 和原生 ES Modules
-├── frontend/            # 分阶段替换中的 Vue 3.5 + TypeScript 候选前端
+├── static/              # 内嵌的 Vue 生产资源与站点图标
+├── frontend/            # Vue 3.5、TypeScript、Vite 与 Vitest 前端源码
 ├── storage/             # 默认运行时文件目录，不提交内容
 ├── config.example.json  # 配置结构示例
 └── ARCHITECTURE.md      # 当前版本的完整设计与安全边界
@@ -121,16 +121,15 @@ cargo deny --locked check
 cargo build --release --locked
 ```
 
-Vue 候选前端当前已迁移首页登录与文件浏览操作闭环，旧前端仍是生产入口。并行开发时保持 Rust 服务运行，再执行：
+修改 Vue 前端时，先生成并检查会被 Rust 内嵌的生产资源：
 
 ```bash
 cd frontend
 npm ci
 npm run check
-npm run dev
 ```
 
-访问 `http://127.0.0.1:5173/v2/` 预览候选前端；依赖更新规则见 [frontend/README.md](frontend/README.md)。
+`npm run check` 会执行静态检查、前端测试、类型检查和生产构建，并把固定名称的资源写入 `static/app/`。随后回到仓库根目录执行 Rust 检查。日常运行仍只需 `cargo run --release --locked`，不需要 Node.js 或第二个终端。开发代理和依赖更新规则见 [frontend/README.md](frontend/README.md)。
 
 运行时配置、初始凭据、安全日志和 `storage` 内容不得提交到 Git。安全问题请勿在公开 Issue 中附带真实密码、配置或私人目录截图。
 

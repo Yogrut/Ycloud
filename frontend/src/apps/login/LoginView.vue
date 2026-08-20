@@ -2,6 +2,7 @@
 import { nextTick, onMounted, ref } from 'vue'
 import CloudIcon from '../../shared/components/icons/CloudIcon.vue'
 import { enterGate, getIdentity } from '../../shared/api/auth'
+import { appPath } from '../../shared/routes'
 
 const password = ref('')
 const errorMessage = ref('')
@@ -10,7 +11,7 @@ const passwordInput = ref<HTMLInputElement>()
 
 function openBrowser(): void {
   sessionStorage.removeItem('ycloud-stay-signed-out')
-  window.location.replace('/v2/browse')
+  window.location.replace(appPath('/browse'))
 }
 
 async function detectExistingAccess(): Promise<void> {

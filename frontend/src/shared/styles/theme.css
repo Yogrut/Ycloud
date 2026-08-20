@@ -271,7 +271,7 @@ input { font: inherit; }
   border-bottom: 1px solid var(--line);
 }
 .file-head { min-height: 41px; color: var(--muted); font-size: 14px; font-weight: 700; }
-.file-row { cursor: default; user-select: none; }
+.file-row { min-height: 41px; cursor: default; user-select: none; }
 .file-row:hover { background: var(--panel-soft); }
 .file-row.selected { background: var(--selected-row); }
 .sort-btn { justify-self: start; padding: 6px; color: inherit; font-weight: inherit; background: transparent; border: 0; cursor: pointer; }

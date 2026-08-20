@@ -9,10 +9,19 @@ const state = {
 const byId = id => document.getElementById(id);
 
 const ADMIN_SECTIONS = new Set(['webdav', 'locks', 'limits', 'account', 'security']);
+const MIGRATED_ADMIN_ROUTES = new Map([
+  ['account', '/v2/admin/account'],
+  ['security', '/v2/admin/security']
+]);
+const candidateReturn = new URLSearchParams(location.search).get('return') === 'v2' || location.port === '5173';
 const GIB = 1024 ** 3;
 
 function activateSection(section, updateHistory = true) {
   const selected = ADMIN_SECTIONS.has(section) ? section : 'webdav';
+  if (candidateReturn && MIGRATED_ADMIN_ROUTES.has(selected)) {
+    location.replace(MIGRATED_ADMIN_ROUTES.get(selected));
+    return;
+  }
   for (const item of document.querySelectorAll('[data-admin-section]')) {
     const active = item.dataset.adminSection === selected;
     item.classList.toggle('active', active);
@@ -30,7 +39,7 @@ function activateSection(section, updateHistory = true) {
 async function request(url, options = {}) {
   const response = await fetch(url, { credentials: 'same-origin', ...options });
   if (response.status === 401 || response.status === 403) {
-    location.replace('/browse');
+    location.replace(candidateReturn ? '/v2/browse' : '/browse');
     throw new Error('管理员登录已失效');
   }
   if (!response.ok) {
@@ -396,6 +405,7 @@ async function load(resetAccount = true) {
 }
 
 byId('newShare').addEventListener('click', () => openShare());
+if (candidateReturn) byId('returnFiles').href = '/v2/browse';
 byId('cancelShare').addEventListener('click', () => byId('dlg').classList.remove('active'));
 byId('shareForm').addEventListener('submit', saveShare);
 byId('newLock').addEventListener('click', () => openLock());

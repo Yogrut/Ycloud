@@ -23,9 +23,9 @@ const activeSection = window.location.pathname.endsWith('/security') ? 'security
 
 const navigation = [
   { group: '存储与访问', items: [
-    { id: 'webdav', label: 'WebDAV', href: '/admin#webdav' },
-    { id: 'locks', label: '文件夹锁', href: '/admin#locks' },
-    { id: 'limits', label: '传输限制', href: '/admin#limits' },
+    { id: 'webdav', label: 'WebDAV', href: '/admin?return=v2#webdav' },
+    { id: 'locks', label: '文件夹锁', href: '/admin?return=v2#locks' },
+    { id: 'limits', label: '传输限制', href: '/admin?return=v2#limits' },
   ] },
   { group: '账户与安全', items: [
     { id: 'account', label: '账户与访问', href: '/v2/admin/account' },

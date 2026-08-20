@@ -1,12 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import type { FileEntry } from '../../shared/api/browser'
-import { adminLogin, createFolder, listFiles, logout, unlockFolder, uploadFile } from '../../shared/api/browser'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import type { BatchOperation, BatchResponse, FileEntry } from '../../shared/api/browser'
+import { adminLogin, batchOperation, createFolder, downloadUrl, listFiles, logout, prepareArchive, renameItem, unlockFolder, uploadFile } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import CloudIcon from '../../shared/components/icons/CloudIcon.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
 import type { ThemeController } from '../../shared/composables/useTheme'
+import BrowserContextMenu from './BrowserContextMenu.vue'
+import type { BrowserAction } from './BrowserActionIcon.vue'
 import FileIcon from './FileIcon.vue'
+import FolderPicker from './FolderPicker.vue'
 
 type SortKey = 'name' | 'time' | 'size'
 
@@ -20,6 +23,8 @@ const selected = ref(new Set<string>())
 const loading = ref(true)
 const canWrite = ref(false)
 const maxUploadBytes = ref(0)
+const maxArchiveBytes = ref(0)
+const maxArchiveEntries = ref(0)
 const truncated = ref(false)
 const notice = ref('')
 const showUnlock = ref(false)
@@ -41,6 +46,22 @@ const uploadCurrent = ref('')
 const uploadProcessed = ref(0)
 const uploadTotal = ref(0)
 const uploadSummary = ref('')
+const contextVisible = ref(false)
+const contextEntry = ref<FileEntry | null>(null)
+const contextX = ref(0)
+const contextY = ref(0)
+const showRename = ref(false)
+const renameTarget = ref('')
+const renameName = ref('')
+const renameError = ref('')
+const renaming = ref(false)
+const showDelete = ref(false)
+const pendingDelete = ref<string[]>([])
+const operationBusy = ref(false)
+const operationError = ref('')
+const pickerOperation = ref<'move' | 'copy' | null>(null)
+const pickerPaths = ref<string[]>([])
+const batchResult = ref<BatchResponse | null>(null)
 
 const uploadPercent = computed(() => uploadTotal.value ? Math.min(100, Math.round(uploadProcessed.value / uploadTotal.value * 100)) : 0)
 
@@ -75,6 +96,8 @@ const crumbs = computed(() => {
 })
 
 const allSelected = computed(() => visibleEntries.value.length > 0 && visibleEntries.value.every(entry => selected.value.has(entry.path)))
+const selectedPaths = computed(() => [...selected.value])
+const pickerTitle = computed(() => `${pickerOperation.value === 'move' ? '移动' : '复制'} ${pickerPaths.value.length} 个项目到…`)
 
 function announce(message: string): void {
   notice.value = message
@@ -89,6 +112,8 @@ async function refresh(): Promise<void> {
     entries.value = data.entries
     canWrite.value = data.can_write
     maxUploadBytes.value = data.max_upload_bytes
+    maxArchiveBytes.value = data.max_archive_bytes
+    maxArchiveEntries.value = data.max_archive_entries
     truncated.value = data.truncated
     selected.value = new Set()
     if (data.truncated) announce('目录内容超过显示上限，当前仅显示部分项目')
@@ -118,6 +143,7 @@ function toggleSelection(entryPath: string): void {
   if (next.has(entryPath)) next.delete(entryPath)
   else next.add(entryPath)
   selected.value = next
+  syncMobileMenu(next)
 }
 
 function toggleSelectAll(): void {
@@ -125,6 +151,52 @@ function toggleSelectAll(): void {
   if (allSelected.value) visibleEntries.value.forEach(entry => next.delete(entry.path))
   else visibleEntries.value.forEach(entry => next.add(entry.path))
   selected.value = next
+  syncMobileMenu(next)
+}
+
+function isMobileLayout(): boolean {
+  return window.matchMedia('(max-width: 760px)').matches
+}
+
+function syncMobileMenu(paths: Set<string>): void {
+  if (!isMobileLayout()) return
+  if (!paths.size) {
+    contextVisible.value = false
+    return
+  }
+  contextEntry.value = paths.size === 1 ? entries.value.find(entry => paths.has(entry.path)) ?? null : null
+  contextX.value = 0
+  contextY.value = 0
+  contextVisible.value = true
+}
+
+function openRowMenu(event: MouseEvent, entry: FileEntry): void {
+  event.preventDefault()
+  if (!selected.value.has(entry.path)) selected.value = new Set([entry.path])
+  contextEntry.value = entry
+  contextX.value = event.clientX
+  contextY.value = event.clientY
+  contextVisible.value = true
+}
+
+function openBackgroundMenu(event: MouseEvent): void {
+  if ((event.target as HTMLElement).closest('.file-row')) return
+  if (!canWrite.value) return
+  event.preventDefault()
+  selected.value = new Set()
+  contextEntry.value = null
+  contextX.value = event.clientX
+  contextY.value = event.clientY
+  contextVisible.value = true
+}
+
+function closeContextMenu(): void {
+  contextVisible.value = false
+}
+
+function clearSelection(): void {
+  selected.value = new Set()
+  closeContextMenu()
 }
 
 function openEntry(entry: FileEntry): void {
@@ -254,6 +326,133 @@ async function uploadFiles(event: Event): Promise<void> {
   }
 }
 
+function entryForPath(entryPath: string): FileEntry | undefined {
+  return entries.value.find(entry => entry.path === entryPath)
+}
+
+function startDownload(entryPath: string): void {
+  window.location.href = downloadUrl(entryPath)
+}
+
+async function startArchive(paths: string[]): Promise<void> {
+  if (!paths.length) return
+  try {
+    const result = await prepareArchive(paths)
+    announce(`正在打包 ${result.file_count} 个文件、${result.entry_count} 个条目（${formatSize(result.total_bytes)}）`)
+    window.location.href = `/api/archive?ticket=${encodeURIComponent(result.ticket)}`
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '打包准备失败'
+    if (/payload too large|too large|大小/i.test(message)) announce(`所选文件总大小超过 ${formatSize(maxArchiveBytes.value)}，请拆分选择`)
+    else if (/entry limit|条目/i.test(message)) announce(`打包最多包含 ${maxArchiveEntries.value} 个条目，请拆分选择`)
+    else announce(message)
+  }
+}
+
+function openRenameDialog(entryPath: string): void {
+  if (!requireWrite()) return
+  renameTarget.value = entryPath
+  renameName.value = entryForPath(entryPath)?.name ?? entryPath.split('/').pop() ?? ''
+  renameError.value = ''
+  showRename.value = true
+}
+
+async function submitRename(): Promise<void> {
+  const name = renameName.value.trim()
+  if (!name || renaming.value) return
+  renaming.value = true
+  renameError.value = ''
+  try {
+    await renameItem(path.value, renameTarget.value, name)
+    showRename.value = false
+    announce('重命名成功')
+    await refresh()
+  } catch (error) {
+    renameError.value = error instanceof Error ? error.message : '重命名失败'
+  } finally {
+    renaming.value = false
+  }
+}
+
+function requestTransfer(operation: 'move' | 'copy', paths: string[]): void {
+  if (!paths.length || !requireWrite()) return
+  pickerOperation.value = operation
+  pickerPaths.value = [...paths]
+  operationError.value = ''
+}
+
+function requestDelete(paths: string[]): void {
+  if (!paths.length || !requireWrite()) return
+  pendingDelete.value = [...paths]
+  operationError.value = ''
+  showDelete.value = true
+}
+
+async function runBatch(operation: BatchOperation, paths: string[], target = ''): Promise<void> {
+  operationBusy.value = true
+  operationError.value = ''
+  try {
+    const result = await batchOperation(operation, paths, target)
+    const label = operation === 'move' ? '移动' : operation === 'copy' ? '复制' : '删除'
+    if (result.failed) batchResult.value = result
+    announce(result.failed ? `${label}成功 ${result.success} 项，失败 ${result.failed} 项` : `${label}成功`)
+    selected.value = new Set()
+    await refresh()
+  } catch (error) {
+    operationError.value = error instanceof Error ? error.message : '操作失败'
+    announce(operationError.value)
+  } finally {
+    operationBusy.value = false
+  }
+}
+
+async function confirmTransfer(target: string): Promise<void> {
+  const operation = pickerOperation.value
+  const paths = [...pickerPaths.value]
+  pickerOperation.value = null
+  if (operation) await runBatch(operation, paths, target)
+}
+
+async function confirmDelete(): Promise<void> {
+  const paths = [...pendingDelete.value]
+  await runBatch('delete', paths)
+  if (!operationError.value) showDelete.value = false
+}
+
+function handleMenuAction(action: BrowserAction): void {
+  const paths = [...selected.value]
+  const entry = contextEntry.value ?? (paths.length === 1 ? entryForPath(paths[0] ?? '') ?? null : null)
+  closeContextMenu()
+  switch (action) {
+    case 'open':
+      if (entry) openEntry(entry)
+      break
+    case 'download':
+      if (paths[0]) startDownload(paths[0])
+      break
+    case 'archive':
+      void startArchive(paths)
+      break
+    case 'rename':
+      if (paths[0]) openRenameDialog(paths[0])
+      break
+    case 'move':
+    case 'copy':
+      requestTransfer(action, paths)
+      break
+    case 'delete':
+      requestDelete(paths)
+      break
+    case 'upload':
+      chooseFiles()
+      break
+    case 'mkdir':
+      openFolderDialog()
+      break
+    case 'folder':
+      break
+  }
+}
+
 async function signOut(): Promise<void> {
   try { await logout() } finally {
     sessionStorage.setItem('ycloud-stay-signed-out', '1')
@@ -261,7 +460,24 @@ async function signOut(): Promise<void> {
   }
 }
 
-onMounted(refresh)
+function handleEscape(event: KeyboardEvent): void {
+  if (event.key === 'Escape') closeContextMenu()
+}
+
+function handleDocumentClick(): void {
+  if (isMobileLayout() && selected.value.size) return
+  closeContextMenu()
+}
+
+onMounted(() => {
+  void refresh()
+  document.addEventListener('click', handleDocumentClick)
+  document.addEventListener('keydown', handleEscape)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('click', handleDocumentClick)
+  document.removeEventListener('keydown', handleEscape)
+})
 </script>
 
 <template>
@@ -281,7 +497,7 @@ onMounted(refresh)
     <input ref="fileInput" class="visually-hidden" type="file" multiple @change="uploadFiles">
   </header>
 
-  <main class="browser-page">
+  <main class="browser-page" :class="{ 'selection-active': selected.size > 0 }">
     <nav class="breadcrumb" aria-label="当前位置">
       <button class="crumb" :aria-current="crumbs.length ? undefined : 'location'" type="button" @click="navigate('')">/</button>
       <template v-for="crumb in crumbs" :key="crumb.path">
@@ -290,7 +506,7 @@ onMounted(refresh)
       </template>
     </nav>
 
-    <section class="file-panel glass" :aria-busy="loading">
+    <section class="file-panel glass" :aria-busy="loading" @contextmenu="openBackgroundMenu">
       <div class="file-head">
         <button class="select-box" :class="{ checked: allSelected }" type="button" aria-label="全选" @click="toggleSelectAll"><span class="visually-hidden">全选</span></button>
         <button class="sort-btn" type="button" @click="changeSort('name')">名称 <span>{{ sort === 'name' ? (ascending ? '▲' : '▼') : '' }}</span></button>
@@ -307,6 +523,7 @@ onMounted(refresh)
           :class="{ selected: selected.has(entry.path) }"
           @click="toggleSelection(entry.path)"
           @dblclick="openEntry(entry)"
+          @contextmenu.stop="openRowMenu($event, entry)"
         >
           <button class="select-box" :class="{ checked: selected.has(entry.path) }" type="button" :aria-label="`选择 ${entry.name}`" @click.stop="toggleSelection(entry.path)"><span class="visually-hidden">选择 {{ entry.name }}</span></button>
           <div class="file-name"><FileIcon :entry="entry" /><span class="file-label">{{ entry.name }}</span></div>
@@ -317,6 +534,17 @@ onMounted(refresh)
     </section>
     <p v-if="truncated" class="browser-warning">当前目录仅显示服务器允许的部分项目</p>
   </main>
+
+  <BrowserContextMenu
+    v-if="contextVisible"
+    :entry="contextEntry"
+    :paths="selectedPaths"
+    :can-write="canWrite"
+    :x="contextX"
+    :y="contextY"
+    @action="handleMenuAction"
+    @clear="clearSelection"
+  />
 
   <div class="toast" :class="{ show: notice }" role="status">{{ notice }}</div>
 
@@ -356,6 +584,39 @@ onMounted(refresh)
       <p>{{ uploadPercent }}% · {{ formatSize(uploadProcessed) }} / {{ formatSize(uploadTotal) }}</p>
       <p class="upload-summary">{{ uploadSummary }}</p>
       <div class="modal-actions"><button class="btn secondary" type="button" :disabled="uploading" @click="showUpload = false">关闭</button></div>
+    </section>
+  </div>
+
+  <div v-if="showRename" class="overlay active" @click.self="showRename = false">
+    <form class="modal" @submit.prevent="submitRename">
+      <h2>重命名</h2>
+      <label>新名称<input v-model="renameName" class="input" autocomplete="off" autofocus></label>
+      <p class="modal-error">{{ renameError }}</p>
+      <div class="modal-actions"><button class="btn secondary" type="button" :disabled="renaming" @click="showRename = false">取消</button><button class="btn" type="submit" :disabled="renaming">{{ renaming ? '保存中…' : '保存' }}</button></div>
+    </form>
+  </div>
+
+  <FolderPicker v-if="pickerOperation" :title="pickerTitle" @close="pickerOperation = null" @confirm="confirmTransfer" />
+
+  <div v-if="showDelete" class="overlay active" @click.self="!operationBusy && (showDelete = false)">
+    <section class="modal" aria-labelledby="delete-title">
+      <h2 id="delete-title">确认永久删除</h2>
+      <p>将永久删除 {{ pendingDelete.length }} 个项目，此操作无法撤销。</p>
+      <p class="modal-error">{{ operationError }}</p>
+      <div class="modal-actions"><button class="btn secondary" type="button" :disabled="operationBusy" @click="showDelete = false">取消</button><button class="btn danger" type="button" :disabled="operationBusy" @click="confirmDelete">{{ operationBusy ? '删除中…' : `删除 (${pendingDelete.length})` }}</button></div>
+    </section>
+  </div>
+
+  <div v-if="batchResult" class="overlay active" @click.self="batchResult = null">
+    <section class="modal result-modal" aria-labelledby="result-title">
+      <h2 id="result-title">部分项目未完成</h2>
+      <p>成功 {{ batchResult.success }} 项，失败 {{ batchResult.failed }} 项。</p>
+      <div class="result-list">
+        <div v-for="item in batchResult.results.filter(result => result.status >= 400)" :key="item.path" class="result-row">
+          <strong>{{ item.path }}</strong><span>{{ item.message }}（{{ item.code }}）</span>
+        </div>
+      </div>
+      <div class="modal-actions"><button class="btn" type="button" @click="batchResult = null">确定</button></div>
     </section>
   </div>
 </template>

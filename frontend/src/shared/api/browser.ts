@@ -20,6 +20,30 @@ export interface FileListResponse {
   max_archive_entries: number
 }
 
+export interface ArchivePrepareResponse {
+  ticket: string
+  total_bytes: number
+  file_count: number
+  entry_count: number
+  max_bytes: number
+  max_entries: number
+}
+
+export interface BatchItemResult {
+  path: string
+  status: number
+  code: string
+  message: string
+}
+
+export interface BatchResponse {
+  success: number
+  failed: number
+  results: BatchItemResult[]
+}
+
+export type BatchOperation = 'delete' | 'move' | 'copy'
+
 interface ErrorEnvelope {
   message?: string
   error?: { message?: string }
@@ -72,6 +96,45 @@ export function createFolder(path: string, name: string): Promise<{ success?: bo
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
   })
+}
+
+export function downloadUrl(path: string): string {
+  const clean = cleanPath(path)
+  return `/api/download?path=${encodeURIComponent(`/${clean}`)}`
+}
+
+export function renameItem(currentPath: string, path: string, newName: string): Promise<{ success?: boolean }> {
+  return apiRequest(actionApi('rename', currentPath), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: `/${cleanPath(path)}`, new_name: newName }),
+  })
+}
+
+export function prepareArchive(paths: string[]): Promise<ArchivePrepareResponse> {
+  return apiRequest('/api/archive/prepare', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths: paths.map(path => `/${cleanPath(path)}`) }),
+  })
+}
+
+export async function batchOperation(operation: BatchOperation, paths: string[], target = ''): Promise<BatchResponse> {
+  const response = await fetch(`/api/batch/${operation}`, {
+    method: operation === 'move' ? 'PUT' : 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths, target: target ? `/${cleanPath(target)}` : '' }),
+  })
+  if (response.status === 401) {
+    window.location.replace('/v2/')
+    throw new Error('登录已失效')
+  }
+
+  const body = await readJson<BatchResponse & ErrorEnvelope>(response)
+  if (body && Array.isArray(body.results)) return body
+  if (!response.ok) throw new Error(body?.error?.message ?? body?.message ?? `请求失败 (${response.status})`)
+  throw new Error('服务返回了无效的批量操作结果')
 }
 
 export function uploadFile(path: string, file: File, onProgress: (loaded: number) => void): Promise<void> {

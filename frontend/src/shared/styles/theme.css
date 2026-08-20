@@ -335,9 +335,35 @@ input { font: inherit; }
 .modal-actions .btn { min-width: 78px; }
 .btn.secondary { color: var(--text); background: var(--panel-soft); border-color: var(--line); }
 .btn.secondary:hover { background: var(--panel-soft); border-color: var(--line-strong); }
+.btn.danger { color: #fff; background: var(--danger); }
+.btn.danger:hover:not(:disabled) { background: var(--danger); }
 .upload-current { overflow: hidden; color: var(--text) !important; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
 .upload-modal progress { width: 100%; height: 12px; overflow: hidden; accent-color: var(--accent); border: 0; border-radius: 999px; }
 .upload-summary { min-height: 20px; }
+.picker-modal { width: min(540px, 100%); }
+.picker-path { margin-bottom: 9px; padding: 9px; color: var(--muted); background: var(--field); border: 1px solid var(--line); border-radius: 8px; font-size: 12px; }
+.picker-list { max-height: 310px; overflow: auto; }
+.picker-row { width: 100%; min-height: 42px; display: flex; align-items: center; gap: 10px; padding: 9px 10px; color: var(--text); text-align: left; background: transparent; border: 0; border-radius: 8px; cursor: pointer; }
+.picker-row:hover { background: var(--panel-soft); }
+.picker-row svg { width: 20px; height: 20px; color: #f5ad16; }
+.picker-state { padding: 24px 10px; text-align: center; }
+.result-list { max-height: 300px; overflow: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.result-row { display: grid; gap: 4px; padding: 11px 2px; border-bottom: 1px solid var(--line); }
+.result-row:last-child { border-bottom: 0; }
+.result-row strong { overflow-wrap: anywhere; font-size: 13px; }
+.result-row span { color: var(--danger); font-size: 12px; overflow-wrap: anywhere; }
+
+.context-menu { position: fixed; z-index: 90; width: 168px; min-width: 168px; max-height: calc(100vh - 16px); overflow: auto; padding: 4px; color: var(--text); background: var(--panel); border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: var(--shadow); }
+.menu-actions { display: contents; }
+.menu-item { width: 100%; min-height: 30px; display: grid; grid-template-columns: 17px 1fr; align-items: center; gap: 8px; padding: 5px 8px; color: var(--text); text-align: left; background: transparent; border: 0; border-radius: 5px; font-size: 12px; cursor: pointer; }
+.menu-item svg { width: 15px; height: 15px; color: var(--muted); }
+.menu-item:hover { background: var(--panel-soft); }
+.menu-item.danger { color: var(--danger); }
+.menu-item.danger svg { color: currentColor; }
+.menu-separator { display: block; height: 1px; margin: 3px 5px; background: var(--line); }
+.menu-caption { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px 4px; color: var(--muted); font-size: 11px; }
+.menu-caption.mobile-only,
+.menu-clear { display: none; }
 
 @media (max-width: 560px) {
   .theme-floating { top: 14px; right: 14px; }
@@ -361,4 +387,14 @@ input { font: inherit; }
   .file-row .modified { display: none; }
   .cell.right { font-size: 13px; }
   .empty { padding: 72px 16px; }
+  .browser-page.selection-active { padding-bottom: calc(134px + env(safe-area-inset-bottom)); }
+  .context-menu { inset: auto 10px max(10px, env(safe-area-inset-bottom)) !important; width: auto; min-width: 0; overflow: hidden; padding: 11px 10px 12px; border-radius: 18px; }
+  .menu-caption,
+  .menu-caption.mobile-only { min-height: 25px; display: flex; padding: 0 6px 7px; }
+  .menu-clear { display: block; padding: 3px 6px; color: var(--accent); background: transparent; border: 0; font: inherit; font-weight: 680; }
+  .menu-actions { display: flex; gap: 6px; overflow-x: auto; padding: 2px 0 0; scrollbar-width: none; overscroll-behavior-x: contain; }
+  .menu-actions::-webkit-scrollbar { display: none; }
+  .menu-item { min-width: 62px; min-height: 72px; flex: 1 0 62px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; padding: 5px 4px 2px; border-radius: 10px; text-align: center; font-size: 11px; }
+  .menu-item svg { box-sizing: content-box; width: 21px; height: 21px; padding: 8px; background: var(--panel-soft); border-radius: 11px; }
+  .menu-separator { display: none; }
 }

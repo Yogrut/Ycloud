@@ -10,6 +10,7 @@ import AdminNavIcon from './AdminNavIcon.vue'
 import LimitsView from './LimitsView.vue'
 import LocksView from './LocksView.vue'
 import SecurityView from './SecurityView.vue'
+import WebDavView from './WebDavView.vue'
 
 defineProps<{ theme: ThemeController }>()
 
@@ -25,11 +26,13 @@ const activeSection = window.location.pathname.endsWith('/security')
   ? 'security'
   : window.location.pathname.endsWith('/limits')
     ? 'limits'
-    : window.location.pathname.endsWith('/locks') ? 'locks' : 'account'
+    : window.location.pathname.endsWith('/locks')
+      ? 'locks'
+      : window.location.pathname.endsWith('/webdav') ? 'webdav' : 'account'
 
 const navigation = [
   { group: '存储与访问', items: [
-    { id: 'webdav', label: 'WebDAV', href: '/admin?return=v2#webdav' },
+    { id: 'webdav', label: 'WebDAV', href: '/v2/admin/webdav' },
     { id: 'locks', label: '文件夹锁', href: '/v2/admin/locks' },
     { id: 'limits', label: '传输限制', href: '/v2/admin/limits' },
   ] },
@@ -110,7 +113,6 @@ onMounted(load)
           :class="{ active: item.id === activeSection }"
           :href="item.href"
           :aria-current="item.id === activeSection ? 'page' : undefined"
-          :title="['account', 'security', 'limits', 'locks'].includes(item.id) ? undefined : '在稳定后台打开，迁移完成后自动切换到新版'"
         >
           <AdminNavIcon :name="item.id" />
           <span>{{ item.label }}</span>
@@ -122,6 +124,7 @@ onMounted(load)
       <SecurityView v-else-if="info && activeSection === 'security'" :records="info.login_security" @changed="showNotice" />
       <LimitsView v-else-if="info && activeSection === 'limits'" :info="info" @saved="showNotice" />
       <LocksView v-else-if="info && activeSection === 'locks'" :locks="info.folder_locks" @changed="showNotice" />
+      <WebDavView v-else-if="info && activeSection === 'webdav'" :mounts="info.shares" @changed="showNotice" />
       <AccountView v-else-if="info" :info="info" @saved="showNotice" @expired="sessionExpired" />
       <div v-else class="admin-loading glass">{{ loginError || '管理后台暂时无法加载' }}</div>
     </div>

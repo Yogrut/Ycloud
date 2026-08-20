@@ -1,12 +1,40 @@
 export interface AdminInfo {
   username: string
   has_global_web_password: boolean
-  shares: unknown[]
+  shares: WebDavMountView[]
   folder_locks: FolderLockView[]
   login_security: LoginRecord[]
   max_upload_bytes: number
   max_archive_bytes: number
   max_archive_entries: number
+}
+
+export interface WebDavMountView {
+  id: string
+  name: string
+  path: string
+  username: string | null
+  webdav_enabled: boolean
+  has_password: boolean
+  readonly: boolean
+}
+
+export interface CreateWebDavMountRequest {
+  name: string
+  path: string
+  username?: string
+  webdav_enabled: boolean
+  password?: string
+  readonly: boolean
+}
+
+export interface UpdateWebDavMountRequest {
+  name?: string
+  path?: string
+  username?: string
+  webdav_enabled?: boolean
+  password?: string
+  readonly?: boolean
 }
 
 export interface FolderLockView {
@@ -134,6 +162,26 @@ export function updateFolderLock(id: string, body: UpdateFolderLockRequest): Pro
 
 export function deleteFolderLock(id: string): Promise<void> {
   return adminRequest(`/api/admin/locks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+export function createWebDavMount(body: CreateWebDavMountRequest): Promise<WebDavMountView> {
+  return adminRequest('/api/admin/shares', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function updateWebDavMount(id: string, body: UpdateWebDavMountRequest): Promise<WebDavMountView> {
+  return adminRequest(`/api/admin/shares/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function deleteWebDavMount(id: string): Promise<void> {
+  return adminRequest(`/api/admin/shares/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
 export function updateLoginRestriction(action: 'block' | 'unblock', entry: LoginEntry, ip: string): Promise<{ success: boolean }> {

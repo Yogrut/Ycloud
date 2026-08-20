@@ -328,6 +328,23 @@ input { font: inherit; }
 .lock-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 .danger-outline { color: var(--danger); background: rgba(228, 86, 107, .06); border-color: rgba(228, 86, 107, .28); }
 .danger-outline:hover:not(:disabled) { background: rgba(228, 86, 107, .12); border-color: rgba(228, 86, 107, .4); }
+.webdav-head { align-items: center; }
+.webdav-body { padding-top: 22px; }
+.webdav-list { border-top: 1px solid var(--line); }
+.webdav-record { min-height: 114px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+.webdav-record-main { min-width: 0; }
+.webdav-record-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.webdav-record-title strong { overflow-wrap: anywhere; color: var(--text); font-size: 15px; }
+.status-pill.inactive { color: var(--muted); background: var(--panel-soft); border-color: var(--line); }
+.status-pill.permission { color: var(--accent); background: var(--accent-soft); border-color: rgba(64, 158, 255, .25); }
+.status-pill.credential { color: var(--text); background: var(--panel-soft); border-color: var(--line); }
+.webdav-record-meta { margin-top: 4px; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.webdav-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.webdav-modal { width: min(660px, 100%); }
+.webdav-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+.webdav-options { display: flex; gap: 24px; margin-top: 18px; padding: 13px 14px; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; }
+.webdav-options label { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--text); cursor: pointer; }
+.webdav-options input { width: 16px; height: 16px; accent-color: var(--accent); }
 .admin-form-error { min-height: 20px; margin: 12px 0 0; color: var(--danger); font-size: 13px; }
 .admin-save-row { display: flex; justify-content: flex-end; padding-top: 4px; }
 .admin-loading { min-height: 240px; display: grid; place-items: center; padding: 32px; color: var(--muted); border-radius: 16px; }
@@ -593,4 +610,10 @@ input { font: inherit; }
   .locks-head .btn { width: 100%; }
   .lock-record { align-items: stretch; flex-direction: column; gap: 13px; }
   .lock-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .webdav-head { align-items: stretch; flex-direction: column; }
+  .webdav-head .btn { width: 100%; }
+  .webdav-record { align-items: stretch; flex-direction: column; gap: 14px; }
+  .webdav-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .webdav-form-grid { grid-template-columns: 1fr; }
+  .webdav-options { align-items: stretch; flex-direction: column; gap: 12px; }
 }

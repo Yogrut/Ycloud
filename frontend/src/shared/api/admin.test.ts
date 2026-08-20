@@ -2,12 +2,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   AdminApiError,
   createFolderLock,
+  createWebDavMount,
   deleteFolderLock,
+  deleteWebDavMount,
   getAdminInfo,
   updateAccount,
   updateFolderLock,
   updateLoginRestriction,
   updateTransferLimits,
+  updateWebDavMount,
 } from './admin'
 
 afterEach(() => vi.unstubAllGlobals())
@@ -93,5 +96,34 @@ describe('admin API', () => {
       method: 'PUT', body: JSON.stringify({ path: 'renamed' }),
     }))
     expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/admin/locks/lock-1', expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('uses the scoped WebDAV mount endpoints without exposing stored hashes', async () => {
+    const view = {
+      id: 'share-1', name: 'media', path: 'files', username: 'dav-user',
+      webdav_enabled: true, has_password: true, readonly: false,
+    }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(view), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...view, readonly: true }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await createWebDavMount({
+      name: 'media', path: 'files', username: 'dav-user', password: 'secure-dav-password',
+      webdav_enabled: true, readonly: false,
+    })
+    await updateWebDavMount('share-1', { readonly: true })
+    await expect(deleteWebDavMount('share-1')).resolves.toBeUndefined()
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/admin/shares', expect.objectContaining({ method: 'POST' }))
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/admin/shares/share-1', expect.objectContaining({
+      method: 'PUT', body: JSON.stringify({ readonly: true }),
+    }))
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/admin/shares/share-1', expect.objectContaining({ method: 'DELETE' }))
   })
 })

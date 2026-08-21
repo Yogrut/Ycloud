@@ -1,3 +1,7 @@
+import { useLocale } from '../i18n'
+
+const locale = useLocale()
+
 export interface AdminInfo {
   username: string
   has_global_web_password: boolean
@@ -108,11 +112,13 @@ async function adminRequest<T>(url: string, options: RequestInit = {}): Promise<
   const body = await readJson<T & ErrorEnvelope>(response)
   if (!response.ok) {
     throw new AdminApiError(
-      body?.error?.message ?? body?.message ?? (response.status === 401 ? '请先登录管理员账户' : `请求失败 (${response.status})`),
+      body?.error?.message ?? body?.message ?? (response.status === 401
+        ? locale.text('请先登录管理员账户', 'Sign in with an administrator account')
+        : locale.t('common.requestFailed', { status: response.status })),
       response.status,
     )
   }
-  if (body === undefined) throw new AdminApiError('服务返回了无效响应', response.status)
+  if (body === undefined) throw new AdminApiError(locale.t('common.invalidResponse'), response.status)
   return body
 }
 

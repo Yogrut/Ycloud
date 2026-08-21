@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { FileEntry } from '../../shared/api/browser'
+import { useLocale } from '../../shared/i18n'
 
 const props = defineProps<{ entry: FileEntry }>()
+const locale = useLocale()
 const knownKinds = new Set(['image', 'video', 'audio', 'archive', 'pdf', 'code', 'doc'])
 const kind = computed(() => props.entry.is_dir ? 'folder' : (knownKinds.has(props.entry.icon) ? props.entry.icon : 'file'))
 </script>
@@ -16,6 +18,6 @@ const kind = computed(() => props.entry.is_dir ? 'folder' : (knownKinds.has(prop
     <svg v-else-if="kind === 'archive'" viewBox="0 0 24 24"><path d="M5 3h14v18H5z" /><path d="M10 3h4v3h-4zm0 6h4v3h-4zm0 6h4v3h-4z" fill="currentColor" /></svg>
     <svg v-else-if="kind === 'code'" viewBox="0 0 24 24"><path d="M8 8 4 12l4 4m8-8 4 4-4 4m-2-10-4 12" /></svg>
     <svg v-else viewBox="0 0 24 24"><path d="M6 2h8l4 4v16H6z" /><path d="M14 2v5h5" /></svg>
-    <span v-if="entry.locked" class="lock-dot" title="文件夹已加锁">●</span>
+    <span v-if="entry.locked" class="lock-dot" :title="locale.t('file.lockedFolder')">●</span>
   </span>
 </template>

@@ -2,10 +2,12 @@
 import { computed, nextTick, ref } from 'vue'
 import type { UpdateWebDavMountRequest, WebDavMountView } from '../../shared/api/admin'
 import { createWebDavMount, deleteWebDavMount, updateWebDavMount } from '../../shared/api/admin'
+import { useLocale } from '../../shared/i18n'
 
 const MASK = '••••••'
 const { mounts } = defineProps<{ mounts: WebDavMountView[] }>()
 const emit = defineEmits<{ changed: [message: string] }>()
+const locale = useLocale()
 
 const editing = ref<WebDavMountView>()
 const showEditor = ref(false)
@@ -86,11 +88,11 @@ function selectMask(event: FocusEvent): void {
 
 function validate(): string | undefined {
   const normalizedName = name.value.trim()
-  if (!normalizedName) return '挂载名称不能为空'
-  if (normalizedName.includes('/') || normalizedName.includes('\\') || normalizedName.includes('\0')) return '挂载名称不能包含斜杠或空字符'
+  if (!normalizedName) return locale.text('挂载名称不能为空', 'Mount name is required')
+  if (normalizedName.includes('/') || normalizedName.includes('\\') || normalizedName.includes('\0')) return locale.text('挂载名称不能包含斜杠或空字符', 'Mount name cannot contain slashes or null characters')
   const hasUsablePassword = (editing.value?.has_password && password.value === MASK) || Boolean(password.value)
-  if (webdavEnabled.value && (!username.value.trim() || !hasUsablePassword)) return '启用 WebDAV 必须设置用户名和密码'
-  if (password.value !== MASK && password.value && [...password.value].length < 12) return 'WebDAV 密码至少需要 12 位'
+  if (webdavEnabled.value && (!username.value.trim() || !hasUsablePassword)) return locale.text('启用 WebDAV 必须设置用户名和密码', 'An enabled WebDAV mount requires a username and password')
+  if (password.value !== MASK && password.value && [...password.value].length < 12) return locale.text('WebDAV 密码至少需要 12 位', 'WebDAV password must be at least 12 characters')
   return undefined
 }
 
@@ -118,7 +120,7 @@ async function submit(): Promise<void> {
       if (readonly.value !== editing.value.readonly) body.readonly = readonly.value
       await updateWebDavMount(editing.value.id, body)
       showEditor.value = false
-      emit('changed', `WebDAV 挂载“${normalizedName}”已更新`)
+      emit('changed', locale.text(`WebDAV 挂载“${normalizedName}”已更新`, `WebDAV mount “${normalizedName}” updated`))
     } else {
       await createWebDavMount({
         name: normalizedName,
@@ -129,10 +131,10 @@ async function submit(): Promise<void> {
         readonly: readonly.value,
       })
       showEditor.value = false
-      emit('changed', `WebDAV 挂载“${normalizedName}”已创建`)
+      emit('changed', locale.text(`WebDAV 挂载“${normalizedName}”已创建`, `WebDAV mount “${normalizedName}” created`))
     }
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '保存失败'
+    errorMessage.value = error instanceof Error ? error.message : locale.text('保存失败', 'Unable to save changes')
   } finally {
     saving.value = false
   }
@@ -146,9 +148,9 @@ async function confirmDelete(): Promise<void> {
   try {
     await deleteWebDavMount(mount.id)
     pendingDelete.value = undefined
-    emit('changed', `WebDAV 挂载“${mount.name}”已删除`)
+    emit('changed', locale.text(`WebDAV 挂载“${mount.name}”已删除`, `WebDAV mount “${mount.name}” deleted`))
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '删除失败'
+    errorMessage.value = error instanceof Error ? error.message : locale.text('删除失败', 'Unable to delete the mount')
   } finally {
     deleting.value = false
   }
@@ -159,28 +161,28 @@ async function confirmDelete(): Promise<void> {
   <section class="admin-pane glass" aria-labelledby="webdav-title">
     <header class="admin-pane-head webdav-head">
       <div>
-        <h1 id="webdav-title">WebDAV 挂载</h1>
-        <p>为外部 WebDAV 客户端配置独立路径、凭据和读写权限。</p>
+        <h1 id="webdav-title">{{ locale.text('WebDAV 挂载', 'WebDAV mounts') }}</h1>
+        <p>{{ locale.text('为外部 WebDAV 客户端配置独立路径、凭据和读写权限。', 'Configure independent paths, credentials, and permissions for external WebDAV clients.') }}</p>
       </div>
-      <button class="btn" type="button" @click="openCreate">新建挂载</button>
+      <button class="btn" type="button" @click="openCreate">{{ locale.text('新建挂载', 'New mount') }}</button>
     </header>
     <div class="admin-pane-body webdav-body">
-      <div v-if="!mounts.length" class="admin-empty">暂无 WebDAV 挂载</div>
+      <div v-if="!mounts.length" class="admin-empty">{{ locale.text('暂无 WebDAV 挂载', 'No WebDAV mounts') }}</div>
       <div v-else class="webdav-list">
         <article v-for="mount in mounts" :key="mount.id" class="webdav-record">
           <div class="webdav-record-main">
             <div class="webdav-record-title">
               <strong>{{ mount.name }}</strong>
-              <span class="status-pill" :class="{ inactive: !mount.webdav_enabled }">{{ mount.webdav_enabled ? '已启用' : '已停用' }}</span>
-              <span class="status-pill permission">{{ mount.readonly ? '只读' : '读写' }}</span>
-              <span v-if="mount.has_password" class="status-pill credential">密码已设置</span>
+              <span class="status-pill" :class="{ inactive: !mount.webdav_enabled }">{{ mount.webdav_enabled ? locale.text('已启用', 'Enabled') : locale.text('已停用', 'Disabled') }}</span>
+              <span class="status-pill permission">{{ mount.readonly ? locale.text('只读', 'Read only') : locale.text('读写', 'Read/write') }}</span>
+              <span v-if="mount.has_password" class="status-pill credential">{{ locale.text('密码已设置', 'Password set') }}</span>
             </div>
-            <div class="webdav-record-meta">存储路径 {{ displayPath(mount.path) }} · 连接路径 {{ connectionPath(mount.name) }}</div>
-            <div class="webdav-record-meta">用户 {{ mount.username || '未设置' }}</div>
+            <div class="webdav-record-meta">{{ locale.text('存储路径', 'Storage path') }} {{ displayPath(mount.path) }} · {{ locale.text('连接路径', 'Connection path') }} {{ connectionPath(mount.name) }}</div>
+            <div class="webdav-record-meta">{{ locale.text('用户', 'User') }} {{ mount.username || locale.text('未设置', 'Not set') }}</div>
           </div>
           <div class="webdav-actions">
-            <button class="btn secondary" type="button" @click="openEdit(mount)">编辑</button>
-            <button class="btn danger-outline" type="button" @click="pendingDelete = mount; errorMessage = ''">删除</button>
+            <button class="btn secondary" type="button" @click="openEdit(mount)">{{ locale.t('common.edit') }}</button>
+            <button class="btn danger-outline" type="button" @click="pendingDelete = mount; errorMessage = ''">{{ locale.t('common.delete') }}</button>
           </div>
         </article>
       </div>
@@ -189,47 +191,47 @@ async function confirmDelete(): Promise<void> {
 
   <div v-if="showEditor" class="overlay" @click.self="closeEditor">
     <form class="modal webdav-modal" role="dialog" aria-modal="true" aria-labelledby="webdav-editor-title" @submit.prevent="submit">
-      <h2 id="webdav-editor-title">{{ editing ? '编辑 WebDAV 挂载' : '新建 WebDAV 挂载' }}</h2>
+      <h2 id="webdav-editor-title">{{ editing ? locale.text('编辑 WebDAV 挂载', 'Edit WebDAV mount') : locale.text('新建 WebDAV 挂载', 'New WebDAV mount') }}</h2>
       <div class="webdav-form-grid">
         <label>
-          挂载名称
+          {{ locale.text('挂载名称', 'Mount name') }}
           <input v-model="name" class="input" required maxlength="128">
         </label>
         <label>
-          存储路径
-          <input v-model="path" class="input" maxlength="4096" placeholder="/ 表示存储根目录">
+          {{ locale.text('存储路径', 'Storage path') }}
+          <input v-model="path" class="input" maxlength="4096" :placeholder="locale.text('/ 表示存储根目录', '/ means the storage root')">
         </label>
         <label>
-          WebDAV 用户名
+          {{ locale.text('WebDAV 用户名', 'WebDAV username') }}
           <input v-model="username" class="input" maxlength="128" autocomplete="username">
         </label>
         <label>
-          WebDAV 密码
+          {{ locale.text('WebDAV 密码', 'WebDAV password') }}
           <input v-model="password" class="input" type="password" maxlength="1024" autocomplete="new-password" @focus="selectMask">
         </label>
       </div>
-      <p class="field-hint">连接路径为 {{ connectionPath(name || '挂载名称') }}；存储路径保存时自动统一。启用 WebDAV 时需要用户名和至少 12 位密码。</p>
-      <p class="field-hint">挂载路径不能与网页文件夹锁的父、当前或子目录重叠；编辑时保留密码掩码表示不修改密码。</p>
+      <p class="field-hint">{{ locale.text('连接路径为', 'Connection path:') }} {{ connectionPath(name || locale.text('挂载名称', 'mount-name')) }}. {{ locale.text('存储路径保存时自动统一。启用 WebDAV 时需要用户名和至少 12 位密码。', 'Storage paths are normalized when saved. An enabled mount requires a username and a password of at least 12 characters.') }}</p>
+      <p class="field-hint">{{ locale.text('挂载路径不能与网页文件夹锁的父、当前或子目录重叠；编辑时保留密码掩码表示不修改密码。', 'A mount path cannot overlap a browser folder lock at any level. Leave the password mask unchanged while editing to keep the current password.') }}</p>
       <div class="webdav-options">
-        <label><input v-model="webdavEnabled" type="checkbox">启用 WebDAV</label>
-        <label><input v-model="readonly" type="checkbox">只读访问</label>
+        <label><input v-model="webdavEnabled" type="checkbox">{{ locale.text('启用 WebDAV', 'Enable WebDAV') }}</label>
+        <label><input v-model="readonly" type="checkbox">{{ locale.text('只读访问', 'Read-only access') }}</label>
       </div>
       <p class="modal-error" role="alert" aria-live="polite">{{ errorMessage }}</p>
       <div class="modal-actions">
-        <button class="btn secondary" type="button" :disabled="saving" @click="closeEditor">取消</button>
-        <button class="btn" type="submit" :disabled="saving || !hasChanges">{{ saving ? '保存中…' : (editing ? '保存' : '创建') }}</button>
+        <button class="btn secondary" type="button" :disabled="saving" @click="closeEditor">{{ locale.t('common.cancel') }}</button>
+        <button class="btn" type="submit" :disabled="saving || !hasChanges">{{ saving ? locale.t('common.saving') : (editing ? locale.t('common.save') : locale.t('common.create')) }}</button>
       </div>
     </form>
   </div>
 
   <div v-if="pendingDelete" class="overlay" @click.self="pendingDelete = undefined; errorMessage = ''">
     <section class="modal" role="dialog" aria-modal="true" aria-labelledby="delete-webdav-title">
-      <h2 id="delete-webdav-title">确认删除 WebDAV 挂载</h2>
-      <p>删除“{{ pendingDelete.name }}”只会移除连接配置，磁盘中的文件不会被删除。</p>
+      <h2 id="delete-webdav-title">{{ locale.text('确认删除 WebDAV 挂载', 'Delete WebDAV mount?') }}</h2>
+      <p>{{ locale.text(`删除“${pendingDelete.name}”只会移除连接配置，磁盘中的文件不会被删除。`, `Deleting “${pendingDelete.name}” removes only the connection settings. Files on disk will not be deleted.`) }}</p>
       <p class="modal-error" role="alert" aria-live="polite">{{ errorMessage }}</p>
       <div class="modal-actions">
-        <button class="btn secondary" type="button" :disabled="deleting" @click="pendingDelete = undefined; errorMessage = ''">取消</button>
-        <button class="btn danger" type="button" :disabled="deleting" @click="confirmDelete">{{ deleting ? '删除中…' : '确认删除' }}</button>
+        <button class="btn secondary" type="button" :disabled="deleting" @click="pendingDelete = undefined; errorMessage = ''">{{ locale.t('common.cancel') }}</button>
+        <button class="btn danger" type="button" :disabled="deleting" @click="confirmDelete">{{ deleting ? locale.text('删除中…', 'Deleting…') : locale.text('确认删除', 'Delete mount') }}</button>
       </div>
     </section>
   </div>

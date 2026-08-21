@@ -2,8 +2,10 @@
 import { nextTick, onMounted, ref } from 'vue'
 import CloudIcon from '../../shared/components/icons/CloudIcon.vue'
 import { enterGate, getIdentity } from '../../shared/api/auth'
+import { useLocale } from '../../shared/i18n'
 import { appPath } from '../../shared/routes'
 
+const locale = useLocale()
 const password = ref('')
 const errorMessage = ref('')
 const submitting = ref(false)
@@ -41,7 +43,7 @@ async function submit(): Promise<void> {
     await enterGate(password.value)
     openBrowser()
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '暂时无法连接服务'
+    errorMessage.value = error instanceof Error ? error.message : locale.t('login.unavailable')
     submitting.value = false
     await nextTick()
     passwordInput.value?.select()
@@ -56,9 +58,9 @@ onMounted(detectExistingAccess)
     <section class="login-panel glass" aria-labelledby="login-title">
       <CloudIcon class="login-logo" />
       <h1 id="login-title">Ycloud</h1>
-      <p>输入网页访问密码进入文件空间</p>
+      <p>{{ locale.t('login.description') }}</p>
       <form @submit.prevent="submit">
-        <label class="visually-hidden" for="web-password">网页访问密码</label>
+        <label class="visually-hidden" for="web-password">{{ locale.t('login.webPassword') }}</label>
         <input
           id="web-password"
           ref="passwordInput"
@@ -70,7 +72,7 @@ onMounted(detectExistingAccess)
           required
         >
         <button class="btn btn-primary" type="submit" :disabled="submitting">
-          {{ submitting ? '验证中…' : '进入' }}
+          {{ locale.t(submitting ? 'login.submitting' : 'login.enter') }}
         </button>
       </form>
       <div class="login-error" role="alert" aria-live="polite">{{ errorMessage }}</div>

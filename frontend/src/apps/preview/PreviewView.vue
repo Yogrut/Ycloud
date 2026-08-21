@@ -1,9 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watchEffect } from 'vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
+import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import type { ThemeController } from '../../shared/composables/useTheme'
+import { useLocale } from '../../shared/i18n'
 
 defineProps<{ theme: ThemeController }>()
+const locale = useLocale()
 
 const requestPath = new URLSearchParams(window.location.search).get('path') ?? ''
 const cleanPath = requestPath.replace(/^\/+/, '')
@@ -28,13 +31,13 @@ async function loadText(): Promise<void> {
   if (kind.value !== 'text') return
   try {
     const response = await fetch(previewUrl, { credentials: 'same-origin', headers: { Range: 'bytes=0-2097151' } })
-    if (!response.ok) throw new Error(`预览失败 (${response.status})`)
+    if (!response.ok) throw new Error(`${locale.t('preview.failed')} (${response.status})`)
     text.value = await response.text()
     const contentRange = response.headers.get('Content-Range')
     const range = contentRange?.match(/^bytes\s+\d+-(\d+)\/(\d+)$/i)
     textTruncated.value = range ? Number(range[1]) + 1 < Number(range[2]) : false
   } catch (error) {
-    textError.value = error instanceof Error ? error.message : '预览失败'
+    textError.value = error instanceof Error ? error.message : locale.t('preview.failed')
   }
 }
 
@@ -43,30 +46,35 @@ function closePreview(): void {
 }
 
 onMounted(() => {
-  document.title = name ? `${name} - 文件预览` : '文件预览'
   void loadText()
+})
+
+watchEffect(() => {
+  const title = locale.t('preview.title')
+  document.title = name ? `${name} - ${title}` : title
 })
 </script>
 
 <template>
   <div class="preview-page">
     <header class="preview-toolbar">
-      <span class="preview-title">{{ name || '文件预览' }}</span>
+      <span class="preview-title">{{ name || locale.t('preview.title') }}</span>
       <div class="preview-actions">
+        <LocaleToggle />
         <ThemeToggle :theme="theme.current.value" @toggle="theme.toggle" />
-        <a class="btn secondary" :href="downloadUrl">下载</a>
-        <button class="btn secondary" type="button" @click="closePreview">关闭</button>
+        <a class="btn secondary" :href="downloadUrl">{{ locale.t('preview.download') }}</a>
+        <button class="btn secondary" type="button" @click="closePreview">{{ locale.t('preview.close') }}</button>
       </div>
     </header>
     <main class="preview-content">
-      <div v-if="!name" class="preview-message"><strong>缺少文件路径</strong><p>请返回文件浏览器后重新打开预览。</p></div>
+      <div v-if="!name" class="preview-message"><strong>{{ locale.t('preview.missingPath') }}</strong><p>{{ locale.t('preview.missingPathHelp') }}</p></div>
       <img v-else-if="kind === 'image'" :src="previewUrl" :alt="name">
       <video v-else-if="kind === 'video'" :src="previewUrl" controls />
       <audio v-else-if="kind === 'audio'" :src="previewUrl" controls />
       <iframe v-else-if="kind === 'pdf'" :src="previewUrl" :title="name" />
       <div v-else-if="kind === 'text' && textError" class="preview-message"><strong>{{ name }}</strong><p>{{ textError }}</p></div>
-      <pre v-else-if="kind === 'text'">{{ text }}{{ textTruncated ? '\n\n[预览已截断，仅显示前 2 MiB]' : '' }}</pre>
-      <div v-else class="preview-message"><strong>{{ name }}</strong><p>此文件类型不在安全预览列表中。</p><a class="btn" :href="downloadUrl">下载文件</a></div>
+      <pre v-else-if="kind === 'text'">{{ text }}{{ textTruncated ? `\n\n${locale.t('preview.truncated')}` : '' }}</pre>
+      <div v-else class="preview-message"><strong>{{ name }}</strong><p>{{ locale.t('preview.unsupported') }}</p><a class="btn" :href="downloadUrl">{{ locale.t('preview.downloadFile') }}</a></div>
     </main>
   </div>
 </template>

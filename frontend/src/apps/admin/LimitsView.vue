@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import type { AdminInfo, UpdateTransferLimitsRequest } from '../../shared/api/admin'
 import { updateTransferLimits } from '../../shared/api/admin'
+import { useLocale } from '../../shared/i18n'
 
 const GIB = 1024 ** 3
 const MIB = 1024 ** 2
@@ -11,6 +12,7 @@ const HARD_MAX_ARCHIVE_ENTRIES = 5000
 
 const props = defineProps<{ info: AdminInfo }>()
 const emit = defineEmits<{ saved: [message: string] }>()
+const locale = useLocale()
 
 const uploadGiB = ref<string | number>('')
 const archiveGiB = ref<string | number>('')
@@ -52,7 +54,7 @@ function parseBytes(value: string | number, originalText: string, originalBytes:
   const gib = Number(value)
   const bytes = Math.round(gib * GIB)
   if (!Number.isFinite(gib) || !Number.isSafeInteger(bytes) || bytes < MIB || bytes > maximum) {
-    throw new Error(`${label}必须在 1 MiB 到 ${maximum / GIB} GiB 之间`)
+    throw new Error(locale.text(`${label}必须在 1 MiB 到 ${maximum / GIB} GiB 之间`, `${label} must be between 1 MiB and ${maximum / GIB} GiB`))
   }
   return bytes
 }
@@ -63,18 +65,18 @@ function buildRequest(): UpdateTransferLimitsRequest {
     initialUploadGiB.value,
     baselineUploadBytes.value,
     HARD_MAX_UPLOAD_BYTES,
-    '单文件上传上限',
+    locale.text('单文件上传上限', 'Single-file upload limit'),
   )
   const maxArchiveBytes = parseBytes(
     archiveGiB.value,
     initialArchiveGiB.value,
     baselineArchiveBytes.value,
     HARD_MAX_ARCHIVE_BYTES,
-    '打包源文件总大小上限',
+    locale.text('打包源文件总大小上限', 'Archive source-size limit'),
   )
   const entries = Number(archiveEntries.value)
   if (!Number.isInteger(entries) || entries < 1 || entries > HARD_MAX_ARCHIVE_ENTRIES) {
-    throw new Error('打包条目数量上限必须在 1 到 5000 之间')
+    throw new Error(locale.text('打包条目数量上限必须在 1 到 5000 之间', 'Archive entry limit must be between 1 and 5000'))
   }
   return {
     max_upload_bytes: maxUploadBytes,
@@ -89,7 +91,7 @@ async function submit(): Promise<void> {
   try {
     body = buildRequest()
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '传输限制无效'
+    errorMessage.value = error instanceof Error ? error.message : locale.text('传输限制无效', 'Invalid transfer limits')
     return
   }
 
@@ -105,9 +107,9 @@ async function submit(): Promise<void> {
     uploadGiB.value = initialUploadGiB.value
     archiveGiB.value = initialArchiveGiB.value
     archiveEntries.value = initialArchiveEntries.value
-    emit('saved', '传输限制已保存并立即生效')
+    emit('saved', locale.text('传输限制已保存并立即生效', 'Transfer limits saved and applied'))
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '保存失败'
+    errorMessage.value = error instanceof Error ? error.message : locale.text('保存失败', 'Unable to save changes')
   } finally {
     saving.value = false
   }
@@ -118,40 +120,40 @@ async function submit(): Promise<void> {
   <section class="admin-pane glass" aria-labelledby="limits-title">
     <header class="admin-pane-head">
       <div>
-        <h1 id="limits-title">传输限制</h1>
-        <p>根据存储容量调整单次传输范围；并发、密码队列和磁盘安全余量继续由系统固定保护。</p>
+        <h1 id="limits-title">{{ locale.text('传输限制', 'Transfer limits') }}</h1>
+        <p>{{ locale.text('根据存储容量调整单次传输范围；并发、密码队列和磁盘安全余量继续由系统固定保护。', 'Adjust transfer sizes for your storage capacity. Concurrency, password queues, and disk reserves remain protected by fixed system limits.') }}</p>
       </div>
     </header>
     <form class="admin-pane-body" @submit.prevent="submit">
       <div class="account-form">
         <label class="admin-field limits-field">
-          <span>单文件上传上限</span>
+          <span>{{ locale.text('单文件上传上限', 'Single-file upload limit') }}</span>
           <span class="limits-control">
             <span class="input-with-unit"><input v-model="uploadGiB" type="number" min="0.001" max="100" step="0.001" inputmode="decimal"><span>GiB</span></span>
-            <small>网页与 WebDAV 共用；范围 1 MiB–100 GiB，且不能超过部署环境的绝对上限。</small>
+            <small>{{ locale.text('网页与 WebDAV 共用；范围 1 MiB–100 GiB，且不能超过部署环境的绝对上限。', 'Shared by the browser and WebDAV. Range: 1 MiB–100 GiB, subject to the deployment hard limit.') }}</small>
           </span>
         </label>
         <label class="admin-field limits-field">
-          <span>打包源文件总大小</span>
+          <span>{{ locale.text('打包源文件总大小', 'Archive source-size limit') }}</span>
           <span class="limits-control">
             <span class="input-with-unit"><input v-model="archiveGiB" type="number" min="0.001" max="10" step="0.001" inputmode="decimal"><span>GiB</span></span>
-            <small>只累计文件内容；范围 1 MiB–10 GiB，普通单文件下载不受影响。</small>
+            <small>{{ locale.text('只累计文件内容；范围 1 MiB–10 GiB，普通单文件下载不受影响。', 'Counts file contents only. Range: 1 MiB–10 GiB. Regular single-file downloads are unaffected.') }}</small>
           </span>
         </label>
         <label class="admin-field limits-field">
-          <span>打包条目数量</span>
+          <span>{{ locale.text('打包条目数量', 'Archive entry limit') }}</span>
           <span class="limits-control">
             <input v-model="archiveEntries" type="number" min="1" max="5000" step="1" inputmode="numeric">
-            <small>文件与文件夹递归合计；重复选择父目录与子项时会自动去重。</small>
+            <small>{{ locale.text('文件与文件夹递归合计；重复选择父目录与子项时会自动去重。', 'Counts files and folders recursively. Overlapping parent and child selections are deduplicated.') }}</small>
           </span>
         </label>
       </div>
       <aside class="safety-note">
-        资源保护保持固定：同时只运行一个打包任务，文件提交保持事务化，密码验证与 WebDAV 请求维持严格并发边界，磁盘始终保留安全余量。
+        {{ locale.text('资源保护保持固定：同时只运行一个打包任务，文件提交保持事务化，密码验证与 WebDAV 请求维持严格并发边界，磁盘始终保留安全余量。', 'Resource safeguards remain fixed: one archive task at a time, transactional file commits, strict password and WebDAV concurrency limits, and a reserved disk safety margin.') }}
       </aside>
       <p class="admin-form-error" role="alert" aria-live="polite">{{ errorMessage }}</p>
       <div class="admin-save-row">
-        <button class="btn" type="submit" :disabled="saving || !hasChanges">{{ saving ? '保存中…' : '保存传输限制' }}</button>
+        <button class="btn" type="submit" :disabled="saving || !hasChanges">{{ saving ? locale.t('common.saving') : locale.text('保存传输限制', 'Save transfer limits') }}</button>
       </div>
     </form>
   </section>

@@ -93,8 +93,20 @@ input { font: inherit; }
 }
 
 .icon-btn svg { width: 20px; height: 20px; }
+.locale-toggle {
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: -.02em;
+}
 .theme-sun { color: #e6a23c; }
-.theme-floating { position: fixed; top: 17px; right: 19px; z-index: 10; }
+.login-floating-actions {
+  position: fixed;
+  top: 17px;
+  right: 19px;
+  z-index: 10;
+  display: flex;
+  gap: 8px;
+}
 
 .login-shell {
   min-height: 100vh;
@@ -562,7 +574,7 @@ input { font: inherit; }
 .preview-message .btn { display: inline-flex; margin-top: 14px; text-decoration: none; }
 
 @media (max-width: 560px) {
-  .theme-floating { top: 14px; right: 14px; }
+  .login-floating-actions { top: 14px; right: 14px; }
   .login-panel { padding: 40px 24px; }
 }
 

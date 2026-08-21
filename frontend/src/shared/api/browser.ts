@@ -10,6 +10,9 @@ export interface FileEntry {
 }
 
 import { appPath } from '../routes'
+import { useLocale } from '../i18n'
+
+const locale = useLocale()
 
 export interface FileListResponse {
   current_path: string
@@ -63,14 +66,14 @@ export async function apiRequest<T>(url: string, options: RequestInit = {}): Pro
   const response = await fetch(url, { credentials: 'same-origin', ...options })
   if (response.status === 401) {
     window.location.replace(appPath('/'))
-    throw new Error('登录已失效')
+    throw new Error(locale.t('common.sessionExpired'))
   }
 
   const body = await readJson<T & ErrorEnvelope>(response)
   if (!response.ok) {
-    throw new Error(body?.error?.message ?? body?.message ?? `请求失败 (${response.status})`)
+    throw new Error(body?.error?.message ?? body?.message ?? locale.t('common.requestFailed', { status: response.status }))
   }
-  if (body === undefined) throw new Error('服务返回了无效响应')
+  if (body === undefined) throw new Error(locale.t('common.invalidResponse'))
   return body
 }
 
@@ -130,13 +133,13 @@ export async function batchOperation(operation: BatchOperation, paths: string[],
   })
   if (response.status === 401) {
     window.location.replace(appPath('/'))
-    throw new Error('登录已失效')
+    throw new Error(locale.t('common.sessionExpired'))
   }
 
   const body = await readJson<BatchResponse & ErrorEnvelope>(response)
   if (body && Array.isArray(body.results)) return body
-  if (!response.ok) throw new Error(body?.error?.message ?? body?.message ?? `请求失败 (${response.status})`)
-  throw new Error('服务返回了无效的批量操作结果')
+  if (!response.ok) throw new Error(body?.error?.message ?? body?.message ?? locale.t('common.requestFailed', { status: response.status }))
+  throw new Error(locale.text('服务返回了无效的批量操作结果', 'The server returned an invalid batch result'))
 }
 
 export function uploadFile(path: string, file: File, onProgress: (loaded: number) => void): Promise<void> {
@@ -151,7 +154,7 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
     request.addEventListener('load', () => {
       if (request.status === 401) {
         window.location.replace(appPath('/'))
-        reject(new Error('登录已失效'))
+        reject(new Error(locale.t('common.sessionExpired')))
         return
       }
       if (request.status >= 200 && request.status < 300) {
@@ -159,7 +162,7 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
         resolve()
         return
       }
-      let message = `上传失败 (${request.status})`
+      let message = locale.text(`上传失败 (${request.status})`, `Upload failed (${request.status})`)
       try {
         const body = JSON.parse(request.responseText) as ErrorEnvelope
         message = body.error?.message ?? body.message ?? message
@@ -168,8 +171,8 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
       }
       reject(new Error(message))
     })
-    request.addEventListener('error', () => reject(new Error('网络连接中断')))
-    request.addEventListener('abort', () => reject(new Error('上传已取消')))
+    request.addEventListener('error', () => reject(new Error(locale.t('common.networkInterrupted'))))
+    request.addEventListener('abort', () => reject(new Error(locale.text('上传已取消', 'Upload cancelled'))))
     request.send(file)
   })
 }

@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import type { Theme } from '../composables/useTheme'
+import { useLocale } from '../i18n'
 
 defineProps<{ theme: Theme }>()
 defineEmits<{ toggle: [] }>()
+const locale = useLocale()
 </script>
 
 <template>
   <button
     class="icon-btn"
     type="button"
-    :title="theme === 'dark' ? '切换到白天模式' : '切换到黑夜模式'"
-    :aria-label="theme === 'dark' ? '切换到白天模式' : '切换到黑夜模式'"
+    :title="locale.t(theme === 'dark' ? 'theme.switchToLight' : 'theme.switchToDark')"
+    :aria-label="locale.t(theme === 'dark' ? 'theme.switchToLight' : 'theme.switchToDark')"
     @click="$emit('toggle')"
   >
     <svg v-if="theme === 'dark'" class="ui-icon" viewBox="0 0 24 24" aria-hidden="true">

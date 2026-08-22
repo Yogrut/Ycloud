@@ -26,3 +26,5 @@ futures-util = { version = "0.3", features = ["io"] }
 tokio-util = { version = "0.7", features = ["io"] }
 async_zip = { version = "0.0.18", default-features = false, features = ["tokio"] }
 fs4 = { version = "1", features = ["sync"] }
+aws-sdk-s3 = { version = "1.143.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.4.0", default-features = false, features = ["default-client"] }

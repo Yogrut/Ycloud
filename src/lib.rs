@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod file_access;
 pub mod login_security;
+pub mod s3_backend;
 pub mod security;
 pub mod state;
 pub mod storage;

@@ -21,6 +21,8 @@ pub struct BackendEntry {
 pub struct BackendMetadata {
     pub is_dir: bool,
     pub size: u64,
+    pub modified_unix: Option<i64>,
+    pub content_type: Option<String>,
 }
 
 /// Read-side storage boundary used while local and S3 implementations are
@@ -41,6 +43,11 @@ impl StorageBackend {
                 Ok(BackendMetadata {
                     is_dir: metadata.is_dir(),
                     size: metadata.len(),
+                    modified_unix: metadata.modified().ok().map(|value| {
+                        let value: chrono::DateTime<chrono::Utc> = value.into();
+                        value.timestamp()
+                    }),
+                    content_type: None,
                 })
             }
             Self::S3(storage) => {
@@ -48,6 +55,8 @@ impl StorageBackend {
                 Ok(BackendMetadata {
                     is_dir: metadata.is_dir,
                     size: metadata.size,
+                    modified_unix: metadata.last_modified,
+                    content_type: metadata.content_type,
                 })
             }
         }

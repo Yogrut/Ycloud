@@ -523,6 +523,127 @@ mod tests {
             .unwrap()
             .is_dir());
 
+        const WEBDAV_AUTH: &str = "Basic eW9ncnV0OndlYmRhdi1wYXNzd29yZA==";
+        let webdav_mkcol = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("MKCOL")
+                    .uri("/dav/open/dav-test")
+                    .header(header::AUTHORIZATION, WEBDAV_AUTH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webdav_mkcol.status(), StatusCode::CREATED);
+
+        let webdav_put = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/dav/open/dav-test/file.txt")
+                    .header(header::AUTHORIZATION, WEBDAV_AUTH)
+                    .header(header::CONTENT_LENGTH, "4")
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from("data"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webdav_put.status(), StatusCode::CREATED);
+
+        let webdav_propfind = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PROPFIND")
+                    .uri("/dav/open/dav-test")
+                    .header(header::AUTHORIZATION, WEBDAV_AUTH)
+                    .header("depth", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webdav_propfind.status(), StatusCode::MULTI_STATUS);
+        let propfind_body = to_bytes(webdav_propfind.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&propfind_body).contains("file.txt"));
+
+        let webdav_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dav/open/dav-test/file.txt")
+                    .header(header::AUTHORIZATION, WEBDAV_AUTH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webdav_get.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(webdav_get.into_body(), 16).await.unwrap().as_ref(),
+            b"data"
+        );
+
+        let webdav_copy = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("COPY")
+                    .uri("/dav/open/dav-test/file.txt")
+                    .header(header::AUTHORIZATION, WEBDAV_AUTH)
+                    .header(header::HOST, "ycloud.test")
+                    .header(
+                        "destination",
+                        "http://ycloud.test/dav/open/dav-test/copy.txt",
+                    )
+                    .header("overwrite", "F")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webdav_copy.status(), StatusCode::CREATED);
+
+        let webdav_move = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("MOVE")
+                    .uri("/dav/open/dav-test/copy.txt")
+                    .header(header::AUTHORIZATION, WEBDAV_AUTH)
+                    .header(header::HOST, "ycloud.test")
+                    .header(
+                        "destination",
+                        "http://ycloud.test/dav/open/dav-test/moved.txt",
+                    )
+                    .header("overwrite", "F")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webdav_move.status(), StatusCode::CREATED);
+
+        let webdav_delete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/dav/open/dav-test/moved.txt")
+                    .header(header::AUTHORIZATION, WEBDAV_AUTH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(webdav_delete.status(), StatusCode::NO_CONTENT);
+
         let limits_update = app
             .clone()
             .oneshot(

@@ -4,7 +4,6 @@ use axum::{
     http::{header, HeaderMap, Method, StatusCode},
     response::Response,
 };
-use futures_util::StreamExt;
 use std::time::Duration;
 
 use crate::{
@@ -14,10 +13,10 @@ use crate::{
     login_security::LoginEntry,
     security::ClientIp,
     state::AppState,
-    storage::{FileResponseMode, ResolvedPath},
+    storage::FileResponseMode,
+    storage_backend::BackendMetadata,
     webdav_path::{
-        display_relative_path, is_write_method, join_relative, parse_destination, parse_share_path,
-        percent_encode,
+        display_relative_path, is_write_method, parse_destination, parse_share_path, percent_encode,
     },
     webdav_xml,
 };
@@ -187,59 +186,41 @@ async fn handle_propfind(
     sub_path: &str,
     headers: &HeaderMap,
 ) -> Result<Response, StatusCode> {
-    let target = resolve_existing(state, share, sub_path).await?;
+    let target = share_storage_path(share, sub_path);
     let metadata = state
-        .storage
+        .backend
         .metadata(&target)
         .await
         .map_err(|error| error.status())?;
     let base_url = format!("/dav/{}", percent_encode(&share.name));
-    let display_relative = display_relative_path(share, target.relative());
+    let display_relative = display_relative_path(share, &target);
     let mut responses = vec![propfind_entry(&target, &metadata, display_relative)];
 
     let depth = headers
         .get("depth")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("1");
-    if metadata.is_dir() && depth != "0" {
-        let mut directory = tokio::fs::read_dir(target.absolute())
+    if metadata.is_dir && depth != "0" {
+        let (entries, truncated) = state
+            .backend
+            .list_directory(&target, state.config.max_list_entries)
             .await
-            .map_err(|_| StatusCode::NOT_FOUND)?;
-        let mut count = 0;
-        while count < state.storage.max_list_entries() {
-            let Some(entry) = directory
-                .next_entry()
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            else {
-                break;
+            .map_err(|error| error.status())?;
+        if truncated {
+            return Err(StatusCode::INSUFFICIENT_STORAGE);
+        }
+        for entry in entries {
+            let child = BackendMetadata {
+                is_dir: entry.is_dir,
+                size: entry.size,
+                modified_unix: entry.modified_unix,
+                content_type: None,
             };
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR)
-            {
-                continue;
-            }
-            let metadata = tokio::fs::symlink_metadata(entry.path())
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            if crate::storage::is_link_or_reparse_point(&metadata) {
-                continue;
-            }
-            let storage_relative =
-                join_relative(target.relative(), &entry.file_name().to_string_lossy());
-            let child = state
-                .storage
-                .resolve_existing(&storage_relative)
-                .await
-                .map_err(|error| error.status())?;
             responses.push(propfind_entry(
+                &entry.relative,
                 &child,
-                &metadata,
-                display_relative_path(share, child.relative()),
+                display_relative_path(share, &entry.relative),
             ));
-            count += 1;
         }
     }
 
@@ -257,10 +238,13 @@ async fn handle_get(
     sub_path: &str,
     headers: &HeaderMap,
 ) -> Result<Response, StatusCode> {
-    let target = resolve_existing(state, share, sub_path).await?;
     let response = state
-        .storage
-        .stream_file(&target, headers, FileResponseMode::WebDav)
+        .backend
+        .stream_file(
+            &share_storage_path(share, sub_path),
+            headers,
+            FileResponseMode::WebDav,
+        )
         .await
         .map_err(|error| error.status())?;
     Ok(state.download_limiter.wrap_response(response))
@@ -292,26 +276,21 @@ async fn handle_put(
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    let mut writer = match expected_bytes {
-        Some(bytes) => {
-            state
-                .storage
-                .begin_atomic_write_with_expected(&storage_path, bytes)
-                .await
-        }
-        None => state.storage.begin_atomic_write(&storage_path).await,
-    }
-    .map_err(|error| error.status())?;
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
-        state.upload_limiter.consume(chunk.len()).await;
-        writer
-            .write_chunk(&chunk)
-            .await
-            .map_err(|error| error.status())?;
-    }
-    writer.commit().await.map_err(|error| error.status())?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let max_upload_bytes = state.config_file.read().await.max_upload_bytes;
+    state
+        .backend
+        .upload_file(
+            &storage_path,
+            state.upload_limiter.wrap_body(body),
+            expected_bytes,
+            max_upload_bytes,
+            content_type,
+        )
+        .await
+        .map_err(|error| error.status())?;
     empty_response(StatusCode::CREATED)
 }
 
@@ -320,10 +299,9 @@ async fn handle_delete(
     share: &Share,
     sub_path: &str,
 ) -> Result<Response, StatusCode> {
-    let target = resolve_existing(state, share, sub_path).await?;
     state
-        .storage
-        .remove(&target)
+        .backend
+        .remove(&share_storage_path(share, sub_path))
         .await
         .map_err(|error| error.status())?;
     empty_response(StatusCode::NO_CONTENT)
@@ -337,10 +315,9 @@ async fn handle_mkcol(
     if sub_path.trim_matches('/').is_empty() {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
     }
-    let target = resolve_write(state, share, sub_path).await?;
     state
-        .storage
-        .create_directory(&target)
+        .backend
+        .create_directory(&share_storage_path(share, sub_path))
         .await
         .map_err(|error| error.status())?;
     empty_response(StatusCode::CREATED)
@@ -363,31 +340,18 @@ async fn handle_move_or_copy(
         .and_then(|value| value.to_str().ok());
     let destination_path =
         parse_destination(&destination, &share.name, request_host).ok_or(StatusCode::FORBIDDEN)?;
-    let source = resolve_existing(state, share, sub_path).await?;
-    let target = resolve_write(state, share, &destination_path).await?;
-
-    // [稳定] Reject destructive overwrite. Clients can DELETE explicitly,
-    // making failure and recovery behavior observable instead of implicit.
-    if headers
-        .get("overwrite")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value != "F")
-        && tokio::fs::try_exists(target.absolute())
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
-        return Err(StatusCode::CONFLICT);
-    }
+    let source = share_storage_path(share, sub_path);
+    let target = share_storage_path(share, &destination_path);
 
     if copy {
         state
-            .storage
+            .backend
             .copy_path(&source, &target)
             .await
             .map_err(|error| error.status())?;
     } else {
         state
-            .storage
+            .backend
             .move_path(&source, &target)
             .await
             .map_err(|error| error.status())?;
@@ -396,61 +360,39 @@ async fn handle_move_or_copy(
 }
 
 fn propfind_entry(
-    path: &ResolvedPath,
-    metadata: &std::fs::Metadata,
+    path: &str,
+    metadata: &BackendMetadata,
     display_relative: String,
 ) -> webdav_xml::PropfindResponseEntry {
-    let is_dir = metadata.is_dir();
+    let is_dir = metadata.is_dir;
     webdav_xml::PropfindResponseEntry {
         href: if display_relative.is_empty() {
             "/".into()
         } else {
             format!("/{}", percent_encode(&display_relative))
         },
-        displayname: path
-            .absolute()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("")
-            .to_string(),
+        displayname: path.rsplit('/').next().unwrap_or("").to_string(),
         is_dir,
-        content_length: if is_dir { 0 } else { metadata.len() },
-        last_modified: metadata
-            .modified()
-            .map(|modified| webdav_xml::to_rfc1123(&modified))
-            .unwrap_or_else(|_| webdav_xml::to_rfc1123(&std::time::SystemTime::UNIX_EPOCH)),
+        content_length: if is_dir { 0 } else { metadata.size },
+        last_modified: metadata.modified_unix.map_or_else(
+            || webdav_xml::to_rfc1123(&std::time::SystemTime::UNIX_EPOCH),
+            |seconds| {
+                chrono::DateTime::from_timestamp_secs(seconds).map_or_else(
+                    || webdav_xml::to_rfc1123(&std::time::SystemTime::UNIX_EPOCH),
+                    |value| value.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+                )
+            },
+        ),
         content_type: if is_dir {
             "httpd/unix-directory".into()
         } else {
-            mime_guess::from_path(path.absolute())
-                .first_or_octet_stream()
-                .to_string()
+            metadata.content_type.clone().unwrap_or_else(|| {
+                mime_guess::from_path(path)
+                    .first_or_octet_stream()
+                    .to_string()
+            })
         },
     }
-}
-
-async fn resolve_existing(
-    state: &AppState,
-    share: &Share,
-    sub_path: &str,
-) -> Result<ResolvedPath, StatusCode> {
-    state
-        .storage
-        .resolve_existing(&share_storage_path(share, sub_path))
-        .await
-        .map_err(|error| error.status())
-}
-
-async fn resolve_write(
-    state: &AppState,
-    share: &Share,
-    sub_path: &str,
-) -> Result<ResolvedPath, StatusCode> {
-    state
-        .storage
-        .resolve_for_write(&share_storage_path(share, sub_path))
-        .await
-        .map_err(|error| error.status())
 }
 
 fn options_response() -> Result<Response, StatusCode> {

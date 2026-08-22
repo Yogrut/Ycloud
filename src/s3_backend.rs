@@ -20,6 +20,7 @@ use axum::{
 use bytes::Bytes;
 use futures_util::Stream;
 use http_body::{Frame, SizeHint};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::ReaderStream;
 
@@ -43,6 +44,9 @@ const S3_REQUEST_CONCURRENCY: usize = 8;
 const S3_PAGE_SIZE: usize = 1_000;
 const S3_MAX_LIST_ENTRIES: usize = 10_000;
 const S3_MAX_LIST_PAGES: usize = 16;
+const S3_TRANSACTION_SCHEMA_VERSION: u32 = 1;
+const S3_MAX_PENDING_TRANSACTIONS: usize = 1_000;
+const S3_MAX_TRANSACTION_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct S3Entry {
@@ -74,6 +78,32 @@ pub struct S3UploadResult {
     pub relative: String,
     pub size: u64,
     pub etag: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum S3UploadStage {
+    Prepared,
+    BackupCreated,
+    DestinationCommitted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct S3ObjectSnapshot {
+    size: u64,
+    etag: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct S3UploadTransaction {
+    schema_version: u32,
+    id: String,
+    relative: String,
+    stage: S3UploadStage,
+    temporary: S3ObjectSnapshot,
+    previous: Option<S3ObjectSnapshot>,
 }
 
 /// One reusable S3 client and its confined namespace.
@@ -488,22 +518,66 @@ impl S3Backend {
                 return Err(error);
             }
         };
+        if temporary.etag.is_none()
+            || existing
+                .as_ref()
+                .is_some_and(|metadata| metadata.etag.is_none())
+        {
+            self.delete_internal_best_effort(&temporary_key).await;
+            return Err(AppError::ServiceUnavailable(
+                "对象存储未返回数据对象 ETag，无法安全提交".into(),
+            ));
+        }
+
+        let journal_key = internal_key(&self.prefix, "transactions", &upload_id);
+        let mut transaction = S3UploadTransaction {
+            schema_version: S3_TRANSACTION_SCHEMA_VERSION,
+            id: upload_id,
+            relative: relative.clone(),
+            stage: S3UploadStage::Prepared,
+            temporary: S3ObjectSnapshot {
+                size: temporary.size,
+                etag: temporary.etag.clone(),
+            },
+            previous: existing.as_ref().map(|metadata| S3ObjectSnapshot {
+                size: metadata.size,
+                etag: metadata.etag.clone(),
+            }),
+        };
+        let mut journal_etag = match self
+            .write_upload_transaction(&journal_key, &transaction, None)
+            .await
+        {
+            Ok(etag) => etag,
+            Err(error) => {
+                self.delete_internal_best_effort(&temporary_key).await;
+                return Err(error);
+            }
+        };
 
         let mut backup_created = false;
         if let Some(existing) = existing.as_ref() {
-            if let Err(error) = self
+            let backup_etag = self
                 .copy_key(
                     &destination_key,
                     &backup_key,
                     existing.etag.as_deref(),
                     true,
                 )
-                .await
-            {
-                self.delete_internal_best_effort(&temporary_key).await;
-                return Err(error);
+                .await?;
+            let backup = self.head_key(&backup_key).await?;
+            if !backup.as_ref().is_some_and(|backup| {
+                backup.size == existing.size && backup.etag.as_ref() == Some(&backup_etag)
+            }) {
+                return Err(AppError::ServiceUnavailable(
+                    "旧对象备份结果无法确认，请停止写入并检查存储后端".into(),
+                ));
             }
             backup_created = true;
+            transaction.stage = S3UploadStage::BackupCreated;
+            journal_etag = self
+                .write_upload_transaction(&journal_key, &transaction, journal_etag.as_deref())
+                .await?;
         }
 
         let commit = self
@@ -516,10 +590,7 @@ impl S3Backend {
             .await;
         let committed = match commit {
             Ok(committed_etag) => self.head_key(&destination_key).await?.filter(|value| {
-                value.size == content_length
-                    && committed_etag
-                        .as_ref()
-                        .is_none_or(|etag| value.etag.as_ref() == Some(etag))
+                value.size == content_length && value.etag.as_ref() == Some(&committed_etag)
             }),
             Err(error) => {
                 tracing::warn!(%error, "S3 upload commit returned an ambiguous failure");
@@ -533,27 +604,66 @@ impl S3Backend {
 
         let Some(committed) = committed else {
             if backup_created {
-                if let Err(error) = self
-                    .copy_key(&backup_key, &destination_key, None, false)
+                let restored_etag = match self
+                    .copy_key(
+                        &backup_key,
+                        &destination_key,
+                        transaction
+                            .previous
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.etag.as_deref()),
+                        false,
+                    )
                     .await
                 {
-                    tracing::error!(%error, "failed to restore S3 object backup after upload commit failure");
+                    Ok(etag) => etag,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to restore S3 object backup after upload commit failure");
+                        return Err(AppError::ServiceUnavailable(
+                            "对象提交失败且旧对象恢复失败，请停止写入并检查存储后端".into(),
+                        ));
+                    }
+                };
+                let restored = self.head_key(&destination_key).await?;
+                let previous = transaction.previous.as_ref();
+                let restore_verified =
+                    restored
+                        .as_ref()
+                        .zip(previous)
+                        .is_some_and(|(restored, previous)| {
+                            restored.size == previous.size
+                                && restored.etag.as_ref() == Some(&restored_etag)
+                        });
+                if !restore_verified {
                     return Err(AppError::ServiceUnavailable(
-                        "对象提交失败且旧对象恢复失败，请停止写入并检查存储后端".into(),
+                        "旧对象恢复结果无法确认，请停止写入并检查存储后端".into(),
                     ));
                 }
+                self.delete_internal_best_effort(&temporary_key).await;
+                self.delete_internal_best_effort(&backup_key).await;
+                self.delete_transaction_best_effort(&journal_key, journal_etag.as_deref())
+                    .await;
+            } else if self.head_key(&destination_key).await?.is_none() {
+                self.delete_internal_best_effort(&temporary_key).await;
+                self.delete_transaction_best_effort(&journal_key, journal_etag.as_deref())
+                    .await;
             }
-            self.delete_internal_best_effort(&temporary_key).await;
-            self.delete_internal_best_effort(&backup_key).await;
             return Err(AppError::ServiceUnavailable(
                 "对象存储未能确认上传提交结果".into(),
             ));
         };
 
+        transaction.stage = S3UploadStage::DestinationCommitted;
+        journal_etag = self
+            .write_upload_transaction(&journal_key, &transaction, journal_etag.as_deref())
+            .await?;
+
         self.delete_internal_best_effort(&temporary_key).await;
         if backup_created {
             self.delete_internal_best_effort(&backup_key).await;
         }
+        self.delete_transaction_best_effort(&journal_key, journal_etag.as_deref())
+            .await;
         Ok(S3UploadResult {
             relative,
             size: committed.size,
@@ -594,6 +704,21 @@ impl S3Backend {
                 AppError::ServiceUnavailable("对象存储无法创建目录".into())
             })?;
         Ok(())
+    }
+
+    /// Resolve upload journals left by an interrupted process. Recovery only
+    /// accepts states that can be proven to be either the old object or the
+    /// newly uploaded object. Anything else stops activation for inspection.
+    pub async fn recover_transactions(&self) -> AppResult<usize> {
+        let _mutation = self.mutation_gate.lock().await;
+        let transaction_keys = self.list_transaction_keys().await?;
+        let recovered = transaction_keys.len();
+        for key in transaction_keys {
+            let (transaction, journal_etag) = self.read_upload_transaction(&key).await?;
+            self.recover_upload_transaction(&key, &journal_etag, &transaction)
+                .await?;
+        }
+        Ok(recovered)
     }
 
     pub async fn copy_file(&self, source: &str, destination: &str) -> AppResult<()> {
@@ -693,9 +818,7 @@ impl S3Backend {
             )
             .await?;
         let destination_metadata = self.metadata(destination).await?;
-        let is_our_copy = copied_etag
-            .as_ref()
-            .is_none_or(|etag| destination_metadata.etag.as_ref() == Some(etag));
+        let is_our_copy = destination_metadata.etag.as_ref() == Some(&copied_etag);
         if destination_metadata.is_dir
             || destination_metadata.size != source_metadata.size
             || !is_our_copy
@@ -760,7 +883,7 @@ impl S3Backend {
         destination_key: &str,
         source_etag: Option<&str>,
         destination_must_not_exist: bool,
-    ) -> AppResult<Option<String>> {
+    ) -> AppResult<String> {
         let _permit = self.acquire_request().await?;
         let mut request = self
             .client
@@ -781,10 +904,11 @@ impl S3Backend {
             );
             AppError::ServiceUnavailable("对象存储服务端复制失败".into())
         })?;
-        Ok(output
+        output
             .copy_object_result()
             .and_then(|result| result.e_tag())
-            .map(str::to_owned))
+            .map(str::to_owned)
+            .ok_or_else(|| AppError::ServiceUnavailable("对象复制未返回提交 ETag".into()))
     }
 
     async fn delete_internal_best_effort(&self, key: &str) {
@@ -817,6 +941,177 @@ impl S3Backend {
             );
             AppError::ServiceUnavailable("对象存储删除失败".into())
         })?;
+        Ok(())
+    }
+
+    async fn write_upload_transaction(
+        &self,
+        key: &str,
+        transaction: &S3UploadTransaction,
+        previous_etag: Option<&str>,
+    ) -> AppResult<Option<String>> {
+        let data = serde_json::to_vec(transaction)
+            .map_err(|error| AppError::with_source("failed to encode S3 transaction", error))?;
+        if data.len() > S3_MAX_TRANSACTION_BYTES {
+            return Err(AppError::ServiceUnavailable(
+                "对象存储事务记录超过安全上限".into(),
+            ));
+        }
+        let content_length = i64::try_from(data.len())
+            .map_err(|_| AppError::ServiceUnavailable("对象存储事务记录过大".into()))?;
+        let _permit = self.acquire_request().await?;
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_length(content_length)
+            .content_type("application/json")
+            .body(ByteStream::from(data));
+        request = if let Some(etag) = previous_etag {
+            request.if_match(etag)
+        } else {
+            request.if_none_match("*")
+        };
+        let output = request.send().await.map_err(|error| {
+            tracing::error!(
+                error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                "S3 transaction journal write failed"
+            );
+            AppError::ServiceUnavailable("无法持久化对象存储事务状态".into())
+        })?;
+        let etag = output
+            .e_tag()
+            .map(str::to_owned)
+            .ok_or_else(|| AppError::ServiceUnavailable("对象存储未返回事务记录 ETag".into()))?;
+        Ok(Some(etag))
+    }
+
+    async fn delete_transaction_best_effort(&self, key: &str, etag: Option<&str>) {
+        if let Err(error) = self.delete_key(key, etag).await {
+            tracing::warn!(%error, "failed to clean up an S3 transaction journal");
+        }
+    }
+
+    async fn list_transaction_keys(&self) -> AppResult<Vec<String>> {
+        let prefix = internal_key(&self.prefix, "transactions", "");
+        let _permit = self.acquire_request().await?;
+        let output = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&prefix)
+            .max_keys(i32::try_from(S3_MAX_PENDING_TRANSACTIONS).unwrap_or(i32::MAX))
+            .send()
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                    "S3 transaction journal listing failed"
+                );
+                AppError::ServiceUnavailable("无法列举对象存储事务记录".into())
+            })?;
+        if output.is_truncated().unwrap_or(false) {
+            return Err(AppError::ServiceUnavailable(
+                "待恢复对象存储事务超过安全上限".into(),
+            ));
+        }
+        let mut keys = Vec::new();
+        for object in output.contents() {
+            let key = object
+                .key()
+                .ok_or_else(|| AppError::ServiceUnavailable("对象存储事务记录缺少键名".into()))?;
+            let id = key.strip_prefix(&prefix).ok_or_else(|| {
+                AppError::ServiceUnavailable("对象存储事务记录越出保留前缀".into())
+            })?;
+            if !valid_transaction_id(id) {
+                return Err(AppError::ServiceUnavailable(
+                    "对象存储事务区包含无法识别的记录".into(),
+                ));
+            }
+            keys.push(key.to_owned());
+        }
+        Ok(keys)
+    }
+
+    async fn read_upload_transaction(&self, key: &str) -> AppResult<(S3UploadTransaction, String)> {
+        let _permit = self.acquire_request().await?;
+        let output = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                    "S3 transaction journal read failed"
+                );
+                AppError::ServiceUnavailable("无法读取对象存储事务记录".into())
+            })?;
+        if output.content_length().is_some_and(|length| {
+            length < 0
+                || usize::try_from(length).map_or(true, |value| value > S3_MAX_TRANSACTION_BYTES)
+        }) {
+            return Err(AppError::ServiceUnavailable(
+                "对象存储事务记录超过安全上限".into(),
+            ));
+        }
+        let etag = output
+            .e_tag()
+            .map(str::to_owned)
+            .ok_or_else(|| AppError::ServiceUnavailable("事务记录缺少 ETag".into()))?;
+        let data = output.body.collect().await.map_err(|error| {
+            AppError::with_source("failed to stream S3 transaction journal", error)
+        })?;
+        let data = data.into_bytes();
+        if data.len() > S3_MAX_TRANSACTION_BYTES {
+            return Err(AppError::ServiceUnavailable(
+                "对象存储事务记录超过安全上限".into(),
+            ));
+        }
+        let transaction: S3UploadTransaction = serde_json::from_slice(&data)
+            .map_err(|error| AppError::with_source("invalid S3 transaction journal", error))?;
+        validate_upload_transaction(&self.prefix, key, &transaction)?;
+        Ok((transaction, etag))
+    }
+
+    async fn recover_upload_transaction(
+        &self,
+        journal_key: &str,
+        journal_etag: &str,
+        transaction: &S3UploadTransaction,
+    ) -> AppResult<()> {
+        let destination_key = object_key(&self.prefix, &transaction.relative)?;
+        let temporary_key = internal_key(&self.prefix, "uploads", &transaction.id);
+        let backup_key = internal_key(&self.prefix, "backups", &transaction.id);
+        let destination = self.head_key(&destination_key).await?;
+
+        let committed = destination
+            .as_ref()
+            .is_some_and(|value| snapshot_matches(value, &transaction.temporary));
+        let rolled_back = match transaction.previous.as_ref() {
+            Some(previous) => destination
+                .as_ref()
+                .is_some_and(|value| snapshot_matches(value, previous)),
+            None => destination.is_none(),
+        };
+        if !committed && !rolled_back {
+            tracing::error!(
+                transaction_id = %transaction.id,
+                stage = ?transaction.stage,
+                "S3 transaction recovery found an ambiguous destination"
+            );
+            return Err(AppError::ServiceUnavailable(
+                "对象存储事务目标状态不明确；已保留恢复数据并拒绝继续写入".into(),
+            ));
+        }
+
+        self.delete_internal_best_effort(&temporary_key).await;
+        self.delete_internal_best_effort(&backup_key).await;
+        self.delete_transaction_best_effort(journal_key, Some(journal_etag))
+            .await;
         Ok(())
     }
 
@@ -974,6 +1269,41 @@ fn range_not_satisfiable(total_length: u64) -> AppResult<Response<Body>> {
 
 fn internal_key(prefix: &str, category: &str, id: &str) -> String {
     format!("{prefix}.ycloud-system/{category}/{id}")
+}
+
+fn valid_transaction_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_upload_transaction(
+    prefix: &str,
+    journal_key: &str,
+    transaction: &S3UploadTransaction,
+) -> AppResult<()> {
+    if transaction.schema_version != S3_TRANSACTION_SCHEMA_VERSION
+        || !valid_transaction_id(&transaction.id)
+        || journal_key != internal_key(prefix, "transactions", &transaction.id)
+        || transaction.temporary.etag.is_none()
+        || transaction
+            .previous
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.etag.is_none())
+    {
+        return Err(AppError::ServiceUnavailable(
+            "对象存储事务记录无法安全恢复".into(),
+        ));
+    }
+    let relative = StorageService::normalize_relative(&transaction.relative)?;
+    if relative.is_empty() || relative != transaction.relative {
+        return Err(AppError::ServiceUnavailable(
+            "对象存储事务记录包含无效目标路径".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_matches(metadata: &RawS3Metadata, snapshot: &S3ObjectSnapshot) -> bool {
+    metadata.size == snapshot.size && metadata.etag.is_some() && metadata.etag == snapshot.etag
 }
 
 fn sanitize_content_type(content_type: Option<&str>) -> AppResult<Option<String>> {
@@ -1134,7 +1464,8 @@ mod tests {
 
     use super::{
         collect_page_entries, copy_source, internal_key, list_prefix, object_key, parent_relative,
-        ExactLengthBody,
+        snapshot_matches, valid_transaction_id, validate_upload_transaction, ExactLengthBody,
+        RawS3Metadata, S3ObjectSnapshot, S3UploadStage, S3UploadTransaction,
     };
 
     #[test]
@@ -1237,5 +1568,63 @@ mod tests {
         assert_eq!(parent_relative("file.txt"), "");
         assert_eq!(parent_relative("folder/file.txt"), "folder");
         assert_eq!(parent_relative("a/b/file.txt"), "a/b");
+    }
+
+    #[test]
+    fn transaction_records_are_confined_and_require_etags() {
+        let transaction = S3UploadTransaction {
+            schema_version: 1,
+            id: "0123456789abcdef0123456789abcdef".into(),
+            relative: "folder/file.bin".into(),
+            stage: S3UploadStage::Prepared,
+            temporary: S3ObjectSnapshot {
+                size: 42,
+                etag: Some("new".into()),
+            },
+            previous: Some(S3ObjectSnapshot {
+                size: 21,
+                etag: Some("old".into()),
+            }),
+        };
+        let key = internal_key("tenant/", "transactions", &transaction.id);
+        assert!(validate_upload_transaction("tenant/", &key, &transaction).is_ok());
+        assert!(valid_transaction_id(&transaction.id));
+
+        let mut escaped = transaction.clone();
+        escaped.relative = "../outside".into();
+        assert!(validate_upload_transaction("tenant/", &key, &escaped).is_err());
+
+        let mut unverifiable = transaction.clone();
+        unverifiable.temporary.etag = None;
+        assert!(validate_upload_transaction("tenant/", &key, &unverifiable).is_err());
+    }
+
+    #[test]
+    fn recovery_snapshots_match_both_size_and_etag() {
+        let metadata = RawS3Metadata {
+            size: 42,
+            etag: Some("etag-a".into()),
+        };
+        assert!(snapshot_matches(
+            &metadata,
+            &S3ObjectSnapshot {
+                size: 42,
+                etag: Some("etag-a".into()),
+            }
+        ));
+        assert!(!snapshot_matches(
+            &metadata,
+            &S3ObjectSnapshot {
+                size: 42,
+                etag: Some("etag-b".into()),
+            }
+        ));
+        assert!(!snapshot_matches(
+            &metadata,
+            &S3ObjectSnapshot {
+                size: 41,
+                etag: Some("etag-a".into()),
+            }
+        ));
     }
 }

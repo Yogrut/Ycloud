@@ -7,13 +7,12 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::file_access::{
-    check_folder_locks, ensure_non_root, ensure_writable, join_request_path, resolve_existing_path,
-    resolve_share, resolve_write_path, share_storage_path, FileQuery, FolderLockAuthorizer,
+    check_folder_locks, ensure_non_root, ensure_writable, join_request_path, resolve_share,
+    share_storage_path, FileQuery, FolderLockAuthorizer,
 };
 use crate::security::session_cookie;
 use crate::state::AppState;
@@ -124,7 +123,7 @@ pub async fn list_files(
     let lock_authorizer = FolderLockAuthorizer::new(&state, &headers).await;
     lock_authorizer.ensure_access(&share_storage_path(&share, request_path))?;
 
-    let limit = state.storage.max_list_entries();
+    let limit = state.config.max_list_entries;
     let (backend_entries, truncated) = state
         .backend
         .list_directory(&storage_directory, limit)
@@ -188,7 +187,7 @@ pub async fn list_files(
         entries,
         truncated,
         can_write: !share.readonly && crate::auth::is_admin_authenticated(&state, &headers).await,
-        max_upload_bytes: state.storage.max_upload_bytes(),
+        max_upload_bytes: state.config_file.read().await.max_upload_bytes,
         max_archive_bytes,
         max_archive_entries,
     }))
@@ -210,8 +209,10 @@ pub async fn create_directory(
     }
     let new_path = join_request_path(request_path, &name);
     check_folder_locks(&state, &headers, &share_storage_path(&share, &new_path)).await?;
-    let directory = resolve_write_path(&state, &share, &new_path).await?;
-    state.storage.create_directory(&directory).await?;
+    state
+        .backend
+        .create_directory(&share_storage_path(&share, &new_path))
+        .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -246,22 +247,21 @@ pub async fn upload_file(
     )
     .await?;
     let storage_path = share_storage_path(&share, file_request_path);
-    let mut writer = match expected_bytes {
-        Some(bytes) => {
-            state
-                .storage
-                .begin_atomic_write_with_expected(&storage_path, bytes)
-                .await?
-        }
-        None => state.storage.begin_atomic_write(&storage_path).await?,
-    };
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| AppError::with_source("failed to read upload", error))?;
-        state.upload_limiter.consume(chunk.len()).await;
-        writer.write_chunk(&chunk).await?;
-    }
-    writer.commit().await?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let body = state.upload_limiter.wrap_body(body);
+    let max_upload_bytes = state.config_file.read().await.max_upload_bytes;
+    state
+        .backend
+        .upload_file(
+            &storage_path,
+            body,
+            expected_bytes,
+            max_upload_bytes,
+            content_type,
+        )
+        .await?;
     Ok(Json(
         serde_json::json!({ "success": true, "uploaded": [file_name] }),
     ))
@@ -293,8 +293,10 @@ pub async fn delete_file(
     let request_path = query.path.as_deref().unwrap_or("");
     ensure_non_root(request_path)?;
     check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
-    let target = resolve_existing_path(&state, &share, request_path).await?;
-    state.storage.remove(&target).await?;
+    state
+        .backend
+        .remove(&share_storage_path(&share, request_path))
+        .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -324,9 +326,13 @@ pub async fn rename_file(
         &share_storage_path(&share, &destination_request_path),
     )
     .await?;
-    let source = resolve_existing_path(&state, &share, &body.path).await?;
-    let destination = resolve_write_path(&state, &share, &destination_request_path).await?;
-    state.storage.move_path(&source, &destination).await?;
+    state
+        .backend
+        .move_path(
+            &share_storage_path(&share, &body.path),
+            &share_storage_path(&share, &destination_request_path),
+        )
+        .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 

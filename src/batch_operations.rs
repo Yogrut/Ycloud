@@ -10,8 +10,8 @@ use crate::{
     error::{AppError, AppResult},
     file_access::{
         batch_destination_path, ensure_copy_target_outside_source, ensure_non_root,
-        ensure_writable, resolve_existing_path, resolve_share, resolve_write_path,
-        share_storage_path, validate_batch_size, FileQuery, FolderLockAuthorizer,
+        ensure_writable, resolve_share, share_storage_path, validate_batch_size, FileQuery,
+        FolderLockAuthorizer,
     },
     state::AppState,
 };
@@ -88,19 +88,19 @@ async fn execute(
         let outcome = async {
             ensure_non_root(&path)?;
             lock_authorizer.ensure_access(&share_storage_path(&share, &path))?;
-            let source = resolve_existing_path(state, &share, &path).await?;
+            let source = share_storage_path(&share, &path);
             match operation {
-                Operation::Delete => state.storage.remove(&source).await,
+                Operation::Delete => state.backend.remove(&source).await,
                 Operation::Move | Operation::Copy => {
                     let destination_path = batch_destination_path(&body.target, &path)?;
                     ensure_copy_target_outside_source(&path, &destination_path)?;
                     lock_authorizer
                         .ensure_access(&share_storage_path(&share, &destination_path))?;
-                    let destination = resolve_write_path(state, &share, &destination_path).await?;
+                    let destination = share_storage_path(&share, &destination_path);
                     if matches!(operation, Operation::Move) {
-                        state.storage.move_path(&source, &destination).await
+                        state.backend.move_path(&source, &destination).await
                     } else {
-                        state.storage.copy_path(&source, &destination).await
+                        state.backend.copy_path(&source, &destination).await
                     }
                 }
             }

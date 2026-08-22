@@ -1,4 +1,5 @@
-use axum::{http::HeaderMap, response::Response};
+use axum::{body::Body, http::HeaderMap, response::Response};
+use futures_util::StreamExt;
 use tokio::fs;
 
 use crate::{
@@ -91,6 +92,111 @@ impl StorageBackend {
                 storage.stream_file(&path, headers, mode).await
             }
             Self::S3(storage) => storage.stream_file(relative, headers, mode).await,
+        }
+    }
+
+    pub async fn upload_file(
+        &self,
+        relative: &str,
+        body: Body,
+        expected_bytes: Option<u64>,
+        max_upload_bytes: u64,
+        content_type: Option<&str>,
+    ) -> AppResult<u64> {
+        match self {
+            Self::Local(storage) => {
+                let mut writer = match expected_bytes {
+                    Some(bytes) => {
+                        storage
+                            .begin_atomic_write_with_expected(relative, bytes)
+                            .await?
+                    }
+                    None => storage.begin_atomic_write(relative).await?,
+                };
+                let mut stream = body.into_data_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk
+                        .map_err(|error| AppError::with_source("failed to read upload", error))?;
+                    writer.write_chunk(&chunk).await?;
+                }
+                writer.commit().await
+            }
+            Self::S3(storage) => {
+                let content_length = expected_bytes.ok_or_else(|| {
+                    AppError::BadRequest(
+                        "对象存储上传需要有效的 Content-Length，不能使用未知长度请求体".into(),
+                    )
+                })?;
+                storage
+                    .upload_file(
+                        relative,
+                        body,
+                        content_length,
+                        max_upload_bytes,
+                        content_type,
+                    )
+                    .await
+                    .map(|result| result.size)
+            }
+        }
+    }
+
+    pub async fn create_directory(&self, relative: &str) -> AppResult<()> {
+        match self {
+            Self::Local(storage) => {
+                let path = storage.resolve_for_write(relative).await?;
+                storage.create_directory(&path).await
+            }
+            Self::S3(storage) => storage.create_directory(relative).await,
+        }
+    }
+
+    pub async fn remove(&self, relative: &str) -> AppResult<()> {
+        match self {
+            Self::Local(storage) => {
+                let path = storage.resolve_existing(relative).await?;
+                storage.remove(&path).await
+            }
+            Self::S3(storage) => {
+                let metadata = storage.metadata(relative).await?;
+                if metadata.is_dir {
+                    storage.delete_empty_directory(relative).await
+                } else {
+                    storage.delete_file(relative).await
+                }
+            }
+        }
+    }
+
+    pub async fn move_path(&self, source: &str, destination: &str) -> AppResult<()> {
+        match self {
+            Self::Local(storage) => {
+                let source = storage.resolve_existing(source).await?;
+                let destination = storage.resolve_for_write(destination).await?;
+                storage.move_path(&source, &destination).await
+            }
+            Self::S3(storage) => {
+                if storage.metadata(source).await?.is_dir {
+                    return Err(AppError::Conflict("对象存储递归目录移动尚未开放".into()));
+                }
+                storage.move_file(source, destination).await
+            }
+        }
+    }
+
+    pub async fn copy_path(&self, source: &str, destination: &str) -> AppResult<()> {
+        match self {
+            Self::Local(storage) => {
+                let source = storage.resolve_existing(source).await?;
+                let destination = storage.resolve_for_write(destination).await?;
+                storage.copy_path(&source, &destination).await
+            }
+            Self::S3(storage) => {
+                if storage.metadata(source).await?.is_dir {
+                    return Err(AppError::Conflict("对象存储递归目录复制尚未开放".into()));
+                }
+                storage.copy_file(source, destination).await
+            }
         }
     }
 

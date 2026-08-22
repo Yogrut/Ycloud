@@ -773,7 +773,7 @@ pub(crate) fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
-fn parse_range(
+pub(crate) fn parse_range(
     headers: &HeaderMap,
     total_length: u64,
 ) -> Result<Option<(u64, u64, StatusCode)>, ()> {
@@ -811,7 +811,7 @@ fn parse_range(
     Ok(Some((start, end - start + 1, StatusCode::PARTIAL_CONTENT)))
 }
 
-fn content_type_for_mode(
+pub(crate) fn content_type_for_mode(
     guessed: &mime_guess::Mime,
     mode: FileResponseMode,
 ) -> (HeaderValue, bool) {

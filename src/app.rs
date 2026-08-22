@@ -102,6 +102,7 @@ pub fn build_router(state: AppState) -> Router {
             put(admin_api::update_share).delete(admin_api::delete_share),
         )
         .route("/account", put(admin_api::update_admin_account))
+        .route("/storage/test", post(admin_api::test_s3_storage))
         .route("/limits", put(admin_api::update_transfer_limits))
         .route(
             "/security/settings",
@@ -369,6 +370,46 @@ mod tests {
                 .unwrap(),
             "nosniff"
         );
+
+        let admin_info = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/info")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_info.status(), StatusCode::OK);
+        let admin_info_body = to_bytes(admin_info.into_body(), 16 * 1024).await.unwrap();
+        let admin_info_json: serde_json::Value = serde_json::from_slice(&admin_info_body).unwrap();
+        assert_eq!(admin_info_json["storage_backend"]["type"], "local");
+        assert!(!String::from_utf8_lossy(&admin_info_body).contains("secret_access_key"));
+
+        let unapproved_s3_test = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/storage/test")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"provider":"minio","endpoint":"http://127.0.0.1:9000","bucket":"ycloud","region":"us-east-1","prefix":"data/","addressing_style":"path","access_key_id":"test-access","secret_access_key":"test-secret"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unapproved_s3_test.status(), StatusCode::FORBIDDEN);
+        let rejected_body = to_bytes(unapproved_s3_test.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&rejected_body).contains("test-secret"));
 
         let webdav_challenge = app
             .clone()

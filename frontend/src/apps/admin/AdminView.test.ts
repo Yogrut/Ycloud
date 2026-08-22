@@ -9,6 +9,7 @@ const adminInfo = {
   admin_login_failures: 3, web_login_failures: 5,
   admin_login_block_seconds: 3600, web_login_block_seconds: 3600,
   security_log_retention_days: 7, security_log_max_entries: 5000,
+  storage_backend: { type: 'local' },
 }
 
 afterEach(() => {
@@ -53,8 +54,25 @@ describe('AdminView', () => {
 
     const links = [...host.querySelectorAll<HTMLAnchorElement>('.admin-nav-item')]
     expect(links.map(link => link.getAttribute('href'))).toEqual([
-      '/v2/admin/webdav', '/v2/admin/locks', '/v2/admin/limits', '/v2/admin/account', '/v2/admin/security',
+      '/v2/admin/storage', '/v2/admin/webdav', '/v2/admin/locks', '/v2/admin/limits', '/v2/admin/account', '/v2/admin/security',
     ])
+    app.unmount()
+  })
+
+  it('renders the guarded storage setup page without exposing credentials', async () => {
+    window.history.replaceState(null, '', '/v2/admin/storage')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountAdmin(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('#storage-title')?.textContent).toBe('存储设置')
+    expect(host.textContent).toContain('本地存储继续作为当前活动后端')
+    expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('存储设置')
     app.unmount()
   })
 

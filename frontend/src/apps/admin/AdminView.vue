@@ -12,6 +12,7 @@ import AdminNavIcon from './AdminNavIcon.vue'
 import LimitsView from './LimitsView.vue'
 import LocksView from './LocksView.vue'
 import SecurityView from './SecurityView.vue'
+import StorageView from './StorageView.vue'
 import WebDavView from './WebDavView.vue'
 import { appPath } from '../../shared/routes'
 
@@ -32,10 +33,13 @@ const activeSection = window.location.pathname.endsWith('/security')
     ? 'limits'
     : window.location.pathname.endsWith('/locks')
       ? 'locks'
-      : window.location.pathname.endsWith('/webdav') ? 'webdav' : 'account'
+      : window.location.pathname.endsWith('/webdav')
+        ? 'webdav'
+        : window.location.pathname.endsWith('/storage') ? 'storage' : 'account'
 
 const navigation = computed(() => [
   { group: locale.text('存储与访问', 'Storage & access'), items: [
+    { id: 'storage', label: locale.text('存储设置', 'Storage'), href: appPath('/admin/storage') },
     { id: 'webdav', label: 'WebDAV', href: appPath('/admin/webdav') },
     { id: 'locks', label: locale.text('文件夹锁', 'Folder locks'), href: appPath('/admin/locks') },
     { id: 'limits', label: locale.text('传输限制', 'Transfer limits'), href: appPath('/admin/limits') },
@@ -127,6 +131,7 @@ onMounted(load)
     <div class="admin-content">
       <div v-if="loading" class="admin-loading glass">{{ locale.t('common.loading') }}</div>
       <SecurityView v-else-if="info && activeSection === 'security'" :info="info" @changed="showNotice" />
+      <StorageView v-else-if="info && activeSection === 'storage'" :backend="info.storage_backend" @tested="showNotice" />
       <LimitsView v-else-if="info && activeSection === 'limits'" :info="info" @saved="showNotice" />
       <LocksView v-else-if="info && activeSection === 'locks'" :locks="info.folder_locks" @changed="showNotice" />
       <WebDavView v-else-if="info && activeSection === 'webdav'" :mounts="info.shares" @changed="showNotice" />

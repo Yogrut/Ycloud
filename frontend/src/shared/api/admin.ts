@@ -18,6 +18,35 @@ export interface AdminInfo {
   web_login_block_seconds: number
   security_log_retention_days: number
   security_log_max_entries: number
+  storage_backend: StorageBackendView
+}
+
+export type S3Provider = 'alibaba_oss' | 'tencent_cos' | 'minio' | 's3_compatible'
+export type S3AddressingStyle = 'path' | 'virtual_hosted'
+
+export type StorageBackendView =
+  | { type: 'local' }
+  | {
+    type: 's3'
+    provider: S3Provider
+    endpoint: string
+    bucket: string
+    region: string
+    prefix: string
+    addressing_style: S3AddressingStyle
+    has_access_key_id: boolean
+    has_secret_access_key: boolean
+  }
+
+export interface TestS3StorageRequest {
+  provider: S3Provider
+  endpoint: string
+  bucket: string
+  region: string
+  prefix: string
+  addressing_style: S3AddressingStyle
+  access_key_id: string
+  secret_access_key: string
 }
 
 export interface WebDavMountView {
@@ -170,6 +199,14 @@ export function updateAccount(body: UpdateAccountRequest): Promise<UpdateAccount
 export function updateTransferLimits(body: UpdateTransferLimitsRequest): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/limits', {
     method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function testS3Storage(body: TestS3StorageRequest): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/storage/test', {
+    method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })

@@ -344,6 +344,44 @@ input { font: inherit; }
 .limits-control > input,
 .input-with-unit { width: 100%; }
 .input-with-unit { position: relative; display: block; }
+.storage-body { display: grid; gap: 24px; }
+.storage-provider-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.storage-provider {
+  min-width: 0;
+  min-height: 76px;
+  display: grid;
+  place-content: center;
+  gap: 6px;
+  padding: 12px;
+  color: var(--text);
+  text-align: center;
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease, border-color .16s ease, box-shadow .16s ease;
+}
+.storage-provider:hover { border-color: var(--line-strong); }
+.storage-provider.active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.storage-provider strong { overflow-wrap: anywhere; font-size: 13px; }
+.storage-provider small { color: var(--muted); font-size: 10px; }
+.storage-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 20px; }
+.storage-form > label { min-width: 0; display: grid; gap: 8px; color: var(--text); font-size: 13px; font-weight: 700; }
+.storage-form .input { width: 100%; height: 44px; }
+.storage-wide { grid-column: 1 / -1; }
+.storage-boundary-note {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  grid-column: 1 / -1;
+  padding: 10px 13px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 11px;
+  line-height: 1.55;
+}
 .input-with-unit input { padding-right: 58px; }
 .input-with-unit > span { position: absolute; top: 50%; right: 14px; color: var(--muted); font-size: 12px; transform: translateY(-50%); pointer-events: none; }
 .limits-control small { color: var(--muted-2); font-size: 11px; line-height: 1.55; }
@@ -649,6 +687,12 @@ input { font: inherit; }
   .account-section:first-child { padding-right: 0; }
   .account-section + .account-section { padding-top: 21px; padding-left: 0; border-top: 1px solid var(--line); border-left: 0; }
   .limits-grid { grid-template-areas: "upload-size" "upload-rate" "download-rate" "archive-size" "archive-entries"; }
+  .storage-body { gap: 18px; }
+  .storage-provider-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .storage-provider { min-height: 66px; padding: 9px; }
+  .storage-form { grid-template-columns: 1fr; gap: 15px; }
+  .storage-wide { grid-column: auto; }
+  .storage-boundary-note { grid-column: auto; }
   .section-heading { margin-bottom: 16px; }
   .admin-save-row { padding-top: 6px; }
   .admin-save-row .btn { width: 100%; }

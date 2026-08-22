@@ -10,10 +10,11 @@ use crate::{
     auth::AppState,
     config::{
         remove_initial_credentials, validate_transfer_limits, validate_transfer_rate, FolderLock,
-        Share,
+        S3AddressingStyle, S3Provider, S3StorageConfig, Share, StorageBackendConfig,
     },
     error::{AppError, AppResult},
     login_security::{LoginEntry, LoginEventPage, LoginPolicy},
+    s3_backend::S3Backend,
 };
 
 #[derive(Serialize)]
@@ -33,6 +34,41 @@ pub struct AdminInfo {
     pub web_login_block_seconds: u64,
     pub security_log_retention_days: u32,
     pub security_log_max_entries: usize,
+    pub storage_backend: StorageBackendView,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StorageBackendView {
+    Local,
+    S3 {
+        provider: S3Provider,
+        endpoint: String,
+        bucket: String,
+        region: String,
+        prefix: String,
+        addressing_style: S3AddressingStyle,
+        has_access_key_id: bool,
+        has_secret_access_key: bool,
+    },
+}
+
+impl From<&StorageBackendConfig> for StorageBackendView {
+    fn from(backend: &StorageBackendConfig) -> Self {
+        match backend {
+            StorageBackendConfig::Local(_) => Self::Local,
+            StorageBackendConfig::S3(settings) => Self::S3 {
+                provider: settings.provider,
+                endpoint: settings.endpoint.clone(),
+                bucket: settings.bucket.clone(),
+                region: settings.region.clone(),
+                prefix: settings.prefix.clone(),
+                addressing_style: settings.addressing_style,
+                has_access_key_id: !settings.access_key_id.is_empty(),
+                has_secret_access_key: !settings.secret_access_key.is_empty(),
+            },
+        }
+    }
 }
 
 /// [安全] Administrative responses expose password presence, never hashes.
@@ -123,6 +159,7 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
         web_login_block_seconds,
         security_log_retention_days,
         security_log_max_entries,
+        storage_backend,
     ) = {
         let config = state.config_file.read().await;
         (
@@ -145,6 +182,7 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
             config.web_login_block_seconds,
             config.security_log_retention_days,
             config.security_log_max_entries,
+            StorageBackendView::from(&config.storage_backend),
         )
     };
     Json(AdminInfo {
@@ -163,7 +201,20 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
         web_login_block_seconds,
         security_log_retention_days,
         security_log_max_entries,
+        storage_backend,
     })
+}
+
+/// Validate credentials and the minimum list permission without changing the
+/// active storage backend. Secrets are consumed by the SDK credential provider
+/// and are never returned by this endpoint.
+pub async fn test_s3_storage(
+    State(state): State<AppState>,
+    Json(settings): Json<S3StorageConfig>,
+) -> AppResult<Json<serde_json::Value>> {
+    let backend = S3Backend::new(&settings, &state.config)?;
+    backend.probe().await?;
+    Ok(Json(serde_json::json!({ "success": true })))
 }
 
 #[derive(Deserialize)]

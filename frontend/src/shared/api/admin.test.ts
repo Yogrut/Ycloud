@@ -9,6 +9,7 @@ import {
   updateAccount,
   updateFolderLock,
   updateLoginRestriction,
+  testS3Storage,
   updateTransferLimits,
   updateWebDavMount,
 } from './admin'
@@ -75,6 +76,32 @@ describe('admin API', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/limits', expect.objectContaining({
       method: 'PUT',
+      credentials: 'same-origin',
+      body: JSON.stringify(body),
+    }))
+  })
+
+  it('tests an S3 profile through the non-persisting administrator endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const body = {
+      provider: 'minio' as const,
+      endpoint: 'https://rustfs.internal.example',
+      bucket: 'ycloud',
+      region: 'us-east-1',
+      prefix: 'data/',
+      addressing_style: 'path' as const,
+      access_key_id: 'access',
+      secret_access_key: 'secret',
+    }
+
+    await testS3Storage(body)
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/test', expect.objectContaining({
+      method: 'POST',
       credentials: 'same-origin',
       body: JSON.stringify(body),
     }))

@@ -186,7 +186,7 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    if state.storage.ready().await {
+    if state.backend.ready().await {
         (
             StatusCode::OK,
             axum::Json(JsonStatus {

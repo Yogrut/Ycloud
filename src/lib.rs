@@ -13,6 +13,7 @@ pub mod s3_backend;
 pub mod security;
 pub mod state;
 pub mod storage;
+pub mod storage_backend;
 mod storage_transaction;
 pub mod transfer_limit;
 pub mod webdav;

@@ -11,6 +11,7 @@ use crate::{
     error::{AppError, AppResult},
     login_security::LoginSecurity,
     storage::StorageService,
+    storage_backend::StorageBackend,
     transfer_limit::BandwidthLimiter,
 };
 
@@ -23,6 +24,7 @@ pub struct AppState {
     pub folder_access: SharedAccessTokenStore,
     pub passwords: PasswordService,
     pub storage: StorageService,
+    pub backend: StorageBackend,
     pub archive_tickets: ArchiveTicketStore,
     pub webdav_gate: Arc<Semaphore>,
     pub login_security: LoginSecurity,
@@ -64,6 +66,7 @@ impl AppState {
             AppError::with_source("failed to load persistent login security state", error)
         })?;
 
+        let backend = StorageBackend::Local(storage.clone());
         Ok(Self {
             config,
             config_file,
@@ -72,6 +75,7 @@ impl AppState {
             folder_access: Arc::new(AccessTokenStore::new()),
             passwords: PasswordService::new(1),
             storage,
+            backend,
             archive_tickets: ArchiveTicketStore::new(),
             webdav_gate: Arc::new(Semaphore::new(8)),
             login_security,

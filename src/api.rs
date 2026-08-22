@@ -9,7 +9,6 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::fs;
 
 use crate::error::{AppError, AppResult};
 use crate::file_access::{
@@ -118,47 +117,27 @@ pub async fn list_files(
 ) -> AppResult<Json<ListResponse>> {
     let share = resolve_share(&state, &headers, &query).await?;
     let request_path = query.path.as_deref().unwrap_or("");
-    let directory = resolve_existing_path(&state, &share, request_path).await?;
-    if !state.storage.metadata(&directory).await?.is_dir() {
+    let storage_directory = share_storage_path(&share, request_path);
+    if !state.backend.metadata(&storage_directory).await?.is_dir {
         return Err(AppError::NotFound);
     }
     let lock_authorizer = FolderLockAuthorizer::new(&state, &headers).await;
     lock_authorizer.ensure_access(&share_storage_path(&share, request_path))?;
 
-    let mut read_dir = fs::read_dir(directory.absolute())
-        .await
-        .map_err(|error| AppError::with_source("failed to list directory", error))?;
-    let mut entries = Vec::new();
     let limit = state.storage.max_list_entries();
-    while entries.len() < limit {
-        let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|error| AppError::with_source("failed to read directory entry", error))?
-        else {
-            break;
-        };
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR) {
-            continue;
-        }
-        let Ok(metadata) = fs::symlink_metadata(entry.path()).await else {
-            tracing::warn!(path = %entry.path().display(), "skipping unreadable directory entry");
-            continue;
-        };
-        if crate::storage::is_link_or_reparse_point(&metadata) {
-            tracing::warn!(path = %entry.path().display(), "skipping symbolic link in storage directory");
-            continue;
-        }
-        let is_dir = metadata.is_dir();
-        let size = metadata.len();
-        let modified = metadata
-            .modified()
-            .ok()
-            .map(|t| {
-                let dt: chrono::DateTime<chrono::Utc> = t.into();
-                dt.format("%Y-%m-%d %H:%M").to_string()
-            })
+    let (backend_entries, truncated) = state
+        .backend
+        .list_directory(&storage_directory, limit)
+        .await?;
+    let mut entries = Vec::with_capacity(backend_entries.len());
+    for entry in backend_entries {
+        let name = entry.name;
+        let is_dir = entry.is_dir;
+        let size = entry.size;
+        let modified = entry
+            .modified_unix
+            .and_then(chrono::DateTime::from_timestamp_secs)
+            .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
             .unwrap_or_default();
         let share_relative = if request_path.is_empty() {
             name.clone()
@@ -168,7 +147,7 @@ pub async fn list_files(
         let mime = if is_dir {
             "inode/directory".into()
         } else {
-            mime_guess::from_path(entry.path())
+            mime_guess::from_path(&name)
                 .first_or_octet_stream()
                 .to_string()
         };
@@ -186,12 +165,6 @@ pub async fn list_files(
             locked,
         });
     }
-    let truncated = entries.len() == limit
-        && read_dir
-            .next_entry()
-            .await
-            .map_err(|error| AppError::with_source("failed to read directory entry", error))?
-            .is_some();
 
     entries.sort_by(|a, b| {
         b.is_dir
@@ -302,9 +275,9 @@ pub async fn download_file(
     let share = resolve_share(&state, &headers, &query).await?;
     let request_path = query.path.as_deref().unwrap_or("");
     check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
-    let file = resolve_existing_path(&state, &share, request_path).await?;
+    let file = share_storage_path(&share, request_path);
     let response = state
-        .storage
+        .backend
         .stream_file(&file, &headers, FileResponseMode::Attachment)
         .await?;
     Ok(state.download_limiter.wrap_response(response))
@@ -365,9 +338,9 @@ pub async fn preview_file(
     let share = resolve_share(&state, &headers, &query).await?;
     let request_path = query.path.as_deref().unwrap_or("");
     check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
-    let file = resolve_existing_path(&state, &share, request_path).await?;
+    let file = share_storage_path(&share, request_path);
     let response = state
-        .storage
+        .backend
         .stream_file(&file, &headers, FileResponseMode::Preview)
         .await?;
     Ok(state.download_limiter.wrap_response(response))

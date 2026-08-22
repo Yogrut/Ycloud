@@ -290,7 +290,7 @@ async fn not_found(_request: Request) -> impl IntoResponse {
 mod tests {
     use super::build_router;
     use crate::{
-        config::{hash_password, Config, ConfigFile, Share},
+        config::{hash_password, Config, ConfigFile, Share, CONFIG_SCHEMA_VERSION},
         state::AppState,
     };
     use axum::{
@@ -324,7 +324,7 @@ mod tests {
                 trusted_proxy_ips: Default::default(),
             },
             Arc::new(RwLock::new(ConfigFile {
-                schema_version: 2,
+                schema_version: CONFIG_SCHEMA_VERSION,
                 admin_username: "admin".into(),
                 admin_password_hash: hash_password("test-password"),
                 global_web_password_hash: None,

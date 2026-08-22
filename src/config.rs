@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,6 +30,7 @@ pub const DEFAULT_SECURITY_LOG_MAX_ENTRIES: usize = 5_000;
 pub const HARD_MAX_TRANSFER_RATE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 
 // ── Data types ────────────────────────────────────────────────────
 
@@ -54,6 +56,71 @@ pub struct FolderLock {
     pub id: String,
     pub path: String,
     pub password_hash: String,
+}
+
+/// Persisted storage selection. Provider presets share one S3 implementation;
+/// they only constrain endpoint and addressing defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "settings", rename_all = "snake_case")]
+pub enum StorageBackendConfig {
+    Local(LocalStorageConfig),
+    S3(S3StorageConfig),
+}
+
+impl Default for StorageBackendConfig {
+    fn default() -> Self {
+        Self::Local(LocalStorageConfig {})
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalStorageConfig {}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct S3StorageConfig {
+    pub provider: S3Provider,
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub prefix: String,
+    pub addressing_style: S3AddressingStyle,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+/// Never include the recoverable S3 secret in diagnostics.
+impl fmt::Debug for S3StorageConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("S3StorageConfig")
+            .field("provider", &self.provider)
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("prefix", &self.prefix)
+            .field("addressing_style", &self.addressing_style)
+            .field("access_key_id", &"[REDACTED]")
+            .field("secret_access_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum S3Provider {
+    AlibabaOss,
+    TencentCos,
+    Minio,
+    S3Compatible,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum S3AddressingStyle {
+    Path,
+    VirtualHosted,
 }
 
 fn uuid_v4() -> String {
@@ -116,9 +183,12 @@ fn path_component_eq(left: &str, right: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     #[serde(default)]
     pub schema_version: u32,
+    #[serde(default)]
+    pub storage_backend: StorageBackendConfig,
     pub admin_username: String,
     pub admin_password_hash: String,
     #[serde(default)]
@@ -229,7 +299,8 @@ impl Default for ConfigFile {
         let second = Uuid::new_v4().simple().to_string();
         let default_hash = hash_password(&format!("{}{}", &first[..12], &second[..12]));
         Self {
-            schema_version: 2,
+            schema_version: CONFIG_SCHEMA_VERSION,
+            storage_backend: StorageBackendConfig::default(),
             admin_username: default_admin_username(),
             admin_password_hash: default_hash.clone(),
             global_web_password_hash: Some(default_hash),
@@ -260,7 +331,7 @@ impl Default for ConfigFile {
 
 impl ConfigFile {
     pub fn validate(&self) -> AppResult<()> {
-        if self.schema_version != 2 {
+        if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(AppError::BadRequest(
                 "Unsupported configuration schema version".into(),
             ));
@@ -296,6 +367,7 @@ impl ConfigFile {
         )?;
         validate_transfer_rate(self.upload_rate_bytes_per_sec, "上传")?;
         validate_transfer_rate(self.download_rate_bytes_per_sec, "下载")?;
+        validate_storage_backend(&self.storage_backend)?;
 
         let mut share_ids = HashSet::new();
         let mut share_names = HashSet::new();
@@ -452,6 +524,131 @@ pub fn validate_transfer_limits(
     if !(1..=HARD_MAX_ARCHIVE_ENTRIES).contains(&max_archive_entries) {
         return Err(AppError::BadRequest(
             "打包条目数量上限必须在 1 到 5000 之间".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_storage_backend(backend: &StorageBackendConfig) -> AppResult<()> {
+    let StorageBackendConfig::S3(settings) = backend else {
+        return Ok(());
+    };
+
+    let endpoint = settings.endpoint.trim();
+    if endpoint != settings.endpoint || endpoint.is_empty() || endpoint.len() > 2_048 {
+        return Err(AppError::BadRequest(
+            "S3 Endpoint 必须是长度不超过 2048 字符的完整地址".into(),
+        ));
+    }
+    let uri: axum::http::Uri = endpoint
+        .parse()
+        .map_err(|_| AppError::BadRequest("S3 Endpoint 地址无效".into()))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| AppError::BadRequest("S3 Endpoint 必须包含 http:// 或 https://".into()))?;
+    if !matches!(scheme, "http" | "https")
+        || uri.authority().is_none()
+        || !matches!(uri.path(), "" | "/")
+        || uri.query().is_some()
+        || uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
+    {
+        return Err(AppError::BadRequest(
+            "S3 Endpoint 只能是无凭据、无路径和无查询参数的 HTTP(S) 地址".into(),
+        ));
+    }
+
+    let host = uri
+        .authority()
+        .expect("authority checked above")
+        .host()
+        .to_ascii_lowercase();
+    match settings.provider {
+        S3Provider::AlibabaOss => {
+            if scheme != "https"
+                || !host.ends_with(".aliyuncs.com")
+                || settings.addressing_style != S3AddressingStyle::VirtualHosted
+            {
+                return Err(AppError::BadRequest(
+                    "阿里云 OSS 必须使用 HTTPS 官方 Endpoint 和虚拟主机寻址".into(),
+                ));
+            }
+        }
+        S3Provider::TencentCos => {
+            if scheme != "https"
+                || !host.ends_with(".myqcloud.com")
+                || settings.addressing_style != S3AddressingStyle::VirtualHosted
+            {
+                return Err(AppError::BadRequest(
+                    "腾讯云 COS 必须使用 HTTPS 官方 Endpoint 和虚拟主机寻址".into(),
+                ));
+            }
+        }
+        S3Provider::Minio | S3Provider::S3Compatible => {}
+    }
+
+    validate_s3_bucket(&settings.bucket)?;
+    if settings.region.is_empty()
+        || settings.region.len() > 64
+        || !settings
+            .region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(AppError::BadRequest("S3 Region 格式无效".into()));
+    }
+    validate_s3_prefix(&settings.prefix)?;
+    if settings.access_key_id.is_empty()
+        || settings.access_key_id.len() > 256
+        || settings.access_key_id.chars().any(char::is_control)
+    {
+        return Err(AppError::BadRequest("S3 Access Key ID 格式无效".into()));
+    }
+    if settings.secret_access_key.is_empty()
+        || settings.secret_access_key.len() > 4_096
+        || settings.secret_access_key.chars().any(char::is_control)
+    {
+        return Err(AppError::BadRequest("S3 Secret Access Key 格式无效".into()));
+    }
+    Ok(())
+}
+
+fn validate_s3_bucket(bucket: &str) -> AppResult<()> {
+    let bytes = bucket.as_bytes();
+    let valid = (3..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(*byte, b'.' | b'-')
+        })
+        && !bucket.contains("..")
+        && !bucket.contains(".-")
+        && !bucket.contains("-.")
+        && bucket.parse::<IpAddr>().is_err();
+    if !valid {
+        return Err(AppError::BadRequest(
+            "S3 Bucket 必须符合 3-63 位 DNS 兼容命名规则".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_s3_prefix(prefix: &str) -> AppResult<()> {
+    if prefix.len() > 1_024
+        || prefix.starts_with('/')
+        || prefix.contains("//")
+        || prefix.contains('\\')
+        || prefix.contains('\0')
+        || prefix.chars().any(char::is_control)
+        || (!prefix.is_empty() && !prefix.ends_with('/'))
+        || prefix
+            .trim_end_matches('/')
+            .split('/')
+            .any(|component| matches!(component, "." | ".."))
+    {
+        return Err(AppError::BadRequest(
+            "S3 Prefix 必须为空或使用以 / 结尾的安全相对路径".into(),
         ));
     }
     Ok(())
@@ -645,13 +842,23 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
             .get("schema_version")
             .and_then(|value| value.as_u64())
             .unwrap_or(0);
-        if schema_version > 2 {
+        if schema_version > CONFIG_SCHEMA_VERSION as u64 {
             anyhow::bail!(
                 "Configuration schema version {schema_version} is newer than this Ycloud build"
             );
         }
         if schema_version < 2 {
             raw["schema_version"] = serde_json::json!(2);
+            migrated = true;
+        }
+        if schema_version < CONFIG_SCHEMA_VERSION as u64 {
+            raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
+            if raw.get("storage_backend").is_none() {
+                raw["storage_backend"] = serde_json::json!({
+                    "type": "local",
+                    "settings": {}
+                });
+            }
             migrated = true;
         }
         let config: ConfigFile =
@@ -671,7 +878,8 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
         let credentials_path = initial_credentials_path(path);
         let credentials = load_or_create_initial_credentials(&credentials_path).await?;
         let config = ConfigFile {
-            schema_version: 2,
+            schema_version: CONFIG_SCHEMA_VERSION,
+            storage_backend: StorageBackendConfig::default(),
             admin_username: credentials.admin_username.clone(),
             admin_password_hash: hash_password(&credentials.admin_password),
             global_web_password_hash: Some(hash_password(&credentials.web_access_password)),
@@ -918,9 +1126,10 @@ mod tests {
     use super::{
         config_backup_path, hash_password, initial_credentials_path, load_config,
         path_is_same_or_descendant, paths_overlap, remove_initial_credentials, save_config,
-        verify_password, ConfigFile, FolderLock, InitialCredentials, DEFAULT_MAX_ARCHIVE_BYTES,
-        DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_UPLOAD_BYTES, HARD_MAX_TRANSFER_RATE_BYTES,
-        MIN_TRANSFER_RATE_BYTES,
+        verify_password, ConfigFile, FolderLock, InitialCredentials, LocalStorageConfig,
+        S3AddressingStyle, S3Provider, S3StorageConfig, StorageBackendConfig,
+        CONFIG_SCHEMA_VERSION, DEFAULT_MAX_ARCHIVE_BYTES, DEFAULT_MAX_ARCHIVE_ENTRIES,
+        DEFAULT_MAX_UPLOAD_BYTES, HARD_MAX_TRANSFER_RATE_BYTES, MIN_TRANSFER_RATE_BYTES,
     };
 
     #[test]
@@ -1017,7 +1226,7 @@ mod tests {
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let path = directory.join("config.json");
         let mut config = ConfigFile {
-            schema_version: 2,
+            schema_version: CONFIG_SCHEMA_VERSION,
             admin_username: "first-admin".into(),
             admin_password_hash: hash_password("test-password"),
             global_web_password_hash: None,
@@ -1043,7 +1252,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stable_config_migrates_to_schema_v2() {
+    async fn stable_config_migrates_to_current_schema() {
         let directory =
             std::env::temp_dir().join(format!("ycloud-migration-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&directory).await.unwrap();
@@ -1072,8 +1281,49 @@ mod tests {
         let persisted: ConfigFile =
             serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
         assert_eq!(persisted.shares[0].id, migrated.shares[0].id);
-        assert_eq!(persisted.schema_version, 2);
+        assert_eq!(persisted.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(
+            persisted.storage_backend,
+            StorageBackendConfig::Local(LocalStorageConfig {})
+        );
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[test]
+    fn s3_storage_config_is_strict_and_redacts_credentials() {
+        let settings = S3StorageConfig {
+            provider: S3Provider::Minio,
+            endpoint: "http://10.126.0.2:9000".into(),
+            bucket: "ycloud-files".into(),
+            region: "us-east-1".into(),
+            prefix: "files/".into(),
+            addressing_style: S3AddressingStyle::Path,
+            access_key_id: "example-access-key".into(),
+            secret_access_key: "example-secret-key".into(),
+        };
+        let mut config = ConfigFile {
+            storage_backend: StorageBackendConfig::S3(settings.clone()),
+            ..ConfigFile::default()
+        };
+        assert!(config.validate().is_ok());
+
+        let debug = format!("{:?}", config.storage_backend);
+        assert!(!debug.contains("example-access-key"));
+        assert!(!debug.contains("example-secret-key"));
+
+        config.storage_backend = StorageBackendConfig::S3(S3StorageConfig {
+            prefix: "../escape/".into(),
+            ..settings.clone()
+        });
+        assert!(config.validate().is_err());
+
+        config.storage_backend = StorageBackendConfig::S3(S3StorageConfig {
+            provider: S3Provider::AlibabaOss,
+            endpoint: "http://oss-cn-hangzhou.aliyuncs.com".into(),
+            addressing_style: S3AddressingStyle::Path,
+            ..settings
+        });
+        assert!(config.validate().is_err());
     }
 
     #[tokio::test]

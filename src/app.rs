@@ -386,6 +386,7 @@ mod tests {
         let admin_info_body = to_bytes(admin_info.into_body(), 16 * 1024).await.unwrap();
         let admin_info_json: serde_json::Value = serde_json::from_slice(&admin_info_body).unwrap();
         assert_eq!(admin_info_json["storage_backend"]["type"], "local");
+        assert!(admin_info_json["storage_backend"]["path"].is_string());
         assert!(!String::from_utf8_lossy(&admin_info_body).contains("secret_access_key"));
 
         let unapproved_s3_test = app

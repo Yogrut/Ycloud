@@ -40,7 +40,9 @@ pub struct AdminInfo {
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StorageBackendView {
-    Local,
+    Local {
+        path: String,
+    },
     S3 {
         provider: S3Provider,
         endpoint: String,
@@ -53,10 +55,12 @@ pub enum StorageBackendView {
     },
 }
 
-impl From<&StorageBackendConfig> for StorageBackendView {
-    fn from(backend: &StorageBackendConfig) -> Self {
+impl StorageBackendView {
+    fn from_config(backend: &StorageBackendConfig, local_path: &std::path::Path) -> Self {
         match backend {
-            StorageBackendConfig::Local(_) => Self::Local,
+            StorageBackendConfig::Local(_) => Self::Local {
+                path: local_path.to_string_lossy().into_owned(),
+            },
             StorageBackendConfig::S3(settings) => Self::S3 {
                 provider: settings.provider,
                 endpoint: settings.endpoint.clone(),
@@ -182,7 +186,7 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
             config.web_login_block_seconds,
             config.security_log_retention_days,
             config.security_log_max_entries,
-            StorageBackendView::from(&config.storage_backend),
+            StorageBackendView::from_config(&config.storage_backend, &state.config.storage_path),
         )
     };
     Json(AdminInfo {

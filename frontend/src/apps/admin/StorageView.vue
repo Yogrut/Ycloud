@@ -8,7 +8,9 @@ const props = defineProps<{ backend: StorageBackendView }>()
 const emit = defineEmits<{ tested: [message: string] }>()
 const locale = useLocale()
 
-const provider = ref<S3Provider>('minio')
+type StorageOption = 'local' | S3Provider
+
+const provider = ref<StorageOption>(props.backend.type === 'local' ? 'local' : props.backend.provider)
 const endpoint = ref('')
 const bucket = ref('')
 const region = ref('us-east-1')
@@ -19,16 +21,19 @@ const secretAccessKey = ref('')
 const testing = ref(false)
 const errorMessage = ref('')
 
-const providers: Array<{ id: S3Provider; zh: string; en: string }> = [
-  { id: 'alibaba_oss', zh: '阿里云 OSS', en: 'Alibaba Cloud OSS' },
-  { id: 'tencent_cos', zh: '腾讯云 COS', en: 'Tencent Cloud COS' },
-  { id: 'minio', zh: 'MinIO / RustFS', en: 'MinIO / RustFS' },
-  { id: 's3_compatible', zh: 'S3 通用协议', en: 'Generic S3-compatible' },
+const providers: Array<{ id: StorageOption; zh: string; en: string; protocol: string }> = [
+  { id: 'local', zh: '本地存储', en: 'Local storage', protocol: 'Filesystem' },
+  { id: 'alibaba_oss', zh: '阿里云 OSS', en: 'Alibaba Cloud OSS', protocol: 'S3 SigV4' },
+  { id: 'tencent_cos', zh: '腾讯云 COS', en: 'Tencent Cloud COS', protocol: 'S3 SigV4' },
+  { id: 'minio', zh: 'MinIO / RustFS', en: 'MinIO / RustFS', protocol: 'RustFS' },
+  { id: 's3_compatible', zh: 'S3 通用协议', en: 'Generic S3-compatible', protocol: 'S3 SigV4' },
 ]
 
+const isS3 = computed(() => provider.value !== 'local')
 const isOfficialCloud = computed(() => provider.value === 'alibaba_oss' || provider.value === 'tencent_cos')
 
 watch(provider, (value) => {
+  if (value === 'local') return
   if (value === 'alibaba_oss' || value === 'tencent_cos') addressingStyle.value = 'virtual_hosted'
   else addressingStyle.value = 'path'
 })
@@ -44,6 +49,7 @@ watch(() => props.backend, (value) => {
 }, { immediate: true })
 
 function requestBody(): TestS3StorageRequest {
+  if (provider.value === 'local') throw new Error('local storage does not use the S3 test endpoint')
   return {
     provider: provider.value,
     endpoint: endpoint.value.trim(),
@@ -77,12 +83,12 @@ async function testConnection(): Promise<void> {
     <header class="admin-pane-head">
       <div>
         <h1 id="storage-title">{{ locale.text('存储设置', 'Storage') }}</h1>
-        <p>{{ locale.text('本地存储继续作为当前活动后端；S3 配置先完成安全连接测试，再进入切换阶段。', 'Local storage remains active. Verify S3 connectivity safely before the later activation stage.') }}</p>
+        <p>{{ locale.text('先选择并配置存储后端。本地目录由部署环境固定，S3 必须先完成安全连接测试。', 'Choose and configure a storage backend. The local root is fixed by deployment; S3 must pass a safe connection test first.') }}</p>
       </div>
       <span class="status-pill">{{ props.backend.type === 'local' ? locale.text('本地存储', 'Local storage') : 'S3' }}</span>
     </header>
     <div class="admin-pane-body storage-body">
-      <div class="storage-provider-grid" role="radiogroup" :aria-label="locale.text('S3 类型', 'S3 provider')">
+      <div class="storage-provider-grid" role="radiogroup" :aria-label="locale.text('存储类型', 'Storage backend')">
         <button
           v-for="item in providers"
           :key="item.id"
@@ -94,11 +100,20 @@ async function testConnection(): Promise<void> {
           @click="provider = item.id"
         >
           <strong>{{ locale.text(item.zh, item.en) }}</strong>
-          <small>{{ item.id === 'minio' ? 'RustFS' : 'S3 SigV4' }}</small>
+          <small>{{ item.protocol }}</small>
         </button>
       </div>
 
-      <form class="storage-form" @submit.prevent="testConnection">
+      <div v-if="!isS3" class="storage-form storage-local-form">
+        <label class="storage-wide">{{ locale.text('本地存储目录', 'Local storage directory') }}
+          <input class="input" :value="props.backend.type === 'local' ? props.backend.path : ''" readonly aria-readonly="true">
+        </label>
+        <div class="storage-boundary-note storage-wide">
+          {{ locale.text('通过 STORAGE_PATH 或 Compose 卷挂载配置。目录必须可写并通过启动检查后才会成为可用存储；网页不能把服务指向任意系统路径。', 'Configure this with STORAGE_PATH or a Compose volume. The directory becomes available only after it is writable and passes startup checks; the web UI cannot redirect the service to arbitrary system paths.') }}
+        </div>
+      </div>
+
+      <form v-else class="storage-form" @submit.prevent="testConnection">
         <label class="storage-wide">{{ locale.text('Endpoint 完整地址', 'Full endpoint URL') }}
           <input v-model="endpoint" class="input" type="url" maxlength="2048" placeholder="https://s3.example.com" autocomplete="off">
         </label>

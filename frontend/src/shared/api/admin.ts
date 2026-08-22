@@ -25,7 +25,7 @@ export type S3Provider = 'alibaba_oss' | 'tencent_cos' | 'minio' | 's3_compatibl
 export type S3AddressingStyle = 'path' | 'virtual_hosted'
 
 export type StorageBackendView =
-  | { type: 'local' }
+  | { type: 'local'; path: string }
   | {
     type: 's3'
     provider: S3Provider

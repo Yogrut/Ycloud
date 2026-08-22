@@ -11,7 +11,7 @@ const info: AdminInfo = {
   admin_login_failures: 3, web_login_failures: 5,
   admin_login_block_seconds: 3600, web_login_block_seconds: 3600,
   security_log_retention_days: 7, security_log_max_entries: 5000,
-  storage_backend: { type: 'local' },
+  storage_backend: { type: 'local', path: './storage' },
 }
 const normal: LoginEvent = {
   id: 2, entry: 'admin', success: true, ip: '192.0.2.10', occurred_at: now,

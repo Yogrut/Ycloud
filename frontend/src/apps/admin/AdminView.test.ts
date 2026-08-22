@@ -9,7 +9,7 @@ const adminInfo = {
   admin_login_failures: 3, web_login_failures: 5,
   admin_login_block_seconds: 3600, web_login_block_seconds: 3600,
   security_log_retention_days: 7, security_log_max_entries: 5000,
-  storage_backend: { type: 'local' },
+  storage_backend: { type: 'local', path: './storage' },
 }
 
 afterEach(() => {
@@ -71,7 +71,8 @@ describe('AdminView', () => {
     await nextTick()
 
     expect(host.querySelector('#storage-title')?.textContent).toBe('存储设置')
-    expect(host.textContent).toContain('本地存储继续作为当前活动后端')
+    expect(host.textContent).toContain('本地目录由部署环境固定')
+    expect(host.querySelector<HTMLInputElement>('.storage-local-form input')?.value).toBe('./storage')
     expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('存储设置')
     app.unmount()
   })

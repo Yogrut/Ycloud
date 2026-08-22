@@ -316,6 +316,7 @@ input { font: inherit; }
 }
 .compact-field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .account-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; padding-top: 30px; }
+.account-pane .admin-pane-head { border-bottom: 0; }
 .account-section { min-width: 0; }
 .account-section:first-child { padding-right: 28px; }
 .account-section + .account-section { padding-left: 28px; border-left: 1px solid var(--line); }
@@ -325,6 +326,7 @@ input { font: inherit; }
 .section-heading p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
 .account-grid { grid-template-columns: 1fr; }
 .security-settings-grid { grid-template-columns: repeat(2, minmax(220px, 1fr)); }
+.account-field-note { margin: 16px 0 0; color: var(--muted-2); font-size: 11px; line-height: 1.55; }
 .limits-grid {
   grid-template-columns: repeat(2, minmax(260px, 1fr));
   grid-template-areas:

@@ -134,7 +134,7 @@ async function submitSecurity(): Promise<void> {
   securityError.value = ''
   try {
     await updateLoginSecuritySettings(body)
-    emit('saved', locale.text('登录保护设置已保存', 'Sign-in protection settings saved'))
+    emit('saved', locale.text('登录限制已保存', 'Sign-in limits saved'))
   } catch (error) {
     securityError.value = error instanceof Error ? error.message : locale.text('保存失败', 'Unable to save changes')
   } finally {
@@ -144,13 +144,15 @@ async function submitSecurity(): Promise<void> {
 </script>
 
 <template>
-  <section class="admin-pane form-pane account-pane glass" :aria-label="locale.text('账户与登录保护', 'Account and sign-in protection')">
+  <section class="admin-pane form-pane account-pane glass" aria-labelledby="account-title">
+    <header class="admin-pane-head">
+      <div>
+        <h1 id="account-title">{{ locale.text('账户与访问', 'Account & access') }}</h1>
+        <p>{{ locale.text('管理管理员凭据、首页访问密码及登录错误限制。', 'Manage administrator credentials, the browser access password, and sign-in failure limits.') }}</p>
+      </div>
+    </header>
     <div class="admin-pane-body account-sections">
-      <form class="account-section" @submit.prevent="submit()">
-        <div class="section-heading">
-          <h1 id="account-title">{{ locale.text('账户与访问', 'Account & access') }}</h1>
-          <p>{{ locale.text('管理后台管理员凭据和首页访问密码。', 'Manage administrator credentials and the browser access password.') }}</p>
-        </div>
+      <form class="account-section" :aria-label="locale.text('账户设置', 'Account settings')" @submit.prevent="submit()">
         <div class="settings-grid account-grid">
           <label class="compact-field">
             <span>{{ locale.text('管理员用户名', 'Administrator username') }}</span>
@@ -171,11 +173,7 @@ async function submitSecurity(): Promise<void> {
         </div>
       </form>
 
-      <form class="account-section login-policy-section" aria-labelledby="login-policy-title" @submit.prevent="submitSecurity">
-        <div class="section-heading">
-          <h2 id="login-policy-title">{{ locale.text('登录保护', 'Sign-in protection') }}</h2>
-          <p>{{ locale.text('管理员和首页分别计数；WebDAV 固定为 5 次错误后限制 60 秒。', 'Administrator and browser failures are counted separately. WebDAV remains fixed at 5 failures and a 60-second restriction.') }}</p>
-        </div>
+      <form class="account-section login-policy-section" :aria-label="locale.text('登录错误限制', 'Sign-in failure limits')" @submit.prevent="submitSecurity">
         <div class="settings-grid security-settings-grid">
           <label class="compact-field limits-field">
             <span>{{ locale.text('管理员错误次数', 'Administrator failure limit') }}</span>
@@ -195,7 +193,8 @@ async function submitSecurity(): Promise<void> {
           </label>
         </div>
         <p class="admin-form-error" role="alert">{{ securityError }}</p>
-        <div class="admin-save-row"><button class="btn" type="submit" :disabled="savingSecurity || !hasSecurityChanges">{{ savingSecurity ? locale.t('common.saving') : locale.text('保存登录保护', 'Save sign-in protection') }}</button></div>
+        <p class="account-field-note">{{ locale.text('管理员和首页分别计数；WebDAV 固定为 5 次错误后限制 60 秒。', 'Administrator and browser failures are counted separately. WebDAV remains fixed at 5 failures and a 60-second restriction.') }}</p>
+        <div class="admin-save-row"><button class="btn" type="submit" :disabled="savingSecurity || !hasSecurityChanges">{{ savingSecurity ? locale.t('common.saving') : locale.text('保存登录限制', 'Save sign-in limits') }}</button></div>
       </form>
     </div>
   </section>

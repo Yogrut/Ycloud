@@ -44,7 +44,8 @@ describe('AccountView', () => {
     expect(host.querySelectorAll('.settings-grid')).toHaveLength(2)
     expect(host.querySelector('.account-sections')).not.toBeNull()
     expect(host.textContent).toContain('账户与访问')
-    expect(host.textContent).toContain('登录保护')
+    expect(host.textContent).not.toContain('登录保护')
+    expect(host.textContent).toContain('保存登录限制')
     app.unmount()
   })
 

@@ -415,6 +415,7 @@ impl S3Backend {
         }
         let relative = StorageService::normalize_relative(relative)?;
         let destination_key = object_key(&self.prefix, &relative)?;
+        self.ensure_parent_directory(&relative).await?;
         let upload_id = uuid::Uuid::new_v4().simple().to_string();
         let temporary_key = internal_key(&self.prefix, "uploads", &upload_id);
         let backup_key = internal_key(&self.prefix, "backups", &upload_id);
@@ -474,6 +475,7 @@ impl S3Backend {
         };
 
         let _mutation = self.mutation_gate.lock().await;
+        self.ensure_parent_directory(&relative).await?;
         let existing = match self.metadata(&relative).await {
             Ok(metadata) if metadata.is_dir => {
                 self.delete_internal_best_effort(&temporary_key).await;
@@ -490,7 +492,12 @@ impl S3Backend {
         let mut backup_created = false;
         if let Some(existing) = existing.as_ref() {
             if let Err(error) = self
-                .copy_key(&destination_key, &backup_key, existing.etag.as_deref())
+                .copy_key(
+                    &destination_key,
+                    &backup_key,
+                    existing.etag.as_deref(),
+                    true,
+                )
                 .await
             {
                 self.delete_internal_best_effort(&temporary_key).await;
@@ -500,13 +507,20 @@ impl S3Backend {
         }
 
         let commit = self
-            .copy_key(&temporary_key, &destination_key, temporary.etag.as_deref())
+            .copy_key(
+                &temporary_key,
+                &destination_key,
+                temporary.etag.as_deref(),
+                false,
+            )
             .await;
         let committed = match commit {
-            Ok(()) => self
-                .head_key(&destination_key)
-                .await?
-                .filter(|value| value.size == content_length),
+            Ok(committed_etag) => self.head_key(&destination_key).await?.filter(|value| {
+                value.size == content_length
+                    && committed_etag
+                        .as_ref()
+                        .is_none_or(|etag| value.etag.as_ref() == Some(etag))
+            }),
             Err(error) => {
                 tracing::warn!(%error, "S3 upload commit returned an ambiguous failure");
                 self.head_key(&destination_key).await?.filter(|value| {
@@ -519,7 +533,10 @@ impl S3Backend {
 
         let Some(committed) = committed else {
             if backup_created {
-                if let Err(error) = self.copy_key(&backup_key, &destination_key, None).await {
+                if let Err(error) = self
+                    .copy_key(&backup_key, &destination_key, None, false)
+                    .await
+                {
                     tracing::error!(%error, "failed to restore S3 object backup after upload commit failure");
                     return Err(AppError::ServiceUnavailable(
                         "对象提交失败且旧对象恢复失败，请停止写入并检查存储后端".into(),
@@ -542,6 +559,166 @@ impl S3Backend {
             size: committed.size,
             etag: committed.etag,
         })
+    }
+
+    pub async fn create_directory(&self, relative: &str) -> AppResult<()> {
+        let relative = StorageService::normalize_relative(relative)?;
+        if relative.is_empty() {
+            return Err(AppError::Conflict("存储根目录已经存在".into()));
+        }
+        let _mutation = self.mutation_gate.lock().await;
+        self.ensure_parent_directory(&relative).await?;
+        match self.metadata(&relative).await {
+            Ok(_) => return Err(AppError::Conflict("目标路径已经存在".into())),
+            Err(AppError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+
+        let marker = list_prefix(&self.prefix, &relative)?;
+        let _permit = self.acquire_request().await?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(marker)
+            .content_length(0)
+            .content_type("application/x-directory")
+            .if_none_match("*")
+            .body(ByteStream::from_static(&[]))
+            .send()
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                    "S3 directory marker creation failed"
+                );
+                AppError::ServiceUnavailable("对象存储无法创建目录".into())
+            })?;
+        Ok(())
+    }
+
+    pub async fn copy_file(&self, source: &str, destination: &str) -> AppResult<()> {
+        let source = StorageService::normalize_relative(source)?;
+        let destination = StorageService::normalize_relative(destination)?;
+        if source.is_empty() || destination.is_empty() || source == destination {
+            return Err(AppError::BadRequest("无效的文件复制路径".into()));
+        }
+        let _mutation = self.mutation_gate.lock().await;
+        self.copy_file_locked(&source, &destination)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn move_file(&self, source: &str, destination: &str) -> AppResult<()> {
+        let source = StorageService::normalize_relative(source)?;
+        let destination = StorageService::normalize_relative(destination)?;
+        if source.is_empty() || destination.is_empty() || source == destination {
+            return Err(AppError::BadRequest("无效的文件移动路径".into()));
+        }
+        let _mutation = self.mutation_gate.lock().await;
+        let source_metadata = self.copy_file_locked(&source, &destination).await?;
+        let source_key = object_key(&self.prefix, &source)?;
+        if let Err(error) = self
+            .delete_key(&source_key, source_metadata.etag.as_deref())
+            .await
+        {
+            tracing::warn!(%error, "S3 move copied the object but could not remove the source");
+            return Err(AppError::ServiceUnavailable(
+                "文件已复制到目标，但源文件删除失败；为避免数据丢失已保留两份".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_file(&self, relative: &str) -> AppResult<()> {
+        let relative = StorageService::normalize_relative(relative)?;
+        if relative.is_empty() {
+            return Err(AppError::BadRequest("不能删除存储根目录".into()));
+        }
+        let _mutation = self.mutation_gate.lock().await;
+        let metadata = self.metadata(&relative).await?;
+        if metadata.is_dir {
+            return Err(AppError::Conflict("目标是目录而不是文件".into()));
+        }
+        let key = object_key(&self.prefix, &relative)?;
+        self.delete_key(&key, metadata.etag.as_deref()).await
+    }
+
+    /// Delete only an empty directory marker. Recursive directory deletion is
+    /// deliberately separate because S3 cannot make a whole prefix disappear
+    /// atomically.
+    pub async fn delete_empty_directory(&self, relative: &str) -> AppResult<()> {
+        let relative = StorageService::normalize_relative(relative)?;
+        if relative.is_empty() {
+            return Err(AppError::BadRequest("不能删除存储根目录".into()));
+        }
+        let _mutation = self.mutation_gate.lock().await;
+        let metadata = self.metadata(&relative).await?;
+        if !metadata.is_dir {
+            return Err(AppError::Conflict("目标不是目录".into()));
+        }
+        if !self.list_directory(&relative, 1).await?.entries.is_empty() {
+            return Err(AppError::Conflict("目录不为空".into()));
+        }
+        let marker = list_prefix(&self.prefix, &relative)?;
+        let marker_metadata = self.head_key(&marker).await?;
+        let Some(marker_metadata) = marker_metadata else {
+            return Err(AppError::Conflict(
+                "隐式目录没有可安全删除的目录标记".into(),
+            ));
+        };
+        self.delete_key(&marker, marker_metadata.etag.as_deref())
+            .await
+    }
+
+    async fn copy_file_locked(&self, source: &str, destination: &str) -> AppResult<S3Metadata> {
+        let source_metadata = self.metadata(source).await?;
+        if source_metadata.is_dir {
+            return Err(AppError::Conflict("当前操作只接受普通文件".into()));
+        }
+        self.ensure_parent_directory(destination).await?;
+        match self.metadata(destination).await {
+            Ok(_) => return Err(AppError::Conflict("目标路径已经存在".into())),
+            Err(AppError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+
+        let source_key = object_key(&self.prefix, source)?;
+        let destination_key = object_key(&self.prefix, destination)?;
+        let copied_etag = self
+            .copy_key(
+                &source_key,
+                &destination_key,
+                source_metadata.etag.as_deref(),
+                true,
+            )
+            .await?;
+        let destination_metadata = self.metadata(destination).await?;
+        let is_our_copy = copied_etag
+            .as_ref()
+            .is_none_or(|etag| destination_metadata.etag.as_ref() == Some(etag));
+        if destination_metadata.is_dir
+            || destination_metadata.size != source_metadata.size
+            || !is_our_copy
+        {
+            if is_our_copy {
+                self.delete_key(&destination_key, destination_metadata.etag.as_deref())
+                    .await?;
+            }
+            return Err(AppError::ServiceUnavailable(
+                "对象存储复制结果校验失败".into(),
+            ));
+        }
+        Ok(source_metadata)
+    }
+
+    async fn ensure_parent_directory(&self, relative: &str) -> AppResult<()> {
+        let parent = parent_relative(relative);
+        let metadata = self.metadata(parent).await?;
+        if metadata.is_dir {
+            Ok(())
+        } else {
+            Err(AppError::Conflict("目标父路径不是目录".into()))
+        }
     }
 
     async fn head_key(&self, key: &str) -> AppResult<Option<RawS3Metadata>> {
@@ -582,7 +759,8 @@ impl S3Backend {
         source_key: &str,
         destination_key: &str,
         source_etag: Option<&str>,
-    ) -> AppResult<()> {
+        destination_must_not_exist: bool,
+    ) -> AppResult<Option<String>> {
         let _permit = self.acquire_request().await?;
         let mut request = self
             .client
@@ -593,14 +771,20 @@ impl S3Backend {
         if let Some(etag) = source_etag {
             request = request.copy_source_if_match(etag);
         }
-        request.send().await.map_err(|error| {
+        if destination_must_not_exist {
+            request = request.if_none_match("*");
+        }
+        let output = request.send().await.map_err(|error| {
             tracing::warn!(
                 error_kind = %error.as_service_error().map_or("transport", |_| "service"),
                 "S3 server-side copy failed"
             );
             AppError::ServiceUnavailable("对象存储服务端复制失败".into())
         })?;
-        Ok(())
+        Ok(output
+            .copy_object_result()
+            .and_then(|result| result.e_tag())
+            .map(str::to_owned))
     }
 
     async fn delete_internal_best_effort(&self, key: &str) {
@@ -618,6 +802,22 @@ impl S3Backend {
         {
             tracing::warn!("failed to clean up an internal S3 transaction object");
         }
+    }
+
+    async fn delete_key(&self, key: &str, etag: Option<&str>) -> AppResult<()> {
+        let _permit = self.acquire_request().await?;
+        let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
+        if let Some(etag) = etag {
+            request = request.if_match(etag);
+        }
+        request.send().await.map_err(|error| {
+            tracing::warn!(
+                error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                "S3 object deletion failed"
+            );
+            AppError::ServiceUnavailable("对象存储删除失败".into())
+        })?;
+        Ok(())
     }
 
     async fn acquire_request(&self) -> AppResult<OwnedSemaphorePermit> {
@@ -684,6 +884,10 @@ fn direct_child_name<'a>(directory_prefix: &str, key: &'a str, is_dir: bool) -> 
         return None;
     }
     Some(suffix)
+}
+
+fn parent_relative(relative: &str) -> &str {
+    relative.rsplit_once('/').map_or("", |(parent, _)| parent)
 }
 
 fn child_entry(
@@ -929,7 +1133,8 @@ mod tests {
     use http_body_util::BodyExt;
 
     use super::{
-        collect_page_entries, copy_source, internal_key, list_prefix, object_key, ExactLengthBody,
+        collect_page_entries, copy_source, internal_key, list_prefix, object_key, parent_relative,
+        ExactLengthBody,
     };
 
     #[test]
@@ -1025,5 +1230,12 @@ mod tests {
             copy_source("bucket", "users/yogrut/游戏 备份.zip"),
             "bucket/users/yogrut/%E6%B8%B8%E6%88%8F%20%E5%A4%87%E4%BB%BD.zip"
         );
+    }
+
+    #[test]
+    fn parent_paths_remain_relative_to_the_storage_prefix() {
+        assert_eq!(parent_relative("file.txt"), "");
+        assert_eq!(parent_relative("folder/file.txt"), "folder");
+        assert_eq!(parent_relative("a/b/file.txt"), "a/b");
     }
 }

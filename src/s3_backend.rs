@@ -12,13 +12,15 @@ use aws_sdk_s3::{
     Client,
 };
 use aws_smithy_http_client::Builder as HttpClientBuilder;
+use aws_smithy_types::byte_stream::ByteStream;
 use axum::{
     body::Body,
     http::{header, HeaderMap, HeaderValue, Response, StatusCode},
 };
 use bytes::Bytes;
 use futures_util::Stream;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use http_body::{Frame, SizeHint};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::io::ReaderStream;
 
 use crate::{
@@ -67,6 +69,13 @@ pub struct S3Metadata {
     etag: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct S3UploadResult {
+    pub relative: String,
+    pub size: u64,
+    pub etag: Option<String>,
+}
+
 /// One reusable S3 client and its confined namespace.
 ///
 /// Provider presets are validated before construction and all object keys are
@@ -78,6 +87,8 @@ pub struct S3Backend {
     bucket: String,
     prefix: String,
     request_gate: std::sync::Arc<Semaphore>,
+    mutation_gate: std::sync::Arc<Mutex<()>>,
+    upload_timeout: Duration,
 }
 
 impl S3Backend {
@@ -127,6 +138,8 @@ impl S3Backend {
             bucket: settings.bucket.clone(),
             prefix: settings.prefix.clone(),
             request_gate: std::sync::Arc::new(Semaphore::new(S3_REQUEST_CONCURRENCY)),
+            mutation_gate: std::sync::Arc::new(Mutex::new(())),
+            upload_timeout: Duration::from_secs(runtime.upload_timeout_secs),
         })
     }
 
@@ -385,6 +398,228 @@ impl S3Backend {
             .map_err(|error| AppError::with_source("failed to build S3 response", error))
     }
 
+    /// Upload directly to an inaccessible temporary object and commit with a
+    /// server-side copy. The caller-provided length is enforced while the
+    /// stream is consumed, so a misleading Content-Length cannot bypass the
+    /// configured single-file limit.
+    pub async fn upload_file(
+        &self,
+        relative: &str,
+        body: Body,
+        content_length: u64,
+        max_upload_bytes: u64,
+        content_type: Option<&str>,
+    ) -> AppResult<S3UploadResult> {
+        if content_length > max_upload_bytes {
+            return Err(AppError::PayloadTooLarge);
+        }
+        let relative = StorageService::normalize_relative(relative)?;
+        let destination_key = object_key(&self.prefix, &relative)?;
+        let upload_id = uuid::Uuid::new_v4().simple().to_string();
+        let temporary_key = internal_key(&self.prefix, "uploads", &upload_id);
+        let backup_key = internal_key(&self.prefix, "backups", &upload_id);
+        let exact_body = ExactLengthBody::new(body.into_data_stream(), content_length);
+        let stream = ByteStream::from_body_1_x(exact_body);
+        let length = i64::try_from(content_length).map_err(|_| AppError::PayloadTooLarge)?;
+        let upload_timeouts = TimeoutConfig::builder()
+            .connect_timeout(S3_CONNECT_TIMEOUT)
+            .operation_attempt_timeout(self.upload_timeout)
+            .operation_timeout(self.upload_timeout)
+            .build();
+        let operation_override = aws_sdk_s3::config::Builder::new()
+            .retry_config(RetryConfig::standard().with_max_attempts(1))
+            .timeout_config(upload_timeouts);
+
+        let permit = self.acquire_request().await?;
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&temporary_key)
+            .content_length(length)
+            .body(stream);
+        if let Some(content_type) = sanitize_content_type(content_type)? {
+            request = request.content_type(content_type);
+        }
+        let upload = request
+            .customize()
+            .config_override(operation_override)
+            .send()
+            .await;
+        drop(permit);
+        if let Err(error) = upload {
+            tracing::warn!(
+                error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                "S3 temporary upload failed"
+            );
+            self.delete_internal_best_effort(&temporary_key).await;
+            return Err(AppError::ServiceUnavailable(
+                "对象存储上传失败或请求体长度不一致".into(),
+            ));
+        }
+
+        let temporary = match self.head_key(&temporary_key).await? {
+            Some(metadata) if metadata.size == content_length => metadata,
+            Some(_) => {
+                self.delete_internal_best_effort(&temporary_key).await;
+                return Err(AppError::ServiceUnavailable(
+                    "对象存储暂存对象长度校验失败".into(),
+                ));
+            }
+            None => {
+                return Err(AppError::ServiceUnavailable(
+                    "对象存储未保存上传的暂存对象".into(),
+                ));
+            }
+        };
+
+        let _mutation = self.mutation_gate.lock().await;
+        let existing = match self.metadata(&relative).await {
+            Ok(metadata) if metadata.is_dir => {
+                self.delete_internal_best_effort(&temporary_key).await;
+                return Err(AppError::Conflict("不能用文件覆盖目录".into()));
+            }
+            Ok(metadata) => Some(metadata),
+            Err(AppError::NotFound) => None,
+            Err(error) => {
+                self.delete_internal_best_effort(&temporary_key).await;
+                return Err(error);
+            }
+        };
+
+        let mut backup_created = false;
+        if let Some(existing) = existing.as_ref() {
+            if let Err(error) = self
+                .copy_key(&destination_key, &backup_key, existing.etag.as_deref())
+                .await
+            {
+                self.delete_internal_best_effort(&temporary_key).await;
+                return Err(error);
+            }
+            backup_created = true;
+        }
+
+        let commit = self
+            .copy_key(&temporary_key, &destination_key, temporary.etag.as_deref())
+            .await;
+        let committed = match commit {
+            Ok(()) => self
+                .head_key(&destination_key)
+                .await?
+                .filter(|value| value.size == content_length),
+            Err(error) => {
+                tracing::warn!(%error, "S3 upload commit returned an ambiguous failure");
+                self.head_key(&destination_key).await?.filter(|value| {
+                    value.size == content_length
+                        && temporary.etag.is_some()
+                        && value.etag == temporary.etag
+                })
+            }
+        };
+
+        let Some(committed) = committed else {
+            if backup_created {
+                if let Err(error) = self.copy_key(&backup_key, &destination_key, None).await {
+                    tracing::error!(%error, "failed to restore S3 object backup after upload commit failure");
+                    return Err(AppError::ServiceUnavailable(
+                        "对象提交失败且旧对象恢复失败，请停止写入并检查存储后端".into(),
+                    ));
+                }
+            }
+            self.delete_internal_best_effort(&temporary_key).await;
+            self.delete_internal_best_effort(&backup_key).await;
+            return Err(AppError::ServiceUnavailable(
+                "对象存储未能确认上传提交结果".into(),
+            ));
+        };
+
+        self.delete_internal_best_effort(&temporary_key).await;
+        if backup_created {
+            self.delete_internal_best_effort(&backup_key).await;
+        }
+        Ok(S3UploadResult {
+            relative,
+            size: committed.size,
+            etag: committed.etag,
+        })
+    }
+
+    async fn head_key(&self, key: &str) -> AppResult<Option<RawS3Metadata>> {
+        let _permit = self.acquire_request().await?;
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => Ok(Some(RawS3Metadata {
+                size: non_negative_size(output.content_length())?,
+                etag: output.e_tag().map(str::to_owned),
+            })),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|value| value.is_not_found()) =>
+            {
+                Ok(None)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                    "S3 object verification failed"
+                );
+                Err(AppError::ServiceUnavailable(
+                    "无法校验对象存储写入结果".into(),
+                ))
+            }
+        }
+    }
+
+    async fn copy_key(
+        &self,
+        source_key: &str,
+        destination_key: &str,
+        source_etag: Option<&str>,
+    ) -> AppResult<()> {
+        let _permit = self.acquire_request().await?;
+        let mut request = self
+            .client
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(copy_source(&self.bucket, source_key))
+            .key(destination_key);
+        if let Some(etag) = source_etag {
+            request = request.copy_source_if_match(etag);
+        }
+        request.send().await.map_err(|error| {
+            tracing::warn!(
+                error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                "S3 server-side copy failed"
+            );
+            AppError::ServiceUnavailable("对象存储服务端复制失败".into())
+        })?;
+        Ok(())
+    }
+
+    async fn delete_internal_best_effort(&self, key: &str) {
+        let Ok(_permit) = self.acquire_request().await else {
+            return;
+        };
+        if self
+            .client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .is_err()
+        {
+            tracing::warn!("failed to clean up an internal S3 transaction object");
+        }
+    }
+
     async fn acquire_request(&self) -> AppResult<OwnedSemaphorePermit> {
         self.request_gate
             .clone()
@@ -392,6 +627,12 @@ impl S3Backend {
             .await
             .map_err(|_| AppError::ServiceUnavailable("对象存储正在关闭".into()))
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawS3Metadata {
+    size: u64,
+    etag: Option<String>,
 }
 
 fn collect_page_entries(
@@ -527,6 +768,125 @@ fn range_not_satisfiable(total_length: u64) -> AppResult<Response<Body>> {
         .map_err(|error| AppError::with_source("failed to build S3 range response", error))
 }
 
+fn internal_key(prefix: &str, category: &str, id: &str) -> String {
+    format!("{prefix}.ycloud-system/{category}/{id}")
+}
+
+fn sanitize_content_type(content_type: Option<&str>) -> AppResult<Option<String>> {
+    let Some(content_type) = content_type else {
+        return Ok(None);
+    };
+    if content_type.len() > 255 || HeaderValue::from_str(content_type).is_err() {
+        return Err(AppError::BadRequest("无效的 Content-Type".into()));
+    }
+    Ok(Some(content_type.to_owned()))
+}
+
+fn copy_source(bucket: &str, key: &str) -> String {
+    format!("{bucket}/{}", percent_encode_s3_key(key))
+}
+
+fn percent_encode_s3_key(key: &str) -> String {
+    let mut encoded = String::with_capacity(key.len());
+    for byte in key.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            encoded.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+struct ExactLengthBody<S> {
+    state: std::sync::Mutex<ExactLengthState<S>>,
+}
+
+struct ExactLengthState<S> {
+    inner: Option<S>,
+    remaining: u64,
+}
+
+impl<S> ExactLengthBody<S> {
+    fn new(inner: S, expected: u64) -> Self {
+        Self {
+            state: std::sync::Mutex::new(ExactLengthState {
+                inner: Some(inner),
+                remaining: expected,
+            }),
+        }
+    }
+}
+
+impl<S, E> http_body::Body for ExactLengthBody<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + 'static,
+{
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Poll::Ready(Some(Err(std::io::Error::other(
+                "upload body state is unavailable",
+            ))));
+        };
+        let Some(inner) = state.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match Pin::new(inner).poll_next(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(chunk))) => {
+                let Ok(length) = u64::try_from(chunk.len()) else {
+                    state.inner = None;
+                    return Poll::Ready(Some(Err(std::io::Error::other(
+                        "upload chunk length overflow",
+                    ))));
+                };
+                if length > state.remaining {
+                    state.inner = None;
+                    return Poll::Ready(Some(Err(std::io::Error::other(
+                        "upload body exceeds Content-Length",
+                    ))));
+                }
+                state.remaining -= length;
+                Poll::Ready(Some(Ok(Frame::data(chunk))))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                state.inner = None;
+                Poll::Ready(Some(Err(std::io::Error::other(error.to_string()))))
+            }
+            Poll::Ready(None) if state.remaining == 0 => {
+                state.inner = None;
+                Poll::Ready(None)
+            }
+            Poll::Ready(None) => {
+                state.inner = None;
+                Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "upload body is shorter than Content-Length",
+                ))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.state
+            .lock()
+            .map_or(true, |state| state.inner.is_none())
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let remaining = self.state.lock().map_or(0, |state| state.remaining);
+        SizeHint::with_exact(remaining)
+    }
+}
+
 struct PermitStream<S> {
     inner: S,
     _permit: OwnedSemaphorePermit,
@@ -564,8 +924,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use aws_sdk_s3::types::{CommonPrefix, Object};
+    use bytes::Bytes;
+    use futures_util::stream;
+    use http_body_util::BodyExt;
 
-    use super::{collect_page_entries, list_prefix, object_key};
+    use super::{
+        collect_page_entries, copy_source, internal_key, list_prefix, object_key, ExactLengthBody,
+    };
 
     #[test]
     fn object_keys_are_confined_below_the_configured_prefix() {
@@ -632,5 +997,33 @@ mod tests {
         let mut entries = BTreeMap::new();
         collect_page_entries("", "users/yogrut/", &prefixes, &[], &mut entries).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_stream_enforces_exact_content_length() {
+        let complete = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"def")),
+        ]);
+        let result = ExactLengthBody::new(complete, 6).collect().await;
+        assert_eq!(result.unwrap().to_bytes(), Bytes::from_static(b"abcdef"));
+
+        let short = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))]);
+        assert!(ExactLengthBody::new(short, 4).collect().await.is_err());
+
+        let long = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"abcd"))]);
+        assert!(ExactLengthBody::new(long, 3).collect().await.is_err());
+    }
+
+    #[test]
+    fn transaction_keys_are_hidden_and_copy_sources_are_encoded() {
+        assert_eq!(
+            internal_key("users/yogrut/", "uploads", "1234"),
+            "users/yogrut/.ycloud-system/uploads/1234"
+        );
+        assert_eq!(
+            copy_source("bucket", "users/yogrut/游戏 备份.zip"),
+            "bucket/users/yogrut/%E6%B8%B8%E6%88%8F%20%E5%A4%87%E4%BB%BD.zip"
+        );
     }
 }

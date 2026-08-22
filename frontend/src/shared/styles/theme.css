@@ -315,14 +315,28 @@ input { font: inherit; }
   transition: border-color .16s ease, box-shadow .16s ease;
 }
 .compact-field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-.account-sections { display: grid; gap: 26px; }
-.account-section + .account-section { padding-top: 25px; border-top: 1px solid var(--line); }
+.account-sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; padding-top: 30px; }
+.account-section { min-width: 0; }
+.account-section:first-child { padding-right: 28px; }
+.account-section + .account-section { padding-left: 28px; border-left: 1px solid var(--line); }
 .section-heading { margin-bottom: 20px; }
-.section-heading h2 { margin: 0 0 6px; color: var(--text); font-size: 16px; }
+.section-heading h1,
+.section-heading h2 { margin: 0 0 6px; color: var(--text); font-size: 19px; letter-spacing: -.015em; }
 .section-heading p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
-.account-grid { grid-template-columns: minmax(180px, .72fr) minmax(240px, 1fr); }
+.account-grid { grid-template-columns: 1fr; }
 .security-settings-grid { grid-template-columns: repeat(2, minmax(220px, 1fr)); }
-.limits-grid { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
+.limits-grid {
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  grid-template-areas:
+    "upload-size upload-rate"
+    "archive-size download-rate"
+    "archive-entries .";
+}
+.limit-upload-size { grid-area: upload-size; }
+.limit-upload-rate { grid-area: upload-rate; }
+.limit-download-rate { grid-area: download-rate; }
+.limit-archive-size { grid-area: archive-size; }
+.limit-archive-entries { grid-area: archive-entries; }
 .limits-field { min-height: 0; }
 .limits-control { min-width: 0; display: grid; gap: 8px; }
 .limits-control > input,
@@ -629,8 +643,10 @@ input { font: inherit; }
   .admin-pane-head h1 { font-size: 20px; }
   .admin-pane-body { padding: 10px 20px 22px; }
   .settings-grid { grid-template-columns: 1fr; gap: 15px; }
-  .account-sections { gap: 22px; padding-top: 20px; }
-  .account-section + .account-section { padding-top: 21px; }
+  .account-sections { grid-template-columns: 1fr; gap: 22px; padding-top: 20px; }
+  .account-section:first-child { padding-right: 0; }
+  .account-section + .account-section { padding-top: 21px; padding-left: 0; border-top: 1px solid var(--line); border-left: 0; }
+  .limits-grid { grid-template-areas: "upload-size" "upload-rate" "download-rate" "archive-size" "archive-entries"; }
   .section-heading { margin-bottom: 16px; }
   .admin-save-row { padding-top: 6px; }
   .admin-save-row .btn { width: 100%; }

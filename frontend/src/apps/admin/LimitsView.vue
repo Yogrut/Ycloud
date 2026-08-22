@@ -157,35 +157,35 @@ async function submit(): Promise<void> {
     </header>
     <form class="admin-pane-body" @submit.prevent="submit">
       <div class="settings-grid limits-grid">
-        <label class="compact-field limits-field">
+        <label class="compact-field limits-field limit-upload-size">
           <span>{{ locale.text('单文件上传上限', 'Single-file upload limit') }}</span>
           <span class="limits-control">
             <span class="input-with-unit"><input v-model="uploadGiB" type="number" min="0.001" max="100" step="0.001" inputmode="decimal"><span>GiB</span></span>
             <small>{{ locale.text('网页与 WebDAV 共用；范围 1 MiB–100 GiB，且不能超过部署环境的绝对上限。', 'Shared by the browser and WebDAV. Range: 1 MiB–100 GiB, subject to the deployment hard limit.') }}</small>
           </span>
         </label>
-        <label class="compact-field limits-field">
+        <label class="compact-field limits-field limit-upload-rate">
           <span>{{ locale.text('全局上传限速', 'Global upload rate') }}</span>
           <span class="limits-control">
             <span class="input-with-unit"><input v-model="uploadRate" type="number" min="0" max="1024" step="0.0625" inputmode="decimal"><span>MiB/s</span></span>
             <small>{{ locale.text('网页上传与 WebDAV PUT 共用；0 表示不限速。', 'Shared by browser uploads and WebDAV PUT. Set to 0 for unlimited.') }}</small>
           </span>
         </label>
-        <label class="compact-field limits-field">
+        <label class="compact-field limits-field limit-download-rate">
           <span>{{ locale.text('全局下载限速', 'Global download rate') }}</span>
           <span class="limits-control">
             <span class="input-with-unit"><input v-model="downloadRate" type="number" min="0" max="1024" step="0.0625" inputmode="decimal"><span>MiB/s</span></span>
             <small>{{ locale.text('普通下载、预览、打包下载与 WebDAV GET 共用；0 表示不限速。', 'Shared by downloads, previews, archives, and WebDAV GET. Set to 0 for unlimited.') }}</small>
           </span>
         </label>
-        <label class="compact-field limits-field">
+        <label class="compact-field limits-field limit-archive-size">
           <span>{{ locale.text('打包源文件总大小', 'Archive source-size limit') }}</span>
           <span class="limits-control">
             <span class="input-with-unit"><input v-model="archiveGiB" type="number" min="0.001" max="10" step="0.001" inputmode="decimal"><span>GiB</span></span>
             <small>{{ locale.text('只累计文件内容；范围 1 MiB–10 GiB，普通单文件下载不受影响。', 'Counts file contents only. Range: 1 MiB–10 GiB. Regular single-file downloads are unaffected.') }}</small>
           </span>
         </label>
-        <label class="compact-field limits-field">
+        <label class="compact-field limits-field limit-archive-entries">
           <span>{{ locale.text('打包条目数量', 'Archive entry limit') }}</span>
           <span class="limits-control">
             <input v-model="archiveEntries" type="number" min="1" max="5000" step="1" inputmode="numeric">

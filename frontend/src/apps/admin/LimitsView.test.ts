@@ -40,6 +40,7 @@ describe('LimitsView', () => {
     expect(host.textContent).toContain('磁盘始终保留安全余量')
     expect(host.querySelector('.limits-grid')).not.toBeNull()
     expect(host.querySelectorAll('.limits-grid > .compact-field')).toHaveLength(5)
+    expect(host.querySelector('.limit-upload-rate + .limit-download-rate')).not.toBeNull()
     app.unmount()
   })
 

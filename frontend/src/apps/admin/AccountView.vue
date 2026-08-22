@@ -144,18 +144,12 @@ async function submitSecurity(): Promise<void> {
 </script>
 
 <template>
-  <section class="admin-pane form-pane account-pane glass" aria-labelledby="account-title">
-    <header class="admin-pane-head">
-      <div>
-        <h1 id="account-title">{{ locale.text('账户与访问', 'Account & access') }}</h1>
-        <p>{{ locale.text('分别管理后台管理员凭据和首页访问密码。', 'Manage administrator credentials and the browser access password separately.') }}</p>
-      </div>
-    </header>
+  <section class="admin-pane form-pane account-pane glass" :aria-label="locale.text('账户与登录保护', 'Account and sign-in protection')">
     <div class="admin-pane-body account-sections">
       <form class="account-section" @submit.prevent="submit()">
         <div class="section-heading">
-          <h2>{{ locale.text('账户凭据', 'Account credentials') }}</h2>
-          <p>{{ locale.text('修改管理员身份和网页文件入口密码。', 'Change the administrator identity and browser file-entry password.') }}</p>
+          <h1 id="account-title">{{ locale.text('账户与访问', 'Account & access') }}</h1>
+          <p>{{ locale.text('管理后台管理员凭据和首页访问密码。', 'Manage administrator credentials and the browser access password.') }}</p>
         </div>
         <div class="settings-grid account-grid">
           <label class="compact-field">

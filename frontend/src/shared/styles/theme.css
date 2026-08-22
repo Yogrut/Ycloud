@@ -287,29 +287,23 @@ input { font: inherit; }
 .admin-nav-item svg { width: 19px; height: 19px; flex: 0 0 auto; }
 .admin-content { min-width: 0; display: grid; align-content: start; gap: 18px; }
 .admin-pane { overflow: hidden; border-radius: 16px; }
+.admin-pane.form-pane { width: min(100%, 1060px); }
 .admin-pane-head {
-  min-height: 124px;
+  min-height: 108px;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 24px;
-  padding: 30px 36px 24px;
+  padding: 26px 30px 21px;
   border-bottom: 1px solid var(--line);
 }
 .admin-pane-head h1 { margin: 0 0 8px; color: var(--text); font-size: 23px; letter-spacing: -.02em; }
 .admin-pane-head p { margin: 0; color: var(--muted); font-size: 13px; }
-.admin-pane-body { padding: 32px 36px 30px; }
-.account-form { display: grid; gap: 0; }
-.admin-field {
-  display: grid;
-  grid-template-columns: 210px minmax(0, 1fr);
-  align-items: center;
-  gap: 28px;
-  min-height: 96px;
-  border-bottom: 1px solid var(--line);
-}
-.admin-field > span { color: var(--text); font-size: 13px; font-weight: 700; }
-.admin-field input {
+.admin-pane-body { padding: 26px 30px 28px; }
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 20px; }
+.compact-field { min-width: 0; display: grid; align-content: start; gap: 8px; }
+.compact-field > span:first-child { color: var(--text); font-size: 13px; font-weight: 700; }
+.compact-field input {
   width: 100%;
   height: 44px;
   padding: 0 14px;
@@ -320,8 +314,16 @@ input { font: inherit; }
   outline: 0;
   transition: border-color .16s ease, box-shadow .16s ease;
 }
-.admin-field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
-.limits-field { min-height: 112px; }
+.compact-field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.account-sections { display: grid; gap: 26px; }
+.account-section + .account-section { padding-top: 25px; border-top: 1px solid var(--line); }
+.section-heading { margin-bottom: 20px; }
+.section-heading h2 { margin: 0 0 6px; color: var(--text); font-size: 16px; }
+.section-heading p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.account-grid { grid-template-columns: minmax(180px, .72fr) minmax(240px, 1fr); }
+.security-settings-grid { grid-template-columns: repeat(2, minmax(220px, 1fr)); }
+.limits-grid { grid-template-columns: repeat(2, minmax(260px, 1fr)); }
+.limits-field { min-height: 0; }
 .limits-control { min-width: 0; display: grid; gap: 8px; }
 .limits-control > input,
 .input-with-unit { width: 100%; }
@@ -329,36 +331,43 @@ input { font: inherit; }
 .input-with-unit input { padding-right: 58px; }
 .input-with-unit > span { position: absolute; top: 50%; right: 14px; color: var(--muted); font-size: 12px; transform: translateY(-50%); pointer-events: none; }
 .limits-control small { color: var(--muted-2); font-size: 11px; line-height: 1.55; }
-.safety-note { margin-top: 20px; padding: 13px 15px; color: var(--muted); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; font-size: 12px; line-height: 1.65; }
+.safety-note { margin-top: 22px; padding: 13px 15px; color: var(--muted); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; font-size: 12px; line-height: 1.65; }
 .locks-head { align-items: center; }
-.locks-body { padding-top: 22px; }
+.locks-body { padding-top: 16px; padding-bottom: 18px; }
 .admin-empty { min-height: 190px; display: grid; place-items: center; color: var(--muted); text-align: center; }
 .locks-list { border-top: 1px solid var(--line); }
-.lock-record { min-height: 84px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 15px 0; border-bottom: 1px solid var(--line); }
+.lock-record { min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 10px 0; border-bottom: 1px solid var(--line); }
 .lock-record-main { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .lock-record-main strong { overflow-wrap: anywhere; color: var(--text); font-size: 15px; }
 .lock-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 .danger-outline { color: var(--danger); background: rgba(228, 86, 107, .06); border-color: rgba(228, 86, 107, .28); }
 .danger-outline:hover:not(:disabled) { background: rgba(228, 86, 107, .12); border-color: rgba(228, 86, 107, .4); }
 .webdav-head { align-items: center; }
-.webdav-body { padding-top: 22px; }
+.webdav-body { padding-top: 16px; padding-bottom: 18px; }
 .webdav-list { border-top: 1px solid var(--line); }
-.webdav-record { min-height: 114px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+.webdav-record { min-height: 92px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 13px 0; border-bottom: 1px solid var(--line); }
 .webdav-record-main { min-width: 0; }
-.webdav-record-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.webdav-record-title { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-bottom: 5px; }
 .webdav-record-title strong { overflow-wrap: anywhere; color: var(--text); font-size: 15px; }
 .status-pill.inactive { color: var(--muted); background: var(--panel-soft); border-color: var(--line); }
 .status-pill.permission { color: var(--accent); background: var(--accent-soft); border-color: rgba(64, 158, 255, .25); }
 .status-pill.credential { color: var(--text); background: var(--panel-soft); border-color: var(--line); }
 .webdav-record-meta { margin-top: 4px; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; line-height: 1.55; }
 .webdav-actions { display: flex; gap: 8px; flex: 0 0 auto; }
-.webdav-modal { width: min(660px, 100%); }
-.webdav-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
-.webdav-options { display: flex; gap: 24px; margin-top: 18px; padding: 13px 14px; background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; }
-.webdav-options label { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--text); cursor: pointer; }
+.webdav-modal { width: min(720px, 100%); }
+.webdav-form-grid { display: grid; grid-template-columns: minmax(180px, .75fr) minmax(240px, 1fr); gap: 0 16px; }
+.webdav-name-field { grid-column: 1; grid-row: 1; }
+.webdav-user-field { grid-column: 2; grid-row: 1; }
+.webdav-password-field { grid-column: 1; grid-row: 2; }
+.webdav-path-field { grid-row: 3; }
+.connection-path-field { grid-row: 4; }
+.webdav-form-grid .full-field { grid-column: 1 / -1; }
+.connection-path-field input[readonly] { color: var(--muted); background: var(--panel-soft); cursor: text; }
+.webdav-options { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 14px; padding: 0; background: transparent; border: 0; }
+.webdav-options label { min-height: 40px; display: flex; align-items: center; gap: 8px; margin: 0; padding: 0 12px; color: var(--text); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 9px; cursor: pointer; }
 .webdav-options input { width: 16px; height: 16px; accent-color: var(--accent); }
 .admin-form-error { min-height: 20px; margin: 12px 0 0; color: var(--danger); font-size: 13px; }
-.admin-save-row { display: flex; justify-content: flex-end; padding-top: 4px; }
+.admin-save-row { display: flex; justify-content: flex-end; padding-top: 6px; }
 .admin-loading { min-height: 240px; display: grid; place-items: center; padding: 32px; color: var(--muted); border-radius: 16px; }
 .admin-login-shell { min-height: calc(100vh - 66px); display: grid; place-items: center; padding: 24px; }
 .admin-login-panel { width: min(440px, 100%); padding: 38px 34px; border-radius: 16px; text-align: center; }
@@ -366,6 +375,9 @@ input { font: inherit; }
 .admin-login-panel label { display: grid; gap: 7px; margin-top: 14px; color: var(--muted); text-align: left; font-size: 13px; font-weight: 650; }
 .admin-login-panel .input { text-align: left; }
 .admin-login-panel .btn { width: 100%; }
+.compact-editor-modal { width: min(560px, 100%); padding: 26px; }
+.compact-editor-modal label { margin-top: 11px; }
+.compact-editor-modal .field-hint { margin: 6px 0 2px; line-height: 1.55; }
 .security-head { align-items: center; }
 .security-body { padding-top: 24px; }
 .security-tabs { display: flex; gap: 6px; margin-bottom: 18px; }
@@ -616,7 +628,10 @@ input { font: inherit; }
   .admin-pane-head { min-height: 0; padding: 22px 20px 18px; }
   .admin-pane-head h1 { font-size: 20px; }
   .admin-pane-body { padding: 10px 20px 22px; }
-  .admin-field { grid-template-columns: 1fr; gap: 8px; min-height: 0; padding: 15px 0; }
+  .settings-grid { grid-template-columns: 1fr; gap: 15px; }
+  .account-sections { gap: 22px; padding-top: 20px; }
+  .account-section + .account-section { padding-top: 21px; }
+  .section-heading { margin-bottom: 16px; }
   .admin-save-row { padding-top: 6px; }
   .admin-save-row .btn { width: 100%; }
   .admin-login-shell { min-height: calc(100vh - 58px); padding: 16px; }
@@ -639,5 +654,6 @@ input { font: inherit; }
   .webdav-record { align-items: stretch; flex-direction: column; gap: 14px; }
   .webdav-actions { display: grid; grid-template-columns: 1fr 1fr; }
   .webdav-form-grid { grid-template-columns: 1fr; }
-  .webdav-options { align-items: stretch; flex-direction: column; gap: 12px; }
+  .webdav-form-grid > label { grid-column: 1; grid-row: auto; }
+  .webdav-options { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 }

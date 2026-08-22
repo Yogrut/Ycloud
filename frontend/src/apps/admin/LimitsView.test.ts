@@ -38,6 +38,8 @@ describe('LimitsView', () => {
     expect(inputs[3]?.value).toBe('3')
     expect(inputs[4]?.value).toBe('1000')
     expect(host.textContent).toContain('磁盘始终保留安全余量')
+    expect(host.querySelector('.limits-grid')).not.toBeNull()
+    expect(host.querySelectorAll('.limits-grid > .compact-field')).toHaveLength(5)
     app.unmount()
   })
 

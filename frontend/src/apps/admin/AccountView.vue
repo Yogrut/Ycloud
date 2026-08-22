@@ -144,64 +144,66 @@ async function submitSecurity(): Promise<void> {
 </script>
 
 <template>
-  <section class="admin-pane glass" aria-labelledby="account-title">
+  <section class="admin-pane form-pane account-pane glass" aria-labelledby="account-title">
     <header class="admin-pane-head">
       <div>
         <h1 id="account-title">{{ locale.text('账户与访问', 'Account & access') }}</h1>
         <p>{{ locale.text('分别管理后台管理员凭据和首页访问密码。', 'Manage administrator credentials and the browser access password separately.') }}</p>
       </div>
     </header>
-    <form class="admin-pane-body" @submit.prevent="submit()">
-      <div class="account-form">
-        <label class="admin-field">
-          <span>{{ locale.text('管理员用户名', 'Administrator username') }}</span>
-          <input v-model="username" autocomplete="username" maxlength="128">
-        </label>
-        <label class="admin-field">
-          <span>{{ locale.text('管理员密码', 'Administrator password') }}</span>
-          <input v-model="adminPassword" type="password" autocomplete="new-password" minlength="12" @focus="selectMask">
-        </label>
-        <label class="admin-field">
-          <span>{{ locale.text('网页访问密码', 'Browser access password') }}</span>
-          <input v-model="webPassword" type="password" autocomplete="new-password" @focus="selectMask">
-        </label>
-      </div>
-      <p class="admin-form-error" role="alert" aria-live="polite">{{ errorMessage }}</p>
-      <div class="admin-save-row">
-        <button class="btn" type="submit" :disabled="saving || !hasAccountChanges">{{ saving ? locale.t('common.saving') : locale.text('保存账户设置', 'Save account settings') }}</button>
-      </div>
-    </form>
-  </section>
+    <div class="admin-pane-body account-sections">
+      <form class="account-section" @submit.prevent="submit()">
+        <div class="section-heading">
+          <h2>{{ locale.text('账户凭据', 'Account credentials') }}</h2>
+          <p>{{ locale.text('修改管理员身份和网页文件入口密码。', 'Change the administrator identity and browser file-entry password.') }}</p>
+        </div>
+        <div class="settings-grid account-grid">
+          <label class="compact-field">
+            <span>{{ locale.text('管理员用户名', 'Administrator username') }}</span>
+            <input v-model="username" autocomplete="username" maxlength="128">
+          </label>
+          <label class="compact-field">
+            <span>{{ locale.text('管理员密码', 'Administrator password') }}</span>
+            <input v-model="adminPassword" type="password" autocomplete="new-password" minlength="12" @focus="selectMask">
+          </label>
+          <label class="compact-field">
+            <span>{{ locale.text('网页访问密码', 'Browser access password') }}</span>
+            <input v-model="webPassword" type="password" autocomplete="new-password" @focus="selectMask">
+          </label>
+        </div>
+        <p class="admin-form-error" role="alert" aria-live="polite">{{ errorMessage }}</p>
+        <div class="admin-save-row">
+          <button class="btn" type="submit" :disabled="saving || !hasAccountChanges">{{ saving ? locale.t('common.saving') : locale.text('保存账户设置', 'Save account settings') }}</button>
+        </div>
+      </form>
 
-  <section class="admin-pane glass" aria-labelledby="login-policy-title">
-    <header class="admin-pane-head">
-      <div>
-        <h1 id="login-policy-title">{{ locale.text('登录保护', 'Sign-in protection') }}</h1>
-        <p>{{ locale.text('管理员和首页分别计数；WebDAV 固定为 5 次错误后限制 60 秒。', 'Administrator and browser failures are counted separately. WebDAV remains fixed at 5 failures and a 60-second restriction.') }}</p>
-      </div>
-    </header>
-    <form class="admin-pane-body" @submit.prevent="submitSecurity">
-      <div class="account-form">
-        <label class="admin-field limits-field">
-          <span>{{ locale.text('管理员错误次数', 'Administrator failure limit') }}</span>
-          <span class="limits-control"><input v-model="adminFailures" type="number" min="3" max="10" step="1"><small>3–10</small></span>
-        </label>
-        <label class="admin-field limits-field">
-          <span>{{ locale.text('管理员封禁时间', 'Administrator block duration') }}</span>
-          <span class="limits-control"><span class="input-with-unit"><input v-model="adminBlockMinutes" type="number" min="5" max="1440" step="1"><span>{{ locale.text('分钟', 'min') }}</span></span><small>5–1440</small></span>
-        </label>
-        <label class="admin-field limits-field">
-          <span>{{ locale.text('首页错误次数', 'Browser failure limit') }}</span>
-          <span class="limits-control"><input v-model="webFailures" type="number" min="3" max="20" step="1"><small>3–20</small></span>
-        </label>
-        <label class="admin-field limits-field">
-          <span>{{ locale.text('首页封禁时间', 'Browser block duration') }}</span>
-          <span class="limits-control"><span class="input-with-unit"><input v-model="webBlockMinutes" type="number" min="5" max="1440" step="1"><span>{{ locale.text('分钟', 'min') }}</span></span><small>5–1440</small></span>
-        </label>
-      </div>
-      <p class="admin-form-error" role="alert">{{ securityError }}</p>
-      <div class="admin-save-row"><button class="btn" type="submit" :disabled="savingSecurity || !hasSecurityChanges">{{ savingSecurity ? locale.t('common.saving') : locale.text('保存登录保护', 'Save sign-in protection') }}</button></div>
-    </form>
+      <form class="account-section login-policy-section" aria-labelledby="login-policy-title" @submit.prevent="submitSecurity">
+        <div class="section-heading">
+          <h2 id="login-policy-title">{{ locale.text('登录保护', 'Sign-in protection') }}</h2>
+          <p>{{ locale.text('管理员和首页分别计数；WebDAV 固定为 5 次错误后限制 60 秒。', 'Administrator and browser failures are counted separately. WebDAV remains fixed at 5 failures and a 60-second restriction.') }}</p>
+        </div>
+        <div class="settings-grid security-settings-grid">
+          <label class="compact-field limits-field">
+            <span>{{ locale.text('管理员错误次数', 'Administrator failure limit') }}</span>
+            <span class="limits-control"><input v-model="adminFailures" type="number" min="3" max="10" step="1"><small>3–10</small></span>
+          </label>
+          <label class="compact-field limits-field">
+            <span>{{ locale.text('管理员封禁时间', 'Administrator block duration') }}</span>
+            <span class="limits-control"><span class="input-with-unit"><input v-model="adminBlockMinutes" type="number" min="5" max="1440" step="1"><span>{{ locale.text('分钟', 'min') }}</span></span><small>5–1440</small></span>
+          </label>
+          <label class="compact-field limits-field">
+            <span>{{ locale.text('首页错误次数', 'Browser failure limit') }}</span>
+            <span class="limits-control"><input v-model="webFailures" type="number" min="3" max="20" step="1"><small>3–20</small></span>
+          </label>
+          <label class="compact-field limits-field">
+            <span>{{ locale.text('首页封禁时间', 'Browser block duration') }}</span>
+            <span class="limits-control"><span class="input-with-unit"><input v-model="webBlockMinutes" type="number" min="5" max="1440" step="1"><span>{{ locale.text('分钟', 'min') }}</span></span><small>5–1440</small></span>
+          </label>
+        </div>
+        <p class="admin-form-error" role="alert">{{ securityError }}</p>
+        <div class="admin-save-row"><button class="btn" type="submit" :disabled="savingSecurity || !hasSecurityChanges">{{ savingSecurity ? locale.t('common.saving') : locale.text('保存登录保护', 'Save sign-in protection') }}</button></div>
+      </form>
+    </div>
   </section>
 
   <div v-if="confirmRemoval" class="overlay" @click.self="confirmRemoval = false">

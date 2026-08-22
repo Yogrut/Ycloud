@@ -33,6 +33,20 @@ function mountAccount(host: HTMLElement) {
 }
 
 describe('AccountView', () => {
+  it('groups credentials and sign-in protection into one compact settings pane', async () => {
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountAccount(host)
+    await nextTick()
+
+    expect(host.querySelectorAll('.admin-pane')).toHaveLength(1)
+    expect(host.querySelectorAll('.account-section')).toHaveLength(2)
+    expect(host.querySelectorAll('.settings-grid')).toHaveLength(2)
+    expect(host.textContent).toContain('账户凭据')
+    expect(host.textContent).toContain('登录保护')
+    app.unmount()
+  })
+
   it('does not submit masked passwords when only the username changes', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
       status: 200,

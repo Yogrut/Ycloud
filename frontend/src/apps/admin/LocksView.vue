@@ -143,7 +143,7 @@ async function confirmDelete(): Promise<void> {
   </section>
 
   <div v-if="showEditor" class="overlay" @click.self="closeEditor">
-    <form class="modal" role="dialog" aria-modal="true" aria-labelledby="lock-editor-title" @submit.prevent="submit">
+    <form class="modal compact-editor-modal" role="dialog" aria-modal="true" aria-labelledby="lock-editor-title" @submit.prevent="submit">
       <h2 id="lock-editor-title">{{ editing ? locale.text('编辑文件夹锁', 'Edit folder lock') : locale.text('新建文件夹锁', 'New folder lock') }}</h2>
       <label>
         {{ locale.text('网页文件夹路径', 'Browser folder path') }}

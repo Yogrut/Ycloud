@@ -75,6 +75,21 @@ describe('WebDavView', () => {
     app.unmount()
   })
 
+  it('shows long storage and connection paths in full-width fields', async () => {
+    const host = document.createElement('div')
+    document.body.append(host)
+    const { app } = mountWebDav(host)
+    ;(host.querySelector('.webdav-head .btn') as HTMLButtonElement).click()
+    await nextTick()
+
+    const fullFields = host.querySelectorAll('.webdav-form-grid .full-field')
+    const connection = host.querySelector<HTMLInputElement>('.connection-path-field input')
+    expect(fullFields).toHaveLength(2)
+    expect(connection?.readOnly).toBe(true)
+    expect(connection?.value).toBe('/dav/挂载名称')
+    app.unmount()
+  })
+
   it('updates only an explicitly changed field and preserves the password mask', async () => {
     const fetchMock = vi.fn().mockResolvedValue(respondJson({ ...mountView, readonly: true }))
     vi.stubGlobal('fetch', fetchMock)

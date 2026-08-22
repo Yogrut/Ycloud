@@ -28,6 +28,7 @@ describe('LocksView', () => {
     const { app, changed } = mountLocks(host)
     ;(host.querySelector('.locks-head .btn') as HTMLButtonElement).click()
     await nextTick()
+    expect(host.querySelector('.compact-editor-modal')).not.toBeNull()
     const inputs = host.querySelectorAll<HTMLInputElement>('.modal input')
     if (!inputs[0] || !inputs[1]) throw new Error('lock inputs missing')
     inputs[0].value = '\\test//child/'

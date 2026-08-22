@@ -193,24 +193,28 @@ async function confirmDelete(): Promise<void> {
     <form class="modal webdav-modal" role="dialog" aria-modal="true" aria-labelledby="webdav-editor-title" @submit.prevent="submit">
       <h2 id="webdav-editor-title">{{ editing ? locale.text('编辑 WebDAV 挂载', 'Edit WebDAV mount') : locale.text('新建 WebDAV 挂载', 'New WebDAV mount') }}</h2>
       <div class="webdav-form-grid">
-        <label>
+        <label class="webdav-name-field">
           {{ locale.text('挂载名称', 'Mount name') }}
           <input v-model="name" class="input" required maxlength="128">
         </label>
-        <label>
+        <label class="webdav-path-field full-field">
           {{ locale.text('存储路径', 'Storage path') }}
           <input v-model="path" class="input" maxlength="4096" :placeholder="locale.text('/ 表示存储根目录', '/ means the storage root')">
         </label>
-        <label>
+        <label class="webdav-user-field">
           {{ locale.text('WebDAV 用户名', 'WebDAV username') }}
           <input v-model="username" class="input" maxlength="128" autocomplete="username">
         </label>
-        <label>
+        <label class="webdav-password-field">
           {{ locale.text('WebDAV 密码', 'WebDAV password') }}
           <input v-model="password" class="input" type="password" maxlength="1024" autocomplete="new-password" @focus="selectMask">
         </label>
+        <label class="full-field connection-path-field">
+          {{ locale.text('连接路径', 'Connection path') }}
+          <input class="input" :value="connectionPath(name || locale.text('挂载名称', 'mount-name'))" readonly tabindex="-1">
+        </label>
       </div>
-      <p class="field-hint">{{ locale.text('连接路径为', 'Connection path:') }} {{ connectionPath(name || locale.text('挂载名称', 'mount-name')) }}. {{ locale.text('存储路径保存时自动统一。启用 WebDAV 时需要用户名和至少 12 位密码。', 'Storage paths are normalized when saved. An enabled mount requires a username and a password of at least 12 characters.') }}</p>
+      <p class="field-hint">{{ locale.text('存储路径保存时自动统一。启用 WebDAV 时需要用户名和至少 12 位密码。', 'Storage paths are normalized when saved. An enabled mount requires a username and a password of at least 12 characters.') }}</p>
       <p class="field-hint">{{ locale.text('挂载路径不能与网页文件夹锁的父、当前或子目录重叠；编辑时保留密码掩码表示不修改密码。', 'A mount path cannot overlap a browser folder lock at any level. Leave the password mask unchanged while editing to keep the current password.') }}</p>
       <div class="webdav-options">
         <label><input v-model="webdavEnabled" type="checkbox">{{ locale.text('启用 WebDAV', 'Enable WebDAV') }}</label>

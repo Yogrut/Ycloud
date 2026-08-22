@@ -240,6 +240,10 @@ pub struct Config {
     pub public_base_url: Option<String>,
     pub public_host: Option<String>,
     pub trusted_proxy_ips: HashSet<IpAddr>,
+    /// Exact origins that administrators may use for MinIO/RustFS or generic
+    /// S3 endpoints. Official Alibaba and Tencent endpoints are constrained by
+    /// their provider presets instead.
+    pub s3_allowed_endpoints: HashSet<String>,
 }
 
 pub type SharedConfig = Arc<RwLock<ConfigFile>>;
@@ -693,6 +697,7 @@ impl Config {
         let allow_lan_http = env_parse("ALLOW_LAN_HTTP", false)?;
         let (public_base_url, public_host, trusted_proxy_ips) =
             public_proxy_config(bind_address, secure_cookies, allow_lan_http)?;
+        let s3_allowed_endpoints = s3_allowed_endpoints()?;
         Ok(Self {
             bind_address,
             port,
@@ -709,12 +714,70 @@ impl Config {
             public_base_url,
             public_host,
             trusted_proxy_ips,
+            s3_allowed_endpoints,
         })
     }
 
     pub fn is_public_mode(&self) -> bool {
         self.public_base_url.is_some()
     }
+
+    pub fn allows_storage_backend(&self, backend: &StorageBackendConfig) -> AppResult<()> {
+        let StorageBackendConfig::S3(settings) = backend else {
+            return Ok(());
+        };
+        if matches!(
+            settings.provider,
+            S3Provider::AlibabaOss | S3Provider::TencentCos
+        ) {
+            return Ok(());
+        }
+        let endpoint = normalize_s3_endpoint(&settings.endpoint)?;
+        if self.s3_allowed_endpoints.contains(&endpoint) {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden)
+        }
+    }
+}
+
+fn s3_allowed_endpoints() -> anyhow::Result<HashSet<String>> {
+    std::env::var("S3_ALLOWED_ENDPOINTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            normalize_s3_endpoint(value)
+                .map_err(|_| anyhow::anyhow!("Invalid S3_ALLOWED_ENDPOINTS origin: {value}"))
+        })
+        .collect()
+}
+
+pub fn normalize_s3_endpoint(endpoint: &str) -> AppResult<String> {
+    let uri: axum::http::Uri = endpoint
+        .parse()
+        .map_err(|_| AppError::BadRequest("S3 Endpoint 地址无效".into()))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| AppError::BadRequest("S3 Endpoint 必须包含 http:// 或 https://".into()))?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| AppError::BadRequest("S3 Endpoint 缺少主机".into()))?;
+    if !matches!(scheme, "http" | "https")
+        || !matches!(uri.path(), "" | "/")
+        || uri.query().is_some()
+        || authority.as_str().contains('@')
+    {
+        return Err(AppError::BadRequest(
+            "S3 Endpoint 只能是无凭据、无路径和无查询参数的 HTTP(S) 地址".into(),
+        ));
+    }
+    Ok(format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.as_str().to_ascii_lowercase()
+    ))
 }
 
 fn public_proxy_config(
@@ -1125,11 +1188,12 @@ impl SecureOpenOptions for OpenOptions {
 mod tests {
     use super::{
         config_backup_path, hash_password, initial_credentials_path, load_config,
-        path_is_same_or_descendant, paths_overlap, remove_initial_credentials, save_config,
-        verify_password, ConfigFile, FolderLock, InitialCredentials, LocalStorageConfig,
-        S3AddressingStyle, S3Provider, S3StorageConfig, StorageBackendConfig,
-        CONFIG_SCHEMA_VERSION, DEFAULT_MAX_ARCHIVE_BYTES, DEFAULT_MAX_ARCHIVE_ENTRIES,
-        DEFAULT_MAX_UPLOAD_BYTES, HARD_MAX_TRANSFER_RATE_BYTES, MIN_TRANSFER_RATE_BYTES,
+        normalize_s3_endpoint, path_is_same_or_descendant, paths_overlap,
+        remove_initial_credentials, save_config, verify_password, Config, ConfigFile, FolderLock,
+        InitialCredentials, LocalStorageConfig, S3AddressingStyle, S3Provider, S3StorageConfig,
+        StorageBackendConfig, CONFIG_SCHEMA_VERSION, DEFAULT_MAX_ARCHIVE_BYTES,
+        DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_UPLOAD_BYTES, HARD_MAX_TRANSFER_RATE_BYTES,
+        MIN_TRANSFER_RATE_BYTES,
     };
 
     #[test]
@@ -1324,6 +1388,49 @@ mod tests {
             ..settings
         });
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn custom_s3_endpoint_cannot_expand_deployment_allowlist() {
+        let endpoint = normalize_s3_endpoint("HTTP://10.126.0.2:9000/").unwrap();
+        assert_eq!(endpoint, "http://10.126.0.2:9000");
+        let runtime = Config {
+            bind_address: std::net::IpAddr::from([127, 0, 0, 1]),
+            port: 18_473,
+            storage_path: "./storage".into(),
+            config_path: "./config.json".into(),
+            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            io_concurrency: 4,
+            max_list_entries: 10_000,
+            request_timeout_secs: 300,
+            upload_timeout_secs: 21_600,
+            disk_reserve_bytes: 512 * 1024 * 1024,
+            secure_cookies: false,
+            allow_lan_http: false,
+            public_base_url: None,
+            public_host: None,
+            trusted_proxy_ips: Default::default(),
+            s3_allowed_endpoints: [endpoint].into_iter().collect(),
+        };
+        let settings = S3StorageConfig {
+            provider: S3Provider::Minio,
+            endpoint: "http://10.126.0.2:9000".into(),
+            bucket: "ycloud-files".into(),
+            region: "us-east-1".into(),
+            prefix: "files/".into(),
+            addressing_style: S3AddressingStyle::Path,
+            access_key_id: "example-access-key".into(),
+            secret_access_key: "example-secret-key".into(),
+        };
+        assert!(runtime
+            .allows_storage_backend(&StorageBackendConfig::S3(settings.clone()))
+            .is_ok());
+        assert!(runtime
+            .allows_storage_backend(&StorageBackendConfig::S3(S3StorageConfig {
+                endpoint: "http://10.126.0.3:9000".into(),
+                ..settings
+            }))
+            .is_err());
     }
 
     #[tokio::test]

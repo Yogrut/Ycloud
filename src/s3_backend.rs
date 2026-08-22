@@ -7,7 +7,9 @@ use aws_sdk_s3::{
 use aws_smithy_http_client::Builder as HttpClientBuilder;
 
 use crate::{
-    config::{validate_storage_backend, S3AddressingStyle, S3StorageConfig, StorageBackendConfig},
+    config::{
+        validate_storage_backend, Config, S3AddressingStyle, S3StorageConfig, StorageBackendConfig,
+    },
     error::{AppError, AppResult},
     storage::StorageService,
 };
@@ -32,8 +34,9 @@ pub struct S3Backend {
 }
 
 impl S3Backend {
-    pub fn new(settings: &S3StorageConfig) -> AppResult<Self> {
+    pub fn new(settings: &S3StorageConfig, runtime: &Config) -> AppResult<Self> {
         validate_storage_backend(&StorageBackendConfig::S3(settings.clone()))?;
+        runtime.allows_storage_backend(&StorageBackendConfig::S3(settings.clone()))?;
 
         let credentials = Credentials::new(
             settings.access_key_id.clone(),

@@ -320,6 +320,7 @@ mod tests {
             public_base_url: None,
             public_host: None,
             trusted_proxy_ips: Default::default(),
+            s3_allowed_endpoints: Default::default(),
         }
     }
 }

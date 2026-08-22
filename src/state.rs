@@ -7,7 +7,7 @@ use crate::{
     auth::{
         AccessTokenStore, PasswordService, SessionStore, SharedAccessTokenStore, SharedSessionStore,
     },
-    config::{save_config, Config, ConfigFile, SharedConfig},
+    config::{save_config, Config, ConfigFile, SharedConfig, StorageBackendConfig},
     error::{AppError, AppResult},
     login_security::LoginSecurity,
     storage::StorageService,
@@ -34,6 +34,12 @@ pub struct AppState {
 impl AppState {
     pub async fn new(config: Config, config_file: SharedConfig) -> AppResult<Self> {
         let persisted = config_file.read().await.clone();
+        config.allows_storage_backend(&persisted.storage_backend)?;
+        if matches!(persisted.storage_backend, StorageBackendConfig::S3(_)) {
+            return Err(AppError::ServiceUnavailable(
+                "S3 存储后端仍在分阶段验收，尚未允许接管真实文件流量".into(),
+            ));
+        }
         let max_upload_bytes = persisted.max_upload_bytes;
         if max_upload_bytes > config.max_upload_bytes {
             return Err(AppError::BadRequest(

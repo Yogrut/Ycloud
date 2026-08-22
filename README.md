@@ -70,6 +70,8 @@ TRUSTED_PROXY_IPS=127.0.0.1
 
 常用环境变量：
 
+- `S3_ALLOWED_ENDPOINTS`：允许后台使用的 MinIO、RustFS 或通用 S3 Endpoint 精确来源，多个值用英文逗号分隔，例如 `http://10.126.0.2:9000,https://s3.example.com`。阿里云 OSS 与腾讯云 COS 使用官方预设域名，不需要加入此列表。
+
 | 变量 | 默认值 | 说明 |
 |---|---:|---|
 | `BIND_ADDRESS` | `127.0.0.1` | 监听地址 |
@@ -78,6 +80,7 @@ TRUSTED_PROXY_IPS=127.0.0.1
 | `CONFIG_PATH` | `./config.json` | 配置文件 |
 | `MAX_UPLOAD_BYTES` | `100 GiB` | 后台上传设置的部署级硬上限 |
 | `DISK_RESERVE_BYTES` | `512 MiB` | 文件提交后保留的磁盘空间 |
+| `S3_ALLOWED_ENDPOINTS` | 空 | MinIO、RustFS 与通用 S3 的精确 Endpoint 白名单 |
 
 默认单文件上传上限为 5 GiB；普通单文件下载不限制大小；打包下载默认最多包含 3 GiB 文件内容和 1,000 个文件与文件夹条目。容量、打包范围及全局上下行速率可在管理后台的硬边界内调整；并发数、密码队列和磁盘预留保持程序固定。
 

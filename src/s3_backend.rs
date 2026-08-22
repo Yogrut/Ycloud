@@ -196,6 +196,106 @@ impl S3Backend {
         Ok(())
     }
 
+    /// Verify every object capability required before this backend can serve
+    /// user traffic. The probe is confined to Ycloud's reserved prefix and
+    /// always attempts cleanup; it never touches a user-visible object key.
+    pub async fn activation_probe(&self) -> AppResult<()> {
+        self.probe().await?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let source_key = internal_key(&self.prefix, "activation-tests", &id);
+        let copy_key = internal_key(&self.prefix, "activation-tests", &format!("{id}-copy"));
+        let payload = format!("ycloud-storage-activation:{id}").into_bytes();
+        let result = self
+            .activation_probe_inner(&source_key, &copy_key, &payload)
+            .await;
+        if result.is_err() {
+            self.delete_internal_best_effort(&copy_key).await;
+            self.delete_internal_best_effort(&source_key).await;
+        }
+        result
+    }
+
+    async fn activation_probe_inner(
+        &self,
+        source_key: &str,
+        copy_key: &str,
+        payload: &[u8],
+    ) -> AppResult<()> {
+        let length = i64::try_from(payload.len())
+            .map_err(|_| AppError::ServiceUnavailable("对象存储激活探测数据无效".into()))?;
+        let _permit = self.acquire_request().await?;
+        let output = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(source_key)
+            .content_length(length)
+            .if_none_match("*")
+            .body(ByteStream::from(payload.to_vec()))
+            .send()
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                    "S3 activation write probe failed"
+                );
+                AppError::ServiceUnavailable("对象存储缺少安全写入权限或条件写入能力".into())
+            })?;
+        let source_etag = output
+            .e_tag()
+            .map(str::to_owned)
+            .ok_or_else(|| AppError::ServiceUnavailable("对象存储写入未返回 ETag".into()))?;
+        drop(_permit);
+
+        let source = self
+            .head_key(source_key)
+            .await?
+            .ok_or_else(|| AppError::ServiceUnavailable("对象存储写入探测对象不可见".into()))?;
+        if source.size != payload.len() as u64 || source.etag.as_deref() != Some(&source_etag) {
+            return Err(AppError::ServiceUnavailable(
+                "对象存储写入后的长度或版本校验失败".into(),
+            ));
+        }
+
+        let _permit = self.acquire_request().await?;
+        let downloaded = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(source_key)
+            .if_match(&source_etag)
+            .send()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("对象存储读取校验失败".into()))?
+            .body
+            .collect()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("对象存储读取响应不完整".into()))?
+            .into_bytes();
+        drop(_permit);
+        if downloaded.as_ref() != payload {
+            return Err(AppError::ServiceUnavailable(
+                "对象存储读取内容校验失败".into(),
+            ));
+        }
+
+        let copied_etag = self
+            .copy_key(source_key, copy_key, Some(&source_etag), true)
+            .await?;
+        let copied = self
+            .head_key(copy_key)
+            .await?
+            .ok_or_else(|| AppError::ServiceUnavailable("对象存储复制探测对象不可见".into()))?;
+        if copied.size != payload.len() as u64 || copied.etag.as_deref() != Some(&copied_etag) {
+            return Err(AppError::ServiceUnavailable(
+                "对象存储服务端复制校验失败".into(),
+            ));
+        }
+        self.delete_key(copy_key, Some(&copied_etag)).await?;
+        self.delete_key(source_key, Some(&source_etag)).await?;
+        Ok(())
+    }
+
     pub fn object_key(&self, relative: &str) -> AppResult<String> {
         object_key(&self.prefix, relative)
     }

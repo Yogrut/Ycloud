@@ -1,6 +1,11 @@
 use axum::{body::Body, http::HeaderMap, response::Response};
 use futures_util::StreamExt;
-use tokio::fs;
+use std::sync::Arc;
+
+use tokio::{
+    fs,
+    sync::{RwLock, RwLockWriteGuard},
+};
 
 use crate::{
     error::{AppError, AppResult},
@@ -26,19 +31,58 @@ pub struct BackendMetadata {
     pub version_tag: Option<String>,
 }
 
-/// Read-side storage boundary used while local and S3 implementations are
-/// migrated in independently verified stages. S3 activation remains blocked
-/// until every write, WebDAV and archive entry point uses the same boundary.
+/// One live storage boundary shared by every HTTP, WebDAV and archive entry
+/// point. A backend replacement takes the write side of this lock, so uploads
+/// and namespace mutations that already started drain before new traffic can
+/// observe the replacement.
 #[derive(Clone)]
-pub enum StorageBackend {
+pub struct StorageBackend {
+    active: Arc<RwLock<StorageBackendKind>>,
+}
+
+#[derive(Clone)]
+enum StorageBackendKind {
     Local(StorageService),
     S3(S3Backend),
 }
 
+pub struct StorageReplacementGuard<'a> {
+    active: RwLockWriteGuard<'a, StorageBackendKind>,
+}
+
+impl StorageReplacementGuard<'_> {
+    pub fn replace_with_local(&mut self, storage: StorageService) {
+        *self.active = StorageBackendKind::Local(storage);
+    }
+
+    pub fn replace_with_s3(&mut self, storage: S3Backend) {
+        *self.active = StorageBackendKind::S3(storage);
+    }
+}
+
 impl StorageBackend {
+    pub fn local(storage: StorageService) -> Self {
+        Self {
+            active: Arc::new(RwLock::new(StorageBackendKind::Local(storage))),
+        }
+    }
+
+    pub fn s3(storage: S3Backend) -> Self {
+        Self {
+            active: Arc::new(RwLock::new(StorageBackendKind::S3(storage))),
+        }
+    }
+
+    pub async fn begin_replacement(&self) -> StorageReplacementGuard<'_> {
+        StorageReplacementGuard {
+            active: self.active.write().await,
+        }
+    }
+
     pub async fn metadata(&self, relative: &str) -> AppResult<BackendMetadata> {
-        match self {
-            Self::Local(storage) => {
+        let active = self.active.read().await;
+        match &*active {
+            StorageBackendKind::Local(storage) => {
                 let path = storage.resolve_existing(relative).await?;
                 let metadata = storage.metadata(&path).await?;
                 Ok(BackendMetadata {
@@ -52,7 +96,7 @@ impl StorageBackend {
                     version_tag: None,
                 })
             }
-            Self::S3(storage) => {
+            StorageBackendKind::S3(storage) => {
                 let metadata = storage.metadata(relative).await?;
                 Ok(BackendMetadata {
                     is_dir: metadata.is_dir,
@@ -70,9 +114,12 @@ impl StorageBackend {
         relative: &str,
         max_entries: usize,
     ) -> AppResult<(Vec<BackendEntry>, bool)> {
-        match self {
-            Self::Local(storage) => list_local_directory(storage, relative, max_entries).await,
-            Self::S3(storage) => {
+        let active = self.active.read().await;
+        match &*active {
+            StorageBackendKind::Local(storage) => {
+                list_local_directory(storage, relative, max_entries).await
+            }
+            StorageBackendKind::S3(storage) => {
                 let result = storage.list_directory(relative, max_entries).await?;
                 Ok((
                     result
@@ -98,12 +145,13 @@ impl StorageBackend {
         headers: &HeaderMap,
         mode: FileResponseMode,
     ) -> AppResult<Response> {
-        match self {
-            Self::Local(storage) => {
+        let active = self.active.read().await;
+        match &*active {
+            StorageBackendKind::Local(storage) => {
                 let path = storage.resolve_existing(relative).await?;
                 storage.stream_file(&path, headers, mode).await
             }
-            Self::S3(storage) => storage.stream_file(relative, headers, mode).await,
+            StorageBackendKind::S3(storage) => storage.stream_file(relative, headers, mode).await,
         }
     }
 
@@ -115,8 +163,9 @@ impl StorageBackend {
         max_upload_bytes: u64,
         content_type: Option<&str>,
     ) -> AppResult<u64> {
-        match self {
-            Self::Local(storage) => {
+        let active = self.active.read().await;
+        match &*active {
+            StorageBackendKind::Local(storage) => {
                 let mut writer = match expected_bytes {
                     Some(bytes) => {
                         storage
@@ -133,7 +182,7 @@ impl StorageBackend {
                 }
                 writer.commit().await
             }
-            Self::S3(storage) => {
+            StorageBackendKind::S3(storage) => {
                 let content_length = expected_bytes.ok_or_else(|| {
                     AppError::BadRequest(
                         "对象存储上传需要有效的 Content-Length，不能使用未知长度请求体".into(),
@@ -154,22 +203,24 @@ impl StorageBackend {
     }
 
     pub async fn create_directory(&self, relative: &str) -> AppResult<()> {
-        match self {
-            Self::Local(storage) => {
+        let active = self.active.read().await;
+        match &*active {
+            StorageBackendKind::Local(storage) => {
                 let path = storage.resolve_for_write(relative).await?;
                 storage.create_directory(&path).await
             }
-            Self::S3(storage) => storage.create_directory(relative).await,
+            StorageBackendKind::S3(storage) => storage.create_directory(relative).await,
         }
     }
 
     pub async fn remove(&self, relative: &str) -> AppResult<()> {
-        match self {
-            Self::Local(storage) => {
+        let active = self.active.read().await;
+        match &*active {
+            StorageBackendKind::Local(storage) => {
                 let path = storage.resolve_existing(relative).await?;
                 storage.remove(&path).await
             }
-            Self::S3(storage) => {
+            StorageBackendKind::S3(storage) => {
                 let metadata = storage.metadata(relative).await?;
                 if metadata.is_dir {
                     storage.delete_directory(relative).await
@@ -181,13 +232,14 @@ impl StorageBackend {
     }
 
     pub async fn move_path(&self, source: &str, destination: &str) -> AppResult<()> {
-        match self {
-            Self::Local(storage) => {
+        let active = self.active.read().await;
+        match &*active {
+            StorageBackendKind::Local(storage) => {
                 let source = storage.resolve_existing(source).await?;
                 let destination = storage.resolve_for_write(destination).await?;
                 storage.move_path(&source, &destination).await
             }
-            Self::S3(storage) => {
+            StorageBackendKind::S3(storage) => {
                 if storage.metadata(source).await?.is_dir {
                     storage.move_directory(source, destination).await
                 } else {
@@ -198,13 +250,14 @@ impl StorageBackend {
     }
 
     pub async fn copy_path(&self, source: &str, destination: &str) -> AppResult<()> {
-        match self {
-            Self::Local(storage) => {
+        let active = self.active.read().await;
+        match &*active {
+            StorageBackendKind::Local(storage) => {
                 let source = storage.resolve_existing(source).await?;
                 let destination = storage.resolve_for_write(destination).await?;
                 storage.copy_path(&source, &destination).await
             }
-            Self::S3(storage) => {
+            StorageBackendKind::S3(storage) => {
                 if storage.metadata(source).await?.is_dir {
                     storage.copy_directory(source, destination).await
                 } else {
@@ -215,9 +268,10 @@ impl StorageBackend {
     }
 
     pub async fn ready(&self) -> bool {
-        match self {
-            Self::Local(storage) => storage.ready().await,
-            Self::S3(storage) => storage.probe().await.is_ok(),
+        let active = self.active.read().await;
+        match &*active {
+            StorageBackendKind::Local(storage) => storage.ready().await,
+            StorageBackendKind::S3(storage) => storage.probe().await.is_ok(),
         }
     }
 }

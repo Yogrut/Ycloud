@@ -35,6 +35,8 @@ pub struct AdminInfo {
     pub security_log_retention_days: u32,
     pub security_log_max_entries: usize,
     pub storage_backend: StorageBackendView,
+    pub pending_storage_backend: Option<StorageBackendView>,
+    pub local_storage_path: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -164,6 +166,7 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
         security_log_retention_days,
         security_log_max_entries,
         storage_backend,
+        pending_storage_backend,
     ) = {
         let config = state.config_file.read().await;
         (
@@ -187,6 +190,9 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
             config.security_log_retention_days,
             config.security_log_max_entries,
             StorageBackendView::from_config(&config.storage_backend, &state.config.storage_path),
+            config.pending_storage_backend.as_ref().map(|backend| {
+                StorageBackendView::from_config(backend, &state.config.storage_path)
+            }),
         )
     };
     Json(AdminInfo {
@@ -206,6 +212,8 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
         security_log_retention_days,
         security_log_max_entries,
         storage_backend,
+        pending_storage_backend,
+        local_storage_path: state.config.storage_path.to_string_lossy().into_owned(),
     })
 }
 
@@ -219,6 +227,36 @@ pub async fn test_s3_storage(
     let backend = S3Backend::new(&settings, &state.config)?;
     backend.probe().await?;
     Ok(Json(serde_json::json!({ "success": true })))
+}
+
+/// Run the full read/write/copy/delete capability probe and persist the
+/// credentials only as a pending backend. User traffic remains on the current
+/// backend until a separate activation request succeeds.
+pub async fn stage_s3_storage(
+    State(state): State<AppState>,
+    Json(settings): Json<S3StorageConfig>,
+) -> AppResult<Json<serde_json::Value>> {
+    state.stage_s3_storage(settings).await?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+pub async fn stage_local_storage(
+    State(state): State<AppState>,
+) -> AppResult<Json<serde_json::Value>> {
+    state.stage_local_storage().await?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+pub async fn activate_pending_storage(
+    State(state): State<AppState>,
+) -> AppResult<Json<serde_json::Value>> {
+    state.activate_pending_storage().await?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+pub async fn discard_pending_storage(State(state): State<AppState>) -> AppResult<StatusCode> {
+    state.discard_pending_storage().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

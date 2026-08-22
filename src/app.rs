@@ -103,6 +103,18 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/account", put(admin_api::update_admin_account))
         .route("/storage/test", post(admin_api::test_s3_storage))
+        .route(
+            "/storage/pending",
+            put(admin_api::stage_s3_storage).delete(admin_api::discard_pending_storage),
+        )
+        .route(
+            "/storage/pending/local",
+            put(admin_api::stage_local_storage),
+        )
+        .route(
+            "/storage/activate",
+            post(admin_api::activate_pending_storage),
+        )
         .route("/limits", put(admin_api::update_transfer_limits))
         .route(
             "/security/settings",
@@ -291,7 +303,10 @@ async fn not_found(_request: Request) -> impl IntoResponse {
 mod tests {
     use super::build_router;
     use crate::{
-        config::{hash_password, Config, ConfigFile, Share, CONFIG_SCHEMA_VERSION},
+        config::{
+            hash_password, Config, ConfigFile, S3AddressingStyle, S3Provider, S3StorageConfig,
+            Share, StorageBackendConfig, CONFIG_SCHEMA_VERSION,
+        },
         state::AppState,
     };
     use axum::{
@@ -343,6 +358,16 @@ mod tests {
                 max_upload_bytes: 1024 * 1024,
                 max_archive_bytes: 2 * 1024 * 1024,
                 max_archive_entries: 100,
+                pending_storage_backend: Some(StorageBackendConfig::S3(S3StorageConfig {
+                    provider: S3Provider::AlibabaOss,
+                    endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
+                    bucket: "ycloud-test".into(),
+                    region: "cn-hangzhou".into(),
+                    prefix: "files/".into(),
+                    addressing_style: S3AddressingStyle::VirtualHosted,
+                    access_key_id: "pending-access-key".into(),
+                    secret_access_key: "pending-secret-key".into(),
+                })),
                 ..ConfigFile::default()
             })),
         )
@@ -387,7 +412,19 @@ mod tests {
         let admin_info_json: serde_json::Value = serde_json::from_slice(&admin_info_body).unwrap();
         assert_eq!(admin_info_json["storage_backend"]["type"], "local");
         assert!(admin_info_json["storage_backend"]["path"].is_string());
-        assert!(!String::from_utf8_lossy(&admin_info_body).contains("secret_access_key"));
+        assert_eq!(admin_info_json["pending_storage_backend"]["type"], "s3");
+        assert_eq!(
+            admin_info_json["pending_storage_backend"]["has_access_key_id"],
+            true
+        );
+        assert_eq!(
+            admin_info_json["pending_storage_backend"]["has_secret_access_key"],
+            true
+        );
+        assert!(admin_info_json["local_storage_path"].is_string());
+        let admin_info_text = String::from_utf8_lossy(&admin_info_body);
+        assert!(!admin_info_text.contains("pending-access-key"));
+        assert!(!admin_info_text.contains("pending-secret-key"));
 
         let unapproved_s3_test = app
             .clone()

@@ -131,7 +131,13 @@ onMounted(load)
     <div class="admin-content">
       <div v-if="loading" class="admin-loading glass">{{ locale.t('common.loading') }}</div>
       <SecurityView v-else-if="info && activeSection === 'security'" :info="info" @changed="showNotice" />
-      <StorageView v-else-if="info && activeSection === 'storage'" :backend="info.storage_backend" @tested="showNotice" />
+      <StorageView
+        v-else-if="info && activeSection === 'storage'"
+        :backend="info.storage_backend"
+        :pending-backend="info.pending_storage_backend"
+        :local-path="info.local_storage_path"
+        @changed="showNotice"
+      />
       <LimitsView v-else-if="info && activeSection === 'limits'" :info="info" @saved="showNotice" />
       <LocksView v-else-if="info && activeSection === 'locks'" :locks="info.folder_locks" @changed="showNotice" />
       <WebDavView v-else-if="info && activeSection === 'webdav'" :mounts="info.shares" @changed="showNotice" />

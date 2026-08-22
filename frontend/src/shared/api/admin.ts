@@ -19,6 +19,8 @@ export interface AdminInfo {
   security_log_retention_days: number
   security_log_max_entries: number
   storage_backend: StorageBackendView
+  pending_storage_backend: StorageBackendView | null
+  local_storage_path: string
 }
 
 export type S3Provider = 'alibaba_oss' | 'tencent_cos' | 'minio' | 's3_compatible'
@@ -210,6 +212,26 @@ export function testS3Storage(body: TestS3StorageRequest): Promise<{ success: bo
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+export function stageS3Storage(body: TestS3StorageRequest): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/storage/pending', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export function stageLocalStorage(): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/storage/pending/local', { method: 'PUT' })
+}
+
+export function activatePendingStorage(): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/storage/activate', { method: 'POST' })
+}
+
+export function discardPendingStorage(): Promise<void> {
+  return adminRequest('/api/admin/storage/pending', { method: 'DELETE' })
 }
 
 export function updateLoginSecuritySettings(body: UpdateLoginSecuritySettingsRequest): Promise<{ success: boolean }> {

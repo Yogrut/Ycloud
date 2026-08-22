@@ -96,6 +96,10 @@ impl ArchiveTicketStore {
         (ticket.created_at.elapsed() <= TICKET_TTL).then_some(ticket)
     }
 
+    pub async fn clear(&self) {
+        self.tickets.lock().await.clear();
+    }
+
     async fn acquire_prepare(&self) -> AppResult<tokio::sync::OwnedSemaphorePermit> {
         self.prepare_gate
             .clone()
@@ -449,7 +453,7 @@ mod tests {
         let storage = StorageService::new(root.clone(), 1024, 2, 100, 0)
             .await
             .unwrap();
-        let backend = StorageBackend::Local(storage);
+        let backend = StorageBackend::local(storage);
         let metadata = backend.metadata("游戏音乐.flac").await.unwrap();
         let (writer_side, mut reader_side) = tokio::io::duplex(16 * 1024);
         let task = tokio::spawn(write_archive(

@@ -30,7 +30,7 @@ pub const DEFAULT_SECURITY_LOG_MAX_ENTRIES: usize = 5_000;
 pub const HARD_MAX_TRANSFER_RATE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const CONFIG_SCHEMA_VERSION: u32 = 4;
 
 // ── Data types ────────────────────────────────────────────────────
 
@@ -189,6 +189,10 @@ pub struct ConfigFile {
     pub schema_version: u32,
     #[serde(default)]
     pub storage_backend: StorageBackendConfig,
+    /// A fully validated backend that has not yet been allowed to serve user
+    /// traffic. S3 secrets remain confined to the restricted config file.
+    #[serde(default)]
+    pub pending_storage_backend: Option<StorageBackendConfig>,
     pub admin_username: String,
     pub admin_password_hash: String,
     #[serde(default)]
@@ -305,6 +309,7 @@ impl Default for ConfigFile {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             storage_backend: StorageBackendConfig::default(),
+            pending_storage_backend: None,
             admin_username: default_admin_username(),
             admin_password_hash: default_hash.clone(),
             global_web_password_hash: Some(default_hash),
@@ -372,6 +377,14 @@ impl ConfigFile {
         validate_transfer_rate(self.upload_rate_bytes_per_sec, "上传")?;
         validate_transfer_rate(self.download_rate_bytes_per_sec, "下载")?;
         validate_storage_backend(&self.storage_backend)?;
+        if let Some(pending) = &self.pending_storage_backend {
+            validate_storage_backend(pending)?;
+            if pending == &self.storage_backend {
+                return Err(AppError::Conflict(
+                    "待启用存储不能与当前活动存储相同".into(),
+                ));
+            }
+        }
 
         let mut share_ids = HashSet::new();
         let mut share_names = HashSet::new();
@@ -943,6 +956,7 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
         let config = ConfigFile {
             schema_version: CONFIG_SCHEMA_VERSION,
             storage_backend: StorageBackendConfig::default(),
+            pending_storage_backend: None,
             admin_username: credentials.admin_username.clone(),
             admin_password_hash: hash_password(&credentials.admin_password),
             global_web_password_hash: Some(hash_password(&credentials.web_access_password)),
@@ -1350,7 +1364,30 @@ mod tests {
             persisted.storage_backend,
             StorageBackendConfig::Local(LocalStorageConfig {})
         );
+        assert_eq!(persisted.pending_storage_backend, None);
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[test]
+    fn pending_storage_must_differ_from_active_storage() {
+        let mut config = ConfigFile {
+            pending_storage_backend: Some(StorageBackendConfig::Local(LocalStorageConfig {})),
+            ..ConfigFile::default()
+        };
+        assert!(config.validate().is_err());
+
+        let pending = S3StorageConfig {
+            provider: S3Provider::Minio,
+            endpoint: "http://10.126.0.2:9000".into(),
+            bucket: "ycloud-files".into(),
+            region: "us-east-1".into(),
+            prefix: "files/".into(),
+            addressing_style: S3AddressingStyle::Path,
+            access_key_id: "example-access-key".into(),
+            secret_access_key: "example-secret-key".into(),
+        };
+        config.pending_storage_backend = Some(StorageBackendConfig::S3(pending));
+        assert!(config.validate().is_ok());
     }
 
     #[test]

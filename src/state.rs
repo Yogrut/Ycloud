@@ -15,6 +15,11 @@ use crate::{
     transfer_limit::BandwidthLimiter,
 };
 
+enum PreparedStorageBackend {
+    Local,
+    S3(crate::s3_backend::S3Backend),
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
@@ -37,11 +42,6 @@ impl AppState {
     pub async fn new(config: Config, config_file: SharedConfig) -> AppResult<Self> {
         let persisted = config_file.read().await.clone();
         config.allows_storage_backend(&persisted.storage_backend)?;
-        if matches!(persisted.storage_backend, StorageBackendConfig::S3(_)) {
-            return Err(AppError::ServiceUnavailable(
-                "S3 存储后端仍在分阶段验收，尚未允许接管真实文件流量".into(),
-            ));
-        }
         let max_upload_bytes = persisted.max_upload_bytes;
         if max_upload_bytes > config.max_upload_bytes {
             return Err(AppError::BadRequest(
@@ -66,7 +66,18 @@ impl AppState {
             AppError::with_source("failed to load persistent login security state", error)
         })?;
 
-        let backend = StorageBackend::Local(storage.clone());
+        let backend = match &persisted.storage_backend {
+            StorageBackendConfig::Local(_) => StorageBackend::local(storage.clone()),
+            StorageBackendConfig::S3(settings) => {
+                let backend = crate::s3_backend::S3Backend::new(settings, &config)?;
+                backend.activation_probe().await?;
+                let recovered = backend.recover_transactions().await?;
+                if recovered > 0 {
+                    tracing::warn!(recovered, "recovered pending S3 storage transactions");
+                }
+                StorageBackend::s3(backend)
+            }
+        };
         Ok(Self {
             config,
             config_file,
@@ -115,5 +126,174 @@ impl AppState {
             tracing::warn!(%error, "security event log compaction will be retried later");
         }
         Ok(result)
+    }
+
+    /// Validate all required S3 capabilities before persisting credentials as
+    /// a pending backend. The active namespace is not changed by this step.
+    pub async fn stage_s3_storage(
+        &self,
+        settings: crate::config::S3StorageConfig,
+    ) -> AppResult<()> {
+        let candidate = StorageBackendConfig::S3(settings.clone());
+        self.config.allows_storage_backend(&candidate)?;
+        let backend = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
+        backend.activation_probe().await?;
+        let _update_guard = self.config_updates.lock().await;
+        let mut next = self.config_file.read().await.clone();
+        if next.storage_backend == candidate {
+            return Err(AppError::Conflict("该存储已经是当前活动存储".into()));
+        }
+        next.pending_storage_backend = Some(candidate);
+        self.persist_storage_selection(&next).await
+    }
+
+    pub async fn stage_local_storage(&self) -> AppResult<()> {
+        let candidate = StorageBackendConfig::default();
+        let _update_guard = self.config_updates.lock().await;
+        let mut next = self.config_file.read().await.clone();
+        if next.storage_backend == candidate {
+            return Err(AppError::Conflict("本地存储已经是当前活动存储".into()));
+        }
+        next.pending_storage_backend = Some(candidate);
+        self.persist_storage_selection(&next).await
+    }
+
+    pub async fn discard_pending_storage(&self) -> AppResult<()> {
+        let _update_guard = self.config_updates.lock().await;
+        let mut next = self.config_file.read().await.clone();
+        if next.pending_storage_backend.take().is_none() {
+            return Err(AppError::NotFound);
+        }
+        self.persist_storage_selection(&next).await
+    }
+
+    /// Revalidate and recover a staged backend, drain active storage writes,
+    /// persist the selection, then publish it to new requests. If validation
+    /// or persistence fails, the current backend remains untouched.
+    pub async fn activate_pending_storage(&self) -> AppResult<()> {
+        let _update_guard = self.config_updates.lock().await;
+        let mut next = self.config_file.read().await.clone();
+        let pending = next
+            .pending_storage_backend
+            .clone()
+            .ok_or(AppError::NotFound)?;
+        self.config.allows_storage_backend(&pending)?;
+
+        let prepared = match &pending {
+            StorageBackendConfig::Local(_) => PreparedStorageBackend::Local,
+            StorageBackendConfig::S3(settings) => {
+                let backend = crate::s3_backend::S3Backend::new(settings, &self.config)?;
+                backend.activation_probe().await?;
+                let recovered = backend.recover_transactions().await?;
+                if recovered > 0 {
+                    tracing::warn!(recovered, "recovered S3 transactions before activation");
+                }
+                PreparedStorageBackend::S3(backend)
+            }
+        };
+
+        next.storage_backend = pending;
+        next.pending_storage_backend = None;
+        next.validate()?;
+
+        // Taking the write side drains uploads and namespace changes. Reads
+        // that already own an OS file or S3 response stream may finish safely.
+        let mut replacement = self.backend.begin_replacement().await;
+        save_config(&self.config.config_path, &next)
+            .await
+            .map_err(|error| {
+                AppError::with_source("failed to persist storage activation", error)
+            })?;
+        match prepared {
+            PreparedStorageBackend::Local => {
+                replacement.replace_with_local(self.storage.clone());
+            }
+            PreparedStorageBackend::S3(backend) => replacement.replace_with_s3(backend),
+        }
+        *self.config_file.write().await = next;
+        drop(replacement);
+        self.archive_tickets.clear().await;
+        tracing::info!("storage backend activation completed");
+        Ok(())
+    }
+
+    /// Save twice so both the primary config and its recovery backup contain
+    /// the current storage credential set. Replacing or discarding a pending
+    /// backend must not leave its superseded secret in `config.json.bak`.
+    async fn persist_storage_selection(&self, next: &ConfigFile) -> AppResult<()> {
+        next.validate()?;
+        save_config(&self.config.config_path, next)
+            .await
+            .map_err(|error| AppError::with_source("failed to persist storage settings", error))?;
+        save_config(&self.config.config_path, next)
+            .await
+            .map_err(|error| {
+                AppError::with_source("failed to refresh storage configuration backup", error)
+            })?;
+        *self.config_file.write().await = next.clone();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppState;
+    use crate::config::{
+        Config, ConfigFile, S3AddressingStyle, S3Provider, S3StorageConfig, StorageBackendConfig,
+    };
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn discarding_pending_storage_scrubs_credentials_from_primary_and_backup() {
+        let root =
+            std::env::temp_dir().join(format!("ycloud-storage-state-{}", uuid::Uuid::new_v4()));
+        let config_path = root.join("config.json");
+        let state = AppState::new(
+            Config {
+                bind_address: std::net::IpAddr::from([127, 0, 0, 1]),
+                port: 18_473,
+                storage_path: root.join("storage"),
+                config_path: config_path.clone(),
+                max_upload_bytes: 5 * 1024 * 1024 * 1024,
+                io_concurrency: 2,
+                max_list_entries: 100,
+                request_timeout_secs: 30,
+                upload_timeout_secs: 300,
+                disk_reserve_bytes: 0,
+                secure_cookies: false,
+                allow_lan_http: false,
+                public_base_url: None,
+                public_host: None,
+                trusted_proxy_ips: Default::default(),
+                s3_allowed_endpoints: Default::default(),
+            },
+            Arc::new(RwLock::new(ConfigFile::default())),
+        )
+        .await
+        .unwrap();
+        let mut pending = state.config_file.read().await.clone();
+        pending.pending_storage_backend = Some(StorageBackendConfig::S3(S3StorageConfig {
+            provider: S3Provider::AlibabaOss,
+            endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
+            bucket: "ycloud-test".into(),
+            region: "cn-hangzhou".into(),
+            prefix: "files/".into(),
+            addressing_style: S3AddressingStyle::VirtualHosted,
+            access_key_id: "credential-to-remove".into(),
+            secret_access_key: "secret-to-remove".into(),
+        }));
+        state.persist_storage_selection(&pending).await.unwrap();
+        state.discard_pending_storage().await.unwrap();
+
+        let primary = tokio::fs::read_to_string(&config_path).await.unwrap();
+        let backup = tokio::fs::read_to_string(config_path.with_extension("json.bak"))
+            .await
+            .unwrap();
+        for content in [&primary, &backup] {
+            assert!(!content.contains("credential-to-remove"));
+            assert!(!content.contains("secret-to-remove"));
+        }
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

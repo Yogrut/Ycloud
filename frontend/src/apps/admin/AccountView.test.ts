@@ -20,6 +20,8 @@ const info: AdminInfo = {
   security_log_retention_days: 7,
   security_log_max_entries: 5000,
   storage_backend: { type: 'local', path: './storage' },
+  pending_storage_backend: null,
+  local_storage_path: './storage',
 }
 
 afterEach(() => {

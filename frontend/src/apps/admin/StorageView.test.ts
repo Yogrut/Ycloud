@@ -1,5 +1,6 @@
 import { createApp, nextTick } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { StorageBackendView } from '../../shared/api/admin'
 import StorageView from './StorageView.vue'
 
 afterEach(() => {
@@ -7,14 +8,16 @@ afterEach(() => {
   document.body.replaceChildren()
 })
 
-function mountStorage(host: HTMLElement) {
-  const tested = vi.fn()
+function mountStorage(host: HTMLElement, pendingBackend: StorageBackendView | null = null) {
+  const changed = vi.fn()
   const app = createApp(StorageView, {
     backend: { type: 'local', path: './storage' },
-    onTested: tested,
+    pendingBackend,
+    localPath: './storage',
+    onChanged: changed,
   })
   app.mount(host)
-  return { app, tested }
+  return { app, changed }
 }
 
 describe('StorageView', () => {
@@ -49,7 +52,7 @@ describe('StorageView', () => {
     app.unmount()
   })
 
-  it('tests a MinIO or RustFS endpoint without persisting or activating it', async () => {
+  it('fully verifies and saves a MinIO or RustFS endpoint as pending', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -57,7 +60,7 @@ describe('StorageView', () => {
     vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
-    const { app, tested } = mountStorage(host)
+    const { app, changed } = mountStorage(host)
     host.querySelectorAll<HTMLButtonElement>('.storage-provider')[3]?.click()
     await nextTick()
     const inputs = host.querySelectorAll<HTMLInputElement>('.storage-form input')
@@ -72,8 +75,8 @@ describe('StorageView', () => {
     ;(host.querySelector('.storage-form') as HTMLFormElement).dispatchEvent(new Event('submit', { cancelable: true }))
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/test', expect.objectContaining({
-      method: 'POST',
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/pending', expect.objectContaining({
+      method: 'PUT',
       body: JSON.stringify({
         provider: 'minio',
         endpoint: 'https://rustfs.internal.example',
@@ -86,7 +89,50 @@ describe('StorageView', () => {
       }),
     }))
     expect(inputs[5].value).toBe('')
-    expect(tested).toHaveBeenCalledWith('S3 连接与最小列举权限验证通过')
+    expect(changed).toHaveBeenCalledWith('S3 读、写、复制和删除验证通过，已保存为待启用配置')
+    app.unmount()
+  })
+
+  it('requires explicit confirmation before activating a pending backend', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const { app, changed } = mountStorage(host, {
+      type: 's3',
+      provider: 'minio',
+      endpoint: 'https://rustfs.internal.example',
+      bucket: 'ycloud',
+      region: 'us-east-1',
+      prefix: 'files/',
+      addressing_style: 'path',
+      has_access_key_id: true,
+      has_secret_access_key: true,
+    })
+    await nextTick()
+
+    expect(host.textContent).toContain('待启用配置')
+    expect(host.textContent).not.toContain('pending-secret')
+    const activate = Array.from(host.querySelectorAll<HTMLButtonElement>('.storage-pending-actions button'))
+      .find(button => button.textContent?.trim() === '启用')
+    activate?.click()
+    await nextTick()
+    expect(host.querySelector('[role="dialog"]')).not.toBeNull()
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    const confirm = Array.from(host.querySelectorAll<HTMLButtonElement>('.modal-actions button'))
+      .find(button => button.textContent?.trim() === '确认切换')
+    confirm?.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/activate', expect.objectContaining({
+      method: 'POST',
+      credentials: 'same-origin',
+    }))
+    expect(changed).toHaveBeenCalledWith('存储后端已安全切换；现有文件没有迁移或删除')
     app.unmount()
   })
 })

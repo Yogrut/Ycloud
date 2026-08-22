@@ -369,6 +369,21 @@ input { font: inherit; }
 .storage-form > label { min-width: 0; display: grid; gap: 8px; color: var(--text); font-size: 13px; font-weight: 700; }
 .storage-form .input { width: 100%; height: 44px; }
 .storage-wide { grid-column: 1 / -1; }
+.storage-pending-card {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 15px 16px;
+  background: var(--accent-soft);
+  border: 1px solid rgba(64, 158, 255, .3);
+  border-radius: 12px;
+}
+.storage-pending-card p { margin: 5px 0; overflow-wrap: anywhere; color: var(--text); font-size: 13px; }
+.storage-pending-card small { color: var(--muted); font-size: 11px; }
+.storage-pending-actions,
+.storage-form-actions { display: flex; justify-content: flex-end; gap: 9px; flex: 0 0 auto; }
 .storage-boundary-note {
   min-height: 44px;
   display: flex;
@@ -693,6 +708,10 @@ input { font: inherit; }
   .storage-form { grid-template-columns: 1fr; gap: 15px; }
   .storage-wide { grid-column: auto; }
   .storage-boundary-note { grid-column: auto; }
+  .storage-pending-card { align-items: stretch; flex-direction: column; }
+  .storage-pending-actions .btn { flex: 1 1 0; }
+  .storage-form-actions { flex-direction: column-reverse; }
+  .storage-form-actions .btn { width: 100%; }
   .section-heading { margin-bottom: 16px; }
   .admin-save-row { padding-top: 6px; }
   .admin-save-row .btn { width: 100%; }

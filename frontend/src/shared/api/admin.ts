@@ -7,10 +7,17 @@ export interface AdminInfo {
   has_global_web_password: boolean
   shares: WebDavMountView[]
   folder_locks: FolderLockView[]
-  login_security: LoginRecord[]
   max_upload_bytes: number
   max_archive_bytes: number
   max_archive_entries: number
+  upload_rate_bytes_per_sec: number
+  download_rate_bytes_per_sec: number
+  admin_login_failures: number
+  web_login_failures: number
+  admin_login_block_seconds: number
+  web_login_block_seconds: number
+  security_log_retention_days: number
+  security_log_max_entries: number
 }
 
 export interface WebDavMountView {
@@ -58,15 +65,22 @@ export interface UpdateFolderLockRequest {
 
 export type LoginEntry = 'admin' | 'web' | 'web_dav'
 
-export interface LoginRecord {
+export interface LoginEvent {
+  id: number
   entry: LoginEntry
+  success: boolean
   ip: string
+  occurred_at: number
+  result: string
   failed_attempts: number
   blocked_until: number | null
-  last_attempt_at: number
-  last_success_at: number | null
-  last_result: string
   user_agent: string | null
+  current_blocked_until: number | null
+}
+
+export interface LoginEventPage {
+  events: LoginEvent[]
+  next_cursor: number | null
 }
 
 export interface UpdateAccountRequest {
@@ -84,6 +98,17 @@ export interface UpdateTransferLimitsRequest {
   max_upload_bytes: number
   max_archive_bytes: number
   max_archive_entries: number
+  upload_rate_bytes_per_sec: number
+  download_rate_bytes_per_sec: number
+}
+
+export interface UpdateLoginSecuritySettingsRequest {
+  admin_login_failures?: number
+  web_login_failures?: number
+  admin_login_block_seconds?: number
+  web_login_block_seconds?: number
+  security_log_retention_days?: number
+  security_log_max_entries?: number
 }
 
 interface ErrorEnvelope {
@@ -148,6 +173,35 @@ export function updateTransferLimits(body: UpdateTransferLimitsRequest): Promise
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+export function updateLoginSecuritySettings(body: UpdateLoginSecuritySettingsRequest): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/security/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+export interface LoginEventQuery {
+  success: boolean
+  since: number
+  entry?: LoginEntry
+  ip?: string
+  cursor?: number
+  limit?: number
+}
+
+export function getLoginEvents(query: LoginEventQuery): Promise<LoginEventPage> {
+  const params = new URLSearchParams({
+    success: String(query.success),
+    since: String(query.since),
+    limit: String(query.limit ?? 20),
+  })
+  if (query.entry) params.set('entry', query.entry)
+  if (query.ip?.trim()) params.set('ip', query.ip.trim())
+  if (query.cursor !== undefined) params.set('cursor', String(query.cursor))
+  return adminRequest(`/api/admin/security/events?${params}`)
 }
 
 export function createFolderLock(body: CreateFolderLockRequest): Promise<FolderLockView> {

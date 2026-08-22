@@ -57,13 +57,19 @@ describe('admin API', () => {
     }))
   })
 
-  it('sends all three transfer limits through the protected settings endpoint', async () => {
+  it('sends transfer size and bandwidth limits through the protected settings endpoint', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     }))
     vi.stubGlobal('fetch', fetchMock)
-    const body = { max_upload_bytes: 6_442_450_944, max_archive_bytes: 2_684_354_560, max_archive_entries: 750 }
+    const body = {
+      max_upload_bytes: 6_442_450_944,
+      max_archive_bytes: 2_684_354_560,
+      max_archive_entries: 750,
+      upload_rate_bytes_per_sec: 8_388_608,
+      download_rate_bytes_per_sec: 16_777_216,
+    }
 
     await updateTransferLimits(body)
 

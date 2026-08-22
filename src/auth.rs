@@ -308,8 +308,15 @@ pub async fn login_handler(
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
+    let admin_policy = {
+        let config = state.config_file.read().await;
+        crate::login_security::LoginPolicy {
+            maximum_failures: config.admin_login_failures,
+            block_seconds: config.admin_login_block_seconds as i64,
+        }
+    };
     match state.login_security.is_blocked(LoginEntry::Admin, ip).await {
-        Ok(true) => return limited_login_response(LoginEntry::Admin),
+        Ok(true) => return limited_login_response(admin_policy.block_seconds),
         Ok(false) => {}
         Err(error) => return login_security_error(error),
     }
@@ -349,7 +356,7 @@ pub async fn login_handler(
     } else {
         if let Err(error) = state
             .login_security
-            .record_failure(LoginEntry::Admin, ip, user_agent)
+            .record_failure(LoginEntry::Admin, ip, user_agent, admin_policy)
             .await
         {
             return login_security_error(error);
@@ -462,8 +469,15 @@ pub async fn gate_handler(
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
+    let web_policy = {
+        let config = state.config_file.read().await;
+        crate::login_security::LoginPolicy {
+            maximum_failures: config.web_login_failures,
+            block_seconds: config.web_login_block_seconds as i64,
+        }
+    };
     match state.login_security.is_blocked(LoginEntry::Web, ip).await {
-        Ok(true) => return limited_login_response(LoginEntry::Web),
+        Ok(true) => return limited_login_response(web_policy.block_seconds),
         Ok(false) => {}
         Err(error) => return login_security_error(error),
     }
@@ -477,7 +491,7 @@ pub async fn gate_handler(
     if !authenticated {
         if let Err(error) = state
             .login_security
-            .record_failure(LoginEntry::Web, ip, user_agent)
+            .record_failure(LoginEntry::Web, ip, user_agent, web_policy)
             .await
         {
             return login_security_error(error);
@@ -521,8 +535,8 @@ fn invalid_login_response(entry: LoginEntry) -> Response {
     .into_response()
 }
 
-fn limited_login_response(entry: LoginEntry) -> Response {
-    let retry_after = entry.policy().1.to_string();
+fn limited_login_response(block_seconds: i64) -> Response {
+    let retry_after = block_seconds.to_string();
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
         Json(LoginResponse {
@@ -694,7 +708,7 @@ mod tests {
             StatusCode::OK
         );
 
-        let limited = limited_login_response(LoginEntry::Admin);
+        let limited = limited_login_response(3600);
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(limited.headers().get(header::RETRY_AFTER).unwrap(), "3600");
     }

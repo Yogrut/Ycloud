@@ -21,6 +21,13 @@ pub const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 1_000;
 pub const HARD_MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024 * 1024;
 pub const HARD_MAX_ARCHIVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub const HARD_MAX_ARCHIVE_ENTRIES: usize = 5_000;
+pub const DEFAULT_ADMIN_LOGIN_FAILURES: u32 = 3;
+pub const DEFAULT_WEB_LOGIN_FAILURES: u32 = 5;
+pub const DEFAULT_LOGIN_BLOCK_SECONDS: u64 = 60 * 60;
+pub const DEFAULT_SECURITY_LOG_RETENTION_DAYS: u32 = 7;
+pub const DEFAULT_SECURITY_LOG_MAX_ENTRIES: usize = 5_000;
+pub const HARD_MAX_TRANSFER_RATE_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
 
 // ── Data types ────────────────────────────────────────────────────
@@ -126,6 +133,22 @@ pub struct ConfigFile {
     pub max_archive_bytes: u64,
     #[serde(default = "default_max_archive_entries")]
     pub max_archive_entries: usize,
+    #[serde(default = "default_admin_login_failures")]
+    pub admin_login_failures: u32,
+    #[serde(default = "default_web_login_failures")]
+    pub web_login_failures: u32,
+    #[serde(default = "default_login_block_seconds")]
+    pub admin_login_block_seconds: u64,
+    #[serde(default = "default_login_block_seconds")]
+    pub web_login_block_seconds: u64,
+    #[serde(default)]
+    pub upload_rate_bytes_per_sec: u64,
+    #[serde(default)]
+    pub download_rate_bytes_per_sec: u64,
+    #[serde(default = "default_security_log_retention_days")]
+    pub security_log_retention_days: u32,
+    #[serde(default = "default_security_log_max_entries")]
+    pub security_log_max_entries: usize,
 }
 
 #[derive(Clone)]
@@ -178,6 +201,26 @@ const fn default_max_archive_entries() -> usize {
     DEFAULT_MAX_ARCHIVE_ENTRIES
 }
 
+const fn default_admin_login_failures() -> u32 {
+    DEFAULT_ADMIN_LOGIN_FAILURES
+}
+
+const fn default_web_login_failures() -> u32 {
+    DEFAULT_WEB_LOGIN_FAILURES
+}
+
+const fn default_login_block_seconds() -> u64 {
+    DEFAULT_LOGIN_BLOCK_SECONDS
+}
+
+const fn default_security_log_retention_days() -> u32 {
+    DEFAULT_SECURITY_LOG_RETENTION_DAYS
+}
+
+const fn default_security_log_max_entries() -> usize {
+    DEFAULT_SECURITY_LOG_MAX_ENTRIES
+}
+
 // ── ConfigFile ────────────────────────────────────────────────────
 
 impl Default for ConfigFile {
@@ -203,6 +246,14 @@ impl Default for ConfigFile {
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
             max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
+            admin_login_failures: DEFAULT_ADMIN_LOGIN_FAILURES,
+            web_login_failures: DEFAULT_WEB_LOGIN_FAILURES,
+            admin_login_block_seconds: DEFAULT_LOGIN_BLOCK_SECONDS,
+            web_login_block_seconds: DEFAULT_LOGIN_BLOCK_SECONDS,
+            upload_rate_bytes_per_sec: 0,
+            download_rate_bytes_per_sec: 0,
+            security_log_retention_days: DEFAULT_SECURITY_LOG_RETENTION_DAYS,
+            security_log_max_entries: DEFAULT_SECURITY_LOG_MAX_ENTRIES,
         }
     }
 }
@@ -235,6 +286,16 @@ impl ConfigFile {
             self.max_archive_bytes,
             self.max_archive_entries,
         )?;
+        validate_login_security_settings(
+            self.admin_login_failures,
+            self.web_login_failures,
+            self.admin_login_block_seconds,
+            self.web_login_block_seconds,
+            self.security_log_retention_days,
+            self.security_log_max_entries,
+        )?;
+        validate_transfer_rate(self.upload_rate_bytes_per_sec, "上传")?;
+        validate_transfer_rate(self.download_rate_bytes_per_sec, "下载")?;
 
         let mut share_ids = HashSet::new();
         let mut share_names = HashSet::new();
@@ -322,6 +383,55 @@ impl ConfigFile {
         }
         Ok(())
     }
+}
+
+pub fn validate_login_security_settings(
+    admin_failures: u32,
+    web_failures: u32,
+    admin_block_seconds: u64,
+    web_block_seconds: u64,
+    retention_days: u32,
+    max_entries: usize,
+) -> AppResult<()> {
+    if !(3..=10).contains(&admin_failures) {
+        return Err(AppError::BadRequest(
+            "管理员登录错误次数必须在 3 到 10 之间".into(),
+        ));
+    }
+    if !(3..=20).contains(&web_failures) {
+        return Err(AppError::BadRequest(
+            "首页登录错误次数必须在 3 到 20 之间".into(),
+        ));
+    }
+    if !(5 * 60..=24 * 60 * 60).contains(&admin_block_seconds)
+        || !(5 * 60..=24 * 60 * 60).contains(&web_block_seconds)
+    {
+        return Err(AppError::BadRequest(
+            "登录封禁时间必须在 5 分钟到 24 小时之间".into(),
+        ));
+    }
+    if ![1, 3, 5, 7, 15, 30].contains(&retention_days) {
+        return Err(AppError::BadRequest(
+            "日志保存天数只能是 1、3、5、7、15 或 30 天".into(),
+        ));
+    }
+    if !(500..=20_000).contains(&max_entries) {
+        return Err(AppError::BadRequest(
+            "日志最大条目数必须在 500 到 20000 之间".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_transfer_rate(bytes_per_second: u64, label: &str) -> AppResult<()> {
+    if bytes_per_second != 0
+        && !(MIN_TRANSFER_RATE_BYTES..=HARD_MAX_TRANSFER_RATE_BYTES).contains(&bytes_per_second)
+    {
+        return Err(AppError::BadRequest(
+            format!("{label}限速必须为 0，或在 64 KiB/s 到 1 GiB/s 之间").into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_transfer_limits(
@@ -578,6 +688,14 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
             max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
+            admin_login_failures: DEFAULT_ADMIN_LOGIN_FAILURES,
+            web_login_failures: DEFAULT_WEB_LOGIN_FAILURES,
+            admin_login_block_seconds: DEFAULT_LOGIN_BLOCK_SECONDS,
+            web_login_block_seconds: DEFAULT_LOGIN_BLOCK_SECONDS,
+            upload_rate_bytes_per_sec: 0,
+            download_rate_bytes_per_sec: 0,
+            security_log_retention_days: DEFAULT_SECURITY_LOG_RETENTION_DAYS,
+            security_log_max_entries: DEFAULT_SECURITY_LOG_MAX_ENTRIES,
         };
         save_config(path, &config).await?;
         tracing::warn!(
@@ -801,7 +919,8 @@ mod tests {
         config_backup_path, hash_password, initial_credentials_path, load_config,
         path_is_same_or_descendant, paths_overlap, remove_initial_credentials, save_config,
         verify_password, ConfigFile, FolderLock, InitialCredentials, DEFAULT_MAX_ARCHIVE_BYTES,
-        DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_UPLOAD_BYTES,
+        DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_UPLOAD_BYTES, HARD_MAX_TRANSFER_RATE_BYTES,
+        MIN_TRANSFER_RATE_BYTES,
     };
 
     #[test]
@@ -862,6 +981,35 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    #[test]
+    fn adjustable_security_and_rate_limits_keep_hard_boundaries() {
+        let mut config = ConfigFile {
+            admin_login_failures: 2,
+            ..ConfigFile::default()
+        };
+        assert!(config.validate().is_err());
+        config.admin_login_failures = 3;
+        config.web_login_failures = 21;
+        assert!(config.validate().is_err());
+        config.web_login_failures = 5;
+        config.admin_login_block_seconds = 299;
+        assert!(config.validate().is_err());
+        config.admin_login_block_seconds = 300;
+        config.security_log_retention_days = 2;
+        assert!(config.validate().is_err());
+        config.security_log_retention_days = 7;
+        config.security_log_max_entries = 20_001;
+        assert!(config.validate().is_err());
+        config.security_log_max_entries = 5_000;
+        config.upload_rate_bytes_per_sec = MIN_TRANSFER_RATE_BYTES - 1;
+        assert!(config.validate().is_err());
+        config.upload_rate_bytes_per_sec = MIN_TRANSFER_RATE_BYTES;
+        config.download_rate_bytes_per_sec = HARD_MAX_TRANSFER_RATE_BYTES + 1;
+        assert!(config.validate().is_err());
+        config.download_rate_bytes_per_sec = 0;
+        assert!(config.validate().is_ok());
+    }
+
     #[tokio::test]
     async fn config_save_keeps_last_known_good_backup() {
         let directory =
@@ -878,6 +1026,7 @@ mod tests {
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
             max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
+            ..ConfigFile::default()
         };
         save_config(&path, &config).await.unwrap();
         config.admin_username = "second-admin".into();

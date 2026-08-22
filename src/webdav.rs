@@ -124,6 +124,7 @@ async fn verify_share_access(
                     headers
                         .get(header::USER_AGENT)
                         .and_then(|value| value.to_str().ok()),
+                    LoginEntry::WebDav.fixed_policy(),
                 )
                 .await
                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -257,11 +258,12 @@ async fn handle_get(
     headers: &HeaderMap,
 ) -> Result<Response, StatusCode> {
     let target = resolve_existing(state, share, sub_path).await?;
-    state
+    let response = state
         .storage
         .stream_file(&target, headers, FileResponseMode::WebDav)
         .await
-        .map_err(|error| error.status())
+        .map_err(|error| error.status())?;
+    Ok(state.download_limiter.wrap_response(response))
 }
 
 async fn handle_head(
@@ -303,6 +305,7 @@ async fn handle_put(
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST)?;
+        state.upload_limiter.consume(chunk.len()).await;
         writer
             .write_chunk(&chunk)
             .await

@@ -6,6 +6,14 @@
   "max_upload_bytes": 5368709120,
   "max_archive_bytes": 3221225472,
   "max_archive_entries": 1000,
+  "upload_rate_bytes_per_sec": 0,
+  "download_rate_bytes_per_sec": 0,
+  "admin_login_failures": 3,
+  "web_login_failures": 5,
+  "admin_login_block_seconds": 3600,
+  "web_login_block_seconds": 3600,
+  "security_log_retention_days": 7,
+  "security_log_max_entries": 5000,
   "folder_locks": [],
   "shares": [
     {

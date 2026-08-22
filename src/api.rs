@@ -285,6 +285,7 @@ pub async fn upload_file(
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| AppError::with_source("failed to read upload", error))?;
+        state.upload_limiter.consume(chunk.len()).await;
         writer.write_chunk(&chunk).await?;
     }
     writer.commit().await?;
@@ -302,10 +303,11 @@ pub async fn download_file(
     let request_path = query.path.as_deref().unwrap_or("");
     check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
     let file = resolve_existing_path(&state, &share, request_path).await?;
-    state
+    let response = state
         .storage
         .stream_file(&file, &headers, FileResponseMode::Attachment)
-        .await
+        .await?;
+    Ok(state.download_limiter.wrap_response(response))
 }
 
 pub async fn delete_file(
@@ -364,10 +366,11 @@ pub async fn preview_file(
     let request_path = query.path.as_deref().unwrap_or("");
     check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
     let file = resolve_existing_path(&state, &share, request_path).await?;
-    state
+    let response = state
         .storage
         .stream_file(&file, &headers, FileResponseMode::Preview)
-        .await
+        .await?;
+    Ok(state.download_limiter.wrap_response(response))
 }
 
 /// POST /api/folder/unlock — verify a folder lock password and return a token cookie.

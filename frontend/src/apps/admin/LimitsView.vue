@@ -9,6 +9,8 @@ const MIB = 1024 ** 2
 const HARD_MAX_UPLOAD_BYTES = 100 * GIB
 const HARD_MAX_ARCHIVE_BYTES = 10 * GIB
 const HARD_MAX_ARCHIVE_ENTRIES = 5000
+const HARD_MAX_RATE_BYTES = 1024 * MIB
+const MIN_RATE_BYTES = 64 * 1024
 
 const props = defineProps<{ info: AdminInfo }>()
 const emit = defineEmits<{ saved: [message: string] }>()
@@ -17,9 +19,13 @@ const locale = useLocale()
 const uploadGiB = ref<string | number>('')
 const archiveGiB = ref<string | number>('')
 const archiveEntries = ref<string | number>('')
+const uploadRate = ref<string | number>('')
+const downloadRate = ref<string | number>('')
 const initialUploadGiB = ref('')
 const initialArchiveGiB = ref('')
 const initialArchiveEntries = ref('')
+const initialUploadRate = ref('')
+const initialDownloadRate = ref('')
 const baselineUploadBytes = ref(0)
 const baselineArchiveBytes = ref(0)
 const saving = ref(false)
@@ -29,15 +35,23 @@ function formatGiB(bytes: number): string {
   return Number((bytes / GIB).toFixed(3)).toString()
 }
 
+function formatRate(bytes: number): string {
+  return bytes === 0 ? '0' : Number((bytes / MIB).toFixed(4)).toString()
+}
+
 function reset(): void {
   baselineUploadBytes.value = props.info.max_upload_bytes
   baselineArchiveBytes.value = props.info.max_archive_bytes
   initialUploadGiB.value = formatGiB(props.info.max_upload_bytes)
   initialArchiveGiB.value = formatGiB(props.info.max_archive_bytes)
   initialArchiveEntries.value = String(props.info.max_archive_entries)
+  initialUploadRate.value = formatRate(props.info.upload_rate_bytes_per_sec)
+  initialDownloadRate.value = formatRate(props.info.download_rate_bytes_per_sec)
   uploadGiB.value = initialUploadGiB.value
   archiveGiB.value = initialArchiveGiB.value
   archiveEntries.value = initialArchiveEntries.value
+  uploadRate.value = initialUploadRate.value
+  downloadRate.value = initialDownloadRate.value
   errorMessage.value = ''
 }
 
@@ -47,6 +61,8 @@ const hasChanges = computed(() => (
   String(uploadGiB.value).trim() !== initialUploadGiB.value
   || String(archiveGiB.value).trim() !== initialArchiveGiB.value
   || String(archiveEntries.value).trim() !== initialArchiveEntries.value
+  || String(uploadRate.value).trim() !== initialUploadRate.value
+  || String(downloadRate.value).trim() !== initialDownloadRate.value
 ))
 
 function parseBytes(value: string | number, originalText: string, originalBytes: number, maximum: number, label: string): number {
@@ -78,10 +94,21 @@ function buildRequest(): UpdateTransferLimitsRequest {
   if (!Number.isInteger(entries) || entries < 1 || entries > HARD_MAX_ARCHIVE_ENTRIES) {
     throw new Error(locale.text('打包条目数量上限必须在 1 到 5000 之间', 'Archive entry limit must be between 1 and 5000'))
   }
+  const parseRate = (value: string | number, label: string): number => {
+    const mib = Number(value)
+    const bytes = Math.round(mib * MIB)
+    if (!Number.isFinite(mib) || !Number.isSafeInteger(bytes)
+      || (bytes !== 0 && (bytes < MIN_RATE_BYTES || bytes > HARD_MAX_RATE_BYTES))) {
+      throw new Error(locale.text(`${label}必须为 0，或在 0.0625 到 1024 MiB/s 之间`, `${label} must be 0, or between 0.0625 and 1024 MiB/s`))
+    }
+    return bytes
+  }
   return {
     max_upload_bytes: maxUploadBytes,
     max_archive_bytes: maxArchiveBytes,
     max_archive_entries: entries,
+    upload_rate_bytes_per_sec: parseRate(uploadRate.value, locale.text('上传限速', 'Upload rate limit')),
+    download_rate_bytes_per_sec: parseRate(downloadRate.value, locale.text('下载限速', 'Download rate limit')),
   }
 }
 
@@ -104,9 +131,13 @@ async function submit(): Promise<void> {
     initialUploadGiB.value = formatGiB(body.max_upload_bytes)
     initialArchiveGiB.value = formatGiB(body.max_archive_bytes)
     initialArchiveEntries.value = String(body.max_archive_entries)
+    initialUploadRate.value = formatRate(body.upload_rate_bytes_per_sec)
+    initialDownloadRate.value = formatRate(body.download_rate_bytes_per_sec)
     uploadGiB.value = initialUploadGiB.value
     archiveGiB.value = initialArchiveGiB.value
     archiveEntries.value = initialArchiveEntries.value
+    uploadRate.value = initialUploadRate.value
+    downloadRate.value = initialDownloadRate.value
     emit('saved', locale.text('传输限制已保存并立即生效', 'Transfer limits saved and applied'))
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : locale.text('保存失败', 'Unable to save changes')
@@ -131,6 +162,20 @@ async function submit(): Promise<void> {
           <span class="limits-control">
             <span class="input-with-unit"><input v-model="uploadGiB" type="number" min="0.001" max="100" step="0.001" inputmode="decimal"><span>GiB</span></span>
             <small>{{ locale.text('网页与 WebDAV 共用；范围 1 MiB–100 GiB，且不能超过部署环境的绝对上限。', 'Shared by the browser and WebDAV. Range: 1 MiB–100 GiB, subject to the deployment hard limit.') }}</small>
+          </span>
+        </label>
+        <label class="admin-field limits-field">
+          <span>{{ locale.text('全局上传限速', 'Global upload rate') }}</span>
+          <span class="limits-control">
+            <span class="input-with-unit"><input v-model="uploadRate" type="number" min="0" max="1024" step="0.0625" inputmode="decimal"><span>MiB/s</span></span>
+            <small>{{ locale.text('网页上传与 WebDAV PUT 共用；0 表示不限速。', 'Shared by browser uploads and WebDAV PUT. Set to 0 for unlimited.') }}</small>
+          </span>
+        </label>
+        <label class="admin-field limits-field">
+          <span>{{ locale.text('全局下载限速', 'Global download rate') }}</span>
+          <span class="limits-control">
+            <span class="input-with-unit"><input v-model="downloadRate" type="number" min="0" max="1024" step="0.0625" inputmode="decimal"><span>MiB/s</span></span>
+            <small>{{ locale.text('普通下载、预览、打包下载与 WebDAV GET 共用；0 表示不限速。', 'Shared by downloads, previews, archives, and WebDAV GET. Set to 0 for unlimited.') }}</small>
           </span>
         </label>
         <label class="admin-field limits-field">

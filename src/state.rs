@@ -11,6 +11,7 @@ use crate::{
     error::{AppError, AppResult},
     login_security::LoginSecurity,
     storage::StorageService,
+    transfer_limit::BandwidthLimiter,
 };
 
 #[derive(Clone)]
@@ -25,12 +26,15 @@ pub struct AppState {
     pub archive_tickets: ArchiveTicketStore,
     pub webdav_gate: Arc<Semaphore>,
     pub login_security: LoginSecurity,
+    pub upload_limiter: BandwidthLimiter,
+    pub download_limiter: BandwidthLimiter,
     config_updates: Arc<Mutex<()>>,
 }
 
 impl AppState {
     pub async fn new(config: Config, config_file: SharedConfig) -> AppResult<Self> {
-        let max_upload_bytes = config_file.read().await.max_upload_bytes;
+        let persisted = config_file.read().await.clone();
+        let max_upload_bytes = persisted.max_upload_bytes;
         if max_upload_bytes > config.max_upload_bytes {
             return Err(AppError::BadRequest(
                 "Persisted upload limit exceeds the deployment MAX_UPLOAD_BYTES envelope".into(),
@@ -44,11 +48,15 @@ impl AppState {
             config.disk_reserve_bytes,
         )
         .await?;
-        let login_security = LoginSecurity::load(&config.config_path)
-            .await
-            .map_err(|error| {
-                AppError::with_source("failed to load persistent login security state", error)
-            })?;
+        let login_security = LoginSecurity::load(
+            &config.config_path,
+            persisted.security_log_retention_days,
+            persisted.security_log_max_entries,
+        )
+        .await
+        .map_err(|error| {
+            AppError::with_source("failed to load persistent login security state", error)
+        })?;
 
         Ok(Self {
             config,
@@ -61,6 +69,8 @@ impl AppState {
             archive_tickets: ArchiveTicketStore::new(),
             webdav_gate: Arc::new(Semaphore::new(8)),
             login_security,
+            upload_limiter: BandwidthLimiter::new(persisted.upload_rate_bytes_per_sec),
+            download_limiter: BandwidthLimiter::new(persisted.download_rate_bytes_per_sec),
             config_updates: Arc::new(Mutex::new(())),
         })
     }
@@ -79,8 +89,21 @@ impl AppState {
         save_config(&self.config.config_path, &next)
             .await
             .map_err(|error| AppError::with_source("failed to persist configuration", error))?;
+        *self.config_file.write().await = next.clone();
         self.storage.set_max_upload_bytes(next.max_upload_bytes);
-        *self.config_file.write().await = next;
+        self.upload_limiter.set_rate(next.upload_rate_bytes_per_sec);
+        self.download_limiter
+            .set_rate(next.download_rate_bytes_per_sec);
+        if let Err(error) = self
+            .login_security
+            .configure_retention(
+                next.security_log_retention_days,
+                next.security_log_max_entries,
+            )
+            .await
+        {
+            tracing::warn!(%error, "security event log compaction will be retried later");
+        }
         Ok(result)
     }
 }

@@ -307,7 +307,7 @@ pub async fn download_archive(
             tracing::warn!(%error, "archive download stopped");
         }
     });
-    Response::builder()
+    let response = Response::builder()
         .header(header::CONTENT_TYPE, "application/zip")
         .header(
             header::CONTENT_DISPOSITION,
@@ -316,7 +316,8 @@ pub async fn download_archive(
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(Body::from_stream(ReaderStream::new(reader_side)))
-        .map_err(|error| AppError::with_source("failed to build archive response", error))
+        .map_err(|error| AppError::with_source("failed to build archive response", error))?;
+    Ok(state.download_limiter.wrap_response(response))
 }
 
 async fn write_archive(

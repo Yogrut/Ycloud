@@ -1,12 +1,19 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     auth::AppState,
-    config::{remove_initial_credentials, validate_transfer_limits, FolderLock, Share},
+    config::{
+        remove_initial_credentials, validate_transfer_limits, validate_transfer_rate, FolderLock,
+        Share,
+    },
     error::{AppError, AppResult},
-    login_security::{LoginEntry, LoginRecord},
+    login_security::{LoginEntry, LoginEventPage, LoginPolicy},
 };
 
 #[derive(Serialize)]
@@ -15,10 +22,17 @@ pub struct AdminInfo {
     pub has_global_web_password: bool,
     pub shares: Vec<ShareView>,
     pub folder_locks: Vec<FolderLockView>,
-    pub login_security: Vec<LoginRecord>,
     pub max_upload_bytes: u64,
     pub max_archive_bytes: u64,
     pub max_archive_entries: usize,
+    pub upload_rate_bytes_per_sec: u64,
+    pub download_rate_bytes_per_sec: u64,
+    pub admin_login_failures: u32,
+    pub web_login_failures: u32,
+    pub admin_login_block_seconds: u64,
+    pub web_login_block_seconds: u64,
+    pub security_log_retention_days: u32,
+    pub security_log_max_entries: usize,
 }
 
 /// [安全] Administrative responses expose password presence, never hashes.
@@ -101,6 +115,14 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
         max_upload_bytes,
         max_archive_bytes,
         max_archive_entries,
+        upload_rate_bytes_per_sec,
+        download_rate_bytes_per_sec,
+        admin_login_failures,
+        web_login_failures,
+        admin_login_block_seconds,
+        web_login_block_seconds,
+        security_log_retention_days,
+        security_log_max_entries,
     ) = {
         let config = state.config_file.read().await;
         (
@@ -115,6 +137,14 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
             config.max_upload_bytes,
             config.max_archive_bytes,
             config.max_archive_entries,
+            config.upload_rate_bytes_per_sec,
+            config.download_rate_bytes_per_sec,
+            config.admin_login_failures,
+            config.web_login_failures,
+            config.admin_login_block_seconds,
+            config.web_login_block_seconds,
+            config.security_log_retention_days,
+            config.security_log_max_entries,
         )
     };
     Json(AdminInfo {
@@ -122,10 +152,17 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
         has_global_web_password,
         shares,
         folder_locks,
-        login_security: state.login_security.snapshot().await,
         max_upload_bytes,
         max_archive_bytes,
         max_archive_entries,
+        upload_rate_bytes_per_sec,
+        download_rate_bytes_per_sec,
+        admin_login_failures,
+        web_login_failures,
+        admin_login_block_seconds,
+        web_login_block_seconds,
+        security_log_retention_days,
+        security_log_max_entries,
     })
 }
 
@@ -134,6 +171,10 @@ pub struct UpdateTransferLimitsRequest {
     pub max_upload_bytes: u64,
     pub max_archive_bytes: u64,
     pub max_archive_entries: usize,
+    #[serde(default)]
+    pub upload_rate_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    pub download_rate_bytes_per_sec: Option<u64>,
 }
 
 pub async fn update_transfer_limits(
@@ -150,11 +191,22 @@ pub async fn update_transfer_limits(
             "单文件上传上限超过部署环境允许的绝对上限；请调整 MAX_UPLOAD_BYTES 后重启服务".into(),
         ));
     }
+    let current = state.config_file.read().await.clone();
+    let upload_rate = body
+        .upload_rate_bytes_per_sec
+        .unwrap_or(current.upload_rate_bytes_per_sec);
+    let download_rate = body
+        .download_rate_bytes_per_sec
+        .unwrap_or(current.download_rate_bytes_per_sec);
+    validate_transfer_rate(upload_rate, "上传")?;
+    validate_transfer_rate(download_rate, "下载")?;
     state
         .update_config(move |config| {
             config.max_upload_bytes = body.max_upload_bytes;
             config.max_archive_bytes = body.max_archive_bytes;
             config.max_archive_entries = body.max_archive_entries;
+            config.upload_rate_bytes_per_sec = upload_rate;
+            config.download_rate_bytes_per_sec = download_rate;
             Ok(())
         })
         .await?;
@@ -167,6 +219,101 @@ pub struct LoginRestrictionRequest {
     pub ip: String,
 }
 
+#[derive(Deserialize)]
+pub struct UpdateLoginSecuritySettingsRequest {
+    pub admin_login_failures: Option<u32>,
+    pub web_login_failures: Option<u32>,
+    pub admin_login_block_seconds: Option<u64>,
+    pub web_login_block_seconds: Option<u64>,
+    pub security_log_retention_days: Option<u32>,
+    pub security_log_max_entries: Option<usize>,
+}
+
+pub async fn update_login_security_settings(
+    State(state): State<AppState>,
+    Json(body): Json<UpdateLoginSecuritySettingsRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    if body.admin_login_failures.is_none()
+        && body.web_login_failures.is_none()
+        && body.admin_login_block_seconds.is_none()
+        && body.web_login_block_seconds.is_none()
+        && body.security_log_retention_days.is_none()
+        && body.security_log_max_entries.is_none()
+    {
+        return Err(AppError::BadRequest("没有需要更新的登录安全设置".into()));
+    }
+    state
+        .update_config(move |config| {
+            if let Some(value) = body.admin_login_failures {
+                config.admin_login_failures = value;
+            }
+            if let Some(value) = body.web_login_failures {
+                config.web_login_failures = value;
+            }
+            if let Some(value) = body.admin_login_block_seconds {
+                config.admin_login_block_seconds = value;
+            }
+            if let Some(value) = body.web_login_block_seconds {
+                config.web_login_block_seconds = value;
+            }
+            if let Some(value) = body.security_log_retention_days {
+                config.security_log_retention_days = value;
+            }
+            if let Some(value) = body.security_log_max_entries {
+                config.security_log_max_entries = value;
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+#[derive(Deserialize)]
+pub struct LoginEventQuery {
+    pub success: Option<bool>,
+    pub entry: Option<LoginEntry>,
+    pub ip: Option<String>,
+    pub since: Option<i64>,
+    pub cursor: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+pub async fn login_events(
+    State(state): State<AppState>,
+    Query(query): Query<LoginEventQuery>,
+) -> AppResult<Json<LoginEventPage>> {
+    let now = chrono::Utc::now().timestamp();
+    let earliest = now - 30 * 24 * 60 * 60;
+    let since = query.since.unwrap_or(now - 7 * 24 * 60 * 60);
+    if since < earliest || since > now {
+        return Err(AppError::BadRequest(
+            "日志查询时间必须在最近 30 天内".into(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(20);
+    if !(1..=100).contains(&limit) {
+        return Err(AppError::BadRequest(
+            "每页日志数量必须在 1 到 100 之间".into(),
+        ));
+    }
+    if query.ip.as_deref().is_some_and(|ip| ip.len() > 64) {
+        return Err(AppError::BadRequest("IP 筛选条件过长".into()));
+    }
+    Ok(Json(
+        state
+            .login_security
+            .query_events(
+                query.success,
+                query.entry,
+                query.ip.as_deref(),
+                since,
+                query.cursor,
+                limit,
+            )
+            .await,
+    ))
+}
+
 pub async fn block_login(
     State(state): State<AppState>,
     Json(body): Json<LoginRestrictionRequest>,
@@ -175,9 +322,26 @@ pub async fn block_login(
         .ip
         .parse()
         .map_err(|_| AppError::BadRequest("IP 地址无效".into()))?;
+    let policy = match body.entry {
+        LoginEntry::Admin => {
+            let config = state.config_file.read().await;
+            LoginPolicy {
+                maximum_failures: config.admin_login_failures,
+                block_seconds: config.admin_login_block_seconds as i64,
+            }
+        }
+        LoginEntry::Web => {
+            let config = state.config_file.read().await;
+            LoginPolicy {
+                maximum_failures: config.web_login_failures,
+                block_seconds: config.web_login_block_seconds as i64,
+            }
+        }
+        LoginEntry::WebDav => LoginEntry::WebDav.fixed_policy(),
+    };
     state
         .login_security
-        .restrict(body.entry, ip)
+        .restrict(body.entry, ip, policy)
         .await
         .map_err(|error| AppError::with_source("无法持久化登录安全状态", error))?;
     Ok(Json(serde_json::json!({ "success": true })))

@@ -17,7 +17,8 @@ Ycloud 面向个人设备、家庭服务器和小规模私有部署，不以企�
 - 多个 WebDAV 挂载，可分别设置路径、账号、密码和只读权限。
 - 大文件流式上传、下载和 ZIP 打包，不把完整文件载入内存。
 - 原子上传、文件操作事务、配置备份和启动恢复。
-- 持久化登录失败限制和 IP 记录，管理员可在后台解除限制。
+- 可配置的网页登录保护、有界审计事件、IP 封禁与解除。
+- 全局流式上传和下载限速，WebDAV 与网页通道共享实际带宽预算。
 - 生产静态资源编译进程序，运行时不需要 Node.js 或外部 CDN。
 
 网页访问密码只授予浏览、预览和下载权限；写入操作必须登录管理员。WebDAV 使用挂载自己的凭据，并且不能与网页文件夹锁保护的路径重叠。
@@ -27,7 +28,7 @@ Ycloud 面向个人设备、家庭服务器和小规模私有部署，不以企�
 需要稳定版 Rust 工具链：
 
 ```bash
-git clone https://github.com/YogruTi/Ycloud.git
+git clone https://github.com/Yogrut/Ycloud.git
 cd Ycloud
 cargo run --release --locked
 ```
@@ -78,7 +79,7 @@ TRUSTED_PROXY_IPS=127.0.0.1
 | `MAX_UPLOAD_BYTES` | `100 GiB` | 后台上传设置的部署级硬上限 |
 | `DISK_RESERVE_BYTES` | `512 MiB` | 文件提交后保留的磁盘空间 |
 
-默认单文件上传上限为 5 GiB；普通单文件下载不限制大小；打包下载默认最多包含 3 GiB 文件内容和 1,000 个文件与文件夹条目。这三个业务限制可在管理后台的安全边界内调整。
+默认单文件上传上限为 5 GiB；普通单文件下载不限制大小；打包下载默认最多包含 3 GiB 文件内容和 1,000 个文件与文件夹条目。容量、打包范围及全局上下行速率可在管理后台的硬边界内调整；并发数、密码队列和磁盘预留保持程序固定。
 
 ## WebDAV
 
@@ -108,7 +109,7 @@ Ycloud/
 └── ARCHITECTURE.md      # 当前版本的完整设计与安全边界
 ```
 
-详细模块职责、认证模型、路径规则、事务恢复和资源限制见 [ARCHITECTURE.md](ARCHITECTURE.md)。待实施且已经确认的功能见 [PLANNED_FEATURES.md](PLANNED_FEATURES.md)。
+详细模块职责、认证模型、路径规则、事务恢复和资源限制见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
 ## 开发检查
 

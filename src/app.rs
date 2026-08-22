@@ -103,6 +103,11 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/account", put(admin_api::update_admin_account))
         .route("/limits", put(admin_api::update_transfer_limits))
+        .route(
+            "/security/settings",
+            put(admin_api::update_login_security_settings),
+        )
+        .route("/security/events", get(admin_api::login_events))
         .route("/security/block", post(admin_api::block_login))
         .route("/security/unblock", post(admin_api::unblock_login))
         .route("/locks", post(admin_api::create_lock))
@@ -336,6 +341,7 @@ mod tests {
                 max_upload_bytes: 1024 * 1024,
                 max_archive_bytes: 2 * 1024 * 1024,
                 max_archive_entries: 100,
+                ..ConfigFile::default()
             })),
         )
         .await

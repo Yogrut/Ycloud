@@ -8,10 +8,17 @@ const info: AdminInfo = {
   has_global_web_password: true,
   shares: [],
   folder_locks: [],
-  login_security: [],
   max_upload_bytes: 1024,
   max_archive_bytes: 1024,
   max_archive_entries: 100,
+  upload_rate_bytes_per_sec: 0,
+  download_rate_bytes_per_sec: 0,
+  admin_login_failures: 3,
+  web_login_failures: 5,
+  admin_login_block_seconds: 3600,
+  web_login_block_seconds: 3600,
+  security_log_retention_days: 7,
+  security_log_max_entries: 5000,
 }
 
 afterEach(() => {

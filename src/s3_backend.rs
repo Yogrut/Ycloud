@@ -70,7 +70,7 @@ pub struct S3Metadata {
     pub size: u64,
     pub last_modified: Option<i64>,
     pub content_type: Option<String>,
-    etag: Option<String>,
+    pub(crate) etag: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

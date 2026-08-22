@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -12,13 +12,9 @@ use axum::{
     http::{header, HeaderMap, Response},
     Json,
 };
-use futures_util::io::AsyncWriteExt as FuturesAsyncWriteExt;
+use futures_util::{io::AsyncWriteExt as FuturesAsyncWriteExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::{
-    fs,
-    io::AsyncReadExt,
-    sync::{Mutex, Semaphore},
-};
+use tokio::sync::{Mutex, Semaphore};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -28,7 +24,8 @@ use crate::{
         resolve_share, share_storage_path, validate_batch_size, FileQuery, FolderLockAuthorizer,
     },
     state::AppState,
-    storage::attachment_header,
+    storage::{attachment_header, FileResponseMode},
+    storage_backend::StorageBackend,
 };
 
 const MAX_ARCHIVE_VISITED_ENTRIES: usize = 10_000;
@@ -51,10 +48,11 @@ struct ArchiveTicket {
 
 #[derive(Clone)]
 struct ArchiveFile {
-    absolute: PathBuf,
     storage_path: String,
     zip_path: String,
     size: u64,
+    modified_unix: Option<i64>,
+    version_tag: Option<String>,
 }
 
 impl Default for ArchiveTicketStore {
@@ -166,11 +164,10 @@ pub async fn prepare_archive(
     for path in &normalized {
         let storage_path = share_storage_path(&share, path);
         authorizer.ensure_access(&storage_path)?;
-        let resolved = state.storage.resolve_existing(&storage_path).await?;
         collect_files(
             &state,
             &authorizer,
-            resolved.absolute().to_path_buf(),
+            storage_path,
             path.clone(),
             &common_parent,
             &mut files,
@@ -202,33 +199,19 @@ pub async fn prepare_archive(
 async fn collect_files(
     state: &AppState,
     authorizer: &FolderLockAuthorizer,
-    root: PathBuf,
+    storage_path: String,
     request_path: String,
     common_parent: &str,
     files: &mut Vec<ArchiveFile>,
-    seen: &mut HashSet<PathBuf>,
+    seen: &mut HashSet<String>,
     total_bytes: &mut u64,
     entry_count: &mut usize,
     max_archive_bytes: u64,
     max_archive_entries: usize,
 ) -> AppResult<()> {
-    let mut pending = vec![(root, request_path)];
-    while let Some((absolute, relative)) = pending.pop() {
-        let metadata = fs::symlink_metadata(&absolute)
-            .await
-            .map_err(|error| AppError::with_source("failed to inspect archive entry", error))?;
-        if crate::storage::is_link_or_reparse_point(&metadata) {
-            return Err(AppError::BadRequest(
-                "Archives cannot contain symbolic links".into(),
-            ));
-        }
-        let canonical = fs::canonicalize(&absolute)
-            .await
-            .map_err(|error| AppError::with_source("failed to resolve archive entry", error))?;
-        if !canonical.starts_with(state.storage.root()) {
-            return Err(AppError::Forbidden);
-        }
-        if !seen.insert(canonical.clone()) {
+    let mut pending = vec![(storage_path, request_path)];
+    while let Some((storage_relative, request_relative)) = pending.pop() {
+        if !seen.insert(storage_relative.clone()) {
             continue;
         }
         *entry_count = entry_count.saturating_add(1);
@@ -242,43 +225,40 @@ async fn collect_files(
                 format!("Archive exceeds the configured {max_archive_entries} entry limit").into(),
             ));
         }
-        authorizer.ensure_access(&relative)?;
-        if metadata.is_dir() {
-            let mut directory = fs::read_dir(&absolute).await.map_err(|error| {
-                AppError::with_source("failed to read archive directory", error)
-            })?;
-            while let Some(entry) = directory
-                .next_entry()
-                .await
-                .map_err(|error| AppError::with_source("failed to read archive entry", error))?
-            {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR) {
-                    continue;
-                }
-                pending.push((entry.path(), join_path(&relative, &name)));
+        authorizer.ensure_access(&storage_relative)?;
+        let metadata = state.backend.metadata(&storage_relative).await?;
+        if metadata.is_dir {
+            let (entries, truncated) = state
+                .backend
+                .list_directory(&storage_relative, state.config.max_list_entries)
+                .await?;
+            if truncated {
+                return Err(AppError::BadRequest(
+                    "Archive directory exceeds the fixed listing safety limit".into(),
+                ));
+            }
+            for entry in entries {
+                pending.push((entry.relative, join_path(&request_relative, &entry.name)));
             }
             continue;
         }
-        if !metadata.is_file() {
-            continue;
-        }
         *total_bytes = total_bytes
-            .checked_add(metadata.len())
+            .checked_add(metadata.size)
             .ok_or(AppError::PayloadTooLarge)?;
         if *total_bytes > max_archive_bytes {
             return Err(AppError::PayloadTooLarge);
         }
-        let zip_path = relative
+        let zip_path = request_relative
             .strip_prefix(common_parent)
-            .unwrap_or(&relative)
+            .unwrap_or(&request_relative)
             .trim_start_matches('/')
             .to_string();
         files.push(ArchiveFile {
-            absolute: canonical,
-            storage_path: relative,
+            storage_path: storage_relative,
             zip_path,
-            size: metadata.len(),
+            size: metadata.size,
+            modified_unix: metadata.modified_unix,
+            version_tag: metadata.version_tag,
         });
     }
     Ok(())
@@ -300,7 +280,7 @@ pub async fn download_archive(
         authorizer.ensure_access(&file.storage_path)?;
     }
     let (writer_side, reader_side) = tokio::io::duplex(128 * 1024);
-    let storage = state.storage.clone();
+    let storage = state.backend.clone();
     tokio::spawn(async move {
         let _stream_permit = stream_permit;
         if let Err(error) = write_archive(storage, ticket.files, writer_side).await {
@@ -321,33 +301,46 @@ pub async fn download_archive(
 }
 
 async fn write_archive(
-    storage: crate::storage::StorageService,
+    storage: StorageBackend,
     files: Vec<ArchiveFile>,
     output: tokio::io::DuplexStream,
 ) -> anyhow::Result<()> {
-    let _permit = storage.acquire_io().await?;
     let mut zip = ZipFileWriter::with_tokio(output);
-    let mut buffer = vec![0_u8; 128 * 1024];
     for file in files {
-        let current = fs::symlink_metadata(&file.absolute).await?;
-        let canonical = fs::canonicalize(&file.absolute).await?;
-        if crate::storage::is_link_or_reparse_point(&current)
-            || !current.is_file()
-            || current.len() != file.size
-            || canonical != file.absolute
-            || !canonical.starts_with(storage.root())
+        let metadata = storage.metadata(&file.storage_path).await?;
+        if metadata.is_dir
+            || metadata.size != file.size
+            || metadata.modified_unix != file.modified_unix
+            || metadata.version_tag != file.version_tag
         {
             anyhow::bail!("archive source changed during download");
         }
         let entry = ZipEntryBuilder::new(file.zip_path.into(), Compression::Stored);
         let mut entry_writer = zip.write_entry_stream(entry).await?;
-        let mut source = fs::File::open(&file.absolute).await?;
-        loop {
-            let read = source.read(&mut buffer).await?;
-            if read == 0 {
-                break;
+        let response = storage
+            .stream_file(
+                &file.storage_path,
+                &HeaderMap::new(),
+                FileResponseMode::WebDav,
+            )
+            .await?;
+        if !response.status().is_success() {
+            anyhow::bail!("archive source could not be streamed");
+        }
+        let mut transferred = 0_u64;
+        let mut source = response.into_body().into_data_stream();
+        while let Some(chunk) = source.next().await {
+            let chunk = chunk?;
+            transferred = transferred
+                .checked_add(u64::try_from(chunk.len())?)
+                .ok_or_else(|| anyhow::anyhow!("archive source length overflow"))?;
+            if transferred > file.size {
+                anyhow::bail!("archive source grew during download");
             }
-            entry_writer.write_all(&buffer[..read]).await?;
+            entry_writer.write_all(&chunk).await?;
+        }
+        if transferred != file.size {
+            anyhow::bail!("archive source changed during download");
         }
         entry_writer.close().await?;
     }
@@ -420,7 +413,7 @@ fn deduplicate_paths(mut paths: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{archive_name, common_parent, deduplicate_paths, write_archive, ArchiveFile};
-    use crate::storage::StorageService;
+    use crate::{storage::StorageService, storage_backend::StorageBackend};
     use futures_util::io::AsyncReadExt as FuturesAsyncReadExt;
     use tokio::io::AsyncReadExt;
 
@@ -453,18 +446,20 @@ mod tests {
         tokio::fs::write(&absolute, b"sample-content")
             .await
             .unwrap();
-        let canonical = tokio::fs::canonicalize(&absolute).await.unwrap();
         let storage = StorageService::new(root.clone(), 1024, 2, 100, 0)
             .await
             .unwrap();
+        let backend = StorageBackend::Local(storage);
+        let metadata = backend.metadata("游戏音乐.flac").await.unwrap();
         let (writer_side, mut reader_side) = tokio::io::duplex(16 * 1024);
         let task = tokio::spawn(write_archive(
-            storage,
+            backend,
             vec![ArchiveFile {
-                absolute: canonical,
                 storage_path: "游戏音乐.flac".into(),
                 zip_path: "游戏音乐.flac".into(),
                 size: 14,
+                modified_unix: metadata.modified_unix,
+                version_tag: metadata.version_tag,
             }],
             writer_side,
         ));

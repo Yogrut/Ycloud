@@ -23,6 +23,7 @@ pub struct BackendMetadata {
     pub size: u64,
     pub modified_unix: Option<i64>,
     pub content_type: Option<String>,
+    pub version_tag: Option<String>,
 }
 
 /// Read-side storage boundary used while local and S3 implementations are
@@ -48,6 +49,7 @@ impl StorageBackend {
                         value.timestamp()
                     }),
                     content_type: None,
+                    version_tag: None,
                 })
             }
             Self::S3(storage) => {
@@ -57,6 +59,7 @@ impl StorageBackend {
                     size: metadata.size,
                     modified_unix: metadata.last_modified,
                     content_type: metadata.content_type,
+                    version_tag: metadata.etag,
                 })
             }
         }

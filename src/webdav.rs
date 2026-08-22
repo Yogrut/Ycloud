@@ -215,6 +215,7 @@ async fn handle_propfind(
                 size: entry.size,
                 modified_unix: entry.modified_unix,
                 content_type: None,
+                version_tag: None,
             };
             responses.push(propfind_entry(
                 &entry.relative,

@@ -48,6 +48,8 @@ const S3_TRANSACTION_SCHEMA_VERSION: u32 = 1;
 const S3_MAX_PENDING_TRANSACTIONS: usize = 1_000;
 const S3_MAX_TRANSACTION_BYTES: usize = 64 * 1024;
 
+mod directory_transaction;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct S3Entry {
     pub name: String,
@@ -718,7 +720,7 @@ impl S3Backend {
             self.recover_upload_transaction(&key, &journal_etag, &transaction)
                 .await?;
         }
-        Ok(recovered)
+        Ok(recovered.saturating_add(self.recover_directory_transactions().await?))
     }
 
     pub async fn copy_file(&self, source: &str, destination: &str) -> AppResult<()> {

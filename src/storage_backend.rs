@@ -172,7 +172,7 @@ impl StorageBackend {
             Self::S3(storage) => {
                 let metadata = storage.metadata(relative).await?;
                 if metadata.is_dir {
-                    storage.delete_empty_directory(relative).await
+                    storage.delete_directory(relative).await
                 } else {
                     storage.delete_file(relative).await
                 }
@@ -189,9 +189,10 @@ impl StorageBackend {
             }
             Self::S3(storage) => {
                 if storage.metadata(source).await?.is_dir {
-                    return Err(AppError::Conflict("对象存储递归目录移动尚未开放".into()));
+                    storage.move_directory(source, destination).await
+                } else {
+                    storage.move_file(source, destination).await
                 }
-                storage.move_file(source, destination).await
             }
         }
     }
@@ -205,9 +206,10 @@ impl StorageBackend {
             }
             Self::S3(storage) => {
                 if storage.metadata(source).await?.is_dir {
-                    return Err(AppError::Conflict("对象存储递归目录复制尚未开放".into()));
+                    storage.copy_directory(source, destination).await
+                } else {
+                    storage.copy_file(source, destination).await
                 }
-                storage.copy_file(source, destination).await
             }
         }
     }

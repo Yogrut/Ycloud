@@ -9,9 +9,11 @@ const adminInfo = {
   admin_login_failures: 3, web_login_failures: 5,
   admin_login_block_seconds: 3600, web_login_block_seconds: 3600,
   security_log_retention_days: 7, security_log_max_entries: 5000,
-  storage_backend: { type: 'local', path: './storage' },
+  storage_backend: { type: 'local', path: './storage', capacity_limit_bytes: null },
   pending_storage_backend: null,
   local_storage_path: './storage',
+  storage_usage_bytes: 0,
+  storage_reserved_bytes: 0,
 }
 
 afterEach(() => {

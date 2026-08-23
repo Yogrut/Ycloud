@@ -80,19 +80,38 @@ impl S3Backend {
     /// S3 has no atomic prefix rename. The operation is therefore bounded and
     /// journaled per object. A crash resumes from the last checkpoint.
     pub async fn copy_directory(&self, source: &str, destination: &str) -> AppResult<()> {
-        self.mutate_directory(Operation::Copy, source, Some(destination))
+        self.mutate_directory(Operation::Copy, source, Some(destination), None)
             .await
+            .map(|_| ())
+    }
+
+    pub async fn copy_directory_with_expected_size(
+        &self,
+        source: &str,
+        destination: &str,
+        expected_size: u64,
+    ) -> AppResult<()> {
+        self.mutate_directory(
+            Operation::Copy,
+            source,
+            Some(destination),
+            Some(expected_size),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn move_directory(&self, source: &str, destination: &str) -> AppResult<()> {
-        self.mutate_directory(Operation::Move, source, Some(destination))
+        self.mutate_directory(Operation::Move, source, Some(destination), None)
             .await
+            .map(|_| ())
     }
 
     /// Deletion first copies every source object to the reserved trash prefix.
     /// This is recoverable deletion, not physical secure erasure.
-    pub async fn delete_directory(&self, source: &str) -> AppResult<()> {
-        self.mutate_directory(Operation::Delete, source, None).await
+    pub async fn delete_directory(&self, source: &str) -> AppResult<u64> {
+        self.mutate_directory(Operation::Delete, source, None, None)
+            .await
     }
 
     async fn mutate_directory(
@@ -100,7 +119,8 @@ impl S3Backend {
         operation: Operation,
         source: &str,
         destination: Option<&str>,
-    ) -> AppResult<()> {
+        expected_size: Option<u64>,
+    ) -> AppResult<u64> {
         let source = StorageService::normalize_relative(source)?;
         if source.is_empty() {
             return Err(AppError::BadRequest("不能变更存储根目录".into()));
@@ -140,6 +160,18 @@ impl S3Backend {
         let objects = self
             .snapshot_objects(&id, operation, &source, destination.as_deref())
             .await?;
+        let snapshot_size = objects.iter().try_fold(0_u64, |total, object| {
+            total
+                .checked_add(object.size)
+                .ok_or_else(|| AppError::internal("S3 directory size exceeds u64"))
+        })?;
+        if let Some(expected_size) = expected_size {
+            if snapshot_size != expected_size {
+                return Err(AppError::Conflict(
+                    "Source changed while preparing the copy".into(),
+                ));
+            }
+        }
         let journal_key = internal_key(&self.prefix, JOURNAL_CATEGORY, &id);
         let mut transaction = Transaction {
             schema_version: SCHEMA_VERSION,
@@ -154,7 +186,8 @@ impl S3Backend {
             .write_directory_transaction(&journal_key, &transaction, None)
             .await?;
         self.execute_directory_transaction(&journal_key, journal_etag, &mut transaction)
-            .await
+            .await?;
+        Ok(snapshot_size)
     }
 
     async fn snapshot_objects(

@@ -5,6 +5,7 @@ pub mod archive;
 pub mod auth;
 pub mod batch_operations;
 pub mod bootstrap;
+pub mod capacity;
 pub mod config;
 pub mod error;
 pub mod file_access;

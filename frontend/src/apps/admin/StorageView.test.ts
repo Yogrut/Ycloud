@@ -11,9 +11,11 @@ afterEach(() => {
 function mountStorage(host: HTMLElement, pendingBackend: StorageBackendView | null = null) {
   const changed = vi.fn()
   const app = createApp(StorageView, {
-    backend: { type: 'local', path: './storage' },
+    backend: { type: 'local', path: './storage', capacity_limit_bytes: null },
     pendingBackend,
     localPath: './storage',
+    usageBytes: 0,
+    reservedBytes: 0,
     onChanged: changed,
   })
   app.mount(host)
@@ -52,6 +54,35 @@ describe('StorageView', () => {
     app.unmount()
   })
 
+  it('stages a local logical capacity without changing the storage path', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const { app, changed } = mountStorage(host)
+    await nextTick()
+
+    const inputs = host.querySelectorAll<HTMLInputElement>('.storage-local-form input')
+    const capacity = inputs[1]
+    if (!capacity) throw new Error('local capacity input missing')
+    capacity.value = '800'
+    capacity.dispatchEvent(new Event('input'))
+    await nextTick()
+    host.querySelector<HTMLButtonElement>('.storage-local-form button')?.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+
+    expect(inputs[0]?.value).toBe('./storage')
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/pending/local', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ capacity_limit_bytes: 800 * (1024 ** 3) }),
+    }))
+    expect(changed).toHaveBeenCalledWith('本地存储已保存为待启用配置')
+    app.unmount()
+  })
+
   it('fully verifies and saves a MinIO or RustFS endpoint as pending', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
       status: 200,
@@ -86,6 +117,7 @@ describe('StorageView', () => {
         addressing_style: 'path',
         access_key_id: 'access-id',
         secret_access_key: 'secret-value',
+        capacity_limit_bytes: null,
       }),
     }))
     expect(inputs[5].value).toBe('')
@@ -111,6 +143,7 @@ describe('StorageView', () => {
       addressing_style: 'path',
       has_access_key_id: true,
       has_secret_access_key: true,
+      capacity_limit_bytes: null,
     })
     await nextTick()
 

@@ -1,8 +1,10 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "storage_backend": {
     "type": "local",
-    "settings": {}
+    "settings": {
+      "capacity_limit_bytes": null
+    }
   },
   "pending_storage_backend": null,
   "admin_username": "admin",

@@ -4,7 +4,13 @@ import type { S3AddressingStyle, S3Provider, StorageBackendView, TestS3StorageRe
 import { activatePendingStorage, discardPendingStorage, stageLocalStorage, stageS3Storage, testS3Storage } from '../../shared/api/admin'
 import { useLocale } from '../../shared/i18n'
 
-const props = defineProps<{ backend: StorageBackendView; pendingBackend: StorageBackendView | null; localPath: string }>()
+const props = defineProps<{
+  backend: StorageBackendView
+  pendingBackend: StorageBackendView | null
+  localPath: string
+  usageBytes: number
+  reservedBytes: number
+}>()
 const emit = defineEmits<{ changed: [message: string] }>()
 const locale = useLocale()
 type StorageOption = 'local' | S3Provider
@@ -17,6 +23,7 @@ const prefix = ref('')
 const addressingStyle = ref<S3AddressingStyle>('path')
 const accessKeyId = ref('')
 const secretAccessKey = ref('')
+const capacityLimitGiB = ref(0)
 const busy = ref(false)
 const errorMessage = ref('')
 const confirmingActivation = ref(false)
@@ -32,6 +39,12 @@ const providers: Array<{ id: StorageOption; zh: string; en: string; protocol: st
 const isS3 = computed(() => provider.value !== 'local')
 const isOfficialCloud = computed(() => provider.value === 'alibaba_oss' || provider.value === 'tencent_cos')
 const activeLabel = computed(() => props.backend.type === 'local' ? locale.text('本地存储', 'Local storage') : providerLabel(props.backend.provider))
+const localLimitChanged = computed(() => {
+  const value = Number(capacityLimitGiB.value)
+  if (!Number.isInteger(value) || value < 0 || value > 4_194_304) return true
+  const selected = value === 0 ? null : value * (1024 ** 3)
+  return props.backend.type !== 'local' || props.backend.capacity_limit_bytes !== selected
+})
 
 watch(provider, value => {
   if (value === 'local') return
@@ -47,11 +60,38 @@ watch(() => [props.backend, props.pendingBackend] as const, ([active, pending]) 
   region.value = source.region
   prefix.value = source.prefix
   addressingStyle.value = source.addressing_style
+  capacityLimitGiB.value = bytesToGiB(source.capacity_limit_bytes)
+}, { immediate: true })
+
+watch(provider, value => {
+  const configured = props.pendingBackend?.type === 'local'
+    ? props.pendingBackend
+    : props.backend.type === 'local' ? props.backend : undefined
+  if (value === 'local') capacityLimitGiB.value = bytesToGiB(configured?.capacity_limit_bytes ?? null)
 }, { immediate: true })
 
 function providerLabel(value: S3Provider): string {
   const item = providers.find(providerItem => providerItem.id === value)
   return item ? locale.text(item.zh, item.en) : 'S3'
+}
+
+function bytesToGiB(value: number | null): number {
+  return value ? value / (1024 ** 3) : 0
+}
+
+function capacityLimitBytes(): number | null {
+  const value = Number(capacityLimitGiB.value)
+  if (!Number.isInteger(value) || value < 0 || value > 4_194_304) {
+    throw new Error(locale.text('容量上限必须是 0 到 4194304 之间的整数 GiB', 'Capacity must be an integer from 0 to 4194304 GiB'))
+  }
+  return value === 0 ? null : value * (1024 ** 3)
+}
+
+function formatBytes(value: number): string {
+  if (value >= 1024 ** 4) return `${(value / (1024 ** 4)).toFixed(2)} TiB`
+  if (value >= 1024 ** 3) return `${(value / (1024 ** 3)).toFixed(2)} GiB`
+  if (value >= 1024 ** 2) return `${(value / (1024 ** 2)).toFixed(2)} MiB`
+  return `${value} B`
 }
 
 function requestBody(): TestS3StorageRequest {
@@ -65,6 +105,7 @@ function requestBody(): TestS3StorageRequest {
     addressing_style: addressingStyle.value,
     access_key_id: accessKeyId.value,
     secret_access_key: secretAccessKey.value,
+    capacity_limit_bytes: capacityLimitBytes(),
   }
 }
 
@@ -103,9 +144,8 @@ async function stageS3(): Promise<void> {
 }
 
 async function stageLocal(): Promise<void> {
-  if (props.backend.type === 'local') return
   await run(async () => {
-    await stageLocalStorage()
+    await stageLocalStorage(capacityLimitBytes())
     emit('changed', locale.text('本地存储已保存为待启用配置', 'Local storage was saved as pending'))
   }, locale.text('无法保存本地存储配置', 'Unable to save local storage configuration'))
 }
@@ -142,13 +182,18 @@ async function activatePending(): Promise<void> {
           <strong>{{ locale.text(item.zh, item.en) }}</strong><small>{{ item.protocol }}</small>
         </button>
       </div>
+      <div class="storage-boundary-note storage-wide">
+        {{ locale.text('当前用户数据：', 'Current user data: ') }}{{ formatBytes(usageBytes) }}
+        · {{ locale.text('活动写入预留：', 'In-flight reservation: ') }}{{ formatBytes(reservedBytes) }}
+        · {{ locale.text('逻辑容量上限：', 'Logical limit: ') }}{{ backend.capacity_limit_bytes ? formatBytes(backend.capacity_limit_bytes) : locale.text('未设置', 'Unlimited') }}
+      </div>
 
       <div v-if="pendingBackend" class="storage-pending-card">
         <div>
           <strong>{{ locale.text('待启用配置', 'Pending backend') }}</strong>
           <p v-if="pendingBackend.type === 'local'">{{ locale.text('本地存储', 'Local storage') }} · {{ localPath }}</p>
           <p v-else>{{ providerLabel(pendingBackend.provider) }} · {{ pendingBackend.bucket }} · {{ pendingBackend.endpoint }}</p>
-          <small>{{ locale.text('尚未接管任何用户流量；凭据不会返回浏览器。', 'It is not serving user traffic; credentials are never returned to the browser.') }}</small>
+          <small>{{ locale.text('容量上限：', 'Capacity: ') }}{{ pendingBackend.capacity_limit_bytes ? formatBytes(pendingBackend.capacity_limit_bytes) : locale.text('未设置', 'Unlimited') }} · {{ locale.text('尚未接管任何用户流量；凭据不会返回浏览器。', 'It is not serving user traffic; credentials are never returned to the browser.') }}</small>
         </div>
         <div class="storage-pending-actions">
           <button class="btn secondary" type="button" :disabled="busy" @click="discardPending">{{ locale.text('删除待启用配置', 'Discard') }}</button>
@@ -158,9 +203,10 @@ async function activatePending(): Promise<void> {
 
       <div v-if="!isS3" class="storage-form storage-local-form">
         <label class="storage-wide">{{ locale.text('本地存储目录', 'Local storage directory') }}<input class="input" :value="localPath" readonly aria-readonly="true"></label>
+        <label>{{ locale.text('Ycloud 容量上限（GiB）', 'Ycloud capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input" type="number" min="0" max="4194304" step="1"><small>{{ locale.text('0 表示不设置逻辑上限；磁盘安全余量仍由系统强制保留。', '0 disables the logical limit; the system disk reserve remains enforced.') }}</small></label>
         <div class="storage-boundary-note storage-wide">{{ locale.text('通过 STORAGE_PATH 或 Compose 卷挂载配置。目录必须可写并通过启动检查；网页不能把服务指向任意系统路径。', 'Configure this with STORAGE_PATH or a Compose volume. The directory must be writable and pass startup checks; the web UI cannot redirect the service to arbitrary system paths.') }}</div>
         <p class="admin-form-error storage-wide" role="alert">{{ errorMessage }}</p>
-        <div v-if="backend.type !== 'local'" class="admin-save-row storage-wide"><button class="btn" type="button" :disabled="busy" @click="stageLocal">{{ locale.text('保存为待启用配置', 'Save as pending') }}</button></div>
+        <div v-if="localLimitChanged" class="admin-save-row storage-wide"><button class="btn" type="button" :disabled="busy" @click="stageLocal">{{ locale.text('保存为待启用配置', 'Save as pending') }}</button></div>
       </div>
 
       <form v-else class="storage-form" @submit.prevent="stageS3">
@@ -171,6 +217,7 @@ async function activatePending(): Promise<void> {
         <label>{{ locale.text('Access Key ID（保存时必须重新输入）', 'Access Key ID (re-enter to save)') }}<input v-model="accessKeyId" class="input" maxlength="256" autocomplete="off"></label>
         <label>{{ locale.text('Secret Access Key（保存时必须重新输入）', 'Secret Access Key (re-enter to save)') }}<input v-model="secretAccessKey" class="input" type="password" maxlength="4096" autocomplete="new-password"></label>
         <label>{{ locale.text('寻址方式', 'Addressing style') }}<select v-model="addressingStyle" class="input" :disabled="isOfficialCloud"><option value="path">Path Style</option><option value="virtual_hosted">Virtual Hosted</option></select></label>
+        <label>{{ locale.text('Ycloud 容量上限（GiB）', 'Ycloud capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input" type="number" min="0" max="4194304" step="1"><small>{{ locale.text('0 表示不设置逻辑上限；仅统计当前 Prefix 的用户对象。', '0 disables the logical limit; only user objects under this prefix are counted.') }}</small></label>
         <div class="storage-boundary-note">{{ locale.text('MinIO、RustFS 和通用端点必须存在于 S3_ALLOWED_ENDPOINTS 精确白名单。保存前会在保留区验证列举、写入、读取、复制和删除，不触碰用户文件。', 'MinIO, RustFS, and generic endpoints must be in the exact S3_ALLOWED_ENDPOINTS allowlist. Before saving, Ycloud checks list, write, read, copy, and delete inside its reserved prefix without touching user files.') }}</div>
         <p class="admin-form-error storage-wide" role="alert">{{ errorMessage }}</p>
         <div class="admin-save-row storage-wide storage-form-actions"><button class="btn secondary" type="button" :disabled="busy" @click="testConnection">{{ locale.text('仅测试连接', 'Test only') }}</button><button class="btn" type="submit" :disabled="busy">{{ busy ? locale.text('验证中…', 'Verifying…') : locale.text('验证并保存待启用配置', 'Verify and save as pending') }}</button></div>

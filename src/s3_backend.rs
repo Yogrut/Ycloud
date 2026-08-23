@@ -44,6 +44,7 @@ const S3_REQUEST_CONCURRENCY: usize = 8;
 const S3_PAGE_SIZE: usize = 1_000;
 const S3_MAX_LIST_ENTRIES: usize = 10_000;
 const S3_MAX_LIST_PAGES: usize = 16;
+const S3_MAX_CAPACITY_SCAN_PAGES: usize = 10_000;
 const S3_TRANSACTION_SCHEMA_VERSION: u32 = 1;
 const S3_MAX_PENDING_TRANSACTIONS: usize = 1_000;
 const S3_MAX_TRANSACTION_BYTES: usize = 64 * 1024;
@@ -79,6 +80,7 @@ pub struct S3Metadata {
 pub struct S3UploadResult {
     pub relative: String,
     pub size: u64,
+    pub previous_size: u64,
     pub etag: Option<String>,
 }
 
@@ -302,6 +304,75 @@ impl S3Backend {
 
     pub fn list_prefix(&self, relative: &str) -> AppResult<String> {
         list_prefix(&self.prefix, relative)
+    }
+
+    /// Sum the user namespace once when a backend is prepared. S3 has no
+    /// portable bucket-capacity API, so logical quota accounting is scoped to
+    /// Ycloud's configured prefix and excludes its reserved transaction area.
+    pub async fn user_data_size(&self) -> AppResult<u64> {
+        self.sum_object_bytes(&self.prefix, true).await
+    }
+
+    pub async fn path_size(&self, relative: &str) -> AppResult<u64> {
+        let metadata = self.metadata(relative).await?;
+        if !metadata.is_dir {
+            return Ok(metadata.size);
+        }
+        let prefix = list_prefix(&self.prefix, relative)?;
+        self.sum_object_bytes(&prefix, false).await
+    }
+
+    async fn sum_object_bytes(&self, prefix: &str, exclude_internal: bool) -> AppResult<u64> {
+        let internal_prefix = format!("{}.ycloud-system/", self.prefix);
+        let mut continuation_token: Option<String> = None;
+        let mut total = 0_u64;
+        for _ in 0..S3_MAX_CAPACITY_SCAN_PAGES {
+            let permit = self.acquire_request().await?;
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix)
+                .max_keys(i32::try_from(S3_PAGE_SIZE).unwrap_or(1_000));
+            if let Some(token) = continuation_token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            let output = request.send().await.map_err(|error| {
+                tracing::warn!(
+                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                    "S3 capacity scan failed"
+                );
+                AppError::ServiceUnavailable("无法统计对象存储已用容量".into())
+            })?;
+            drop(permit);
+
+            for object in output.contents() {
+                let key = object.key().ok_or_else(|| {
+                    AppError::ServiceUnavailable("对象存储容量统计遇到无键名对象".into())
+                })?;
+                if exclude_internal && key.starts_with(&internal_prefix) {
+                    continue;
+                }
+                total = total
+                    .checked_add(non_negative_size(object.size())?)
+                    .ok_or_else(|| AppError::internal("S3 storage usage exceeds u64"))?;
+            }
+            if !output.is_truncated().unwrap_or(false) {
+                return Ok(total);
+            }
+            let next = output.next_continuation_token().ok_or_else(|| {
+                AppError::ServiceUnavailable("对象存储容量统计分页结果无效".into())
+            })?;
+            if continuation_token.as_deref() == Some(next) {
+                return Err(AppError::ServiceUnavailable(
+                    "对象存储容量统计分页未前进".into(),
+                ));
+            }
+            continuation_token = Some(next.to_owned());
+        }
+        Err(AppError::ServiceUnavailable(
+            "对象存储对象数量超过 Ycloud 容量统计安全上限".into(),
+        ))
     }
 
     /// List direct children only. Pagination, result count and concurrent S3
@@ -769,6 +840,7 @@ impl S3Backend {
         Ok(S3UploadResult {
             relative,
             size: committed.size,
+            previous_size: existing.as_ref().map_or(0, |metadata| metadata.size),
             etag: committed.etag,
         })
     }
@@ -824,13 +896,32 @@ impl S3Backend {
     }
 
     pub async fn copy_file(&self, source: &str, destination: &str) -> AppResult<()> {
+        self.copy_file_internal(source, destination, None).await
+    }
+
+    pub async fn copy_file_with_expected_size(
+        &self,
+        source: &str,
+        destination: &str,
+        expected_size: u64,
+    ) -> AppResult<()> {
+        self.copy_file_internal(source, destination, Some(expected_size))
+            .await
+    }
+
+    async fn copy_file_internal(
+        &self,
+        source: &str,
+        destination: &str,
+        expected_size: Option<u64>,
+    ) -> AppResult<()> {
         let source = StorageService::normalize_relative(source)?;
         let destination = StorageService::normalize_relative(destination)?;
         if source.is_empty() || destination.is_empty() || source == destination {
             return Err(AppError::BadRequest("无效的文件复制路径".into()));
         }
         let _mutation = self.mutation_gate.lock().await;
-        self.copy_file_locked(&source, &destination)
+        self.copy_file_locked(&source, &destination, expected_size)
             .await
             .map(|_| ())
     }
@@ -842,7 +933,7 @@ impl S3Backend {
             return Err(AppError::BadRequest("无效的文件移动路径".into()));
         }
         let _mutation = self.mutation_gate.lock().await;
-        let source_metadata = self.copy_file_locked(&source, &destination).await?;
+        let source_metadata = self.copy_file_locked(&source, &destination, None).await?;
         let source_key = object_key(&self.prefix, &source)?;
         if let Err(error) = self
             .delete_key(&source_key, source_metadata.etag.as_deref())
@@ -856,7 +947,7 @@ impl S3Backend {
         Ok(())
     }
 
-    pub async fn delete_file(&self, relative: &str) -> AppResult<()> {
+    pub async fn delete_file(&self, relative: &str) -> AppResult<u64> {
         let relative = StorageService::normalize_relative(relative)?;
         if relative.is_empty() {
             return Err(AppError::BadRequest("不能删除存储根目录".into()));
@@ -867,7 +958,8 @@ impl S3Backend {
             return Err(AppError::Conflict("目标是目录而不是文件".into()));
         }
         let key = object_key(&self.prefix, &relative)?;
-        self.delete_key(&key, metadata.etag.as_deref()).await
+        self.delete_key(&key, metadata.etag.as_deref()).await?;
+        Ok(metadata.size)
     }
 
     /// Delete only an empty directory marker. Recursive directory deletion is
@@ -897,10 +989,20 @@ impl S3Backend {
             .await
     }
 
-    async fn copy_file_locked(&self, source: &str, destination: &str) -> AppResult<S3Metadata> {
+    async fn copy_file_locked(
+        &self,
+        source: &str,
+        destination: &str,
+        expected_size: Option<u64>,
+    ) -> AppResult<S3Metadata> {
         let source_metadata = self.metadata(source).await?;
         if source_metadata.is_dir {
             return Err(AppError::Conflict("当前操作只接受普通文件".into()));
+        }
+        if expected_size.is_some_and(|size| size != source_metadata.size) {
+            return Err(AppError::Conflict(
+                "Source changed while preparing the copy".into(),
+            ));
         }
         self.ensure_parent_directory(destination).await?;
         match self.metadata(destination).await {

@@ -367,6 +367,7 @@ mod tests {
                     addressing_style: S3AddressingStyle::VirtualHosted,
                     access_key_id: "pending-access-key".into(),
                     secret_access_key: "pending-secret-key".into(),
+                    capacity_limit_bytes: None,
                 })),
                 ..ConfigFile::default()
             })),

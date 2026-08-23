@@ -16,8 +16,15 @@ use crate::{
 };
 
 enum PreparedStorageBackend {
-    Local,
-    S3(crate::s3_backend::S3Backend),
+    Local {
+        used: u64,
+        capacity_limit: Option<u64>,
+    },
+    S3 {
+        backend: crate::s3_backend::S3Backend,
+        used: u64,
+        capacity_limit: Option<u64>,
+    },
 }
 
 #[derive(Clone)]
@@ -67,7 +74,10 @@ impl AppState {
         })?;
 
         let backend = match &persisted.storage_backend {
-            StorageBackendConfig::Local(_) => StorageBackend::local(storage.clone()),
+            StorageBackendConfig::Local(settings) => {
+                StorageBackend::local_configured(storage.clone(), settings.capacity_limit_bytes)
+                    .await?
+            }
             StorageBackendConfig::S3(settings) => {
                 let backend = crate::s3_backend::S3Backend::new(settings, &config)?;
                 backend.activation_probe().await?;
@@ -75,7 +85,7 @@ impl AppState {
                 if recovered > 0 {
                     tracing::warn!(recovered, "recovered pending S3 storage transactions");
                 }
-                StorageBackend::s3(backend)
+                StorageBackend::s3_configured(backend, settings.capacity_limit_bytes).await?
             }
         };
         Ok(Self {
@@ -147,8 +157,10 @@ impl AppState {
         self.persist_storage_selection(&next).await
     }
 
-    pub async fn stage_local_storage(&self) -> AppResult<()> {
-        let candidate = StorageBackendConfig::default();
+    pub async fn stage_local_storage(&self, capacity_limit_bytes: Option<u64>) -> AppResult<()> {
+        let candidate = StorageBackendConfig::Local(crate::config::LocalStorageConfig {
+            capacity_limit_bytes,
+        });
         let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
         if next.storage_backend == candidate {
@@ -180,7 +192,10 @@ impl AppState {
         self.config.allows_storage_backend(&pending)?;
 
         let prepared = match &pending {
-            StorageBackendConfig::Local(_) => PreparedStorageBackend::Local,
+            StorageBackendConfig::Local(settings) => PreparedStorageBackend::Local {
+                used: self.storage.user_data_size().await?,
+                capacity_limit: settings.capacity_limit_bytes,
+            },
             StorageBackendConfig::S3(settings) => {
                 let backend = crate::s3_backend::S3Backend::new(settings, &self.config)?;
                 backend.activation_probe().await?;
@@ -188,7 +203,12 @@ impl AppState {
                 if recovered > 0 {
                     tracing::warn!(recovered, "recovered S3 transactions before activation");
                 }
-                PreparedStorageBackend::S3(backend)
+                let used = backend.user_data_size().await?;
+                PreparedStorageBackend::S3 {
+                    backend,
+                    used,
+                    capacity_limit: settings.capacity_limit_bytes,
+                }
             }
         };
 
@@ -205,10 +225,17 @@ impl AppState {
                 AppError::with_source("failed to persist storage activation", error)
             })?;
         match prepared {
-            PreparedStorageBackend::Local => {
-                replacement.replace_with_local(self.storage.clone());
+            PreparedStorageBackend::Local {
+                used,
+                capacity_limit,
+            } => {
+                replacement.replace_with_local(self.storage.clone(), capacity_limit, used);
             }
-            PreparedStorageBackend::S3(backend) => replacement.replace_with_s3(backend),
+            PreparedStorageBackend::S3 {
+                backend,
+                used,
+                capacity_limit,
+            } => replacement.replace_with_s3(backend, capacity_limit, used),
         }
         *self.config_file.write().await = next;
         drop(replacement);
@@ -282,6 +309,7 @@ mod tests {
             addressing_style: S3AddressingStyle::VirtualHosted,
             access_key_id: "credential-to-remove".into(),
             secret_access_key: "secret-to-remove".into(),
+            capacity_limit_bytes: None,
         }));
         state.persist_storage_selection(&pending).await.unwrap();
         state.discard_pending_storage().await.unwrap();

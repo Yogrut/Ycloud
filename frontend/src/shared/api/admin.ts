@@ -21,13 +21,15 @@ export interface AdminInfo {
   storage_backend: StorageBackendView
   pending_storage_backend: StorageBackendView | null
   local_storage_path: string
+  storage_usage_bytes: number
+  storage_reserved_bytes: number
 }
 
 export type S3Provider = 'alibaba_oss' | 'tencent_cos' | 'minio' | 's3_compatible'
 export type S3AddressingStyle = 'path' | 'virtual_hosted'
 
 export type StorageBackendView =
-  | { type: 'local'; path: string }
+  | { type: 'local'; path: string; capacity_limit_bytes: number | null }
   | {
     type: 's3'
     provider: S3Provider
@@ -38,6 +40,7 @@ export type StorageBackendView =
     addressing_style: S3AddressingStyle
     has_access_key_id: boolean
     has_secret_access_key: boolean
+    capacity_limit_bytes: number | null
   }
 
 export interface TestS3StorageRequest {
@@ -49,6 +52,7 @@ export interface TestS3StorageRequest {
   addressing_style: S3AddressingStyle
   access_key_id: string
   secret_access_key: string
+  capacity_limit_bytes: number | null
 }
 
 export interface WebDavMountView {
@@ -222,8 +226,12 @@ export function stageS3Storage(body: TestS3StorageRequest): Promise<{ success: b
   })
 }
 
-export function stageLocalStorage(): Promise<{ success: boolean }> {
-  return adminRequest('/api/admin/storage/pending/local', { method: 'PUT' })
+export function stageLocalStorage(capacityLimitBytes: number | null): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/storage/pending/local', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ capacity_limit_bytes: capacityLimitBytes }),
+  })
 }
 
 export function activatePendingStorage(): Promise<{ success: boolean }> {

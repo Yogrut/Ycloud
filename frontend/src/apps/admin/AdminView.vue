@@ -136,6 +136,8 @@ onMounted(load)
         :backend="info.storage_backend"
         :pending-backend="info.pending_storage_backend"
         :local-path="info.local_storage_path"
+        :usage-bytes="info.storage_usage_bytes"
+        :reserved-bytes="info.storage_reserved_bytes"
         @changed="showNotice"
       />
       <LimitsView v-else-if="info && activeSection === 'limits'" :info="info" @saved="showNotice" />

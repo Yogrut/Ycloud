@@ -30,7 +30,9 @@ pub const DEFAULT_SECURITY_LOG_MAX_ENTRIES: usize = 5_000;
 pub const HARD_MAX_TRANSFER_RATE_BYTES: u64 = 1024 * 1024 * 1024;
 pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 4;
+pub const MIN_STORAGE_CAPACITY_BYTES: u64 = 1024 * 1024;
+pub const HARD_MAX_STORAGE_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024 * 1024;
+pub const CONFIG_SCHEMA_VERSION: u32 = 5;
 
 // ── Data types ────────────────────────────────────────────────────
 
@@ -69,13 +71,25 @@ pub enum StorageBackendConfig {
 
 impl Default for StorageBackendConfig {
     fn default() -> Self {
-        Self::Local(LocalStorageConfig {})
+        Self::Local(LocalStorageConfig::default())
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl StorageBackendConfig {
+    pub fn capacity_limit_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Local(settings) => settings.capacity_limit_bytes,
+            Self::S3(settings) => settings.capacity_limit_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct LocalStorageConfig {}
+pub struct LocalStorageConfig {
+    #[serde(default)]
+    pub capacity_limit_bytes: Option<u64>,
+}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +102,8 @@ pub struct S3StorageConfig {
     pub addressing_style: S3AddressingStyle,
     pub access_key_id: String,
     pub secret_access_key: String,
+    #[serde(default)]
+    pub capacity_limit_bytes: Option<u64>,
 }
 
 /// Never include the recoverable S3 secret in diagnostics.
@@ -103,6 +119,7 @@ impl fmt::Debug for S3StorageConfig {
             .field("addressing_style", &self.addressing_style)
             .field("access_key_id", &"[REDACTED]")
             .field("secret_access_key", &"[REDACTED]")
+            .field("capacity_limit_bytes", &self.capacity_limit_bytes)
             .finish()
     }
 }
@@ -547,6 +564,13 @@ pub fn validate_transfer_limits(
 }
 
 pub fn validate_storage_backend(backend: &StorageBackendConfig) -> AppResult<()> {
+    if let Some(limit) = backend.capacity_limit_bytes() {
+        if !(MIN_STORAGE_CAPACITY_BYTES..=HARD_MAX_STORAGE_CAPACITY_BYTES).contains(&limit) {
+            return Err(AppError::BadRequest(
+                "存储容量上限必须在 1 MiB 到 4 PiB 之间，留空表示不设置逻辑上限".into(),
+            ));
+        }
+    }
     let StorageBackendConfig::S3(settings) = backend else {
         return Ok(());
     };
@@ -1362,7 +1386,7 @@ mod tests {
         assert_eq!(persisted.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(
             persisted.storage_backend,
-            StorageBackendConfig::Local(LocalStorageConfig {})
+            StorageBackendConfig::Local(LocalStorageConfig::default())
         );
         assert_eq!(persisted.pending_storage_backend, None);
         tokio::fs::remove_dir_all(directory).await.unwrap();
@@ -1371,7 +1395,9 @@ mod tests {
     #[test]
     fn pending_storage_must_differ_from_active_storage() {
         let mut config = ConfigFile {
-            pending_storage_backend: Some(StorageBackendConfig::Local(LocalStorageConfig {})),
+            pending_storage_backend: Some(StorageBackendConfig::Local(
+                LocalStorageConfig::default(),
+            )),
             ..ConfigFile::default()
         };
         assert!(config.validate().is_err());
@@ -1385,8 +1411,24 @@ mod tests {
             addressing_style: S3AddressingStyle::Path,
             access_key_id: "example-access-key".into(),
             secret_access_key: "example-secret-key".into(),
+            capacity_limit_bytes: None,
         };
         config.pending_storage_backend = Some(StorageBackendConfig::S3(pending));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn storage_capacity_limit_has_safe_numeric_bounds() {
+        let mut config = ConfigFile {
+            storage_backend: StorageBackendConfig::Local(LocalStorageConfig {
+                capacity_limit_bytes: Some(super::MIN_STORAGE_CAPACITY_BYTES - 1),
+            }),
+            ..ConfigFile::default()
+        };
+        assert!(config.validate().is_err());
+        config.storage_backend = StorageBackendConfig::Local(LocalStorageConfig {
+            capacity_limit_bytes: Some(super::MIN_STORAGE_CAPACITY_BYTES),
+        });
         assert!(config.validate().is_ok());
     }
 
@@ -1401,6 +1443,7 @@ mod tests {
             addressing_style: S3AddressingStyle::Path,
             access_key_id: "example-access-key".into(),
             secret_access_key: "example-secret-key".into(),
+            capacity_limit_bytes: None,
         };
         let mut config = ConfigFile {
             storage_backend: StorageBackendConfig::S3(settings.clone()),
@@ -1458,6 +1501,7 @@ mod tests {
             addressing_style: S3AddressingStyle::Path,
             access_key_id: "example-access-key".into(),
             secret_access_key: "example-secret-key".into(),
+            capacity_limit_bytes: None,
         };
         assert!(runtime
             .allows_storage_backend(&StorageBackendConfig::S3(settings.clone()))

@@ -260,29 +260,8 @@ impl StorageService {
         // cannot silently redirect the final write outside the storage root.
         self.resolve_for_write(destination.relative()).await?;
 
-        let root = self.root.clone();
-        let available = tokio::task::spawn_blocking(move || fs4::available_space(root.as_path()))
-            .await
-            .map_err(|error| AppError::with_source("failed to inspect storage capacity", error))?
-            .map_err(|error| AppError::with_source("failed to inspect storage capacity", error))?;
         let initially_reserved = expected_bytes.unwrap_or(0);
-        let required = initially_reserved.saturating_add(self.disk_reserve_bytes);
-        {
-            let mut reserved = self
-                .reserved_upload_bytes
-                .lock()
-                .map_err(|_| AppError::internal("upload reservation state is unavailable"))?;
-            if available < required.saturating_add(*reserved) {
-                return Err(AppError::InsufficientStorage);
-            }
-            *reserved = reserved.saturating_add(initially_reserved);
-        }
-        let reservation = UploadReservation {
-            reserved_upload_bytes: self.reserved_upload_bytes.clone(),
-            remaining: initially_reserved,
-            root: self.root.clone(),
-            disk_reserve_bytes: self.disk_reserve_bytes,
-        };
+        let reservation = self.reserve_physical_bytes(initially_reserved).await?;
 
         let transaction_id = Uuid::new_v4().to_string();
         let temporary = self.transactions.upload_path(&transaction_id);
@@ -390,7 +369,7 @@ impl StorageService {
             .map_err(|error| AppError::with_source("failed to build file response", error))
     }
 
-    pub async fn remove(&self, path: &ResolvedPath) -> AppResult<()> {
+    pub async fn remove(&self, path: &ResolvedPath) -> AppResult<u64> {
         if path.is_root() {
             return Err(AppError::BadRequest(
                 "The storage root cannot be removed".into(),
@@ -404,9 +383,10 @@ impl StorageService {
                 std::io::ErrorKind::NotFound => AppError::NotFound,
                 _ => AppError::with_source("failed to inspect path", error),
             })?;
+        let removed_size = self.path_size(path).await?;
         self.transactions.stage_delete(path.absolute()).await?;
         self.trash_notify.notify_one();
-        Ok(())
+        Ok(removed_size)
     }
 
     pub async fn create_directory(&self, path: &ResolvedPath) -> AppResult<()> {
@@ -450,6 +430,17 @@ impl StorageService {
         source: &ResolvedPath,
         destination: &ResolvedPath,
     ) -> AppResult<()> {
+        let expected_size = self.path_size(source).await?;
+        self.copy_path_with_expected_size(source, destination, expected_size)
+            .await
+    }
+
+    pub async fn copy_path_with_expected_size(
+        &self,
+        source: &ResolvedPath,
+        destination: &ResolvedPath,
+        expected_size: u64,
+    ) -> AppResult<()> {
         reject_root_or_descendant(source, destination)?;
         let _permit = self.acquire_io().await?;
         let _mutation = self.mutation_gate.lock().await;
@@ -461,6 +452,13 @@ impl StorageService {
         }
 
         let metadata = self.metadata(source).await?;
+        let copy_size = self.path_size(source).await?;
+        if copy_size != expected_size {
+            return Err(AppError::Conflict(
+                "Source changed while preparing the copy".into(),
+            ));
+        }
+        let _physical_reservation = self.reserve_physical_bytes(copy_size).await?;
         let transaction_id = Uuid::new_v4().to_string();
         let temporary = self.transactions.copy_path(&transaction_id);
         let result = if metadata.is_dir() {
@@ -495,6 +493,25 @@ impl StorageService {
             .unwrap_or(false)
     }
 
+    /// Count only user-visible files. The reserved transaction directory is
+    /// excluded because it contains temporary copies, backups and trash that
+    /// must not consume the logical user quota twice.
+    pub async fn user_data_size(&self) -> AppResult<u64> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || calculate_plain_path_size(&root, true))
+            .await
+            .map_err(|error| {
+                AppError::with_source("failed to inspect local storage usage", error)
+            })?
+    }
+
+    pub async fn path_size(&self, path: &ResolvedPath) -> AppResult<u64> {
+        let absolute = path.absolute.clone();
+        tokio::task::spawn_blocking(move || calculate_plain_path_size(&absolute, false))
+            .await
+            .map_err(|error| AppError::with_source("failed to inspect local path size", error))?
+    }
+
     pub(crate) async fn acquire_io(&self) -> AppResult<OwnedSemaphorePermit> {
         self.io_gate
             .clone()
@@ -502,6 +519,83 @@ impl StorageService {
             .await
             .map_err(|_| AppError::ServiceUnavailable("Storage is shutting down".into()))
     }
+
+    async fn reserve_physical_bytes(&self, bytes: u64) -> AppResult<UploadReservation> {
+        let root = self.root.clone();
+        let available = tokio::task::spawn_blocking(move || fs4::available_space(root.as_path()))
+            .await
+            .map_err(|error| AppError::with_source("failed to inspect storage capacity", error))?
+            .map_err(|error| AppError::with_source("failed to inspect storage capacity", error))?;
+        let mut reserved = self
+            .reserved_upload_bytes
+            .lock()
+            .map_err(|_| AppError::internal("storage reservation state is unavailable"))?;
+        if available
+            < self
+                .disk_reserve_bytes
+                .saturating_add(*reserved)
+                .saturating_add(bytes)
+        {
+            return Err(AppError::InsufficientStorage);
+        }
+        *reserved = reserved.saturating_add(bytes);
+        Ok(UploadReservation {
+            reserved_upload_bytes: self.reserved_upload_bytes.clone(),
+            remaining: bytes,
+            root: self.root.clone(),
+            disk_reserve_bytes: self.disk_reserve_bytes,
+        })
+    }
+}
+
+fn calculate_plain_path_size(path: &Path, skip_reserved_root_entry: bool) -> AppResult<u64> {
+    let root_metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| AppError::with_source("failed to inspect local storage usage", error))?;
+    if is_link_or_reparse_point(&root_metadata) {
+        return Err(AppError::Forbidden);
+    }
+    if root_metadata.is_file() {
+        return Ok(root_metadata.len());
+    }
+    if !root_metadata.is_dir() {
+        return Err(AppError::Forbidden);
+    }
+
+    let root = path.to_path_buf();
+    let mut stack = vec![root.clone()];
+    let mut total = 0_u64;
+    while let Some(directory) = stack.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| AppError::with_source("failed to read local storage usage", error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                AppError::with_source("failed to read local storage usage entry", error)
+            })?;
+            if skip_reserved_root_entry
+                && directory == root
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(SYSTEM_DIR)
+            {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(entry.path()).map_err(|error| {
+                AppError::with_source("failed to inspect local storage usage entry", error)
+            })?;
+            if is_link_or_reparse_point(&metadata) {
+                continue;
+            }
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            } else if metadata.is_file() {
+                total = total
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| AppError::internal("local storage usage exceeds u64"))?;
+            }
+        }
+    }
+    Ok(total)
 }
 
 pub struct AtomicFileWriter {
@@ -538,7 +632,7 @@ impl AtomicFileWriter {
         Ok(())
     }
 
-    pub async fn commit(mut self) -> AppResult<u64> {
+    pub async fn commit(mut self) -> AppResult<AtomicWriteResult> {
         if self
             .expected_bytes
             .is_some_and(|expected| expected != self.bytes_written)
@@ -556,12 +650,22 @@ impl AtomicFileWriter {
             .map_err(|error| AppError::with_source("failed to flush upload", error))?;
         drop(file);
         let _mutation = self.mutation_gate.lock().await;
-        self.transactions
+        let previous_size = self
+            .transactions
             .commit_file(&self.relative, &self.temporary, &self.destination)
             .await?;
         self.committed = true;
-        Ok(self.bytes_written)
+        Ok(AtomicWriteResult {
+            size: self.bytes_written,
+            previous_size,
+        })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtomicWriteResult {
+    pub size: u64,
+    pub previous_size: u64,
 }
 
 impl Drop for AtomicFileWriter {
@@ -897,7 +1001,7 @@ pub(crate) fn attachment_header(path: &Path) -> HeaderValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{attachment_header, parse_range, StorageService};
+    use super::{attachment_header, parse_range, AtomicWriteResult, StorageService};
     use crate::storage_transaction::SYSTEM_DIR;
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
     use bytes::Bytes;
@@ -963,7 +1067,13 @@ mod tests {
             .write_chunk(&Bytes::from_static(b"-write"))
             .await
             .unwrap();
-        assert_eq!(writer.commit().await.unwrap(), 12);
+        assert_eq!(
+            writer.commit().await.unwrap(),
+            AtomicWriteResult {
+                size: 12,
+                previous_size: 0,
+            }
+        );
         assert_eq!(
             tokio::fs::read(root.join("docs/runbook.txt"))
                 .await

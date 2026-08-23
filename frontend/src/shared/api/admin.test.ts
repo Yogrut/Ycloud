@@ -96,6 +96,7 @@ describe('admin API', () => {
       addressing_style: 'path' as const,
       access_key_id: 'access',
       secret_access_key: 'secret',
+      capacity_limit_bytes: null,
     }
 
     await testS3Storage(body)

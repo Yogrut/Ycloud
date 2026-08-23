@@ -11,6 +11,9 @@
 /initial-credentials.json
 /security-events.json
 /security-events.json.bak
+/security-events.jsonl
+/security-state.json
+/security-state.json.bak
 *.upload
 *.tmp
 

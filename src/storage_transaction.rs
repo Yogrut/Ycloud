@@ -137,7 +137,7 @@ impl TransactionPaths {
         relative: &str,
         temporary: &Path,
         destination: &Path,
-    ) -> AppResult<()> {
+    ) -> AppResult<u64> {
         let metadata = match fs::symlink_metadata(destination).await {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -188,7 +188,7 @@ impl TransactionPaths {
             .await
             .map_err(|e| AppError::with_source("failed to finalize replacement journal", e))?;
         sync_parent(&journal_path).await?;
-        Ok(())
+        Ok(metadata.as_ref().map_or(0, std::fs::Metadata::len))
     }
 
     pub async fn stage_delete(&self, source: &Path) -> AppResult<PathBuf> {

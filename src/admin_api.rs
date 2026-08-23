@@ -37,6 +37,8 @@ pub struct AdminInfo {
     pub storage_backend: StorageBackendView,
     pub pending_storage_backend: Option<StorageBackendView>,
     pub local_storage_path: String,
+    pub storage_usage_bytes: u64,
+    pub storage_reserved_bytes: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -44,6 +46,7 @@ pub struct AdminInfo {
 pub enum StorageBackendView {
     Local {
         path: String,
+        capacity_limit_bytes: Option<u64>,
     },
     S3 {
         provider: S3Provider,
@@ -54,14 +57,16 @@ pub enum StorageBackendView {
         addressing_style: S3AddressingStyle,
         has_access_key_id: bool,
         has_secret_access_key: bool,
+        capacity_limit_bytes: Option<u64>,
     },
 }
 
 impl StorageBackendView {
     fn from_config(backend: &StorageBackendConfig, local_path: &std::path::Path) -> Self {
         match backend {
-            StorageBackendConfig::Local(_) => Self::Local {
+            StorageBackendConfig::Local(settings) => Self::Local {
                 path: local_path.to_string_lossy().into_owned(),
+                capacity_limit_bytes: settings.capacity_limit_bytes,
             },
             StorageBackendConfig::S3(settings) => Self::S3 {
                 provider: settings.provider,
@@ -72,6 +77,7 @@ impl StorageBackendView {
                 addressing_style: settings.addressing_style,
                 has_access_key_id: !settings.access_key_id.is_empty(),
                 has_secret_access_key: !settings.secret_access_key.is_empty(),
+                capacity_limit_bytes: settings.capacity_limit_bytes,
             },
         }
     }
@@ -149,6 +155,7 @@ pub struct UpdateAdminRequest {
 }
 
 pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
+    let capacity = state.backend.capacity_status().await;
     let (
         username,
         has_global_web_password,
@@ -214,6 +221,8 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
         storage_backend,
         pending_storage_backend,
         local_storage_path: state.config.storage_path.to_string_lossy().into_owned(),
+        storage_usage_bytes: capacity.used,
+        storage_reserved_bytes: capacity.reserved,
     })
 }
 
@@ -240,10 +249,19 @@ pub async fn stage_s3_storage(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+#[derive(Deserialize)]
+pub struct StageLocalStorageRequest {
+    #[serde(default)]
+    pub capacity_limit_bytes: Option<u64>,
+}
+
 pub async fn stage_local_storage(
     State(state): State<AppState>,
+    Json(settings): Json<StageLocalStorageRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.stage_local_storage().await?;
+    state
+        .stage_local_storage(settings.capacity_limit_bytes)
+        .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 

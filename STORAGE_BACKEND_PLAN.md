@@ -65,5 +65,23 @@ Ycloud 的用户入口和存储后端互相独立，不要求使用相同的域�
 - AWS SDK 1.143.0 仍间接固定 `lru 0.16.4`，命中 `RUSTSEC-2026-0253`。该依赖只位于 SDK 的 S3 Express 身份缓存；Ycloud 为所有 S3 客户端关闭 S3 Express 会话认证，因此受影响路径不可达。`cargo-deny` 仅对这一编号保留有理由的临时例外，全局 `unsound = "all"` 不变；AWS SDK 接受 `lru >= 0.18.2` 后必须立即删除例外。
 - 目录事务当前使用单次 `CopyObject`，因此在创建事务前拒绝包含超过 5 GB 对象的目录；超过该边界需要后续实现分段复制。尚未完成真实 AWS、腾讯 COS、阿里 OSS、MinIO/RustFS 的全套故障注入和客户端兼容验证，生产切换前必须先用独立测试桶完成冒烟测试。
 - Bucket、Prefix 和 Object Key 逐层规范化，禁止越过配置前缀或访问 Ycloud 内部保留命名空间。
+
+## RustFS / MinIO 兼容性验收
+
+仓库提供默认忽略的真实 S3 冒烟测试 `s3_backend::tests::rustfs_minio_s3_smoke`。测试要求一个与正式数据隔离的现有 Bucket，并在每次执行时创建随机独占 Prefix；它依次验证列举、条件写入、HEAD、下载、覆盖、文件复制/移动/删除、目录复制/移动/删除、事务恢复与容量扫描。不要使用正式 Bucket、正式 Prefix 或 RustFS 根凭据，测试身份应只获得测试 Bucket 所需的最小 S3 权限。
+
+PowerShell 中只为当前会话设置凭据，然后单线程显式运行被忽略的测试：
+
+```powershell
+$env:YCLOUD_S3_SMOKE_ENDPOINT = "http://127.0.0.1:9000"
+$env:YCLOUD_S3_SMOKE_BUCKET = "ycloud-test"
+$env:YCLOUD_S3_SMOKE_REGION = "us-east-1"
+$env:YCLOUD_S3_SMOKE_PREFIX = "compatibility/"
+$env:YCLOUD_S3_SMOKE_ACCESS_KEY_ID = "<test-access-key>"
+$env:YCLOUD_S3_SMOKE_SECRET_ACCESS_KEY = "<test-secret-key>"
+cargo test --locked s3_backend::tests::rustfs_minio_s3_smoke -- --ignored --nocapture --test-threads=1
+```
+
+RustFS 使用 S3 API 端口（默认 `9000`），不是管理控制台端口（默认 `9001`），寻址方式使用 Path Style。正常 `cargo test` 不读取这些变量，也不会连接外部对象存储。
 - Endpoint、凭据或 Bucket 变化后终止旧连接池和未授权会话，不让旧凭据继续长期生效。
 - 加入针对 SSRF、DNS 重绑定、恶意重定向、证书错误、凭据泄露、路径越界和连接耗尽的自动化测试后，远程存储功能才可验收。

@@ -1659,18 +1659,168 @@ fn list_prefix(prefix: &str, relative: &str) -> AppResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::{BTreeMap, HashSet},
+        net::IpAddr,
+        path::PathBuf,
+    };
 
     use aws_sdk_s3::types::{CommonPrefix, Object};
+    use axum::{body::Body, http::HeaderMap};
     use bytes::Bytes;
     use futures_util::stream;
     use http_body_util::BodyExt;
 
+    use crate::{
+        config::{normalize_s3_endpoint, Config, S3AddressingStyle, S3Provider, S3StorageConfig},
+        error::{AppError, AppResult},
+        storage::FileResponseMode,
+    };
+
     use super::{
         collect_page_entries, copy_source, internal_key, list_prefix, object_key, parent_relative,
         snapshot_matches, valid_transaction_id, validate_upload_transaction, ExactLengthBody,
-        RawS3Metadata, S3ObjectSnapshot, S3UploadStage, S3UploadTransaction,
+        RawS3Metadata, S3Backend, S3ObjectSnapshot, S3UploadStage, S3UploadTransaction,
     };
+
+    fn required_smoke_env(name: &str) -> String {
+        std::env::var(name)
+            .unwrap_or_else(|_| panic!("missing required smoke-test variable {name}"))
+    }
+
+    /// Opt-in compatibility test for an isolated RustFS or MinIO bucket.
+    ///
+    /// The test never runs in the normal suite and creates a unique Prefix for
+    /// every execution. Credentials are read only from process environment
+    /// variables and are never printed.
+    #[tokio::test]
+    #[ignore = "requires an isolated RustFS/MinIO test bucket and explicit credentials"]
+    async fn rustfs_minio_s3_smoke() {
+        let endpoint = required_smoke_env("YCLOUD_S3_SMOKE_ENDPOINT");
+        let bucket = required_smoke_env("YCLOUD_S3_SMOKE_BUCKET");
+        let access_key_id = required_smoke_env("YCLOUD_S3_SMOKE_ACCESS_KEY_ID");
+        let secret_access_key = required_smoke_env("YCLOUD_S3_SMOKE_SECRET_ACCESS_KEY");
+        let region = std::env::var("YCLOUD_S3_SMOKE_REGION").unwrap_or_else(|_| "us-east-1".into());
+        let base_prefix =
+            std::env::var("YCLOUD_S3_SMOKE_PREFIX").unwrap_or_else(|_| "ycloud-smoke/".into());
+        let base_prefix = base_prefix.trim_matches('/');
+        let run_id = uuid::Uuid::new_v4().simple().to_string();
+        let prefix = if base_prefix.is_empty() {
+            format!("{run_id}/")
+        } else {
+            format!("{base_prefix}/{run_id}/")
+        };
+        let settings = S3StorageConfig {
+            provider: S3Provider::Minio,
+            endpoint: endpoint.clone(),
+            bucket,
+            region,
+            prefix,
+            addressing_style: S3AddressingStyle::Path,
+            access_key_id,
+            secret_access_key,
+            capacity_limit_bytes: Some(1024 * 1024),
+        };
+        let runtime = Config {
+            bind_address: IpAddr::from([127, 0, 0, 1]),
+            port: 0,
+            storage_path: PathBuf::from("unused-smoke-local-storage"),
+            config_path: PathBuf::from("unused-smoke-config.json"),
+            max_upload_bytes: 1024 * 1024,
+            io_concurrency: 2,
+            max_list_entries: 100,
+            request_timeout_secs: 30,
+            upload_timeout_secs: 30,
+            disk_reserve_bytes: 0,
+            secure_cookies: false,
+            allow_lan_http: true,
+            public_base_url: None,
+            public_host: None,
+            trusted_proxy_ips: HashSet::new(),
+            s3_allowed_endpoints: HashSet::from([normalize_s3_endpoint(&endpoint).unwrap()]),
+        };
+        let backend = S3Backend::new(&settings, &runtime).unwrap();
+        let payload = Bytes::from_static(b"ycloud-rustfs-compatibility-smoke");
+
+        let result: AppResult<()> = async {
+            backend.activation_probe().await?;
+            assert_eq!(backend.user_data_size().await?, 0);
+            backend.create_directory("suite").await?;
+            let uploaded = backend
+                .upload_file(
+                    "suite/source.bin",
+                    Body::from(payload.clone()),
+                    payload.len() as u64,
+                    1024 * 1024,
+                    Some("application/octet-stream"),
+                )
+                .await?;
+            assert_eq!(uploaded.previous_size, 0);
+            assert_eq!(uploaded.size, payload.len() as u64);
+
+            let response = backend
+                .stream_file(
+                    "suite/source.bin",
+                    &HeaderMap::new(),
+                    FileResponseMode::Attachment,
+                )
+                .await?;
+            let downloaded = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|error| AppError::with_source("failed to collect smoke download", error))?
+                .to_bytes();
+            assert_eq!(downloaded, payload);
+
+            backend
+                .copy_file("suite/source.bin", "suite/copied.bin")
+                .await?;
+            backend
+                .move_file("suite/copied.bin", "suite/moved.bin")
+                .await?;
+            assert_eq!(
+                backend.delete_file("suite/moved.bin").await?,
+                payload.len() as u64
+            );
+
+            let replacement = Bytes::from_static(b"replacement");
+            let replaced = backend
+                .upload_file(
+                    "suite/source.bin",
+                    Body::from(replacement.clone()),
+                    replacement.len() as u64,
+                    1024 * 1024,
+                    Some("application/octet-stream"),
+                )
+                .await?;
+            assert_eq!(replaced.previous_size, payload.len() as u64);
+            assert_eq!(replaced.size, replacement.len() as u64);
+
+            backend.copy_directory("suite", "suite-copy").await?;
+            backend.move_directory("suite-copy", "suite-moved").await?;
+            assert_eq!(
+                backend.delete_directory("suite-moved").await?,
+                replacement.len() as u64
+            );
+            assert_eq!(
+                backend.delete_directory("suite").await?,
+                replacement.len() as u64
+            );
+            assert_eq!(backend.user_data_size().await?, 0);
+            Ok(())
+        }
+        .await;
+
+        // Preserve transaction evidence on ambiguous failures, but clean all
+        // ordinary test paths so successful and simple failed runs do not
+        // contaminate later capacity scans.
+        let _ = backend.recover_transactions().await;
+        for path in ["suite-moved", "suite-copy", "suite"] {
+            let _ = backend.delete_directory(path).await;
+        }
+        result.unwrap();
+    }
 
     #[test]
     fn object_keys_are_confined_below_the_configured_prefix() {

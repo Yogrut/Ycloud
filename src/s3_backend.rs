@@ -1666,6 +1666,7 @@ mod tests {
     };
 
     use aws_sdk_s3::types::{CommonPrefix, Object};
+    use aws_smithy_types::error::metadata::ProvideErrorMetadata;
     use axum::{body::Body, http::HeaderMap};
     use bytes::Bytes;
     use futures_util::stream;
@@ -1686,6 +1687,26 @@ mod tests {
     fn required_smoke_env(name: &str) -> String {
         std::env::var(name)
             .unwrap_or_else(|_| panic!("missing required smoke-test variable {name}"))
+    }
+
+    fn sanitize_smoke_text(mut text: String, secrets: &[&str]) -> String {
+        for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+            text = text.replace(secret, "<redacted>");
+        }
+        text.chars().take(1_024).collect()
+    }
+
+    fn sanitized_smoke_error_chain(
+        error: &(dyn std::error::Error + 'static),
+        secrets: &[&str],
+    ) -> String {
+        let mut parts = Vec::new();
+        let mut current = Some(error);
+        while let Some(cause) = current {
+            parts.push(sanitize_smoke_text(cause.to_string(), secrets));
+            current = cause.source();
+        }
+        parts.join(" -> ").chars().take(1_024).collect()
     }
 
     /// Opt-in compatibility test for an isolated RustFS or MinIO bucket.
@@ -1743,6 +1764,38 @@ mod tests {
         let payload = Bytes::from_static(b"ycloud-rustfs-compatibility-smoke");
 
         let result: AppResult<()> = async {
+            if let Err(error) = backend
+                .client
+                .list_objects_v2()
+                .bucket(&backend.bucket)
+                .prefix(&backend.prefix)
+                .max_keys(1)
+                .send()
+                .await
+            {
+                let service = error.as_service_error();
+                let secrets = [
+                    settings.access_key_id.as_str(),
+                    settings.secret_access_key.as_str(),
+                ];
+                let code = service
+                    .and_then(ProvideErrorMetadata::code)
+                    .unwrap_or("transport");
+                let message = sanitize_smoke_text(
+                    service
+                        .and_then(ProvideErrorMetadata::message)
+                        .unwrap_or("no service message")
+                        .to_owned(),
+                    &secrets,
+                );
+                let status = error
+                    .raw_response()
+                    .map(|response| response.status().as_u16());
+                let chain = sanitized_smoke_error_chain(&error, &secrets);
+                panic!(
+                    "RustFS/MinIO list probe failed: status={status:?}, code={code}, message={message}, cause={chain}"
+                );
+            }
             backend.activation_probe().await?;
             assert_eq!(backend.user_data_size().await?, 0);
             backend.create_directory("suite").await?;

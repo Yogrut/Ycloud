@@ -1199,43 +1199,73 @@ impl S3Backend {
 
     async fn list_transaction_keys(&self) -> AppResult<Vec<String>> {
         let prefix = internal_key(&self.prefix, "transactions", "");
-        let _permit = self.acquire_request().await?;
-        let output = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&prefix)
-            .max_keys(i32::try_from(S3_MAX_PENDING_TRANSACTIONS).unwrap_or(i32::MAX))
-            .send()
-            .await
-            .map_err(|error| {
+        let mut continuation_token: Option<String> = None;
+        let mut keys = Vec::new();
+        for _ in 0..S3_MAX_LIST_PAGES {
+            let remaining = S3_MAX_PENDING_TRANSACTIONS
+                .saturating_add(1)
+                .saturating_sub(keys.len());
+            if remaining == 0 {
+                return Err(AppError::ServiceUnavailable(
+                    "待恢复对象存储事务超过安全上限".into(),
+                ));
+            }
+            let max_keys = i32::try_from(remaining.min(S3_PAGE_SIZE))
+                .map_err(|_| AppError::internal("invalid S3 transaction list page size"))?;
+            let permit = self.acquire_request().await?;
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix)
+                .max_keys(max_keys);
+            if let Some(token) = continuation_token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            let output = request.send().await.map_err(|error| {
                 tracing::error!(
                     error_kind = %error.as_service_error().map_or("transport", |_| "service"),
                     "S3 transaction journal listing failed"
                 );
                 AppError::ServiceUnavailable("无法列举对象存储事务记录".into())
             })?;
-        if output.is_truncated().unwrap_or(false) {
-            return Err(AppError::ServiceUnavailable(
-                "待恢复对象存储事务超过安全上限".into(),
-            ));
-        }
-        let mut keys = Vec::new();
-        for object in output.contents() {
-            let key = object
-                .key()
-                .ok_or_else(|| AppError::ServiceUnavailable("对象存储事务记录缺少键名".into()))?;
-            let id = key.strip_prefix(&prefix).ok_or_else(|| {
-                AppError::ServiceUnavailable("对象存储事务记录越出保留前缀".into())
-            })?;
-            if !valid_transaction_id(id) {
+            drop(permit);
+
+            for object in output.contents() {
+                if keys.len() == S3_MAX_PENDING_TRANSACTIONS {
+                    return Err(AppError::ServiceUnavailable(
+                        "待恢复对象存储事务超过安全上限".into(),
+                    ));
+                }
+                let key = object.key().ok_or_else(|| {
+                    AppError::ServiceUnavailable("对象存储事务记录缺少键名".into())
+                })?;
+                let id = key.strip_prefix(&prefix).ok_or_else(|| {
+                    AppError::ServiceUnavailable("对象存储事务记录越出保留前缀".into())
+                })?;
+                if !valid_transaction_id(id) {
+                    return Err(AppError::ServiceUnavailable(
+                        "对象存储事务区包含无法识别的记录".into(),
+                    ));
+                }
+                keys.push(key.to_owned());
+            }
+            if !output.is_truncated().unwrap_or(false) {
+                return Ok(keys);
+            }
+            let next = output
+                .next_continuation_token()
+                .ok_or_else(|| AppError::ServiceUnavailable("对象存储事务分页结果无效".into()))?;
+            if continuation_token.as_deref() == Some(next) {
                 return Err(AppError::ServiceUnavailable(
-                    "对象存储事务区包含无法识别的记录".into(),
+                    "对象存储事务分页未前进".into(),
                 ));
             }
-            keys.push(key.to_owned());
+            continuation_token = Some(next.to_owned());
         }
-        Ok(keys)
+        Err(AppError::ServiceUnavailable(
+            "对象存储事务分页超过安全页数上限".into(),
+        ))
     }
 
     async fn read_upload_transaction(&self, key: &str) -> AppResult<(S3UploadTransaction, String)> {
@@ -1689,6 +1719,32 @@ mod tests {
             .unwrap_or_else(|_| panic!("missing required smoke-test variable {name}"))
     }
 
+    fn smoke_provider(value: Option<&str>) -> S3Provider {
+        match value.unwrap_or("minio") {
+            "alibaba_oss" => S3Provider::AlibabaOss,
+            "tencent_cos" => S3Provider::TencentCos,
+            "minio" => S3Provider::Minio,
+            "s3_compatible" => S3Provider::S3Compatible,
+            value => panic!(
+                "invalid YCLOUD_S3_SMOKE_PROVIDER {value:?}; expected alibaba_oss, tencent_cos, minio, or s3_compatible"
+            ),
+        }
+    }
+
+    fn smoke_addressing_style(value: Option<&str>, provider: S3Provider) -> S3AddressingStyle {
+        match value {
+            Some("path") => S3AddressingStyle::Path,
+            Some("virtual_hosted") => S3AddressingStyle::VirtualHosted,
+            Some(value) => panic!(
+                "invalid YCLOUD_S3_SMOKE_ADDRESSING_STYLE {value:?}; expected path or virtual_hosted"
+            ),
+            None if matches!(provider, S3Provider::AlibabaOss | S3Provider::TencentCos) => {
+                S3AddressingStyle::VirtualHosted
+            }
+            None => S3AddressingStyle::Path,
+        }
+    }
+
     fn sanitize_smoke_text(mut text: String, secrets: &[&str]) -> String {
         for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
             text = text.replace(secret, "<redacted>");
@@ -1709,18 +1765,25 @@ mod tests {
         parts.join(" -> ").chars().take(1_024).collect()
     }
 
-    /// Opt-in compatibility test for an isolated RustFS or MinIO bucket.
+    /// Opt-in compatibility test for an isolated S3-compatible bucket.
     ///
     /// The test never runs in the normal suite and creates a unique Prefix for
     /// every execution. Credentials are read only from process environment
     /// variables and are never printed.
     #[tokio::test]
-    #[ignore = "requires an isolated RustFS/MinIO test bucket and explicit credentials"]
-    async fn rustfs_minio_s3_smoke() {
+    #[ignore = "requires an isolated S3 test bucket and explicit credentials"]
+    async fn s3_compatibility_smoke() {
         let endpoint = required_smoke_env("YCLOUD_S3_SMOKE_ENDPOINT");
         let bucket = required_smoke_env("YCLOUD_S3_SMOKE_BUCKET");
         let access_key_id = required_smoke_env("YCLOUD_S3_SMOKE_ACCESS_KEY_ID");
         let secret_access_key = required_smoke_env("YCLOUD_S3_SMOKE_SECRET_ACCESS_KEY");
+        let provider = smoke_provider(std::env::var("YCLOUD_S3_SMOKE_PROVIDER").ok().as_deref());
+        let addressing_style = smoke_addressing_style(
+            std::env::var("YCLOUD_S3_SMOKE_ADDRESSING_STYLE")
+                .ok()
+                .as_deref(),
+            provider,
+        );
         let region = std::env::var("YCLOUD_S3_SMOKE_REGION").unwrap_or_else(|_| "us-east-1".into());
         let base_prefix =
             std::env::var("YCLOUD_S3_SMOKE_PREFIX").unwrap_or_else(|_| "ycloud-smoke/".into());
@@ -1732,12 +1795,12 @@ mod tests {
             format!("{base_prefix}/{run_id}/")
         };
         let settings = S3StorageConfig {
-            provider: S3Provider::Minio,
+            provider,
             endpoint: endpoint.clone(),
             bucket,
             region,
             prefix,
-            addressing_style: S3AddressingStyle::Path,
+            addressing_style,
             access_key_id,
             secret_access_key,
             capacity_limit_bytes: Some(1024 * 1024),
@@ -1761,7 +1824,7 @@ mod tests {
             s3_allowed_endpoints: HashSet::from([normalize_s3_endpoint(&endpoint).unwrap()]),
         };
         let backend = S3Backend::new(&settings, &runtime).unwrap();
-        let payload = Bytes::from_static(b"ycloud-rustfs-compatibility-smoke");
+        let payload = Bytes::from_static(b"ycloud-s3-compatibility-smoke");
 
         let result: AppResult<()> = async {
             if let Err(error) = backend
@@ -1793,7 +1856,7 @@ mod tests {
                     .map(|response| response.status().as_u16());
                 let chain = sanitized_smoke_error_chain(&error, &secrets);
                 panic!(
-                    "RustFS/MinIO list probe failed: status={status:?}, code={code}, message={message}, cause={chain}"
+                    "S3 list probe failed for {provider:?}: status={status:?}, code={code}, message={message}, cause={chain}"
                 );
             }
             backend.activation_probe().await?;
@@ -1873,6 +1936,23 @@ mod tests {
             let _ = backend.delete_directory(path).await;
         }
         result.unwrap();
+    }
+
+    #[test]
+    fn smoke_defaults_match_provider_addressing_requirements() {
+        assert_eq!(smoke_provider(None), S3Provider::Minio);
+        assert_eq!(
+            smoke_addressing_style(None, S3Provider::Minio),
+            S3AddressingStyle::Path
+        );
+        assert_eq!(
+            smoke_addressing_style(None, S3Provider::TencentCos),
+            S3AddressingStyle::VirtualHosted
+        );
+        assert_eq!(
+            smoke_addressing_style(None, S3Provider::AlibabaOss),
+            S3AddressingStyle::VirtualHosted
+        );
     }
 
     #[test]

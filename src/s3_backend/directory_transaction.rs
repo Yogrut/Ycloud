@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     internal_key, list_prefix, non_negative_size, valid_transaction_id, S3Backend,
-    S3_MAX_PENDING_TRANSACTIONS,
+    S3_MAX_LIST_PAGES, S3_MAX_PENDING_TRANSACTIONS, S3_PAGE_SIZE,
 };
 use crate::{
     error::{AppError, AppResult},
@@ -22,6 +22,10 @@ const MAX_SINGLE_COPY_BYTES: u64 = 5_000_000_000;
 const CHECKPOINT_OBJECTS: usize = 16;
 const JOURNAL_CATEGORY: &str = "directory-transactions";
 const TRASH_CATEGORY: &str = "directory-trash";
+
+fn directory_object_limit_error() -> AppError {
+    AppError::Conflict(format!("目录包含超过 {MAX_OBJECTS} 个对象，超出单次安全变更上限").into())
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -205,53 +209,82 @@ impl S3Backend {
             )?,
             Operation::Delete => internal_key(&self.prefix, TRASH_CATEGORY, &format!("{id}/")),
         };
-        let _permit = self.acquire_request().await?;
-        let output = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&source_prefix)
-            .max_keys(i32::try_from(MAX_OBJECTS).unwrap_or(i32::MAX))
-            .send()
-            .await
-            .map_err(|error| {
+        let mut continuation_token: Option<String> = None;
+        let mut objects = Vec::new();
+        let mut listing_complete = false;
+        for _ in 0..S3_MAX_LIST_PAGES {
+            let remaining = MAX_OBJECTS.saturating_add(1).saturating_sub(objects.len());
+            if remaining == 0 {
+                return Err(directory_object_limit_error());
+            }
+            let max_keys = i32::try_from(remaining.min(S3_PAGE_SIZE))
+                .map_err(|_| AppError::internal("invalid S3 transaction list page size"))?;
+            let permit = self.acquire_request().await?;
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&source_prefix)
+                .max_keys(max_keys);
+            if let Some(token) = continuation_token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            let output = request.send().await.map_err(|error| {
                 tracing::warn!(
                     error_kind = %error.as_service_error().map_or("transport", |_| "service"),
                     "S3 directory transaction listing failed"
                 );
                 AppError::ServiceUnavailable("无法读取待变更的对象存储目录".into())
             })?;
-        if output.is_truncated().unwrap_or(false) {
-            return Err(AppError::Conflict(
-                format!("目录包含超过 {MAX_OBJECTS} 个对象，超出单次安全变更上限").into(),
-            ));
-        }
+            drop(permit);
 
-        let mut objects = Vec::with_capacity(output.contents().len());
-        for object in output.contents() {
-            let source_key = object
-                .key()
-                .ok_or_else(|| AppError::ServiceUnavailable("对象存储目录包含无键对象".into()))?;
-            let suffix = source_key.strip_prefix(&source_prefix).ok_or_else(|| {
-                AppError::ServiceUnavailable("对象存储目录列举结果越出源前缀".into())
+            for object in output.contents() {
+                if objects.len() == MAX_OBJECTS {
+                    return Err(directory_object_limit_error());
+                }
+                let source_key = object.key().ok_or_else(|| {
+                    AppError::ServiceUnavailable("对象存储目录包含无键对象".into())
+                })?;
+                let suffix = source_key.strip_prefix(&source_prefix).ok_or_else(|| {
+                    AppError::ServiceUnavailable("对象存储目录列举结果越出源前缀".into())
+                })?;
+                let source_etag = object.e_tag().map(str::to_owned).ok_or_else(|| {
+                    AppError::ServiceUnavailable("对象存储目录对象缺少 ETag，无法安全变更".into())
+                })?;
+                let size = non_negative_size(object.size())?;
+                if size > MAX_SINGLE_COPY_BYTES {
+                    return Err(AppError::Conflict(
+                        "目录包含超过 5 GB 的对象；当前安全目录事务尚不支持分段复制".into(),
+                    ));
+                }
+                objects.push(ObjectRecord {
+                    source_key: source_key.to_owned(),
+                    target_key: format!("{target_prefix}{suffix}"),
+                    size,
+                    source_etag,
+                    target_etag: None,
+                    source_deleted: false,
+                });
+            }
+
+            if !output.is_truncated().unwrap_or(false) {
+                listing_complete = true;
+                break;
+            }
+            let next = output.next_continuation_token().ok_or_else(|| {
+                AppError::ServiceUnavailable("对象存储目录分页结果缺少继续令牌".into())
             })?;
-            let source_etag = object.e_tag().map(str::to_owned).ok_or_else(|| {
-                AppError::ServiceUnavailable("对象存储目录对象缺少 ETag，无法安全变更".into())
-            })?;
-            let size = non_negative_size(object.size())?;
-            if size > MAX_SINGLE_COPY_BYTES {
-                return Err(AppError::Conflict(
-                    "目录包含超过 5 GB 的对象；当前安全目录事务尚不支持分段复制".into(),
+            if continuation_token.as_deref() == Some(next) {
+                return Err(AppError::ServiceUnavailable(
+                    "对象存储目录分页未前进".into(),
                 ));
             }
-            objects.push(ObjectRecord {
-                source_key: source_key.to_owned(),
-                target_key: format!("{target_prefix}{suffix}"),
-                size,
-                source_etag,
-                target_etag: None,
-                source_deleted: false,
-            });
+            continuation_token = Some(next.to_owned());
+        }
+        if !listing_complete {
+            return Err(AppError::ServiceUnavailable(
+                "对象存储目录分页超过安全页数上限".into(),
+            ));
         }
         if objects.is_empty() {
             return Err(AppError::Conflict(
@@ -500,31 +533,44 @@ impl S3Backend {
 
     async fn list_directory_transaction_keys(&self) -> AppResult<Vec<String>> {
         let prefix = internal_key(&self.prefix, JOURNAL_CATEGORY, "");
-        let _permit = self.acquire_request().await?;
-        let output = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(&prefix)
-            .max_keys(i32::try_from(S3_MAX_PENDING_TRANSACTIONS).unwrap_or(i32::MAX))
-            .send()
-            .await
-            .map_err(|error| {
+        let mut continuation_token: Option<String> = None;
+        let mut keys = Vec::new();
+        for _ in 0..S3_MAX_LIST_PAGES {
+            let remaining = S3_MAX_PENDING_TRANSACTIONS
+                .saturating_add(1)
+                .saturating_sub(keys.len());
+            if remaining == 0 {
+                return Err(AppError::ServiceUnavailable(
+                    "待恢复对象存储目录事务超过安全上限".into(),
+                ));
+            }
+            let max_keys = i32::try_from(remaining.min(S3_PAGE_SIZE))
+                .map_err(|_| AppError::internal("invalid S3 transaction list page size"))?;
+            let permit = self.acquire_request().await?;
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&prefix)
+                .max_keys(max_keys);
+            if let Some(token) = continuation_token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            let output = request.send().await.map_err(|error| {
                 tracing::error!(
                     error_kind = %error.as_service_error().map_or("transport", |_| "service"),
                     "S3 directory transaction journal listing failed"
                 );
                 AppError::ServiceUnavailable("无法列举对象存储目录事务记录".into())
             })?;
-        if output.is_truncated().unwrap_or(false) {
-            return Err(AppError::ServiceUnavailable(
-                "待恢复对象存储目录事务超过安全上限".into(),
-            ));
-        }
-        output
-            .contents()
-            .iter()
-            .map(|object| {
+            drop(permit);
+
+            for object in output.contents() {
+                if keys.len() == S3_MAX_PENDING_TRANSACTIONS {
+                    return Err(AppError::ServiceUnavailable(
+                        "待恢复对象存储目录事务超过安全上限".into(),
+                    ));
+                }
                 let key = object.key().ok_or_else(|| {
                     AppError::ServiceUnavailable("对象存储目录事务记录缺少键名".into())
                 })?;
@@ -536,9 +582,24 @@ impl S3Backend {
                         "对象存储目录事务区包含无法识别的记录".into(),
                     ));
                 }
-                Ok(key.to_owned())
-            })
-            .collect()
+                keys.push(key.to_owned());
+            }
+            if !output.is_truncated().unwrap_or(false) {
+                return Ok(keys);
+            }
+            let next = output.next_continuation_token().ok_or_else(|| {
+                AppError::ServiceUnavailable("对象存储目录事务分页结果无效".into())
+            })?;
+            if continuation_token.as_deref() == Some(next) {
+                return Err(AppError::ServiceUnavailable(
+                    "对象存储目录事务分页未前进".into(),
+                ));
+            }
+            continuation_token = Some(next.to_owned());
+        }
+        Err(AppError::ServiceUnavailable(
+            "对象存储目录事务分页超过安全页数上限".into(),
+        ))
     }
 
     async fn read_directory_transaction(&self, key: &str) -> AppResult<(Transaction, String)> {

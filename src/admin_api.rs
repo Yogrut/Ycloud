@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -9,8 +9,9 @@ use uuid::Uuid;
 use crate::{
     auth::AppState,
     config::{
-        remove_initial_credentials, validate_transfer_limits, validate_transfer_rate, FolderLock,
-        S3AddressingStyle, S3Provider, S3StorageConfig, Share, StorageBackendConfig,
+        remove_initial_credentials, validate_transfer_limits, validate_transfer_rate, Config,
+        FolderLock, S3AddressingStyle, S3Provider, S3StorageConfig, Share, StorageBackendConfig,
+        StorageInstanceConfig, StoragePermission, UserAccount,
     },
     error::{AppError, AppResult},
     login_security::{LoginEntry, LoginEventPage, LoginPolicy},
@@ -34,17 +35,60 @@ pub struct AdminInfo {
     pub web_login_block_seconds: u64,
     pub security_log_retention_days: u32,
     pub security_log_max_entries: usize,
-    pub storage_backend: StorageBackendView,
-    pub pending_storage_backend: Option<StorageBackendView>,
+    pub storage_instances: Vec<StorageInstanceView>,
+    pub pending_storage_instance: Option<StorageInstanceView>,
+    pub default_storage_id: String,
     pub local_storage_path: String,
-    pub storage_usage_bytes: u64,
-    pub storage_reserved_bytes: u64,
+    pub local_mounts: Vec<LocalMountView>,
+    pub user_accounts: Vec<UserAccountView>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct LocalMountView {
+    pub mount_id: String,
+    pub name: String,
+    pub path: String,
+    pub storage_id: Option<String>,
+    pub ready: bool,
+    pub total_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct UserAccountView {
+    pub id: String,
+    pub username: String,
+    pub enabled: bool,
+    pub permissions: Vec<StoragePermission>,
+}
+
+impl From<&UserAccount> for UserAccountView {
+    fn from(account: &UserAccount) -> Self {
+        Self {
+            id: account.id.clone(),
+            username: account.username.clone(),
+            enabled: account.enabled,
+            permissions: account.permissions.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+pub struct StorageInstanceView {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+    pub ready: bool,
+    pub backend: StorageBackendView,
+    pub usage_bytes: u64,
+    pub reserved_bytes: u64,
 }
 
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StorageBackendView {
     Local {
+        mount_id: String,
         path: String,
         capacity_limit_bytes: Option<u64>,
     },
@@ -62,10 +106,15 @@ pub enum StorageBackendView {
 }
 
 impl StorageBackendView {
-    fn from_config(backend: &StorageBackendConfig, local_path: &std::path::Path) -> Self {
+    fn from_config(backend: &StorageBackendConfig, config: &Config) -> Self {
         match backend {
             StorageBackendConfig::Local(settings) => Self::Local {
-                path: local_path.to_string_lossy().into_owned(),
+                mount_id: settings.mount_id.clone(),
+                path: config
+                    .local_mounts
+                    .resolve(&settings.mount_id)
+                    .map(|mount| mount.path.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 capacity_limit_bytes: settings.capacity_limit_bytes,
             },
             StorageBackendConfig::S3(settings) => Self::S3 {
@@ -87,6 +136,7 @@ impl StorageBackendView {
 #[derive(Clone, Serialize)]
 pub struct ShareView {
     pub id: String,
+    pub storage_id: String,
     pub name: String,
     pub path: String,
     pub username: Option<String>,
@@ -99,6 +149,7 @@ impl From<&Share> for ShareView {
     fn from(share: &Share) -> Self {
         Self {
             id: share.id.clone(),
+            storage_id: share.storage_id.clone(),
             name: share.name.clone(),
             path: share.path.clone(),
             username: share.username.clone(),
@@ -112,6 +163,7 @@ impl From<&Share> for ShareView {
 #[derive(Clone, Serialize)]
 pub struct FolderLockView {
     pub id: String,
+    pub storage_id: String,
     pub path: String,
 }
 
@@ -119,6 +171,7 @@ impl From<&FolderLock> for FolderLockView {
     fn from(lock: &FolderLock) -> Self {
         Self {
             id: lock.id.clone(),
+            storage_id: lock.storage_id.clone(),
             path: lock.path.clone(),
         }
     }
@@ -126,6 +179,8 @@ impl From<&FolderLock> for FolderLockView {
 
 #[derive(Deserialize)]
 pub struct CreateShareRequest {
+    #[serde(default)]
+    pub storage_id: Option<String>,
     pub name: String,
     pub path: String,
     #[serde(default)]
@@ -139,6 +194,7 @@ pub struct CreateShareRequest {
 
 #[derive(Deserialize)]
 pub struct UpdateShareRequest {
+    pub storage_id: Option<String>,
     pub name: Option<String>,
     pub path: Option<String>,
     pub username: Option<String>,
@@ -154,8 +210,7 @@ pub struct UpdateAdminRequest {
     pub global_web_password: Option<String>,
 }
 
-pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
-    let capacity = state.backend.capacity_status().await;
+pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminInfo>> {
     let (
         username,
         has_global_web_password,
@@ -172,8 +227,10 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
         web_login_block_seconds,
         security_log_retention_days,
         security_log_max_entries,
-        storage_backend,
-        pending_storage_backend,
+        storage_configs,
+        pending_storage_config,
+        default_storage_id,
+        user_accounts,
     ) = {
         let config = state.config_file.read().await;
         (
@@ -196,13 +253,57 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
             config.web_login_block_seconds,
             config.security_log_retention_days,
             config.security_log_max_entries,
-            StorageBackendView::from_config(&config.storage_backend, &state.config.storage_path),
-            config.pending_storage_backend.as_ref().map(|backend| {
-                StorageBackendView::from_config(backend, &state.config.storage_path)
-            }),
+            config.storage_instances.clone(),
+            config.pending_storage_instance.clone(),
+            config.default_storage_id.clone(),
+            config
+                .user_accounts
+                .iter()
+                .map(UserAccountView::from)
+                .collect(),
         )
     };
-    Json(AdminInfo {
+    let mut storage_instances = Vec::with_capacity(storage_configs.len());
+    let configured_local_mounts = storage_configs
+        .iter()
+        .filter_map(|instance| match &instance.backend {
+            StorageBackendConfig::Local(settings) => {
+                Some((settings.mount_id.clone(), instance.id.clone()))
+            }
+            StorageBackendConfig::S3(_) => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    for instance in storage_configs {
+        storage_instances.push(storage_instance_view(&state, instance, &default_storage_id).await);
+    }
+    let pending_storage_instance = pending_storage_config.map(|instance| StorageInstanceView {
+        id: instance.id,
+        name: instance.name,
+        is_default: false,
+        ready: false,
+        backend: StorageBackendView::from_config(&instance.backend, &state.config),
+        usage_bytes: 0,
+        reserved_bytes: 0,
+    });
+    let mut local_mounts = Vec::with_capacity(state.config.local_mounts.all().len());
+    for mount in state.config.local_mounts.all() {
+        let status = state.config.local_mounts.status(&mount.id).await;
+        let storage_id = configured_local_mounts.get(&mount.id).cloned();
+        let ready = match storage_id.as_deref() {
+            Some(id) => state.backends.is_ready(id).await,
+            None => status.ready,
+        };
+        local_mounts.push(LocalMountView {
+            mount_id: mount.id.clone(),
+            name: mount.name.clone(),
+            path: mount.path.to_string_lossy().into_owned(),
+            storage_id,
+            ready,
+            total_bytes: status.total_bytes,
+            available_bytes: status.available_bytes,
+        });
+    }
+    Ok(Json(AdminInfo {
         username,
         has_global_web_password,
         shares,
@@ -218,12 +319,37 @@ pub async fn admin_info(State(state): State<AppState>) -> Json<AdminInfo> {
         web_login_block_seconds,
         security_log_retention_days,
         security_log_max_entries,
-        storage_backend,
-        pending_storage_backend,
+        storage_instances,
+        pending_storage_instance,
+        default_storage_id,
         local_storage_path: state.config.storage_path.to_string_lossy().into_owned(),
-        storage_usage_bytes: capacity.used,
-        storage_reserved_bytes: capacity.reserved,
-    })
+        local_mounts,
+        user_accounts,
+    }))
+}
+
+async fn storage_instance_view(
+    state: &AppState,
+    instance: StorageInstanceConfig,
+    default_storage_id: &str,
+) -> StorageInstanceView {
+    let backend_view = StorageBackendView::from_config(&instance.backend, &state.config);
+    let (ready, usage_bytes, reserved_bytes) = match state.storage_backend(&instance.id).await {
+        Ok(backend) => {
+            let capacity = backend.capacity_status().await;
+            (true, capacity.used, capacity.reserved)
+        }
+        Err(_) => (false, 0, 0),
+    };
+    StorageInstanceView {
+        is_default: instance.id == default_storage_id,
+        id: instance.id,
+        name: instance.name,
+        ready,
+        backend: backend_view,
+        usage_bytes,
+        reserved_bytes,
+    }
 }
 
 /// Validate credentials and the minimum list permission without changing the
@@ -241,28 +367,82 @@ pub async fn test_s3_storage(
 /// Run the full read/write/copy/delete capability probe and persist the
 /// credentials only as a pending backend. User traffic remains on the current
 /// backend until a separate activation request succeeds.
+#[derive(Deserialize)]
+pub struct StageS3StorageRequest {
+    pub name: String,
+    #[serde(flatten)]
+    pub settings: S3StorageConfig,
+}
+
 pub async fn stage_s3_storage(
     State(state): State<AppState>,
-    Json(settings): Json<S3StorageConfig>,
+    Json(body): Json<StageS3StorageRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.stage_s3_storage(settings).await?;
+    state.stage_s3_storage(body.name, body.settings).await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
 #[derive(Deserialize)]
-pub struct StageLocalStorageRequest {
+pub struct UpdateLocalStorageRequest {
+    pub storage_id: String,
     #[serde(default)]
     pub capacity_limit_bytes: Option<u64>,
 }
 
-pub async fn stage_local_storage(
+pub async fn update_local_storage(
     State(state): State<AppState>,
-    Json(settings): Json<StageLocalStorageRequest>,
+    Json(settings): Json<UpdateLocalStorageRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     state
-        .stage_local_storage(settings.capacity_limit_bytes)
+        .update_local_storage(&settings.storage_id, settings.capacity_limit_bytes)
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
+}
+
+#[derive(Deserialize)]
+pub struct AddLocalStorageRequest {
+    pub mount_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub capacity_limit_bytes: Option<u64>,
+}
+
+pub async fn add_local_storage(
+    State(state): State<AppState>,
+    Json(settings): Json<AddLocalStorageRequest>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let storage_id = state
+        .add_local_storage(
+            settings.mount_id,
+            settings.name,
+            settings.capacity_limit_bytes,
+        )
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "storage_id": storage_id })),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct SetDefaultStorageRequest {
+    pub storage_id: String,
+}
+
+pub async fn set_default_storage(
+    State(state): State<AppState>,
+    Json(body): Json<SetDefaultStorageRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    state.set_default_storage(body.storage_id).await?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+pub async fn delete_storage(
+    State(state): State<AppState>,
+    Path(storage_id): Path<String>,
+) -> AppResult<StatusCode> {
+    state.delete_storage(&storage_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn activate_pending_storage(
@@ -441,6 +621,7 @@ pub async fn block_login(
                 block_seconds: config.admin_login_block_seconds as i64,
             }
         }
+        LoginEntry::Account => LoginEntry::Account.fixed_policy(),
         LoginEntry::Web => {
             let config = state.config_file.read().await;
             LoginPolicy {
@@ -482,8 +663,10 @@ pub async fn create_share(
     Json(body): Json<CreateShareRequest>,
 ) -> AppResult<Json<ShareView>> {
     let password_hash = hash_optional_password(&state, body.password, 12, "WebDAV").await?;
+    let default_storage_id = state.config_file.read().await.default_storage_id.clone();
     let share = Share {
         id: Uuid::new_v4().to_string(),
+        storage_id: body.storage_id.unwrap_or(default_storage_id),
         name: body.name.trim().to_string(),
         path: body.path.trim_matches('/').to_string(),
         username: body
@@ -533,6 +716,9 @@ pub async fn update_share(
                 .iter_mut()
                 .find(|share| share.id == id)
                 .ok_or(AppError::NotFound)?;
+            if let Some(storage_id) = body.storage_id {
+                share.storage_id = storage_id;
+            }
             if let Some(name) = body.name {
                 share.name = name.trim().to_string();
             }
@@ -635,13 +821,120 @@ pub async fn update_admin_account(
 }
 
 #[derive(Deserialize)]
+pub struct CreateUserAccountRequest {
+    pub username: String,
+    pub password: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub permissions: Vec<StoragePermission>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateUserAccountRequest {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub enabled: Option<bool>,
+    pub permissions: Option<Vec<StoragePermission>>,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+pub async fn create_user_account(
+    State(state): State<AppState>,
+    Json(body): Json<CreateUserAccountRequest>,
+) -> AppResult<(StatusCode, Json<UserAccountView>)> {
+    validate_password(&body.password, 12, "普通账号")?;
+    let password_hash = state.passwords.hash(body.password).await?;
+    let account = UserAccount {
+        id: Uuid::new_v4().to_string(),
+        username: body.username.trim().to_string(),
+        password_hash,
+        enabled: body.enabled,
+        permissions: body.permissions,
+    };
+    let view = UserAccountView::from(&account);
+    state
+        .update_config(move |config| {
+            config.user_accounts.push(account);
+            Ok(())
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+pub async fn update_user_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateUserAccountRequest>,
+) -> AppResult<Json<UserAccountView>> {
+    let password_hash = match body.password {
+        Some(password) if !password.is_empty() => {
+            validate_password(&password, 12, "普通账号")?;
+            Some(state.passwords.hash(password).await?)
+        }
+        _ => None,
+    };
+    let user_id = id.clone();
+    let view = state
+        .update_config(move |config| {
+            let account = config
+                .user_accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or(AppError::NotFound)?;
+            if let Some(username) = body.username {
+                account.username = username.trim().to_string();
+            }
+            if let Some(hash) = password_hash {
+                account.password_hash = hash;
+            }
+            if let Some(enabled) = body.enabled {
+                account.enabled = enabled;
+            }
+            if let Some(permissions) = body.permissions {
+                account.permissions = permissions;
+            }
+            Ok(UserAccountView::from(&*account))
+        })
+        .await?;
+    // Credential, status and authorization changes take effect immediately.
+    state.sessions.revoke_user(&user_id).await;
+    Ok(Json(view))
+}
+
+pub async fn delete_user_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<StatusCode> {
+    let user_id = id.clone();
+    state
+        .update_config(move |config| {
+            let before = config.user_accounts.len();
+            config.user_accounts.retain(|account| account.id != id);
+            if before == config.user_accounts.len() {
+                return Err(AppError::NotFound);
+            }
+            Ok(())
+        })
+        .await?;
+    state.sessions.revoke_user(&user_id).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
 pub struct CreateLockRequest {
+    #[serde(default)]
+    pub storage_id: Option<String>,
     pub path: String,
     pub password: String,
 }
 
 #[derive(Deserialize)]
 pub struct UpdateLockRequest {
+    pub storage_id: Option<String>,
     pub path: Option<String>,
     pub password: Option<String>,
 }
@@ -651,19 +944,19 @@ pub async fn create_lock(
     Json(body): Json<CreateLockRequest>,
 ) -> AppResult<Json<FolderLockView>> {
     validate_password(&body.password, 8, "文件夹锁")?;
+    let default_storage_id = state.config_file.read().await.default_storage_id.clone();
     let lock = FolderLock {
         id: Uuid::new_v4().to_string(),
+        storage_id: body.storage_id.unwrap_or(default_storage_id),
         path: body.path.trim_matches('/').to_string(),
         password_hash: state.passwords.hash(body.password).await?,
     };
     let result = FolderLockView::from(&lock);
     state
         .update_config(move |config| {
-            if config
-                .folder_locks
-                .iter()
-                .any(|existing| existing.path == lock.path)
-            {
+            if config.folder_locks.iter().any(|existing| {
+                existing.storage_id == lock.storage_id && existing.path == lock.path
+            }) {
                 return Err(AppError::Conflict("Folder already has a lock".into()));
             }
             config.folder_locks.push(lock);
@@ -703,6 +996,9 @@ pub async fn update_lock(
                 .iter_mut()
                 .find(|lock| lock.id == id)
                 .ok_or(AppError::NotFound)?;
+            if let Some(storage_id) = body.storage_id {
+                lock.storage_id = storage_id;
+            }
             if let Some(path) = body.path {
                 lock.path = path.trim_matches('/').to_string();
             }

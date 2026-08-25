@@ -4,6 +4,8 @@ const locale = useLocale()
 
 export interface Identity {
   logged_in: boolean
+  is_admin?: boolean
+  username?: string | null
   web_password_required?: boolean
 }
 

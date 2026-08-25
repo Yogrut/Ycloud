@@ -18,18 +18,72 @@ export interface AdminInfo {
   web_login_block_seconds: number
   security_log_retention_days: number
   security_log_max_entries: number
-  storage_backend: StorageBackendView
-  pending_storage_backend: StorageBackendView | null
+  storage_instances: StorageInstanceView[]
+  pending_storage_instance: StorageInstanceView | null
+  default_storage_id: string
   local_storage_path: string
-  storage_usage_bytes: number
-  storage_reserved_bytes: number
+  local_mounts?: LocalMountView[]
+  user_accounts?: UserAccountView[]
+}
+
+export interface LocalMountView {
+  mount_id: string
+  name: string
+  path: string
+  storage_id: string | null
+  ready: boolean
+  total_bytes: number | null
+  available_bytes: number | null
+}
+
+export interface StoragePermission {
+  storage_id: string
+  browse: boolean
+  download: boolean
+  upload: boolean
+  create_directory: boolean
+  rename: boolean
+  move_items: boolean
+  copy: boolean
+  delete: boolean
+}
+
+export interface UserAccountView {
+  id: string
+  username: string
+  enabled: boolean
+  permissions: StoragePermission[]
+}
+
+export interface CreateUserAccountRequest {
+  username: string
+  password: string
+  enabled: boolean
+  permissions: StoragePermission[]
+}
+
+export interface UpdateUserAccountRequest {
+  username?: string
+  password?: string
+  enabled?: boolean
+  permissions?: StoragePermission[]
+}
+
+export interface StorageInstanceView {
+  id: string
+  name: string
+  is_default: boolean
+  ready: boolean
+  backend: StorageBackendView
+  usage_bytes: number
+  reserved_bytes: number
 }
 
 export type S3Provider = 'alibaba_oss' | 'tencent_cos' | 'minio' | 's3_compatible'
 export type S3AddressingStyle = 'path' | 'virtual_hosted'
 
 export type StorageBackendView =
-  | { type: 'local'; path: string; capacity_limit_bytes: number | null }
+  | { type: 'local'; mount_id?: string; path: string; capacity_limit_bytes: number | null }
   | {
     type: 's3'
     provider: S3Provider
@@ -57,6 +111,7 @@ export interface TestS3StorageRequest {
 
 export interface WebDavMountView {
   id: string
+  storage_id: string
   name: string
   path: string
   username: string | null
@@ -66,6 +121,7 @@ export interface WebDavMountView {
 }
 
 export interface CreateWebDavMountRequest {
+  storage_id?: string
   name: string
   path: string
   username?: string
@@ -75,6 +131,7 @@ export interface CreateWebDavMountRequest {
 }
 
 export interface UpdateWebDavMountRequest {
+  storage_id?: string
   name?: string
   path?: string
   username?: string
@@ -85,20 +142,23 @@ export interface UpdateWebDavMountRequest {
 
 export interface FolderLockView {
   id: string
+  storage_id: string
   path: string
 }
 
 export interface CreateFolderLockRequest {
+  storage_id?: string
   path: string
   password: string
 }
 
 export interface UpdateFolderLockRequest {
+  storage_id?: string
   path?: string
   password?: string
 }
 
-export type LoginEntry = 'admin' | 'web' | 'web_dav'
+export type LoginEntry = 'admin' | 'account' | 'web' | 'web_dav'
 
 export interface LoginEvent {
   id: number
@@ -186,12 +246,28 @@ export function getAdminInfo(): Promise<AdminInfo> {
   return adminRequest('/api/admin/info')
 }
 
-export function loginAdministrator(username: string, password: string): Promise<{ success: boolean; message?: string }> {
+export function loginAdministrator(username: string, password: string): Promise<{ success: boolean; message?: string; is_admin: boolean }> {
   return adminRequest('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password }),
   })
+}
+
+export function createUserAccount(body: CreateUserAccountRequest): Promise<UserAccountView> {
+  return adminRequest('/api/admin/users', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  })
+}
+
+export function updateUserAccount(id: string, body: UpdateUserAccountRequest): Promise<UserAccountView> {
+  return adminRequest(`/api/admin/users/${encodeURIComponent(id)}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  })
+}
+
+export function deleteUserAccount(id: string): Promise<void> {
+  return adminRequest(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
 export function updateAccount(body: UpdateAccountRequest): Promise<UpdateAccountResponse> {
@@ -218,20 +294,40 @@ export function testS3Storage(body: TestS3StorageRequest): Promise<{ success: bo
   })
 }
 
-export function stageS3Storage(body: TestS3StorageRequest): Promise<{ success: boolean }> {
+export function stageS3Storage(name: string, body: TestS3StorageRequest): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/storage/pending', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ name, ...body }),
   })
 }
 
-export function stageLocalStorage(capacityLimitBytes: number | null): Promise<{ success: boolean }> {
-  return adminRequest('/api/admin/storage/pending/local', {
+export function addLocalStorage(mountId: string, name: string, capacityLimitBytes: number | null): Promise<{ storage_id: string }> {
+  return adminRequest('/api/admin/storage/local', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mount_id: mountId, name, capacity_limit_bytes: capacityLimitBytes }),
+  })
+}
+
+export function updateLocalStorage(storageId: string, capacityLimitBytes: number | null): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/storage/local', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ capacity_limit_bytes: capacityLimitBytes }),
+    body: JSON.stringify({ storage_id: storageId, capacity_limit_bytes: capacityLimitBytes }),
   })
+}
+
+export function setDefaultStorage(storageId: string): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/storage/default', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ storage_id: storageId }),
+  })
+}
+
+export function deleteStorage(storageId: string): Promise<void> {
+  return adminRequest(`/api/admin/storage/${encodeURIComponent(storageId)}`, { method: 'DELETE' })
 }
 
 export function activatePendingStorage(): Promise<{ success: boolean }> {

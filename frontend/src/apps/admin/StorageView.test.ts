@@ -1,6 +1,6 @@
 import { createApp, nextTick } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { StorageBackendView } from '../../shared/api/admin'
+import type { LocalMountView, StorageInstanceView } from '../../shared/api/admin'
 import StorageView from './StorageView.vue'
 
 afterEach(() => {
@@ -8,14 +8,28 @@ afterEach(() => {
   document.body.replaceChildren()
 })
 
-function mountStorage(host: HTMLElement, pendingBackend: StorageBackendView | null = null) {
+const localInstance: StorageInstanceView = {
+  id: 'primary',
+  name: '本地存储',
+  is_default: true,
+  ready: true,
+  backend: { type: 'local', path: './storage', capacity_limit_bytes: null },
+  usage_bytes: 0,
+  reserved_bytes: 0,
+}
+
+const localMounts: LocalMountView[] = [
+  { mount_id: 'primary', name: '主数据盘', path: './storage', storage_id: 'primary', ready: true, total_bytes: 40 * (1024 ** 3), available_bytes: 30 * (1024 ** 3) },
+  { mount_id: 'archive', name: '归档盘', path: '/mnt/archive', storage_id: null, ready: true, total_bytes: 100 * (1024 ** 3), available_bytes: 90 * (1024 ** 3) },
+]
+
+function mountStorage(host: HTMLElement, pendingInstance: StorageInstanceView | null = null) {
   const changed = vi.fn()
   const app = createApp(StorageView, {
-    backend: { type: 'local', path: './storage', capacity_limit_bytes: null },
-    pendingBackend,
-    localPath: './storage',
-    usageBytes: 0,
-    reservedBytes: 0,
+    instances: [localInstance],
+    pendingInstance,
+    defaultStorageId: 'primary',
+    localMounts,
     onChanged: changed,
   })
   app.mount(host)
@@ -35,8 +49,10 @@ describe('StorageView', () => {
     expect(host.textContent).toContain('腾讯云 COS')
     expect(host.textContent).toContain('MinIO / RustFS')
     expect(host.textContent).toContain('S3 通用协议')
-    expect(host.querySelector<HTMLInputElement>('.storage-local-form input')?.value).toBe('./storage')
-    expect(host.textContent).toContain('STORAGE_PATH')
+    expect(host.querySelectorAll('.local-mount-card')).toHaveLength(2)
+    expect(host.textContent).toContain('已声明 2 个挂载地址')
+    expect(host.querySelector<HTMLInputElement>('.local-path-input')?.value).toBe('./storage')
+    expect(host.textContent).toContain('LOCAL_STORAGE_MOUNTS')
     app.unmount()
   })
 
@@ -65,21 +81,52 @@ describe('StorageView', () => {
     const { app, changed } = mountStorage(host)
     await nextTick()
 
-    const inputs = host.querySelectorAll<HTMLInputElement>('.storage-local-form input')
-    const capacity = inputs[1]
+    const path = host.querySelector<HTMLInputElement>('.local-path-input')
+    const capacity = host.querySelector<HTMLInputElement>('.local-capacity-input')
     if (!capacity) throw new Error('local capacity input missing')
     capacity.value = '800'
     capacity.dispatchEvent(new Event('input'))
     await nextTick()
-    host.querySelector<HTMLButtonElement>('.storage-local-form button')?.click()
+    host.querySelector<HTMLButtonElement>('.local-save-button')?.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
-    expect(inputs[0]?.value).toBe('./storage')
-    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/pending/local', expect.objectContaining({
+    expect(path?.value).toBe('./storage')
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/local', expect.objectContaining({
       method: 'PUT',
-      body: JSON.stringify({ capacity_limit_bytes: 800 * (1024 ** 3) }),
+      body: JSON.stringify({ storage_id: 'primary', capacity_limit_bytes: 800 * (1024 ** 3) }),
     }))
-    expect(changed).toHaveBeenCalledWith('本地存储已保存为待启用配置')
+    expect(changed).toHaveBeenCalledWith('本地存储容量设置已更新')
+    app.unmount()
+  })
+
+  it('adds a declared unused mount as a separate local storage source', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ storage_id: 'local-archive' }), {
+      status: 201,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const { app, changed } = mountStorage(host)
+    await nextTick()
+
+    host.querySelector<HTMLButtonElement>('[data-mount-id="archive"]')?.click()
+    await nextTick()
+    const name = host.querySelector<HTMLInputElement>('.local-storage-name')
+    const capacity = host.querySelector<HTMLInputElement>('.local-capacity-input')
+    if (!name || !capacity) throw new Error('local storage fields missing')
+    name.value = '冷数据归档'
+    name.dispatchEvent(new Event('input'))
+    capacity.value = '80'
+    capacity.dispatchEvent(new Event('input'))
+    host.querySelector<HTMLButtonElement>('.local-add-button')?.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/local', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ mount_id: 'archive', name: '冷数据归档', capacity_limit_bytes: 80 * (1024 ** 3) }),
+    }))
+    expect(changed).toHaveBeenCalledWith('本地存储源已添加；现有文件和默认存储均未改变')
     app.unmount()
   })
 
@@ -95,12 +142,12 @@ describe('StorageView', () => {
     host.querySelectorAll<HTMLButtonElement>('.storage-provider')[3]?.click()
     await nextTick()
     const inputs = host.querySelectorAll<HTMLInputElement>('.storage-form input')
-    if (!inputs[0] || !inputs[1] || !inputs[2] || !inputs[3] || !inputs[4] || !inputs[5]) {
+    if (!inputs[0] || !inputs[1] || !inputs[2] || !inputs[3] || !inputs[4] || !inputs[5] || !inputs[6] || !inputs[7]) {
       throw new Error('storage setup input missing')
     }
-    const values = ['https://rustfs.internal.example', 'ycloud', 'us-east-1', 'files/', 'access-id', 'secret-value']
+    const values = ['家庭 RustFS', '0', 'https://rustfs.internal.example', 'ycloud', 'us-east-1', 'files/', 'access-id', 'secret-value']
     inputs.forEach((input, index) => {
-      input.value = values[index] ?? ''
+      input.value = values[index] ?? input.value
       input.dispatchEvent(new Event('input'))
     })
     ;(host.querySelector('.storage-form') as HTMLFormElement).dispatchEvent(new Event('submit', { cancelable: true }))
@@ -109,6 +156,7 @@ describe('StorageView', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/pending', expect.objectContaining({
       method: 'PUT',
       body: JSON.stringify({
+        name: '家庭 RustFS',
         provider: 'minio',
         endpoint: 'https://rustfs.internal.example',
         bucket: 'ycloud',
@@ -120,8 +168,8 @@ describe('StorageView', () => {
         capacity_limit_bytes: null,
       }),
     }))
-    expect(inputs[5].value).toBe('')
-    expect(changed).toHaveBeenCalledWith('S3 读、写、复制和删除验证通过，已保存为待启用配置')
+    expect(inputs[7].value).toBe('')
+    expect(changed).toHaveBeenCalledWith('S3 完整能力验证通过，已保存为待添加存储')
     app.unmount()
   })
 
@@ -134,30 +182,38 @@ describe('StorageView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const { app, changed } = mountStorage(host, {
-      type: 's3',
-      provider: 'minio',
-      endpoint: 'https://rustfs.internal.example',
-      bucket: 'ycloud',
-      region: 'us-east-1',
-      prefix: 'files/',
-      addressing_style: 'path',
-      has_access_key_id: true,
-      has_secret_access_key: true,
-      capacity_limit_bytes: null,
+      id: 'rustfs',
+      name: '家庭 RustFS',
+      is_default: false,
+      ready: true,
+      backend: {
+        type: 's3',
+        provider: 'minio',
+        endpoint: 'https://rustfs.internal.example',
+        bucket: 'ycloud',
+        region: 'us-east-1',
+        prefix: 'files/',
+        addressing_style: 'path',
+        has_access_key_id: true,
+        has_secret_access_key: true,
+        capacity_limit_bytes: null,
+      },
+      usage_bytes: 0,
+      reserved_bytes: 0,
     })
     await nextTick()
 
-    expect(host.textContent).toContain('待启用配置')
+    expect(host.textContent).toContain('待添加：家庭 RustFS')
     expect(host.textContent).not.toContain('pending-secret')
     const activate = Array.from(host.querySelectorAll<HTMLButtonElement>('.storage-pending-actions button'))
-      .find(button => button.textContent?.trim() === '启用')
+      .find(button => button.textContent?.trim() === '添加存储')
     activate?.click()
     await nextTick()
     expect(host.querySelector('[role="dialog"]')).not.toBeNull()
     expect(fetchMock).not.toHaveBeenCalled()
 
     const confirm = Array.from(host.querySelectorAll<HTMLButtonElement>('.modal-actions button'))
-      .find(button => button.textContent?.trim() === '确认切换')
+      .find(button => button.textContent?.trim() === '确认添加')
     confirm?.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
@@ -165,7 +221,7 @@ describe('StorageView', () => {
       method: 'POST',
       credentials: 'same-origin',
     }))
-    expect(changed).toHaveBeenCalledWith('存储后端已安全切换；现有文件没有迁移或删除')
+    expect(changed).toHaveBeenCalledWith('新存储已添加；默认存储和现有文件均未改变')
     app.unmount()
   })
 })

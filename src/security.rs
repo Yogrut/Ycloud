@@ -308,6 +308,11 @@ mod tests {
             bind_address: "127.0.0.1".parse().unwrap(),
             port: 18_473,
             storage_path: "storage".into(),
+            local_mounts: crate::storage_catalog::LocalMountCatalog::new(
+                "storage".into(),
+                Vec::new(),
+            )
+            .unwrap(),
             config_path: "config.json".into(),
             max_upload_bytes: 1,
             io_concurrency: 1,

@@ -1,10 +1,11 @@
 import { createApp, nextTick } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { WebDavMountView } from '../../shared/api/admin'
+import type { StorageInstanceView, WebDavMountView } from '../../shared/api/admin'
 import WebDavView from './WebDavView.vue'
 
 const mountView: WebDavMountView = {
   id: 'share-1',
+  storage_id: 'primary',
   name: 'media',
   path: 'files',
   username: 'dav-user',
@@ -19,8 +20,13 @@ afterEach(() => {
 })
 
 function mountWebDav(host: HTMLElement, mounts: WebDavMountView[] = []) {
+  const storages: StorageInstanceView[] = [{
+    id: 'primary', name: '本地存储', is_default: true, ready: true,
+    backend: { type: 'local', path: './storage', capacity_limit_bytes: null },
+    usage_bytes: 0, reserved_bytes: 0,
+  }]
   const changed = vi.fn()
-  const app = createApp(WebDavView, { mounts, onChanged: changed })
+  const app = createApp(WebDavView, { mounts, storages, defaultStorageId: 'primary', onChanged: changed })
   app.mount(host)
   return { app, changed }
 }
@@ -67,7 +73,7 @@ describe('WebDavView', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/shares', expect.objectContaining({
       method: 'POST',
       body: JSON.stringify({
-        name: 'media', path: 'files', username: 'dav-user', password: '安全挂载密码12345678',
+        storage_id: 'primary', name: 'media', path: 'files', username: 'dav-user', password: '安全挂载密码12345678',
         webdav_enabled: true, readonly: false,
       }),
     }))
@@ -84,7 +90,7 @@ describe('WebDavView', () => {
 
     const fullFields = host.querySelectorAll('.webdav-form-grid .full-field')
     const connection = host.querySelector<HTMLInputElement>('.connection-path-field input')
-    expect(fullFields).toHaveLength(2)
+    expect(fullFields).toHaveLength(3)
     expect(connection?.readOnly).toBe(true)
     expect(connection?.value).toBe('/dav/挂载名称')
     app.unmount()

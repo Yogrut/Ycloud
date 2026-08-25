@@ -1,11 +1,9 @@
 use axum::{body::Body, http::HeaderMap, response::Response};
 use futures_util::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::{
-    fs,
-    sync::{RwLock, RwLockWriteGuard},
-};
+use tokio::{fs, sync::RwLock};
 
 use crate::{
     capacity::{CapacityStatus, CapacityTracker},
@@ -33,12 +31,96 @@ pub struct BackendMetadata {
 }
 
 /// One live storage boundary shared by every HTTP, WebDAV and archive entry
-/// point. A backend replacement takes the write side of this lock, so uploads
-/// and namespace mutations that already started drain before new traffic can
-/// observe the replacement.
+/// point. Its identity is immutable after registration.
 #[derive(Clone)]
 pub struct StorageBackend {
     active: Arc<RwLock<ActiveStorage>>,
+}
+
+/// Routes every storage operation through an immutable storage identity.
+///
+/// The first migration stage registers only `primary`. Keeping the registry
+/// separate from persisted configuration prevents a partially migrated
+/// configuration from exposing two names that still point at one mutable
+/// backend.
+#[derive(Clone, Default)]
+pub struct StorageRegistry {
+    entries: Arc<RwLock<HashMap<String, RegisteredStorage>>>,
+}
+
+#[derive(Clone)]
+enum RegisteredStorage {
+    Ready(StorageBackend),
+    Unavailable,
+}
+
+impl StorageRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn single(storage_id: impl Into<String>, backend: StorageBackend) -> Self {
+        let mut entries = HashMap::new();
+        entries.insert(storage_id.into(), RegisteredStorage::Ready(backend));
+        Self {
+            entries: Arc::new(RwLock::new(entries)),
+        }
+    }
+
+    pub async fn insert_ready(&self, storage_id: impl Into<String>, backend: StorageBackend) {
+        self.entries
+            .write()
+            .await
+            .insert(storage_id.into(), RegisteredStorage::Ready(backend));
+    }
+
+    pub async fn insert_unavailable(&self, storage_id: impl Into<String>) {
+        self.entries
+            .write()
+            .await
+            .insert(storage_id.into(), RegisteredStorage::Unavailable);
+    }
+
+    pub async fn remove(&self, storage_id: &str) -> bool {
+        self.entries.write().await.remove(storage_id).is_some()
+    }
+
+    pub async fn get(&self, storage_id: &str) -> AppResult<StorageBackend> {
+        match self.entries.read().await.get(storage_id) {
+            Some(RegisteredStorage::Ready(backend)) => Ok(backend.clone()),
+            Some(RegisteredStorage::Unavailable) => Err(AppError::ServiceUnavailable(
+                "存储实例当前不可用，请检查连接后重试".into(),
+            )),
+            None => Err(AppError::NotFound),
+        }
+    }
+
+    pub async fn contains(&self, storage_id: &str) -> bool {
+        self.entries.read().await.contains_key(storage_id)
+    }
+
+    pub async fn is_ready(&self, storage_id: &str) -> bool {
+        matches!(
+            self.entries.read().await.get(storage_id),
+            Some(RegisteredStorage::Ready(_))
+        )
+    }
+
+    pub async fn set_local_max_upload_bytes(&self, max_upload_bytes: u64) {
+        let backends = self
+            .entries
+            .read()
+            .await
+            .values()
+            .filter_map(|entry| match entry {
+                RegisteredStorage::Ready(backend) => Some(backend.clone()),
+                RegisteredStorage::Unavailable => None,
+            })
+            .collect::<Vec<_>>();
+        for backend in backends {
+            backend.set_local_max_upload_bytes(max_upload_bytes).await;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -53,32 +135,14 @@ struct ActiveStorage {
     capacity: CapacityTracker,
 }
 
-pub struct StorageReplacementGuard<'a> {
-    active: RwLockWriteGuard<'a, ActiveStorage>,
-}
-
-impl StorageReplacementGuard<'_> {
-    pub fn replace_with_local(
-        &mut self,
-        storage: StorageService,
-        capacity_limit: Option<u64>,
-        used: u64,
-    ) {
-        *self.active = ActiveStorage {
-            kind: StorageBackendKind::Local(storage),
-            capacity: CapacityTracker::new(capacity_limit, used),
-        };
-    }
-
-    pub fn replace_with_s3(&mut self, storage: S3Backend, capacity_limit: Option<u64>, used: u64) {
-        *self.active = ActiveStorage {
-            kind: StorageBackendKind::S3(storage),
-            capacity: CapacityTracker::new(capacity_limit, used),
-        };
-    }
-}
-
 impl StorageBackend {
+    async fn set_local_max_upload_bytes(&self, max_upload_bytes: u64) {
+        let active = self.active.read().await;
+        if let StorageBackendKind::Local(storage) = &active.kind {
+            storage.set_max_upload_bytes(max_upload_bytes);
+        }
+    }
+
     pub fn local(storage: StorageService) -> Self {
         Self {
             active: Arc::new(RwLock::new(ActiveStorage {
@@ -109,12 +173,6 @@ impl StorageBackend {
                 capacity: CapacityTracker::new(capacity_limit, used),
             })),
         })
-    }
-
-    pub async fn begin_replacement(&self) -> StorageReplacementGuard<'_> {
-        StorageReplacementGuard {
-            active: self.active.write().await,
-        }
     }
 
     pub async fn metadata(&self, relative: &str) -> AppResult<BackendMetadata> {
@@ -405,6 +463,10 @@ impl StorageBackend {
         self.active.read().await.capacity.status()
     }
 
+    pub async fn set_capacity_limit(&self, limit: Option<u64>) -> AppResult<()> {
+        self.active.read().await.capacity.set_limit(limit)
+    }
+
     pub async fn ready(&self) -> bool {
         let active = self.active.read().await;
         match &active.kind {
@@ -494,7 +556,7 @@ async fn list_local_directory(
 mod tests {
     use axum::body::Body;
 
-    use super::StorageBackend;
+    use super::{StorageBackend, StorageRegistry};
     use crate::storage::StorageService;
 
     #[tokio::test]
@@ -534,6 +596,28 @@ mod tests {
         backend.copy_path("new.bin", "copy.bin").await.unwrap();
         assert_eq!(backend.capacity_status().await.used, 4);
         assert!(backend.copy_path("new.bin", "third.bin").await.is_err());
+
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn registry_routes_only_registered_storage_ids() {
+        let root =
+            std::env::temp_dir().join(format!("ycloud-backend-registry-{}", uuid::Uuid::new_v4()));
+        let storage = StorageService::new(root.clone(), 1024, 1, 100, 0)
+            .await
+            .unwrap();
+        let backend = StorageBackend::local(storage);
+        let registry = StorageRegistry::single("primary", backend).await;
+
+        assert!(registry.contains("primary").await);
+        assert!(!registry.contains("unregistered").await);
+        registry.get("primary").await.unwrap();
+        let error = match registry.get("unregistered").await {
+            Ok(_) => panic!("unregistered storage unexpectedly resolved"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status(), axum::http::StatusCode::NOT_FOUND);
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

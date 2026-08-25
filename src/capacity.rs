@@ -78,6 +78,18 @@ impl CapacityTracker {
             reserved: state.reserved,
         }
     }
+
+    pub fn set_limit(&self, limit: Option<u64>) -> AppResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::internal("storage capacity state is unavailable"))?;
+        if limit.is_some_and(|limit| state.used.saturating_add(state.reserved) > limit) {
+            return Err(AppError::InsufficientStorage);
+        }
+        state.limit = limit;
+        Ok(())
+    }
 }
 
 impl CapacityReservation {
@@ -165,5 +177,15 @@ mod tests {
         let reservation = tracker.reserve_replacement(30, 45).unwrap();
         reservation.commit(40, 45);
         assert_eq!(tracker.status().used, 85);
+    }
+
+    #[test]
+    fn capacity_limit_cannot_be_lowered_below_committed_and_reserved_bytes() {
+        let tracker = CapacityTracker::new(None, 80);
+        let reservation = tracker.reserve_replacement(0, 15).unwrap();
+        assert!(tracker.set_limit(Some(94)).is_err());
+        tracker.set_limit(Some(95)).unwrap();
+        assert_eq!(tracker.status().limit, Some(95));
+        drop(reservation);
     }
 }

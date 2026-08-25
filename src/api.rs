@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::file_access::{
-    check_folder_locks, ensure_non_root, ensure_writable, join_request_path, resolve_share,
-    share_storage_path, FileQuery, FolderLockAuthorizer,
+    check_folder_locks, ensure_non_root, ensure_storage_action, ensure_writable, join_request_path,
+    resolve_share, share_storage_path, storage_permission, FileQuery, FolderLockAuthorizer,
+    StorageAction,
 };
 use crate::security::session_cookie;
 use crate::state::AppState;
@@ -35,14 +36,37 @@ pub struct FileEntry {
 
 #[derive(Serialize)]
 pub struct ListResponse {
+    pub storage_id: String,
+    pub storages: Vec<BrowserStorageView>,
     pub current_path: String,
     pub parent_path: Option<String>,
     pub entries: Vec<FileEntry>,
     pub truncated: bool,
     pub can_write: bool,
+    pub is_admin: bool,
+    pub capabilities: BrowserCapabilities,
     pub max_upload_bytes: u64,
     pub max_archive_bytes: u64,
     pub max_archive_entries: usize,
+}
+
+#[derive(Default, Serialize)]
+pub struct BrowserCapabilities {
+    pub download: bool,
+    pub upload: bool,
+    pub create_directory: bool,
+    pub rename: bool,
+    pub move_items: bool,
+    pub copy: bool,
+    pub delete: bool,
+}
+
+#[derive(Serialize)]
+pub struct BrowserStorageView {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+    pub ready: bool,
 }
 
 #[derive(Deserialize)]
@@ -115,19 +139,17 @@ pub async fn list_files(
     Query(query): Query<FileQuery>,
 ) -> AppResult<Json<ListResponse>> {
     let share = resolve_share(&state, &headers, &query).await?;
+    let backend = state.storage_backend(&share.storage_id).await?;
     let request_path = query.path.as_deref().unwrap_or("");
     let storage_directory = share_storage_path(&share, request_path);
-    if !state.backend.metadata(&storage_directory).await?.is_dir {
+    if !backend.metadata(&storage_directory).await?.is_dir {
         return Err(AppError::NotFound);
     }
-    let lock_authorizer = FolderLockAuthorizer::new(&state, &headers).await;
+    let lock_authorizer = FolderLockAuthorizer::new(&state, &headers, &share.storage_id).await;
     lock_authorizer.ensure_access(&share_storage_path(&share, request_path))?;
 
     let limit = state.config.max_list_entries;
-    let (backend_entries, truncated) = state
-        .backend
-        .list_directory(&storage_directory, limit)
-        .await?;
+    let (backend_entries, truncated) = backend.list_directory(&storage_directory, limit).await?;
     let mut entries = Vec::with_capacity(backend_entries.len());
     for entry in backend_entries {
         let name = entry.name;
@@ -177,17 +199,74 @@ pub async fn list_files(
         .and_then(|p| p.to_str())
         .map(|s| s.to_string());
 
-    let (max_archive_bytes, max_archive_entries) = {
+    let permission = storage_permission(&state, &headers, &share.storage_id).await;
+    let (max_upload_bytes, max_archive_bytes, max_archive_entries, storage_configs, default_id) = {
         let config = state.config_file.read().await;
-        (config.max_archive_bytes, config.max_archive_entries)
+        (
+            config.max_upload_bytes,
+            config.max_archive_bytes,
+            config.max_archive_entries,
+            config.storage_instances.clone(),
+            config.default_storage_id.clone(),
+        )
     };
+    let principal = crate::auth::current_principal(&state, &headers).await;
+    let is_admin = matches!(
+        principal,
+        Some(crate::auth::SessionPrincipal::Administrator)
+    );
+    let mut storages = Vec::new();
+    if principal.is_some() {
+        storages.reserve(storage_configs.len());
+        for storage in storage_configs {
+            if storage_permission(&state, &headers, &storage.id)
+                .await
+                .is_none_or(|permission| !permission.browse)
+            {
+                continue;
+            }
+            storages.push(BrowserStorageView {
+                id: storage.id.clone(),
+                name: storage.name,
+                is_default: storage.id == default_id,
+                ready: state.backends.is_ready(&storage.id).await,
+            });
+        }
+    }
+    let mut capabilities = permission
+        .as_ref()
+        .map(|permission| BrowserCapabilities {
+            download: permission.download,
+            upload: permission.upload,
+            create_directory: permission.create_directory,
+            rename: permission.rename,
+            move_items: permission.move_items,
+            copy: permission.copy,
+            delete: permission.delete,
+        })
+        .unwrap_or_default();
+    if share.readonly {
+        capabilities.upload = false;
+        capabilities.create_directory = false;
+        capabilities.rename = false;
+        capabilities.move_items = false;
+        capabilities.copy = false;
+        capabilities.delete = false;
+    }
+    let can_write = permission
+        .as_ref()
+        .is_some_and(|permission| permission.grants_write());
     Ok(Json(ListResponse {
+        storage_id: share.storage_id,
+        storages,
         current_path,
         parent_path,
         entries,
         truncated,
-        can_write: !share.readonly && crate::auth::is_admin_authenticated(&state, &headers).await,
-        max_upload_bytes: state.config_file.read().await.max_upload_bytes,
+        can_write: !share.readonly && can_write,
+        is_admin,
+        capabilities,
+        max_upload_bytes,
         max_archive_bytes,
         max_archive_entries,
     }))
@@ -200,17 +279,36 @@ pub async fn create_directory(
     Json(body): Json<MkdirBody>,
 ) -> AppResult<Json<serde_json::Value>> {
     let share = resolve_share(&state, &headers, &query).await?;
+    ensure_storage_action(
+        &state,
+        &headers,
+        &share.storage_id,
+        StorageAction::CreateDirectory,
+    )
+    .await?;
+    let backend = state.storage_backend(&share.storage_id).await?;
     ensure_writable(&share)?;
     let request_path = query.path.as_deref().unwrap_or("");
-    check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
+    check_folder_locks(
+        &state,
+        &headers,
+        &share.storage_id,
+        &share_storage_path(&share, request_path),
+    )
+    .await?;
     let name = sanitize_name(&body.name);
     if name.is_empty() {
         return Err(AppError::BadRequest("Directory name is required".into()));
     }
     let new_path = join_request_path(request_path, &name);
-    check_folder_locks(&state, &headers, &share_storage_path(&share, &new_path)).await?;
-    state
-        .backend
+    check_folder_locks(
+        &state,
+        &headers,
+        &share.storage_id,
+        &share_storage_path(&share, &new_path),
+    )
+    .await?;
+    backend
         .create_directory(&share_storage_path(&share, &new_path))
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
@@ -227,6 +325,8 @@ pub async fn upload_file(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
     let share = resolve_share(&state, &headers, &query).await?;
+    ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Upload).await?;
+    let backend = state.storage_backend(&share.storage_id).await?;
     ensure_writable(&share)?;
     let file_request_path = query.path.as_deref().unwrap_or("").trim_matches('/');
     ensure_non_root(file_request_path)?;
@@ -243,6 +343,7 @@ pub async fn upload_file(
     check_folder_locks(
         &state,
         &headers,
+        &share.storage_id,
         &share_storage_path(&share, file_request_path),
     )
     .await?;
@@ -252,8 +353,7 @@ pub async fn upload_file(
         .and_then(|value| value.to_str().ok());
     let body = state.upload_limiter.wrap_body(body);
     let max_upload_bytes = state.config_file.read().await.max_upload_bytes;
-    state
-        .backend
+    backend
         .upload_file(
             &storage_path,
             body,
@@ -273,11 +373,18 @@ pub async fn download_file(
     Query(query): Query<FileQuery>,
 ) -> AppResult<axum::response::Response> {
     let share = resolve_share(&state, &headers, &query).await?;
+    ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Download).await?;
+    let backend = state.storage_backend(&share.storage_id).await?;
     let request_path = query.path.as_deref().unwrap_or("");
-    check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
+    check_folder_locks(
+        &state,
+        &headers,
+        &share.storage_id,
+        &share_storage_path(&share, request_path),
+    )
+    .await?;
     let file = share_storage_path(&share, request_path);
-    let response = state
-        .backend
+    let response = backend
         .stream_file(&file, &headers, FileResponseMode::Attachment)
         .await?;
     Ok(state.download_limiter.wrap_response(response))
@@ -289,12 +396,19 @@ pub async fn delete_file(
     Query(query): Query<FileQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
     let share = resolve_share(&state, &headers, &query).await?;
+    ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Delete).await?;
+    let backend = state.storage_backend(&share.storage_id).await?;
     ensure_writable(&share)?;
     let request_path = query.path.as_deref().unwrap_or("");
     ensure_non_root(request_path)?;
-    check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
-    state
-        .backend
+    check_folder_locks(
+        &state,
+        &headers,
+        &share.storage_id,
+        &share_storage_path(&share, request_path),
+    )
+    .await?;
+    backend
         .remove(&share_storage_path(&share, request_path))
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
@@ -307,9 +421,17 @@ pub async fn rename_file(
     Json(body): Json<RenameBody>,
 ) -> AppResult<Json<serde_json::Value>> {
     let share = resolve_share(&state, &headers, &query).await?;
+    ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Rename).await?;
+    let backend = state.storage_backend(&share.storage_id).await?;
     ensure_writable(&share)?;
     ensure_non_root(&body.path)?;
-    check_folder_locks(&state, &headers, &share_storage_path(&share, &body.path)).await?;
+    check_folder_locks(
+        &state,
+        &headers,
+        &share.storage_id,
+        &share_storage_path(&share, &body.path),
+    )
+    .await?;
     let new_name = sanitize_name(&body.new_name);
     if new_name.is_empty() {
         return Err(AppError::BadRequest("File name is required".into()));
@@ -323,11 +445,11 @@ pub async fn rename_file(
     check_folder_locks(
         &state,
         &headers,
+        &share.storage_id,
         &share_storage_path(&share, &destination_request_path),
     )
     .await?;
-    state
-        .backend
+    backend
         .move_path(
             &share_storage_path(&share, &body.path),
             &share_storage_path(&share, &destination_request_path),
@@ -342,11 +464,18 @@ pub async fn preview_file(
     Query(query): Query<FileQuery>,
 ) -> AppResult<axum::response::Response> {
     let share = resolve_share(&state, &headers, &query).await?;
+    ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Download).await?;
+    let backend = state.storage_backend(&share.storage_id).await?;
     let request_path = query.path.as_deref().unwrap_or("");
-    check_folder_locks(&state, &headers, &share_storage_path(&share, request_path)).await?;
+    check_folder_locks(
+        &state,
+        &headers,
+        &share.storage_id,
+        &share_storage_path(&share, request_path),
+    )
+    .await?;
     let file = share_storage_path(&share, request_path);
-    let response = state
-        .backend
+    let response = backend
         .stream_file(&file, &headers, FileResponseMode::Preview)
         .await?;
     Ok(state.download_limiter.wrap_response(response))
@@ -356,16 +485,17 @@ pub async fn preview_file(
 pub async fn unlock_folder(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<FileQuery>,
     Json(body): Json<LockBody>,
 ) -> AppResult<axum::response::Response> {
-    let share = resolve_share(&state, &headers, &FileQuery { path: None }).await?;
+    let share = resolve_share(&state, &headers, &query).await?;
     let storage_path = share_storage_path(&share, &body.path);
     let lock = {
         let config = state.config_file.read().await;
         config
             .folder_locks
             .iter()
-            .filter(|lock| lock.matches(&storage_path))
+            .filter(|lock| lock.matches(&share.storage_id, &storage_path))
             .max_by_key(|lock| lock.path.trim_matches('/').split('/').count())
             .map(|lock| (lock.id.clone(), lock.password_hash.clone()))
     };

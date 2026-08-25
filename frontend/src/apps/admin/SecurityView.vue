@@ -33,6 +33,7 @@ const pageNumber = computed(() => cursorHistory.value.length + 1)
 
 function entryLabel(value: LoginEntry): string {
   if (value === 'admin') return locale.text('管理员', 'Administrator')
+  if (value === 'account') return locale.text('普通账号', 'User account')
   if (value === 'web') return locale.text('首页', 'Browser')
   return 'WebDAV'
 }
@@ -172,7 +173,7 @@ onMounted(() => load())
 
       <div class="security-filters">
         <label><span>{{ locale.text('查看时间', 'Time range') }}</span><select v-model="days"><option value="1">{{ locale.text('最近 1 天', 'Last day') }}</option><option value="3">{{ locale.text('最近 3 天', 'Last 3 days') }}</option><option value="7">{{ locale.text('最近 7 天', 'Last 7 days') }}</option><option value="15">{{ locale.text('最近 15 天', 'Last 15 days') }}</option><option value="30">{{ locale.text('最近 30 天', 'Last 30 days') }}</option></select></label>
-        <label><span>{{ locale.text('登录入口', 'Entry') }}</span><select v-model="entry"><option value="">{{ locale.text('全部', 'All') }}</option><option value="admin">{{ locale.text('管理员', 'Administrator') }}</option><option value="web">{{ locale.text('首页', 'Browser') }}</option><option value="web_dav">WebDAV</option></select></label>
+        <label><span>{{ locale.text('登录入口', 'Entry') }}</span><select v-model="entry"><option value="">{{ locale.text('全部', 'All') }}</option><option value="admin">{{ locale.text('管理员', 'Administrator') }}</option><option value="account">{{ locale.text('普通账号', 'User account') }}</option><option value="web">{{ locale.text('首页', 'Browser') }}</option><option value="web_dav">WebDAV</option></select></label>
         <label class="security-ip-filter"><span>IP</span><input v-model="ip" maxlength="64" :placeholder="locale.text('筛选 IP', 'Filter IP')" @keyup.enter="resetAndLoad"></label>
         <button class="btn secondary" type="button" @click="resetAndLoad">{{ locale.text('查询', 'Search') }}</button>
       </div>

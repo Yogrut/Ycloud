@@ -14,7 +14,10 @@ use tokio::sync::RwLock;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::error::{AppError, AppResult};
+use crate::{
+    error::{AppError, AppResult},
+    storage_catalog::LocalMountCatalog,
+};
 
 pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_ARCHIVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
@@ -32,7 +35,10 @@ pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
 pub const MIN_STORAGE_CAPACITY_BYTES: u64 = 1024 * 1024;
 pub const HARD_MAX_STORAGE_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 5;
+pub const CONFIG_SCHEMA_VERSION: u32 = 8;
+pub const DEFAULT_STORAGE_ID: &str = "primary";
+pub const MAX_STORAGE_INSTANCES: usize = 16;
+pub const MAX_USER_ACCOUNTS: usize = 100;
 
 // ── Data types ────────────────────────────────────────────────────
 
@@ -40,6 +46,8 @@ pub const CONFIG_SCHEMA_VERSION: u32 = 5;
 pub struct Share {
     #[serde(default = "uuid_v4")]
     pub id: String,
+    #[serde(default = "default_storage_id")]
+    pub storage_id: String,
     pub name: String,
     pub path: String,
     #[serde(default)]
@@ -56,8 +64,82 @@ pub struct Share {
 pub struct FolderLock {
     #[serde(default = "uuid_v4")]
     pub id: String,
+    #[serde(default = "default_storage_id")]
+    pub storage_id: String,
     pub path: String,
     pub password_hash: String,
+}
+
+/// File-browser permissions granted to one ordinary account for one storage.
+/// Administrative configuration APIs are deliberately not represented here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StoragePermission {
+    pub storage_id: String,
+    #[serde(default)]
+    pub browse: bool,
+    #[serde(default)]
+    pub download: bool,
+    #[serde(default)]
+    pub upload: bool,
+    #[serde(default)]
+    pub create_directory: bool,
+    #[serde(default)]
+    pub rename: bool,
+    #[serde(default)]
+    pub move_items: bool,
+    #[serde(default)]
+    pub copy: bool,
+    #[serde(default)]
+    pub delete: bool,
+}
+
+impl StoragePermission {
+    pub fn grants_any(&self) -> bool {
+        self.browse
+            || self.download
+            || self.upload
+            || self.create_directory
+            || self.rename
+            || self.move_items
+            || self.copy
+            || self.delete
+    }
+
+    pub fn grants_write(&self) -> bool {
+        self.upload
+            || self.create_directory
+            || self.rename
+            || self.move_items
+            || self.copy
+            || self.delete
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserAccount {
+    #[serde(default = "uuid_v4")]
+    pub id: String,
+    pub username: String,
+    pub password_hash: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub permissions: Vec<StoragePermission>,
+}
+
+impl fmt::Debug for UserAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserAccount")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("password_hash", &"[REDACTED]")
+            .field("enabled", &self.enabled)
+            .field("permissions", &self.permissions)
+            .finish()
+    }
 }
 
 /// Persisted storage selection. Provider presets share one S3 implementation;
@@ -67,6 +149,31 @@ pub struct FolderLock {
 pub enum StorageBackendConfig {
     Local(LocalStorageConfig),
     S3(S3StorageConfig),
+}
+
+/// One independently addressable storage namespace. The ID is immutable and
+/// is used by WebDAV mounts, browser locks and archive tickets; the name is
+/// presentation-only and may be changed later without changing permissions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StorageInstanceConfig {
+    pub id: String,
+    pub name: String,
+    pub backend: StorageBackendConfig,
+}
+
+impl StorageInstanceConfig {
+    fn primary(backend: StorageBackendConfig) -> Self {
+        let name = match &backend {
+            StorageBackendConfig::Local(_) => "Local storage",
+            StorageBackendConfig::S3(_) => "S3 storage",
+        };
+        Self {
+            id: DEFAULT_STORAGE_ID.into(),
+            name: name.into(),
+            backend,
+        }
+    }
 }
 
 impl Default for StorageBackendConfig {
@@ -84,11 +191,22 @@ impl StorageBackendConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LocalStorageConfig {
+    #[serde(default = "default_local_mount_id")]
+    pub mount_id: String,
     #[serde(default)]
     pub capacity_limit_bytes: Option<u64>,
+}
+
+impl Default for LocalStorageConfig {
+    fn default() -> Self {
+        Self {
+            mount_id: default_local_mount_id(),
+            capacity_limit_bytes: None,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -144,9 +262,21 @@ fn uuid_v4() -> String {
     Uuid::new_v4().to_string()
 }
 
+fn default_storage_id() -> String {
+    DEFAULT_STORAGE_ID.into()
+}
+
+fn default_local_mount_id() -> String {
+    DEFAULT_STORAGE_ID.into()
+}
+
+const fn default_true() -> bool {
+    true
+}
+
 impl FolderLock {
-    pub fn matches(&self, request_path: &str) -> bool {
-        path_is_same_or_descendant(request_path, &self.path)
+    pub fn matches(&self, storage_id: &str, request_path: &str) -> bool {
+        self.storage_id == storage_id && path_is_same_or_descendant(request_path, &self.path)
     }
 }
 
@@ -205,13 +335,18 @@ pub struct ConfigFile {
     #[serde(default)]
     pub schema_version: u32,
     #[serde(default)]
-    pub storage_backend: StorageBackendConfig,
-    /// A fully validated backend that has not yet been allowed to serve user
-    /// traffic. S3 secrets remain confined to the restricted config file.
+    pub storage_instances: Vec<StorageInstanceConfig>,
+    pub default_storage_id: String,
+    /// A fully validated instance that has not yet been added to the runtime
+    /// registry. S3 secrets remain confined to the restricted config file.
     #[serde(default)]
-    pub pending_storage_backend: Option<StorageBackendConfig>,
+    pub pending_storage_instance: Option<StorageInstanceConfig>,
     pub admin_username: String,
     pub admin_password_hash: String,
+    /// Ordinary accounts can use only explicitly granted browser operations.
+    /// Creation and credential changes are administrator-only API operations.
+    #[serde(default)]
+    pub user_accounts: Vec<UserAccount>,
     #[serde(default)]
     pub global_web_password_hash: Option<String>,
     #[serde(default)]
@@ -247,6 +382,7 @@ pub struct Config {
     pub bind_address: IpAddr,
     pub port: u16,
     pub storage_path: PathBuf,
+    pub local_mounts: LocalMountCatalog,
     pub config_path: PathBuf,
     pub max_upload_bytes: u64,
     pub io_concurrency: usize,
@@ -325,14 +461,19 @@ impl Default for ConfigFile {
         let default_hash = hash_password(&format!("{}{}", &first[..12], &second[..12]));
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
-            storage_backend: StorageBackendConfig::default(),
-            pending_storage_backend: None,
+            storage_instances: vec![StorageInstanceConfig::primary(
+                StorageBackendConfig::default(),
+            )],
+            default_storage_id: default_storage_id(),
+            pending_storage_instance: None,
             admin_username: default_admin_username(),
             admin_password_hash: default_hash.clone(),
+            user_accounts: Vec::new(),
             global_web_password_hash: Some(default_hash),
             folder_locks: Vec::new(),
             shares: vec![Share {
                 id: uuid_v4(),
+                storage_id: default_storage_id(),
                 name: "Default".into(),
                 path: String::new(),
                 username: Some("admin".into()),
@@ -373,6 +514,9 @@ impl ConfigFile {
                 "Administrator password hash is invalid".into(),
             ));
         }
+        if self.user_accounts.len() > MAX_USER_ACCOUNTS {
+            return Err(AppError::BadRequest("普通账号数量不能超过 100 个".into()));
+        }
         if self.shares.len() > 1_000 || self.folder_locks.len() > 10_000 {
             return Err(AppError::BadRequest(
                 "Configuration exceeds supported limits".into(),
@@ -393,19 +537,106 @@ impl ConfigFile {
         )?;
         validate_transfer_rate(self.upload_rate_bytes_per_sec, "上传")?;
         validate_transfer_rate(self.download_rate_bytes_per_sec, "下载")?;
-        validate_storage_backend(&self.storage_backend)?;
-        if let Some(pending) = &self.pending_storage_backend {
-            validate_storage_backend(pending)?;
-            if pending == &self.storage_backend {
+        if self.storage_instances.is_empty() || self.storage_instances.len() > MAX_STORAGE_INSTANCES
+        {
+            return Err(AppError::BadRequest(
+                "存储实例数量必须在 1 到 16 之间".into(),
+            ));
+        }
+        let mut storage_ids = HashSet::new();
+        let mut storage_names = HashSet::new();
+        let mut local_mount_ids = HashSet::new();
+        for storage in &self.storage_instances {
+            validate_storage_instance(storage)?;
+            if !storage_ids.insert(storage.id.as_str()) {
+                return Err(AppError::Conflict("存储实例 ID 必须唯一".into()));
+            }
+            if !storage_names.insert(storage.name.trim().to_lowercase()) {
+                return Err(AppError::Conflict("存储实例名称必须唯一".into()));
+            }
+            if let StorageBackendConfig::Local(settings) = &storage.backend {
+                validate_storage_id(&settings.mount_id)?;
+                if !local_mount_ids.insert(settings.mount_id.as_str()) {
+                    return Err(AppError::Conflict(
+                        "同一个部署挂载点不能配置为多个本地存储实例".into(),
+                    ));
+                }
+            }
+        }
+        if !storage_ids.contains(self.default_storage_id.as_str()) {
+            return Err(AppError::BadRequest(
+                "默认展示存储必须引用现有存储实例".into(),
+            ));
+        }
+        let mut account_ids = HashSet::new();
+        let mut account_names = HashSet::new();
+        account_names.insert(self.admin_username.trim().to_lowercase());
+        for account in &self.user_accounts {
+            if account.id.is_empty()
+                || account.id.len() > 128
+                || !account
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                || !account_ids.insert(account.id.as_str())
+            {
+                return Err(AppError::Conflict("普通账号 ID 必须唯一且格式有效".into()));
+            }
+            let username = account.username.trim();
+            if username.is_empty()
+                || username.chars().count() > 128
+                || username.chars().any(char::is_whitespace)
+                || !account_names.insert(username.to_lowercase())
+            {
                 return Err(AppError::Conflict(
-                    "待启用存储不能与当前活动存储相同".into(),
+                    "普通账号用户名必须唯一，且不能包含空白字符".into(),
                 ));
+            }
+            if PasswordHash::new(&account.password_hash).is_err() {
+                return Err(AppError::BadRequest("普通账号密码哈希无效".into()));
+            }
+            let mut permission_storages = HashSet::new();
+            for permission in &account.permissions {
+                validate_storage_reference(&permission.storage_id, &storage_ids)?;
+                if !permission_storages.insert(permission.storage_id.as_str()) {
+                    return Err(AppError::Conflict(
+                        "同一普通账号不能重复配置同一存储权限".into(),
+                    ));
+                }
+                if !permission.grants_any() {
+                    return Err(AppError::BadRequest(
+                        "普通账号的存储权限不能全部为空".into(),
+                    ));
+                }
+                if !permission.browse {
+                    return Err(AppError::BadRequest(
+                        "授予其他文件权限时必须同时授予浏览权限".into(),
+                    ));
+                }
+            }
+        }
+        if let Some(pending) = &self.pending_storage_instance {
+            validate_storage_instance(pending)?;
+            if storage_ids.contains(pending.id.as_str()) {
+                return Err(AppError::Conflict("待添加存储实例 ID 已存在".into()));
+            }
+            if storage_names.contains(pending.name.trim().to_lowercase().as_str()) {
+                return Err(AppError::Conflict("待添加存储实例名称已存在".into()));
+            }
+            if let StorageBackendConfig::Local(settings) = &pending.backend {
+                validate_storage_id(&settings.mount_id)?;
+                if local_mount_ids.contains(settings.mount_id.as_str()) {
+                    return Err(AppError::Conflict(
+                        "待添加本地存储不能重复使用已有部署挂载点".into(),
+                    ));
+                }
             }
         }
 
         let mut share_ids = HashSet::new();
         let mut share_names = HashSet::new();
         for share in &self.shares {
+            validate_storage_reference(&share.storage_id, &storage_ids)?;
             if share.id.is_empty()
                 || share.id.len() > 128
                 || !share
@@ -454,6 +685,7 @@ impl ConfigFile {
 
         let mut lock_ids = HashSet::new();
         for lock in &self.folder_locks {
+            validate_storage_reference(&lock.storage_id, &storage_ids)?;
             if lock.id.is_empty()
                 || lock.id.len() > 128
                 || !lock
@@ -477,11 +709,9 @@ impl ConfigFile {
             }
         }
         for share in self.shares.iter().filter(|share| share.webdav_enabled) {
-            if self
-                .folder_locks
-                .iter()
-                .any(|lock| paths_overlap(&share.path, &lock.path))
-            {
+            if self.folder_locks.iter().any(|lock| {
+                lock.storage_id == share.storage_id && paths_overlap(&share.path, &lock.path)
+            }) {
                 return Err(AppError::Conflict(
                     "WebDAV 挂载不能与网页文件夹锁的父目录、当前目录或子目录重叠".into(),
                 ));
@@ -489,6 +719,42 @@ impl ConfigFile {
         }
         Ok(())
     }
+}
+
+fn validate_storage_instance(storage: &StorageInstanceConfig) -> AppResult<()> {
+    validate_storage_id(&storage.id)?;
+    let name = storage.name.trim();
+    if name.is_empty()
+        || name.chars().count() > 64
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(AppError::BadRequest(
+            "存储实例名称必须包含 1 到 64 个字符且不能包含路径分隔符".into(),
+        ));
+    }
+    validate_storage_backend(&storage.backend)
+}
+
+fn validate_storage_id(storage_id: &str) -> AppResult<()> {
+    if storage_id.is_empty()
+        || storage_id.len() > 64
+        || !storage_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(AppError::BadRequest("存储实例 ID 格式无效".into()));
+    }
+    Ok(())
+}
+
+fn validate_storage_reference(storage_id: &str, known_ids: &HashSet<&str>) -> AppResult<()> {
+    validate_storage_id(storage_id)?;
+    if !known_ids.contains(storage_id) {
+        return Err(AppError::BadRequest("配置引用了不存在的存储实例".into()));
+    }
+    Ok(())
 }
 
 pub fn validate_login_security_settings(
@@ -719,6 +985,9 @@ impl Config {
         let port = env_parse("PORT", 18_473_u16)?;
         let storage_path =
             PathBuf::from(std::env::var("STORAGE_PATH").unwrap_or_else(|_| "./storage".into()));
+        let additional_local_mounts = std::env::var("LOCAL_STORAGE_MOUNTS").ok();
+        let local_mounts =
+            LocalMountCatalog::from_json(storage_path.clone(), additional_local_mounts.as_deref())?;
         let config_path =
             PathBuf::from(std::env::var("CONFIG_PATH").unwrap_or_else(|_| "./config.json".into()));
         // This is an absolute transport envelope. The administrator-facing,
@@ -739,6 +1008,7 @@ impl Config {
             bind_address,
             port,
             storage_path,
+            local_mounts,
             config_path,
             max_upload_bytes,
             io_concurrency,
@@ -951,14 +1221,74 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
             raw["schema_version"] = serde_json::json!(2);
             migrated = true;
         }
-        if schema_version < CONFIG_SCHEMA_VERSION as u64 {
-            raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
+        if schema_version < 5 {
             if raw.get("storage_backend").is_none() {
                 raw["storage_backend"] = serde_json::json!({
                     "type": "local",
                     "settings": {}
                 });
             }
+            migrated = true;
+        }
+        if schema_version < 6 {
+            let pending = raw
+                .get("pending_storage_backend")
+                .cloned()
+                .filter(|value| !value.is_null());
+            let active = raw
+                .get("storage_backend")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({ "type": "local", "settings": {} }));
+            let active_is_local = active
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|kind| kind == "local");
+            let pending_is_local = pending.as_ref().is_some_and(|backend| {
+                backend
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|kind| kind == "local")
+            });
+            let mut instances = vec![serde_json::json!({
+                "id": DEFAULT_STORAGE_ID,
+                "name": if active_is_local { "Local storage" } else { "S3 storage" },
+                "backend": active
+            })];
+            if !active_is_local {
+                let local_backend = if pending_is_local {
+                    pending.clone().expect("pending local checked above")
+                } else {
+                    serde_json::json!({ "type": "local", "settings": {} })
+                };
+                instances.push(serde_json::json!({
+                    "id": "local",
+                    "name": "Local storage",
+                    "backend": local_backend
+                }));
+            }
+            raw["storage_instances"] = serde_json::Value::Array(instances);
+            raw["default_storage_id"] = serde_json::json!(DEFAULT_STORAGE_ID);
+            if let Some(pending) = pending.filter(|_| !pending_is_local) {
+                raw["pending_storage_instance"] = serde_json::json!({
+                    "id": format!("pending-{}", Uuid::new_v4().simple()),
+                    "name": "Pending storage",
+                    "backend": pending
+                });
+            }
+            if let Some(object) = raw.as_object_mut() {
+                object.remove("storage_backend");
+                object.remove("pending_storage_backend");
+            }
+            raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
+            migrated = true;
+        }
+        if schema_version < 7 {
+            raw["user_accounts"] = serde_json::json!([]);
+            raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
+            migrated = true;
+        }
+        if schema_version < 8 {
+            raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
             migrated = true;
         }
         let config: ConfigFile =
@@ -979,14 +1309,19 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
         let credentials = load_or_create_initial_credentials(&credentials_path).await?;
         let config = ConfigFile {
             schema_version: CONFIG_SCHEMA_VERSION,
-            storage_backend: StorageBackendConfig::default(),
-            pending_storage_backend: None,
+            storage_instances: vec![StorageInstanceConfig::primary(
+                StorageBackendConfig::default(),
+            )],
+            default_storage_id: default_storage_id(),
+            pending_storage_instance: None,
             admin_username: credentials.admin_username.clone(),
             admin_password_hash: hash_password(&credentials.admin_password),
+            user_accounts: Vec::new(),
             global_web_password_hash: Some(hash_password(&credentials.web_access_password)),
             folder_locks: Vec::new(),
             shares: vec![Share {
                 id: uuid_v4(),
+                storage_id: default_storage_id(),
                 name: "Default".into(),
                 path: String::new(),
                 username: Some("admin".into()),
@@ -1229,8 +1564,9 @@ mod tests {
         normalize_s3_endpoint, path_is_same_or_descendant, paths_overlap,
         remove_initial_credentials, save_config, verify_password, Config, ConfigFile, FolderLock,
         InitialCredentials, LocalStorageConfig, S3AddressingStyle, S3Provider, S3StorageConfig,
-        StorageBackendConfig, CONFIG_SCHEMA_VERSION, DEFAULT_MAX_ARCHIVE_BYTES,
-        DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_UPLOAD_BYTES, HARD_MAX_TRANSFER_RATE_BYTES,
+        StorageBackendConfig, StorageInstanceConfig, StoragePermission, UserAccount,
+        CONFIG_SCHEMA_VERSION, DEFAULT_MAX_ARCHIVE_BYTES, DEFAULT_MAX_ARCHIVE_ENTRIES,
+        DEFAULT_MAX_UPLOAD_BYTES, DEFAULT_STORAGE_ID, HARD_MAX_TRANSFER_RATE_BYTES,
         MIN_TRANSFER_RATE_BYTES,
     };
 
@@ -1258,14 +1594,16 @@ mod tests {
     fn folder_lock_protects_descendants() {
         let lock = FolderLock {
             id: "lock-id".into(),
+            storage_id: DEFAULT_STORAGE_ID.into(),
             path: "photos/private".into(),
             password_hash: "unused".into(),
         };
 
-        assert!(lock.matches("photos/private"));
-        assert!(lock.matches("photos/private/child/file.txt"));
-        assert!(!lock.matches("photos/public"));
-        assert!(!lock.matches("photos/private-old"));
+        assert!(lock.matches(DEFAULT_STORAGE_ID, "photos/private"));
+        assert!(lock.matches(DEFAULT_STORAGE_ID, "photos/private/child/file.txt"));
+        assert!(!lock.matches(DEFAULT_STORAGE_ID, "photos/public"));
+        assert!(!lock.matches(DEFAULT_STORAGE_ID, "photos/private-old"));
+        assert!(!lock.matches("another", "photos/private"));
     }
 
     #[test]
@@ -1319,6 +1657,59 @@ mod tests {
         assert!(config.validate().is_err());
         config.download_rate_bytes_per_sec = 0;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn ordinary_accounts_require_unique_names_and_storage_scoped_permissions() {
+        let mut config = ConfigFile::default();
+        config.user_accounts.push(UserAccount {
+            id: "reader".into(),
+            username: "reader".into(),
+            password_hash: hash_password("ordinary-user-password"),
+            enabled: true,
+            permissions: vec![StoragePermission {
+                storage_id: DEFAULT_STORAGE_ID.into(),
+                browse: true,
+                download: true,
+                upload: false,
+                create_directory: false,
+                rename: false,
+                move_items: false,
+                copy: false,
+                delete: false,
+            }],
+        });
+        assert!(config.validate().is_ok());
+
+        config.user_accounts[0].username = config.admin_username.clone();
+        assert!(config.validate().is_err());
+        config.user_accounts[0].username = "reader".into();
+        config.user_accounts[0].permissions[0].browse = false;
+        assert!(config.validate().is_err());
+        config.user_accounts[0].permissions[0].browse = true;
+        config.user_accounts[0].permissions[0].storage_id = "missing-storage".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn local_storage_instances_require_distinct_deployment_mounts() {
+        let mut config = ConfigFile::default();
+        config.storage_instances.push(StorageInstanceConfig {
+            id: "archive".into(),
+            name: "Archive disk".into(),
+            backend: StorageBackendConfig::Local(LocalStorageConfig {
+                mount_id: "archive-disk".into(),
+                capacity_limit_bytes: None,
+            }),
+        });
+
+        assert!(config.validate().is_ok());
+
+        config.storage_instances[1].backend = StorageBackendConfig::Local(LocalStorageConfig {
+            mount_id: "primary".into(),
+            capacity_limit_bytes: None,
+        });
+        assert!(config.validate().is_err());
     }
 
     #[tokio::test]
@@ -1376,6 +1767,7 @@ mod tests {
         let migrated = load_config(&path).await.unwrap();
         assert_eq!(migrated.shares.len(), 1);
         assert!(!migrated.shares[0].id.is_empty());
+        assert_eq!(migrated.shares[0].storage_id, DEFAULT_STORAGE_ID);
         assert_eq!(migrated.max_upload_bytes, DEFAULT_MAX_UPLOAD_BYTES);
         assert_eq!(migrated.max_archive_bytes, DEFAULT_MAX_ARCHIVE_BYTES);
         assert_eq!(migrated.max_archive_entries, DEFAULT_MAX_ARCHIVE_ENTRIES);
@@ -1383,21 +1775,87 @@ mod tests {
         let persisted: ConfigFile =
             serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
         assert_eq!(persisted.shares[0].id, migrated.shares[0].id);
+        assert_eq!(persisted.shares[0].storage_id, DEFAULT_STORAGE_ID);
         assert_eq!(persisted.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(persisted.storage_instances.len(), 1);
+        assert_eq!(persisted.storage_instances[0].id, DEFAULT_STORAGE_ID);
         assert_eq!(
-            persisted.storage_backend,
+            persisted.storage_instances[0].backend,
             StorageBackendConfig::Local(LocalStorageConfig::default())
         );
-        assert_eq!(persisted.pending_storage_backend, None);
+        assert_eq!(persisted.pending_storage_instance, None);
+        assert!(persisted.user_accounts.is_empty());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_s3_with_pending_local_migrates_to_one_local_instance() {
+        let directory = std::env::temp_dir().join(format!(
+            "ycloud-storage-v6-migration-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let path = directory.join("config.json");
+        let mut raw = serde_json::to_value(ConfigFile::default()).unwrap();
+        raw["schema_version"] = serde_json::json!(5);
+        raw["storage_backend"] = serde_json::to_value(StorageBackendConfig::S3(S3StorageConfig {
+            provider: S3Provider::Minio,
+            endpoint: "http://10.126.0.2:9000".into(),
+            bucket: "ycloud-files".into(),
+            region: "us-east-1".into(),
+            prefix: "files/".into(),
+            addressing_style: S3AddressingStyle::Path,
+            access_key_id: "migration-access-key".into(),
+            secret_access_key: "migration-secret-key".into(),
+            capacity_limit_bytes: None,
+        }))
+        .unwrap();
+        raw["pending_storage_backend"] =
+            serde_json::to_value(StorageBackendConfig::Local(LocalStorageConfig {
+                capacity_limit_bytes: Some(800 * 1024 * 1024),
+                ..LocalStorageConfig::default()
+            }))
+            .unwrap();
+        let object = raw.as_object_mut().unwrap();
+        object.remove("storage_instances");
+        object.remove("default_storage_id");
+        object.remove("pending_storage_instance");
+        tokio::fs::write(&path, serde_json::to_vec(&raw).unwrap())
+            .await
+            .unwrap();
+
+        let migrated = load_config(&path).await.unwrap();
+        assert_eq!(migrated.storage_instances.len(), 2);
+        assert_eq!(
+            migrated
+                .storage_instances
+                .iter()
+                .filter(|instance| matches!(instance.backend, StorageBackendConfig::Local(_)))
+                .count(),
+            1
+        );
+        let local = migrated
+            .storage_instances
+            .iter()
+            .find(|instance| matches!(instance.backend, StorageBackendConfig::Local(_)))
+            .unwrap();
+        assert_eq!(
+            local.backend.capacity_limit_bytes(),
+            Some(800 * 1024 * 1024)
+        );
+        assert!(migrated.pending_storage_instance.is_none());
+        assert_eq!(migrated.default_storage_id, DEFAULT_STORAGE_ID);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
     #[test]
     fn pending_storage_must_differ_from_active_storage() {
         let mut config = ConfigFile {
-            pending_storage_backend: Some(StorageBackendConfig::Local(
-                LocalStorageConfig::default(),
-            )),
+            pending_storage_instance: Some(StorageInstanceConfig {
+                id: "pending-local".into(),
+                name: "Second local".into(),
+                backend: StorageBackendConfig::Local(LocalStorageConfig::default()),
+            }),
             ..ConfigFile::default()
         };
         assert!(config.validate().is_err());
@@ -1413,21 +1871,27 @@ mod tests {
             secret_access_key: "example-secret-key".into(),
             capacity_limit_bytes: None,
         };
-        config.pending_storage_backend = Some(StorageBackendConfig::S3(pending));
+        config.pending_storage_instance = Some(StorageInstanceConfig {
+            id: "pending-s3".into(),
+            name: "Remote storage".into(),
+            backend: StorageBackendConfig::S3(pending),
+        });
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn storage_capacity_limit_has_safe_numeric_bounds() {
         let mut config = ConfigFile {
-            storage_backend: StorageBackendConfig::Local(LocalStorageConfig {
-                capacity_limit_bytes: Some(super::MIN_STORAGE_CAPACITY_BYTES - 1),
-            }),
             ..ConfigFile::default()
         };
+        config.storage_instances[0].backend = StorageBackendConfig::Local(LocalStorageConfig {
+            capacity_limit_bytes: Some(super::MIN_STORAGE_CAPACITY_BYTES - 1),
+            ..LocalStorageConfig::default()
+        });
         assert!(config.validate().is_err());
-        config.storage_backend = StorageBackendConfig::Local(LocalStorageConfig {
+        config.storage_instances[0].backend = StorageBackendConfig::Local(LocalStorageConfig {
             capacity_limit_bytes: Some(super::MIN_STORAGE_CAPACITY_BYTES),
+            ..LocalStorageConfig::default()
         });
         assert!(config.validate().is_ok());
     }
@@ -1446,22 +1910,26 @@ mod tests {
             capacity_limit_bytes: None,
         };
         let mut config = ConfigFile {
-            storage_backend: StorageBackendConfig::S3(settings.clone()),
+            storage_instances: vec![StorageInstanceConfig {
+                id: DEFAULT_STORAGE_ID.into(),
+                name: "S3 storage".into(),
+                backend: StorageBackendConfig::S3(settings.clone()),
+            }],
             ..ConfigFile::default()
         };
         assert!(config.validate().is_ok());
 
-        let debug = format!("{:?}", config.storage_backend);
+        let debug = format!("{:?}", config.storage_instances[0].backend);
         assert!(!debug.contains("example-access-key"));
         assert!(!debug.contains("example-secret-key"));
 
-        config.storage_backend = StorageBackendConfig::S3(S3StorageConfig {
+        config.storage_instances[0].backend = StorageBackendConfig::S3(S3StorageConfig {
             prefix: "../escape/".into(),
             ..settings.clone()
         });
         assert!(config.validate().is_err());
 
-        config.storage_backend = StorageBackendConfig::S3(S3StorageConfig {
+        config.storage_instances[0].backend = StorageBackendConfig::S3(S3StorageConfig {
             provider: S3Provider::AlibabaOss,
             endpoint: "http://oss-cn-hangzhou.aliyuncs.com".into(),
             addressing_style: S3AddressingStyle::Path,
@@ -1478,6 +1946,11 @@ mod tests {
             bind_address: std::net::IpAddr::from([127, 0, 0, 1]),
             port: 18_473,
             storage_path: "./storage".into(),
+            local_mounts: crate::storage_catalog::LocalMountCatalog::new(
+                "./storage".into(),
+                Vec::new(),
+            )
+            .unwrap(),
             config_path: "./config.json".into(),
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             io_concurrency: 4,

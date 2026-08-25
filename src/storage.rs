@@ -20,7 +20,7 @@ use futures_util::Stream;
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore},
+    sync::{mpsc, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
 };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -43,7 +43,7 @@ pub struct StorageService {
     reserved_upload_bytes: Arc<Mutex<u64>>,
     transactions: Arc<TransactionPaths>,
     mutation_gate: Arc<AsyncMutex<()>>,
-    trash_notify: Arc<Notify>,
+    trash_notify: mpsc::UnboundedSender<()>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,26 +81,93 @@ impl StorageService {
         max_list_entries: usize,
         disk_reserve_bytes: u64,
     ) -> AppResult<Self> {
-        fs::create_dir_all(&root)
+        Self::initialize(
+            root,
+            max_upload_bytes,
+            Arc::new(Semaphore::new(io_concurrency.max(1))),
+            max_list_entries,
+            disk_reserve_bytes,
+            true,
+        )
+        .await
+    }
+
+    pub async fn open_declared(
+        root: PathBuf,
+        max_upload_bytes: u64,
+        io_gate: Arc<Semaphore>,
+        max_list_entries: usize,
+        disk_reserve_bytes: u64,
+    ) -> AppResult<Self> {
+        Self::initialize(
+            root,
+            max_upload_bytes,
+            io_gate,
+            max_list_entries,
+            disk_reserve_bytes,
+            false,
+        )
+        .await
+    }
+
+    pub async fn new_with_io_gate(
+        root: PathBuf,
+        max_upload_bytes: u64,
+        io_gate: Arc<Semaphore>,
+        max_list_entries: usize,
+        disk_reserve_bytes: u64,
+    ) -> AppResult<Self> {
+        Self::initialize(
+            root,
+            max_upload_bytes,
+            io_gate,
+            max_list_entries,
+            disk_reserve_bytes,
+            true,
+        )
+        .await
+    }
+
+    async fn initialize(
+        root: PathBuf,
+        max_upload_bytes: u64,
+        io_gate: Arc<Semaphore>,
+        max_list_entries: usize,
+        disk_reserve_bytes: u64,
+        create_root: bool,
+    ) -> AppResult<Self> {
+        if create_root {
+            fs::create_dir_all(&root).await.map_err(|error| {
+                AppError::with_source("failed to create storage directory", error)
+            })?;
+        }
+        let root_metadata = fs::symlink_metadata(&root)
             .await
-            .map_err(|error| AppError::with_source("failed to create storage directory", error))?;
+            .map_err(|error| AppError::with_source("declared local mount is unavailable", error))?;
+        if !root_metadata.is_dir() || is_link_or_reparse_point(&root_metadata) {
+            return Err(AppError::Conflict(
+                "Declared local mount must be a plain directory".into(),
+            ));
+        }
         let root = fs::canonicalize(&root)
             .await
             .map_err(|error| AppError::with_source("failed to resolve storage directory", error))?;
 
         let transactions = TransactionPaths::initialize(&root).await?;
-        let trash_notify = Arc::new(Notify::new());
-        let cleaner_notify = trash_notify.clone();
+        let (trash_notify, mut trash_events) = mpsc::unbounded_channel();
         let trash = transactions.trash.clone();
+        let cleaner_gate = io_gate.clone();
         tokio::spawn(async move {
-            loop {
-                cleaner_notify.notified().await;
+            while trash_events.recv().await.is_some() {
+                let Ok(_permit) = cleaner_gate.acquire().await else {
+                    break;
+                };
                 purge_trash(&trash).await;
             }
         });
         Ok(Self {
             root: Arc::new(root),
-            io_gate: Arc::new(Semaphore::new(io_concurrency.max(1))),
+            io_gate,
             max_upload_bytes: Arc::new(AtomicU64::new(max_upload_bytes)),
             max_list_entries: max_list_entries.max(1),
             disk_reserve_bytes,
@@ -265,9 +332,14 @@ impl StorageService {
 
         let transaction_id = Uuid::new_v4().to_string();
         let temporary = self.transactions.upload_path(&transaction_id);
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
             .open(&temporary)
             .await
             .map_err(|error| AppError::with_source("failed to create temporary file", error))?;
@@ -385,7 +457,7 @@ impl StorageService {
             })?;
         let removed_size = self.path_size(path).await?;
         self.transactions.stage_delete(path.absolute()).await?;
-        self.trash_notify.notify_one();
+        let _ = self.trash_notify.send(());
         Ok(removed_size)
     }
 
@@ -1049,6 +1121,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declared_local_mount_must_exist_before_startup() {
+        let root =
+            std::env::temp_dir().join(format!("ycloud-declared-mount-{}", uuid::Uuid::new_v4()));
+        let result = StorageService::open_declared(
+            root.clone(),
+            16,
+            std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            100,
+            0,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
     async fn atomic_writer_commits_streamed_chunks() {
         let root = std::env::temp_dir().join(format!("ycloud-storage-{}", uuid::Uuid::new_v4()));
         let storage = StorageService::new(root.clone(), 16, 2, 100, 0)
@@ -1103,6 +1192,28 @@ mod tests {
             .await
             .unwrap();
         assert!(entries.next_entry().await.unwrap().is_none());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn temporary_upload_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("ycloud-private-upload-{}", uuid::Uuid::new_v4()));
+        let storage = StorageService::new(root.clone(), 16, 2, 100, 0)
+            .await
+            .unwrap();
+        let writer = storage.begin_atomic_write("private.bin").await.unwrap();
+        let mode = tokio::fs::metadata(&writer.temporary)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(writer);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 

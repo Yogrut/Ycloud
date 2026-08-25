@@ -1,6 +1,6 @@
 import { createApp, nextTick } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { FolderLockView } from '../../shared/api/admin'
+import type { FolderLockView, StorageInstanceView } from '../../shared/api/admin'
 import LocksView from './LocksView.vue'
 
 afterEach(() => {
@@ -9,8 +9,13 @@ afterEach(() => {
 })
 
 function mountLocks(host: HTMLElement, locks: FolderLockView[] = []) {
+  const storages: StorageInstanceView[] = [{
+    id: 'primary', name: '本地存储', is_default: true, ready: true,
+    backend: { type: 'local', path: './storage', capacity_limit_bytes: null },
+    usage_bytes: 0, reserved_bytes: 0,
+  }]
   const changed = vi.fn()
-  const app = createApp(LocksView, { locks, onChanged: changed })
+  const app = createApp(LocksView, { locks, storages, defaultStorageId: 'primary', onChanged: changed })
   app.mount(host)
   return { app, changed }
 }
@@ -40,7 +45,7 @@ describe('LocksView', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/locks', expect.objectContaining({
       method: 'POST',
-      body: JSON.stringify({ path: 'test/child', password: '安全密码123456' }),
+      body: JSON.stringify({ storage_id: 'primary', path: 'test/child', password: '安全密码123456' }),
     }))
     expect(changed).toHaveBeenCalledWith('文件夹锁 /test/child 已创建')
     app.unmount()
@@ -51,7 +56,7 @@ describe('LocksView', () => {
     vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
-    const { app } = mountLocks(host, [{ id: 'lock-1', path: 'test' }])
+    const { app } = mountLocks(host, [{ id: 'lock-1', storage_id: 'primary', path: 'test' }])
     ;(host.querySelector('.lock-actions .btn') as HTMLButtonElement).click()
     await nextTick()
     const pathInput = host.querySelector<HTMLInputElement>('.modal input')
@@ -94,7 +99,7 @@ describe('LocksView', () => {
     vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
-    const { app, changed } = mountLocks(host, [{ id: 'lock-1', path: 'test' }])
+    const { app, changed } = mountLocks(host, [{ id: 'lock-1', storage_id: 'primary', path: 'test' }])
     ;(host.querySelector('.lock-actions .danger-outline') as HTMLButtonElement).click()
     await nextTick()
     ;(host.querySelector('.modal .btn.danger') as HTMLButtonElement).click()

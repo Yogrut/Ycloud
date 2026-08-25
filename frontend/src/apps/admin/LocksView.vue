@@ -1,17 +1,22 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from 'vue'
-import type { FolderLockView, UpdateFolderLockRequest } from '../../shared/api/admin'
+import type { FolderLockView, StorageInstanceView, UpdateFolderLockRequest } from '../../shared/api/admin'
 import { createFolderLock, deleteFolderLock, updateFolderLock } from '../../shared/api/admin'
 import { useLocale } from '../../shared/i18n'
 
 const MASK = '••••••'
-const { locks } = defineProps<{ locks: FolderLockView[] }>()
+const { locks, storages, defaultStorageId } = defineProps<{
+  locks: FolderLockView[]
+  storages: StorageInstanceView[]
+  defaultStorageId: string
+}>()
 const emit = defineEmits<{ changed: [message: string] }>()
 const locale = useLocale()
 
 const editing = ref<FolderLockView>()
 const showEditor = ref(false)
 const path = ref('')
+const storageId = ref('')
 const password = ref('')
 const saving = ref(false)
 const errorMessage = ref('')
@@ -27,15 +32,22 @@ function displayPath(value: string): string {
   return normalized ? `/${normalized}` : '/'
 }
 
+function storageName(id: string): string {
+  return storages.find((storage) => storage.id === id)?.name ?? id
+}
+
 const hasChanges = computed(() => {
   if (!showEditor.value) return false
   if (!editing.value) return Boolean(path.value.trim() || password.value)
-  return normalizePath(path.value) !== editing.value.path || password.value !== MASK
+  return storageId.value !== editing.value.storage_id
+    || normalizePath(path.value) !== editing.value.path
+    || password.value !== MASK
 })
 
 function openCreate(): void {
   editing.value = undefined
   path.value = ''
+  storageId.value = defaultStorageId || storages[0]?.id || ''
   password.value = ''
   errorMessage.value = ''
   showEditor.value = true
@@ -44,6 +56,7 @@ function openCreate(): void {
 function openEdit(lock: FolderLockView): void {
   editing.value = lock
   path.value = displayPath(lock.path)
+  storageId.value = lock.storage_id
   password.value = MASK
   errorMessage.value = ''
   showEditor.value = true
@@ -62,6 +75,7 @@ function selectMask(event: FocusEvent): void {
 }
 
 function validate(): string | undefined {
+  if (!storageId.value) return locale.text('请选择存储', 'Select a storage')
   if (!normalizePath(path.value)) return locale.text('不能给存储根目录加锁，请填写具体文件夹路径', 'The storage root cannot be locked. Enter a specific folder path')
   if (!editing.value && !password.value) return locale.text('文件夹锁必须设置密码', 'A folder lock password is required')
   if (password.value !== MASK && [...password.value].length < 8) return locale.text('文件夹锁密码至少需要 8 位', 'Folder lock password must be at least 8 characters')
@@ -82,13 +96,14 @@ async function submit(): Promise<void> {
   try {
     if (editing.value) {
       const body: UpdateFolderLockRequest = {}
+      if (storageId.value !== editing.value.storage_id) body.storage_id = storageId.value
       if (normalizedPath !== editing.value.path) body.path = normalizedPath
       if (password.value !== MASK) body.password = password.value
       await updateFolderLock(editing.value.id, body)
       showEditor.value = false
       emit('changed', locale.text(`文件夹锁 ${displayPath(normalizedPath)} 已更新`, `Folder lock ${displayPath(normalizedPath)} updated`))
     } else {
-      await createFolderLock({ path: normalizedPath, password: password.value })
+      await createFolderLock({ storage_id: storageId.value, path: normalizedPath, password: password.value })
       showEditor.value = false
       emit('changed', locale.text(`文件夹锁 ${displayPath(normalizedPath)} 已创建`, `Folder lock ${displayPath(normalizedPath)} created`))
     }
@@ -132,6 +147,7 @@ async function confirmDelete(): Promise<void> {
           <div class="lock-record-main">
             <strong>{{ displayPath(lock.path) }}</strong>
             <span class="status-pill">{{ locale.text('网页保护', 'Browser protected') }}</span>
+            <span v-if="storages.length > 1" class="lock-storage-name">{{ storageName(lock.storage_id) }}</span>
           </div>
           <div class="lock-actions">
             <button class="btn secondary" type="button" @click="openEdit(lock)">{{ locale.t('common.edit') }}</button>
@@ -145,6 +161,14 @@ async function confirmDelete(): Promise<void> {
   <div v-if="showEditor" class="overlay" @click.self="closeEditor">
     <form class="modal compact-editor-modal" role="dialog" aria-modal="true" aria-labelledby="lock-editor-title" @submit.prevent="submit">
       <h2 id="lock-editor-title">{{ editing ? locale.text('编辑文件夹锁', 'Edit folder lock') : locale.text('新建文件夹锁', 'New folder lock') }}</h2>
+      <label>
+        {{ locale.text('所属存储', 'Storage') }}
+        <select v-model="storageId" class="input" required>
+          <option v-for="storage in storages" :key="storage.id" :value="storage.id" :disabled="!storage.ready">
+            {{ storage.name }}{{ storage.ready ? '' : locale.text('（不可用）', ' (unavailable)') }}
+          </option>
+        </select>
+      </label>
       <label>
         {{ locale.text('网页文件夹路径', 'Browser folder path') }}
         <input v-model="path" class="input" required maxlength="4096" :placeholder="locale.text('例如 /test', 'For example: /test')">

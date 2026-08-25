@@ -17,6 +17,8 @@ function mountBrowser(host: HTMLElement) {
 
 function listResponse(names: string[]) {
   return {
+    storage_id: 'primary',
+    storages: [],
     current_path: '',
     parent_path: null,
     entries: names.map((name, index) => ({
@@ -54,6 +56,8 @@ function domRect(left: number, top: number, right: number, bottom: number): DOMR
 describe('BrowserView', () => {
   it('renders a directory response without trusting HTML from file names', async () => {
     const response = {
+      storage_id: 'primary',
+      storages: [],
       current_path: '',
       parent_path: null,
       entries: [{
@@ -89,9 +93,56 @@ describe('BrowserView', () => {
     app.unmount()
   })
 
+  it('lets an administrator switch storage without mixing the previous path or selection', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ...listResponse(['one.txt']),
+        current_path: 'games',
+        storages: [
+          { id: 'primary', name: 'Local', is_default: true, ready: true },
+          { id: 'rustfs', name: 'RustFS', is_default: false, ready: true },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ...listResponse(['remote.txt']),
+        storage_id: 'rustfs',
+        storages: [
+          { id: 'primary', name: 'Local', is_default: true, ready: true },
+          { id: 'rustfs', name: 'RustFS', is_default: false, ready: true },
+        ],
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    const firstRow = host.querySelector('.file-row') as HTMLElement
+    firstRow.click()
+    await nextTick()
+    expect(firstRow.classList.contains('selected')).toBe(true)
+
+    const selector = host.querySelector('.storage-switcher select') as HTMLSelectElement
+    selector.value = 'rustfs'
+    selector.dispatchEvent(new Event('change', { bubbles: true }))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=rustfs', { credentials: 'same-origin' })
+    expect(host.textContent).toContain('remote.txt')
+    expect(host.textContent).not.toContain('one.txt')
+    expect(host.querySelector('.file-row.selected')).toBeNull()
+    expect(host.querySelector('[aria-current="location"]')?.textContent).toContain('/')
+    app.unmount()
+  })
+
   it('opens the mobile action panel when the header selects all entries', async () => {
     vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }))
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      storage_id: 'primary',
+      storages: [],
       current_path: '',
       parent_path: null,
       entries: [{

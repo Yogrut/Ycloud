@@ -49,8 +49,8 @@ impl BandwidthLimiter {
     pub async fn consume(&self, bytes: usize) {
         let mut remaining = bytes as u64;
         while remaining > 0 {
-            let mut bucket = self.bucket.lock().await;
-            let consumed = loop {
+            let outcome = {
+                let mut bucket = self.bucket.lock().await;
                 let rate = self.rate();
                 if rate == 0 {
                     return;
@@ -67,16 +67,20 @@ impl BandwidthLimiter {
                 bucket.last_refill = now;
                 if bucket.tokens >= portion as f64 {
                     bucket.tokens -= portion as f64;
-                    break portion;
+                    Ok(portion)
+                } else {
+                    let missing = portion as f64 - bucket.tokens;
+                    Err(Duration::from_secs_f64(missing / rate as f64))
                 }
-                let missing = portion as f64 - bucket.tokens;
-                // Keep the lock while waiting. This makes the global budget
-                // exact under concurrency, and cancellation releases the lock
-                // without leaving reserved bandwidth debt behind.
-                tokio::time::sleep(Duration::from_secs_f64(missing / rate as f64)).await;
             };
-            drop(bucket);
-            remaining -= consumed;
+            match outcome {
+                Ok(consumed) => remaining -= consumed,
+                // Never hold the shared bucket while waiting. Competing
+                // streams re-check the budget after waking, so cancellation
+                // creates no reserved-token debt and the global cap remains
+                // authoritative.
+                Err(wait) => tokio::time::sleep(wait).await,
+            }
         }
     }
 
@@ -111,6 +115,7 @@ impl BandwidthLimiter {
 #[cfg(test)]
 mod tests {
     use super::BandwidthLimiter;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn zero_rate_is_disabled_and_updates_are_visible() {
@@ -118,5 +123,25 @@ mod tests {
         limiter.consume(1024).await;
         limiter.set_rate(64 * 1024);
         assert_eq!(limiter.rate(), 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn waiting_consumer_does_not_hold_the_bucket_mutex() {
+        let limiter = BandwidthLimiter::new(100);
+        limiter.consume(100).await;
+        let waiting = tokio::spawn({
+            let limiter = limiter.clone();
+            async move { limiter.consume(100).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Another consumer must be able to inspect the bucket while the first
+        // one sleeps. Setting the rate to zero gives that inspection an
+        // immediate completion path.
+        limiter.set_rate(0);
+        tokio::time::timeout(Duration::from_millis(100), limiter.consume(1))
+            .await
+            .expect("sleeping consumer must not retain the bucket mutex");
+        waiting.abort();
     }
 }

@@ -14,6 +14,7 @@ import LocksView from './LocksView.vue'
 import SecurityView from './SecurityView.vue'
 import StorageView from './StorageView.vue'
 import WebDavView from './WebDavView.vue'
+import UsersView from './UsersView.vue'
 import { appPath } from '../../shared/routes'
 
 defineProps<{ theme: ThemeController }>()
@@ -35,7 +36,9 @@ const activeSection = window.location.pathname.endsWith('/security')
       ? 'locks'
       : window.location.pathname.endsWith('/webdav')
         ? 'webdav'
-        : window.location.pathname.endsWith('/storage') ? 'storage' : 'account'
+        : window.location.pathname.endsWith('/storage')
+          ? 'storage'
+          : window.location.pathname.endsWith('/users') ? 'users' : 'account'
 
 const navigation = computed(() => [
   { group: locale.text('存储与访问', 'Storage & access'), items: [
@@ -46,6 +49,7 @@ const navigation = computed(() => [
   ] },
   { group: locale.text('账户与安全', 'Account & security'), items: [
     { id: 'account', label: locale.text('账户与访问', 'Account & access'), href: appPath('/admin/account') },
+    { id: 'users', label: locale.text('普通账号', 'User accounts'), href: appPath('/admin/users') },
     { id: 'security', label: locale.text('登录安全', 'Sign-in security'), href: appPath('/admin/security') },
   ] },
 ] as const)
@@ -77,6 +81,10 @@ async function submitLogin(): Promise<void> {
   try {
     const result = await loginAdministrator(username.value.trim(), password.value)
     if (!result.success) throw new Error(result.message ?? locale.text('登录失败', 'Sign-in failed'))
+    if (!result.is_admin) {
+      await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' })
+      throw new Error(locale.text('普通账号不能进入管理后台', 'This account cannot open the admin console.'))
+    }
     password.value = ''
     await load()
   } catch (error) {
@@ -131,18 +139,30 @@ onMounted(load)
     <div class="admin-content">
       <div v-if="loading" class="admin-loading glass">{{ locale.t('common.loading') }}</div>
       <SecurityView v-else-if="info && activeSection === 'security'" :info="info" @changed="showNotice" />
+      <UsersView v-else-if="info && activeSection === 'users'" :info="info" @changed="showNotice" />
       <StorageView
         v-else-if="info && activeSection === 'storage'"
-        :backend="info.storage_backend"
-        :pending-backend="info.pending_storage_backend"
-        :local-path="info.local_storage_path"
-        :usage-bytes="info.storage_usage_bytes"
-        :reserved-bytes="info.storage_reserved_bytes"
+        :instances="info.storage_instances"
+        :pending-instance="info.pending_storage_instance"
+        :default-storage-id="info.default_storage_id"
+        :local-mounts="info.local_mounts ?? []"
         @changed="showNotice"
       />
       <LimitsView v-else-if="info && activeSection === 'limits'" :info="info" @saved="showNotice" />
-      <LocksView v-else-if="info && activeSection === 'locks'" :locks="info.folder_locks" @changed="showNotice" />
-      <WebDavView v-else-if="info && activeSection === 'webdav'" :mounts="info.shares" @changed="showNotice" />
+      <LocksView
+        v-else-if="info && activeSection === 'locks'"
+        :locks="info.folder_locks"
+        :storages="info.storage_instances"
+        :default-storage-id="info.default_storage_id"
+        @changed="showNotice"
+      />
+      <WebDavView
+        v-else-if="info && activeSection === 'webdav'"
+        :mounts="info.shares"
+        :storages="info.storage_instances"
+        :default-storage-id="info.default_storage_id"
+        @changed="showNotice"
+      />
       <AccountView v-else-if="info" :info="info" @saved="showNotice" @expired="sessionExpired" />
       <div v-else class="admin-loading glass">{{ loginError || locale.text('管理后台暂时无法加载', 'The admin console is temporarily unavailable') }}</div>
     </div>

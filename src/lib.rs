@@ -15,6 +15,7 @@ pub mod security;
 pub mod state;
 pub mod storage;
 pub mod storage_backend;
+pub mod storage_catalog;
 mod storage_transaction;
 pub mod transfer_limit;
 pub mod webdav;

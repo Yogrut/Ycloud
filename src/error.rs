@@ -158,7 +158,22 @@ impl From<StatusCode> for AppError {
             StatusCode::INSUFFICIENT_STORAGE => Self::InsufficientStorage,
             StatusCode::REQUEST_TIMEOUT => Self::RequestTimeout,
             StatusCode::TOO_MANY_REQUESTS => Self::TooManyRequests,
+            StatusCode::SERVICE_UNAVAILABLE => {
+                Self::ServiceUnavailable("Service temporarily unavailable".into())
+            }
             _ => Self::internal("request failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppError;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn status_conversion_preserves_service_unavailable() {
+        let error = AppError::from(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

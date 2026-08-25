@@ -27,6 +27,8 @@ use crate::{
     webdav,
 };
 
+const MAX_BATCH_BODY_BYTES: usize = 256 * 1024;
+
 pub fn build_router(state: AppState) -> Router {
     let max_body_bytes = usize::try_from(state.config.max_upload_bytes)
         .unwrap_or(usize::MAX)
@@ -63,14 +65,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/preview", get(api::preview_file))
         .merge(unlock_route);
 
+    // Batch payloads contain only paths and a destination. Keep their JSON
+    // envelope independent from the much larger raw upload body allowance so
+    // deserialization cannot reserve upload-sized memory.
+    let batch_api = Router::new()
+        .route("/batch/delete", post(batch_operations::delete))
+        .route("/batch/move", put(batch_operations::move_items))
+        .route("/batch/copy", post(batch_operations::copy))
+        .layer(DefaultBodyLimit::max(MAX_BATCH_BODY_BYTES));
+
     let write_api = Router::new()
         .route("/files", axum::routing::delete(api::delete_file))
         .route("/mkdir", post(api::create_directory))
         .route("/upload", put(api::upload_file))
         .route("/rename", put(api::rename_file))
-        .route("/batch/delete", post(batch_operations::delete))
-        .route("/batch/move", put(batch_operations::move_items))
-        .route("/batch/copy", post(batch_operations::copy))
+        .merge(batch_api)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             write_auth_middleware,
@@ -102,18 +111,28 @@ pub fn build_router(state: AppState) -> Router {
             put(admin_api::update_share).delete(admin_api::delete_share),
         )
         .route("/account", put(admin_api::update_admin_account))
+        .route("/users", post(admin_api::create_user_account))
+        .route(
+            "/users/{id}",
+            put(admin_api::update_user_account).delete(admin_api::delete_user_account),
+        )
         .route("/storage/test", post(admin_api::test_s3_storage))
         .route(
             "/storage/pending",
             put(admin_api::stage_s3_storage).delete(admin_api::discard_pending_storage),
         )
         .route(
-            "/storage/pending/local",
-            put(admin_api::stage_local_storage),
+            "/storage/local",
+            post(admin_api::add_local_storage).put(admin_api::update_local_storage),
         )
         .route(
             "/storage/activate",
             post(admin_api::activate_pending_storage),
+        )
+        .route("/storage/default", put(admin_api::set_default_storage))
+        .route(
+            "/storage/{id}",
+            axum::routing::delete(admin_api::delete_storage),
         )
         .route("/limits", put(admin_api::update_transfer_limits))
         .route(
@@ -199,7 +218,14 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    if state.backend.ready().await {
+    let ready = match state
+        .storage_backend(crate::config::DEFAULT_STORAGE_ID)
+        .await
+    {
+        Ok(backend) => backend.ready().await,
+        Err(_) => false,
+    };
+    if ready {
         (
             StatusCode::OK,
             axum::Json(JsonStatus {
@@ -301,11 +327,11 @@ async fn not_found(_request: Request) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::build_router;
+    use super::{build_router, MAX_BATCH_BODY_BYTES};
     use crate::{
         config::{
             hash_password, Config, ConfigFile, S3AddressingStyle, S3Provider, S3StorageConfig,
-            Share, StorageBackendConfig, CONFIG_SCHEMA_VERSION,
+            Share, StorageBackendConfig, StoragePermission, UserAccount, CONFIG_SCHEMA_VERSION,
         },
         state::AppState,
     };
@@ -326,6 +352,11 @@ mod tests {
                 bind_address: std::net::IpAddr::from([127, 0, 0, 1]),
                 port: 18_473,
                 storage_path: root.clone(),
+                local_mounts: crate::storage_catalog::LocalMountCatalog::new(
+                    root.clone(),
+                    Vec::new(),
+                )
+                .unwrap(),
                 config_path: root.join("config.json"),
                 max_upload_bytes: 2 * 1024 * 1024,
                 io_concurrency: 2,
@@ -348,6 +379,7 @@ mod tests {
                 folder_locks: Vec::new(),
                 shares: vec![Share {
                     id: "test-share".into(),
+                    storage_id: crate::config::DEFAULT_STORAGE_ID.into(),
                     name: "open".into(),
                     path: String::new(),
                     username: Some("yogrut".into()),
@@ -355,26 +387,48 @@ mod tests {
                     password_hash: Some(hash_password("webdav-password")),
                     readonly: false,
                 }],
+                user_accounts: vec![UserAccount {
+                    id: "reader".into(),
+                    username: "reader".into(),
+                    password_hash: hash_password("reader-password"),
+                    enabled: true,
+                    permissions: vec![StoragePermission {
+                        storage_id: crate::config::DEFAULT_STORAGE_ID.into(),
+                        browse: true,
+                        download: true,
+                        upload: false,
+                        create_directory: false,
+                        rename: false,
+                        move_items: false,
+                        copy: false,
+                        delete: false,
+                    }],
+                }],
                 max_upload_bytes: 1024 * 1024,
                 max_archive_bytes: 2 * 1024 * 1024,
                 max_archive_entries: 100,
-                pending_storage_backend: Some(StorageBackendConfig::S3(S3StorageConfig {
-                    provider: S3Provider::AlibabaOss,
-                    endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
-                    bucket: "ycloud-test".into(),
-                    region: "cn-hangzhou".into(),
-                    prefix: "files/".into(),
-                    addressing_style: S3AddressingStyle::VirtualHosted,
-                    access_key_id: "pending-access-key".into(),
-                    secret_access_key: "pending-secret-key".into(),
-                    capacity_limit_bytes: None,
-                })),
+                pending_storage_instance: Some(crate::config::StorageInstanceConfig {
+                    id: "pending-test".into(),
+                    name: "Pending test".into(),
+                    backend: StorageBackendConfig::S3(S3StorageConfig {
+                        provider: S3Provider::AlibabaOss,
+                        endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
+                        bucket: "ycloud-test".into(),
+                        region: "cn-hangzhou".into(),
+                        prefix: "files/".into(),
+                        addressing_style: S3AddressingStyle::VirtualHosted,
+                        access_key_id: "pending-access-key".into(),
+                        secret_access_key: "pending-secret-key".into(),
+                        capacity_limit_bytes: None,
+                    }),
+                }),
                 ..ConfigFile::default()
             })),
         )
         .await
         .unwrap();
         let admin_token = state.sessions.create().await;
+        let reader_token = state.sessions.create_user("reader".into()).await;
         let gate_token = state.gate_access.create("__gate__".into()).await;
         let app = build_router(state);
 
@@ -411,21 +465,84 @@ mod tests {
         assert_eq!(admin_info.status(), StatusCode::OK);
         let admin_info_body = to_bytes(admin_info.into_body(), 16 * 1024).await.unwrap();
         let admin_info_json: serde_json::Value = serde_json::from_slice(&admin_info_body).unwrap();
-        assert_eq!(admin_info_json["storage_backend"]["type"], "local");
-        assert!(admin_info_json["storage_backend"]["path"].is_string());
-        assert_eq!(admin_info_json["pending_storage_backend"]["type"], "s3");
         assert_eq!(
-            admin_info_json["pending_storage_backend"]["has_access_key_id"],
+            admin_info_json["storage_instances"][0]["backend"]["type"],
+            "local"
+        );
+        assert!(admin_info_json["storage_instances"][0]["backend"]["path"].is_string());
+        assert_eq!(
+            admin_info_json["pending_storage_instance"]["backend"]["type"],
+            "s3"
+        );
+        assert_eq!(
+            admin_info_json["pending_storage_instance"]["backend"]["has_access_key_id"],
             true
         );
         assert_eq!(
-            admin_info_json["pending_storage_backend"]["has_secret_access_key"],
+            admin_info_json["pending_storage_instance"]["backend"]["has_secret_access_key"],
             true
         );
         assert!(admin_info_json["local_storage_path"].is_string());
+        assert_eq!(admin_info_json["local_mounts"][0]["mount_id"], "primary");
+        assert_eq!(admin_info_json["local_mounts"][0]["storage_id"], "primary");
+        assert!(admin_info_json["local_mounts"][0]["path"].is_string());
+        assert_eq!(admin_info_json["user_accounts"][0]["username"], "reader");
+        assert!(admin_info_json["user_accounts"][0]
+            .get("password_hash")
+            .is_none());
         let admin_info_text = String::from_utf8_lossy(&admin_info_body);
         assert!(!admin_info_text.contains("pending-access-key"));
         assert!(!admin_info_text.contains("pending-secret-key"));
+
+        let reader_admin_info = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/info")
+                    .header(header::COOKIE, format!("session={reader_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reader_admin_info.status(), StatusCode::UNAUTHORIZED);
+
+        let reader_files = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/files")
+                    .header(header::COOKIE, format!("session={reader_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reader_files.status(), StatusCode::OK);
+        let reader_files_body = to_bytes(reader_files.into_body(), 4096).await.unwrap();
+        let reader_files_json: serde_json::Value =
+            serde_json::from_slice(&reader_files_body).unwrap();
+        assert_eq!(reader_files_json["is_admin"], false);
+        assert_eq!(reader_files_json["capabilities"]["download"], true);
+        assert_eq!(reader_files_json["capabilities"]["upload"], false);
+        assert_eq!(reader_files_json["capabilities"]["delete"], false);
+
+        let reader_write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/mkdir")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("session={reader_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"reader-forbidden"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reader_write.status(), StatusCode::FORBIDDEN);
 
         let unapproved_s3_test = app
             .clone()
@@ -894,6 +1011,26 @@ mod tests {
         tokio::fs::write(root.join("duplicate-delete.txt"), b"data")
             .await
             .unwrap();
+        let oversized_batch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/batch/delete")
+                    .header(header::HOST, "ycloud.test")
+                    .header(header::ORIGIN, "http://ycloud.test")
+                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"paths":["{}"]}}"#,
+                        "x".repeat(MAX_BATCH_BODY_BYTES)
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(oversized_batch.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
         let partial_batch = app
             .oneshot(
                 Request::builder()

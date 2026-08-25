@@ -9,11 +9,10 @@ const adminInfo = {
   admin_login_failures: 3, web_login_failures: 5,
   admin_login_block_seconds: 3600, web_login_block_seconds: 3600,
   security_log_retention_days: 7, security_log_max_entries: 5000,
-  storage_backend: { type: 'local', path: './storage', capacity_limit_bytes: null },
-  pending_storage_backend: null,
+  storage_instances: [{ id: 'primary', name: '本地存储', is_default: true, ready: true, backend: { type: 'local', path: './storage', capacity_limit_bytes: null }, usage_bytes: 0, reserved_bytes: 0 }],
+  pending_storage_instance: null,
+  default_storage_id: 'primary',
   local_storage_path: './storage',
-  storage_usage_bytes: 0,
-  storage_reserved_bytes: 0,
 }
 
 afterEach(() => {
@@ -58,7 +57,7 @@ describe('AdminView', () => {
 
     const links = [...host.querySelectorAll<HTMLAnchorElement>('.admin-nav-item')]
     expect(links.map(link => link.getAttribute('href'))).toEqual([
-      '/v2/admin/storage', '/v2/admin/webdav', '/v2/admin/locks', '/v2/admin/limits', '/v2/admin/account', '/v2/admin/security',
+      '/v2/admin/storage', '/v2/admin/webdav', '/v2/admin/locks', '/v2/admin/limits', '/v2/admin/account', '/v2/admin/users', '/v2/admin/security',
     ])
     app.unmount()
   })
@@ -75,8 +74,8 @@ describe('AdminView', () => {
     await nextTick()
 
     expect(host.querySelector('#storage-title')?.textContent).toBe('存储设置')
-    expect(host.textContent).toContain('先验证并保存为待启用配置')
-    expect(host.querySelector<HTMLInputElement>('.storage-local-form input')?.value).toBe('./storage')
+    expect(host.textContent).toContain('每个存储拥有独立命名空间')
+    expect(host.querySelector<HTMLInputElement>('.storage-form input')?.value).toBe('./storage')
     expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('存储设置')
     app.unmount()
   })

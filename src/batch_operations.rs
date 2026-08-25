@@ -10,8 +10,8 @@ use crate::{
     error::{AppError, AppResult},
     file_access::{
         batch_destination_path, ensure_copy_target_outside_source, ensure_non_root,
-        ensure_writable, resolve_share, share_storage_path, validate_batch_size, FileQuery,
-        FolderLockAuthorizer,
+        ensure_storage_action, ensure_writable, resolve_share, share_storage_path,
+        validate_batch_size, FileQuery, FolderLockAuthorizer, StorageAction,
     },
     state::AppState,
 };
@@ -80,9 +80,16 @@ async fn execute(
     operation: Operation,
 ) -> AppResult<Response> {
     let share = resolve_share(state, headers, query).await?;
+    let action = match operation {
+        Operation::Delete => StorageAction::Delete,
+        Operation::Move => StorageAction::Move,
+        Operation::Copy => StorageAction::Copy,
+    };
+    ensure_storage_action(state, headers, &share.storage_id, action).await?;
+    let backend = state.storage_backend(&share.storage_id).await?;
     ensure_writable(&share)?;
     validate_batch_size(&body.paths)?;
-    let lock_authorizer = FolderLockAuthorizer::new(state, headers).await;
+    let lock_authorizer = FolderLockAuthorizer::new(state, headers, &share.storage_id).await;
     let mut results = Vec::with_capacity(body.paths.len());
     for path in body.paths {
         let outcome = async {
@@ -90,7 +97,7 @@ async fn execute(
             lock_authorizer.ensure_access(&share_storage_path(&share, &path))?;
             let source = share_storage_path(&share, &path);
             match operation {
-                Operation::Delete => state.backend.remove(&source).await,
+                Operation::Delete => backend.remove(&source).await,
                 Operation::Move | Operation::Copy => {
                     let destination_path = batch_destination_path(&body.target, &path)?;
                     ensure_copy_target_outside_source(&path, &destination_path)?;
@@ -98,9 +105,9 @@ async fn execute(
                         .ensure_access(&share_storage_path(&share, &destination_path))?;
                     let destination = share_storage_path(&share, &destination_path);
                     if matches!(operation, Operation::Move) {
-                        state.backend.move_path(&source, &destination).await
+                        backend.move_path(&source, &destination).await
                     } else {
-                        state.backend.copy_path(&source, &destination).await
+                        backend.copy_path(&source, &destination).await
                     }
                 }
             }

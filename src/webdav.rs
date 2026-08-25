@@ -14,7 +14,7 @@ use crate::{
     security::ClientIp,
     state::AppState,
     storage::FileResponseMode,
-    storage_backend::BackendMetadata,
+    storage_backend::{BackendMetadata, StorageBackend},
     webdav_path::{
         display_relative_path, is_write_method, parse_destination, parse_share_path, percent_encode,
     },
@@ -54,6 +54,10 @@ pub async fn webdav_handler(
             Err(StatusCode::UNAUTHORIZED) => return Ok(basic_auth_challenge()),
             Err(status) => return Err(status),
         };
+    let backend = state
+        .storage_backend(&share.storage_id)
+        .await
+        .map_err(|error| error.status())?;
 
     let destination = headers
         .get("destination")
@@ -64,16 +68,18 @@ pub async fn webdav_handler(
     }
 
     match method.as_str() {
-        "PROPFIND" => handle_propfind(&state, &share, &sub_path, &headers).await,
-        "GET" => handle_get(&state, &share, &sub_path, &headers).await,
-        "HEAD" => handle_head(&state, &share, &sub_path, &headers).await,
-        "PUT" => handle_put(&state, &share, &sub_path, &headers, body).await,
-        "DELETE" => handle_delete(&state, &share, &sub_path).await,
-        "MKCOL" => handle_mkcol(&state, &share, &sub_path).await,
+        "PROPFIND" => handle_propfind(&state, &backend, &share, &sub_path, &headers).await,
+        "GET" => handle_get(&state, &backend, &share, &sub_path, &headers).await,
+        "HEAD" => handle_head(&state, &backend, &share, &sub_path, &headers).await,
+        "PUT" => handle_put(&state, &backend, &share, &sub_path, &headers, body).await,
+        "DELETE" => handle_delete(&backend, &share, &sub_path).await,
+        "MKCOL" => handle_mkcol(&backend, &share, &sub_path).await,
         "MOVE" => {
-            handle_move_or_copy(&state, &share, &sub_path, destination, &headers, false).await
+            handle_move_or_copy(&backend, &share, &sub_path, destination, &headers, false).await
         }
-        "COPY" => handle_move_or_copy(&state, &share, &sub_path, destination, &headers, true).await,
+        "COPY" => {
+            handle_move_or_copy(&backend, &share, &sub_path, destination, &headers, true).await
+        }
         // [稳定 + 安全] DAV class-2 locks were removed because the previous
         // implementation returned tokens without storing or enforcing them.
         "LOCK" | "UNLOCK" | "PROPPATCH" => Err(StatusCode::NOT_IMPLEMENTED),
@@ -182,13 +188,13 @@ async fn verify_share_basic_auth(
 
 async fn handle_propfind(
     state: &AppState,
+    backend: &StorageBackend,
     share: &Share,
     sub_path: &str,
     headers: &HeaderMap,
 ) -> Result<Response, StatusCode> {
     let target = share_storage_path(share, sub_path);
-    let metadata = state
-        .backend
+    let metadata = backend
         .metadata(&target)
         .await
         .map_err(|error| error.status())?;
@@ -201,8 +207,7 @@ async fn handle_propfind(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("1");
     if metadata.is_dir && depth != "0" {
-        let (entries, truncated) = state
-            .backend
+        let (entries, truncated) = backend
             .list_directory(&target, state.config.max_list_entries)
             .await
             .map_err(|error| error.status())?;
@@ -235,12 +240,12 @@ async fn handle_propfind(
 
 async fn handle_get(
     state: &AppState,
+    backend: &StorageBackend,
     share: &Share,
     sub_path: &str,
     headers: &HeaderMap,
 ) -> Result<Response, StatusCode> {
-    let response = state
-        .backend
+    let response = backend
         .stream_file(
             &share_storage_path(share, sub_path),
             headers,
@@ -253,17 +258,19 @@ async fn handle_get(
 
 async fn handle_head(
     state: &AppState,
+    backend: &StorageBackend,
     share: &Share,
     sub_path: &str,
     headers: &HeaderMap,
 ) -> Result<Response, StatusCode> {
-    let mut response = handle_get(state, share, sub_path, headers).await?;
+    let mut response = handle_get(state, backend, share, sub_path, headers).await?;
     *response.body_mut() = Body::empty();
     Ok(response)
 }
 
 async fn handle_put(
     state: &AppState,
+    backend: &StorageBackend,
     share: &Share,
     sub_path: &str,
     headers: &HeaderMap,
@@ -281,8 +288,7 @@ async fn handle_put(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
     let max_upload_bytes = state.config_file.read().await.max_upload_bytes;
-    state
-        .backend
+    backend
         .upload_file(
             &storage_path,
             state.upload_limiter.wrap_body(body),
@@ -296,12 +302,11 @@ async fn handle_put(
 }
 
 async fn handle_delete(
-    state: &AppState,
+    backend: &StorageBackend,
     share: &Share,
     sub_path: &str,
 ) -> Result<Response, StatusCode> {
-    state
-        .backend
+    backend
         .remove(&share_storage_path(share, sub_path))
         .await
         .map_err(|error| error.status())?;
@@ -309,15 +314,14 @@ async fn handle_delete(
 }
 
 async fn handle_mkcol(
-    state: &AppState,
+    backend: &StorageBackend,
     share: &Share,
     sub_path: &str,
 ) -> Result<Response, StatusCode> {
     if sub_path.trim_matches('/').is_empty() {
         return Err(StatusCode::METHOD_NOT_ALLOWED);
     }
-    state
-        .backend
+    backend
         .create_directory(&share_storage_path(share, sub_path))
         .await
         .map_err(|error| error.status())?;
@@ -325,7 +329,7 @@ async fn handle_mkcol(
 }
 
 async fn handle_move_or_copy(
-    state: &AppState,
+    backend: &StorageBackend,
     share: &Share,
     sub_path: &str,
     destination: Option<String>,
@@ -345,14 +349,12 @@ async fn handle_move_or_copy(
     let target = share_storage_path(share, &destination_path);
 
     if copy {
-        state
-            .backend
+        backend
             .copy_path(&source, &target)
             .await
             .map_err(|error| error.status())?;
     } else {
-        state
-            .backend
+        backend
             .move_path(&source, &target)
             .await
             .map_err(|error| error.status())?;

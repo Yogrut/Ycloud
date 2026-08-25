@@ -15,14 +15,35 @@ import { useLocale } from '../i18n'
 const locale = useLocale()
 
 export interface FileListResponse {
+  storage_id: string
+  storages: BrowserStorage[]
   current_path: string
   parent_path: string | null
   entries: FileEntry[]
   truncated: boolean
   can_write: boolean
+  is_admin?: boolean
+  capabilities?: BrowserCapabilities
   max_upload_bytes: number
   max_archive_bytes: number
   max_archive_entries: number
+}
+
+export interface BrowserCapabilities {
+  download: boolean
+  upload: boolean
+  create_directory: boolean
+  rename: boolean
+  move_items: boolean
+  copy: boolean
+  delete: boolean
+}
+
+export interface BrowserStorage {
+  id: string
+  name: string
+  is_default: boolean
+  ready: boolean
 }
 
 export interface ArchivePrepareResponse {
@@ -81,51 +102,58 @@ function cleanPath(path: string): string {
   return path.replace(/^\/+|\/+$/g, '')
 }
 
-export function fileApi(path: string): string {
+function withStorage(url: string, storageId?: string): string {
+  if (!storageId) return url
+  return `${url}${url.includes('?') ? '&' : '?'}storage_id=${encodeURIComponent(storageId)}`
+}
+
+export function fileApi(path: string, storageId?: string): string {
   const clean = cleanPath(path)
-  return clean ? `/api/files?path=${encodeURIComponent(`/${clean}`)}` : '/api/files'
+  const url = clean ? `/api/files?path=${encodeURIComponent(`/${clean}`)}` : '/api/files'
+  return withStorage(url, storageId)
 }
 
-export function listFiles(path: string): Promise<FileListResponse> {
-  return apiRequest<FileListResponse>(fileApi(path))
+export function listFiles(path: string, storageId?: string): Promise<FileListResponse> {
+  return apiRequest<FileListResponse>(fileApi(path, storageId))
 }
 
-function actionApi(action: string, path: string): string {
+function actionApi(action: string, path: string, storageId?: string): string {
   const clean = cleanPath(path)
-  return clean ? `/api/${action}?path=${encodeURIComponent(`/${clean}`)}` : `/api/${action}`
+  const url = clean ? `/api/${action}?path=${encodeURIComponent(`/${clean}`)}` : `/api/${action}`
+  return withStorage(url, storageId)
 }
 
-export function createFolder(path: string, name: string): Promise<{ success?: boolean; message?: string }> {
-  return apiRequest(actionApi('mkdir', path), {
+export function createFolder(path: string, name: string, storageId?: string): Promise<{ success?: boolean; message?: string }> {
+  return apiRequest(actionApi('mkdir', path, storageId), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
   })
 }
 
-export function downloadUrl(path: string): string {
+export function downloadUrl(path: string, storageId?: string): string {
   const clean = cleanPath(path)
-  return `/api/download?path=${encodeURIComponent(`/${clean}`)}`
+  return withStorage(`/api/download?path=${encodeURIComponent(`/${clean}`)}`, storageId)
 }
 
-export function renameItem(currentPath: string, path: string, newName: string): Promise<{ success?: boolean }> {
-  return apiRequest(actionApi('rename', currentPath), {
+export function renameItem(currentPath: string, path: string, newName: string, storageId?: string): Promise<{ success?: boolean }> {
+  return apiRequest(actionApi('rename', currentPath, storageId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: `/${cleanPath(path)}`, new_name: newName }),
   })
 }
 
-export function prepareArchive(paths: string[]): Promise<ArchivePrepareResponse> {
-  return apiRequest('/api/archive/prepare', {
+export function prepareArchive(paths: string[], storageId?: string): Promise<ArchivePrepareResponse> {
+  return apiRequest(withStorage('/api/archive/prepare', storageId), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ paths: paths.map(path => `/${cleanPath(path)}`) }),
   })
 }
 
-export async function batchOperation(operation: BatchOperation, paths: string[], target = ''): Promise<BatchResponse> {
-  const response = await fetch(`/api/batch/${operation}`, {
+export async function batchOperation(operation: BatchOperation, paths: string[], target = '', storageId?: string): Promise<BatchResponse> {
+  const response = await fetch(withStorage(`/api/batch/${operation}`, storageId), {
     method: operation === 'move' ? 'PUT' : 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
@@ -142,10 +170,10 @@ export async function batchOperation(operation: BatchOperation, paths: string[],
   throw new Error(locale.text('服务返回了无效的批量操作结果', 'The server returned an invalid batch result'))
 }
 
-export function uploadFile(path: string, file: File, onProgress: (loaded: number) => void): Promise<void> {
+export function uploadFile(path: string, file: File, onProgress: (loaded: number) => void, storageId?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest()
-    request.open('PUT', actionApi('upload', path))
+    request.open('PUT', actionApi('upload', path, storageId))
     request.withCredentials = true
     request.setRequestHeader('Content-Type', 'application/octet-stream')
     request.upload.addEventListener('progress', event => {
@@ -177,15 +205,15 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
   })
 }
 
-export function unlockFolder(path: string, password: string): Promise<{ success: boolean; message?: string }> {
-  return apiRequest('/api/folder/unlock', {
+export function unlockFolder(path: string, password: string, storageId?: string): Promise<{ success: boolean; message?: string }> {
+  return apiRequest(withStorage('/api/folder/unlock', storageId), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path, password }),
   })
 }
 
-export function adminLogin(username: string, password: string): Promise<{ success: boolean; message?: string }> {
+export function adminLogin(username: string, password: string): Promise<{ success: boolean; message?: string; is_admin: boolean }> {
   return apiRequest('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

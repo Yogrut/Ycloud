@@ -106,6 +106,13 @@ const ACCESS_TOKEN_TTL: chrono::Duration = chrono::Duration::days(7);
 #[derive(Clone, Debug)]
 pub struct Session {
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub principal: SessionPrincipal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionPrincipal {
+    Administrator,
+    User(String),
 }
 
 #[derive(Default)]
@@ -118,14 +125,35 @@ impl SessionStore {
         Self::default()
     }
     pub async fn create(&self) -> String {
+        self.create_for(SessionPrincipal::Administrator).await
+    }
+    pub async fn create_user(&self, user_id: String) -> String {
+        self.create_for(SessionPrincipal::User(user_id)).await
+    }
+    async fn create_for(&self, principal: SessionPrincipal) -> String {
         let token = Uuid::new_v4().to_string();
         self.sessions.write().await.insert(
             token.clone(),
             Session {
                 created_at: chrono::Utc::now(),
+                principal,
             },
         );
         token
+    }
+    pub async fn principal(&self, token: &str) -> Option<SessionPrincipal> {
+        let sessions = self.sessions.read().await;
+        match sessions.get(token) {
+            Some(session) if chrono::Utc::now() - session.created_at <= SESSION_TTL => {
+                Some(session.principal.clone())
+            }
+            Some(_) => {
+                drop(sessions);
+                self.sessions.write().await.remove(token);
+                None
+            }
+            None => None,
+        }
     }
     pub async fn validate(&self, token: &str) -> bool {
         let sessions = self.sessions.read().await;
@@ -147,6 +175,11 @@ impl SessionStore {
     }
     pub async fn clear(&self) {
         self.sessions.write().await.clear();
+    }
+    pub async fn revoke_user(&self, user_id: &str) {
+        self.sessions.write().await.retain(
+            |_, session| !matches!(&session.principal, SessionPrincipal::User(id) if id == user_id),
+        );
     }
     /// Remove all expired sessions; call periodically from a background task.
     pub async fn cleanup(&self) {
@@ -290,12 +323,14 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub success: bool,
     pub message: String,
+    pub is_admin: bool,
 }
 
 #[derive(Serialize)]
 pub struct MeResponse {
     pub logged_in: bool,
     pub is_admin: bool,
+    pub username: Option<String>,
     pub web_password_required: bool,
 }
 
@@ -308,43 +343,90 @@ pub async fn login_handler(
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
-    let admin_policy = {
+    let (admin_policy, admin_username, admin_hash, ordinary_candidate) = {
         let config = state.config_file.read().await;
-        crate::login_security::LoginPolicy {
-            maximum_failures: config.admin_login_failures,
-            block_seconds: config.admin_login_block_seconds as i64,
-        }
-    };
-    match state.login_security.is_blocked(LoginEntry::Admin, ip).await {
-        Ok(true) => return limited_login_response(admin_policy.block_seconds),
-        Ok(false) => {}
-        Err(error) => return login_security_error(error),
-    }
-    let (expected_username, password_hash) = {
-        let config = state.config_file.read().await;
+        let supplied = body.username.as_deref().unwrap_or("");
         (
+            crate::login_security::LoginPolicy {
+                maximum_failures: config.admin_login_failures,
+                block_seconds: config.admin_login_block_seconds as i64,
+            },
             config.admin_username.clone(),
             config.admin_password_hash.clone(),
+            config
+                .user_accounts
+                .iter()
+                .find(|account| account.username == supplied)
+                .map(|account| {
+                    (
+                        account.id.clone(),
+                        account.password_hash.clone(),
+                        account.enabled,
+                    )
+                }),
         )
     };
     let supplied_username = body.username.as_deref().unwrap_or("");
-    let authenticated = supplied_username == expected_username
-        && valid_password_length(&body.password)
+    let administrator = supplied_username == admin_username;
+    let entry = if administrator {
+        LoginEntry::Admin
+    } else {
+        LoginEntry::Account
+    };
+    let policy = if administrator {
+        admin_policy
+    } else {
+        LoginEntry::Account.fixed_policy()
+    };
+    match state.login_security.is_blocked(entry, ip).await {
+        Ok(true) => return limited_login_response(policy.block_seconds),
+        Ok(false) => {}
+        Err(error) => return login_security_error(error),
+    }
+    // Always run Argon2, including for an unknown username, so account
+    // existence is not exposed by a cheap timing distinction.
+    let password_hash = if administrator {
+        admin_hash.clone()
+    } else {
+        ordinary_candidate
+            .as_ref()
+            .map(|(_, hash, _)| hash.clone())
+            .unwrap_or(admin_hash)
+    };
+    let password_valid = valid_password_length(&body.password)
         && state.passwords.verify(password_hash, body.password).await;
+    let authenticated = password_valid
+        && (administrator
+            || ordinary_candidate
+                .as_ref()
+                .is_some_and(|(_, _, enabled)| *enabled));
 
     if authenticated {
         if let Err(error) = state
             .login_security
-            .record_success(LoginEntry::Admin, ip, user_agent)
+            .record_success(entry, ip, user_agent)
             .await
         {
             return login_security_error(error);
         }
-        let token = state.sessions.create().await;
+        let token = if administrator {
+            state.sessions.create().await
+        } else {
+            state
+                .sessions
+                .create_user(
+                    ordinary_candidate
+                        .as_ref()
+                        .map(|(id, _, _)| id.clone())
+                        .unwrap_or_default(),
+                )
+                .await
+        };
         json_with_cookie(
             LoginResponse {
                 success: true,
                 message: "Authenticated".into(),
+                is_admin: administrator,
             },
             session_cookie(
                 "session",
@@ -356,12 +438,12 @@ pub async fn login_handler(
     } else {
         if let Err(error) = state
             .login_security
-            .record_failure(LoginEntry::Admin, ip, user_agent, admin_policy)
+            .record_failure(entry, ip, user_agent, policy)
             .await
         {
             return login_security_error(error);
         }
-        invalid_login_response(LoginEntry::Admin)
+        invalid_login_response(entry)
     }
 }
 
@@ -396,6 +478,7 @@ pub async fn logout_handler(
     let mut response = Json(LoginResponse {
         success: true,
         message: "Logged out".into(),
+        is_admin: false,
     })
     .into_response();
     for name in ["session", "gate_access"] {
@@ -421,11 +504,28 @@ pub async fn me_handler(
 ) -> impl axum::response::IntoResponse {
     let mut logged_in = false;
     let mut is_admin = false;
+    let mut username = None;
 
     if let Some(token) = extract_session_token(&headers) {
-        if state.sessions.validate(&token).await {
+        if let Some(principal) = state.sessions.principal(&token).await {
             logged_in = true;
-            is_admin = true;
+            match principal {
+                SessionPrincipal::Administrator => {
+                    is_admin = true;
+                    username = Some(state.config_file.read().await.admin_username.clone());
+                }
+                SessionPrincipal::User(id) => {
+                    username = state
+                        .config_file
+                        .read()
+                        .await
+                        .user_accounts
+                        .iter()
+                        .find(|account| account.id == id && account.enabled)
+                        .map(|account| account.username.clone());
+                    logged_in = username.is_some();
+                }
+            }
         }
     }
     if !logged_in {
@@ -439,6 +539,7 @@ pub async fn me_handler(
     Json(MeResponse {
         logged_in,
         is_admin,
+        username,
         web_password_required: state
             .config_file
             .read()
@@ -512,6 +613,7 @@ pub async fn gate_handler(
         LoginResponse {
             success: true,
             message: "Authenticated".into(),
+            is_admin: false,
         },
         session_cookie(
             "gate_access",
@@ -525,12 +627,14 @@ pub async fn gate_handler(
 fn invalid_login_response(entry: LoginEntry) -> Response {
     let message = match entry {
         LoginEntry::Admin => "用户名或密码错误",
+        LoginEntry::Account => "用户名或密码错误",
         LoginEntry::Web => "访问密码错误",
         LoginEntry::WebDav => "WebDAV 用户名或密码错误",
     };
     Json(LoginResponse {
         success: false,
         message: message.into(),
+        is_admin: false,
     })
     .into_response()
 }
@@ -542,6 +646,7 @@ fn limited_login_response(block_seconds: i64) -> Response {
         Json(LoginResponse {
             success: false,
             message: "尝试次数过多，请在限制结束后重试".into(),
+            is_admin: false,
         }),
     )
         .into_response();
@@ -558,6 +663,7 @@ fn login_security_error(error: anyhow::Error) -> Response {
         Json(LoginResponse {
             success: false,
             message: "登录安全状态暂时不可用".into(),
+            is_admin: false,
         }),
     )
         .into_response()
@@ -625,28 +731,42 @@ pub async fn admin_auth_middleware(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// Browser write APIs require administrator authentication. A valid web-gate
-/// session grants read access only and is deliberately insufficient here.
+/// Browser write APIs require an authenticated administrator or ordinary
+/// account. The handler then applies the operation-specific storage grant.
+/// A valid web-gate session remains read-only and is deliberately insufficient.
 pub async fn write_auth_middleware(
     axum::extract::State(state): axum::extract::State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if is_admin_authenticated(&state, request.headers()).await {
+    if current_principal(&state, request.headers()).await.is_some() {
         return Ok(next.run(request).await);
     }
 
     Err(StatusCode::FORBIDDEN)
 }
 
-pub async fn is_admin_authenticated(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
-    if let Some(token) = extract_session_token(headers) {
-        if state.sessions.validate(&token).await {
-            return true;
-        }
+pub async fn current_principal(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<SessionPrincipal> {
+    let token = extract_session_token(headers)?;
+    let principal = state.sessions.principal(&token).await?;
+    match &principal {
+        SessionPrincipal::Administrator => Some(principal),
+        SessionPrincipal::User(id) => state
+            .config_file
+            .read()
+            .await
+            .user_accounts
+            .iter()
+            .any(|account| account.id == *id && account.enabled)
+            .then_some(principal),
     }
+}
 
-    false
+pub async fn is_admin_authenticated(state: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    current_principal(state, headers).await == Some(SessionPrincipal::Administrator)
 }
 
 // ── General auth middleware ───────────────────────────────────────
@@ -659,10 +779,8 @@ pub async fn auth_middleware(
 ) -> Result<Response, StatusCode> {
     let headers = request.headers();
 
-    if let Some(token) = extract_session_token(headers) {
-        if state.sessions.validate(&token).await {
-            return Ok(next.run(request).await);
-        }
+    if current_principal(&state, headers).await.is_some() {
+        return Ok(next.run(request).await);
     }
     if let Some(token) = extract_gate_token(headers) {
         if state.gate_access.get_scope(&token).await.is_some() {
@@ -726,6 +844,30 @@ mod tests {
         accesses.clear().await;
         assert!(!sessions.validate(&session).await);
         assert!(accesses.get_scope(&gate).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn ordinary_account_sessions_keep_their_identity_and_can_be_revoked_selectively() {
+        let sessions = SessionStore::new();
+        let administrator = sessions.create().await;
+        let first = sessions.create_user("first-user".into()).await;
+        let second = sessions.create_user("second-user".into()).await;
+
+        assert_eq!(
+            sessions.principal(&first).await,
+            Some(super::SessionPrincipal::User("first-user".into()))
+        );
+        sessions.revoke_user("first-user").await;
+
+        assert!(sessions.principal(&first).await.is_none());
+        assert_eq!(
+            sessions.principal(&administrator).await,
+            Some(super::SessionPrincipal::Administrator)
+        );
+        assert_eq!(
+            sessions.principal(&second).await,
+            Some(super::SessionPrincipal::User("second-user".into()))
+        );
     }
 
     #[tokio::test]

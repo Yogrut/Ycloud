@@ -1809,6 +1809,11 @@ mod tests {
             bind_address: IpAddr::from([127, 0, 0, 1]),
             port: 0,
             storage_path: PathBuf::from("unused-smoke-local-storage"),
+            local_mounts: crate::storage_catalog::LocalMountCatalog::new(
+                PathBuf::from("unused-smoke-local-storage"),
+                Vec::new(),
+            )
+            .unwrap(),
             config_path: PathBuf::from("unused-smoke-config.json"),
             max_upload_bytes: 1024 * 1024,
             io_concurrency: 2,

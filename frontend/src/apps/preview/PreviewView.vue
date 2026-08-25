@@ -9,11 +9,13 @@ defineProps<{ theme: ThemeController }>()
 const locale = useLocale()
 
 const requestPath = new URLSearchParams(window.location.search).get('path') ?? ''
+const storageId = new URLSearchParams(window.location.search).get('storage_id') ?? ''
 const cleanPath = requestPath.replace(/^\/+/, '')
 const name = cleanPath.split('/').filter(Boolean).pop() ?? ''
 const extension = name.includes('.') ? name.split('.').pop()?.toLowerCase() ?? '' : ''
-const previewUrl = `/api/preview?path=${encodeURIComponent(`/${cleanPath}`)}`
-const downloadUrl = `/api/download?path=${encodeURIComponent(`/${cleanPath}`)}`
+const storageQuery = storageId ? `&storage_id=${encodeURIComponent(storageId)}` : ''
+const previewUrl = `/api/preview?path=${encodeURIComponent(`/${cleanPath}`)}${storageQuery}`
+const downloadUrl = `/api/download?path=${encodeURIComponent(`/${cleanPath}`)}${storageQuery}`
 const text = ref('')
 const textError = ref('')
 const textTruncated = ref(false)

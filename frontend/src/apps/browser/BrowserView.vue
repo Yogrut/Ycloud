@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import type { BatchOperation, BatchResponse, FileEntry } from '../../shared/api/browser'
+import type { BatchOperation, BatchResponse, BrowserCapabilities, BrowserStorage, FileEntry } from '../../shared/api/browser'
 import { adminLogin, batchOperation, createFolder, downloadUrl, listFiles, logout, prepareArchive, renameItem, unlockFolder, uploadFile } from '../../shared/api/browser'
 import { appPath } from '../../shared/routes'
 import { formatSize } from '../../shared/format'
@@ -22,6 +22,8 @@ const DRAG_THRESHOLD = 6
 defineProps<{ theme: ThemeController }>()
 const locale = useLocale()
 const path = ref('')
+const currentStorageId = ref('')
+const storages = ref<BrowserStorage[]>([])
 const entries = ref<FileEntry[]>([])
 const query = ref('')
 const sort = ref<SortKey>('name')
@@ -29,6 +31,8 @@ const ascending = ref(true)
 const selected = ref(new Set<string>())
 const loading = ref(true)
 const canWrite = ref(false)
+const isAdministrator = ref(false)
+const capabilities = ref<BrowserCapabilities>({ download: false, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false })
 const maxUploadBytes = ref(0)
 const maxArchiveBytes = ref(0)
 const maxArchiveEntries = ref(0)
@@ -121,10 +125,22 @@ function announce(message: string): void {
 async function refresh(): Promise<void> {
   loading.value = true
   try {
-    const data = await listFiles(path.value)
+    const data = await listFiles(path.value, currentStorageId.value || undefined)
+    currentStorageId.value = data.storage_id
+    storages.value = data.storages ?? []
     path.value = data.current_path.replace(/^\/+|\/+$/g, '')
     entries.value = data.entries
     canWrite.value = data.can_write
+    isAdministrator.value = Boolean(data.is_admin)
+    capabilities.value = data.capabilities ?? {
+      download: true,
+      upload: data.can_write,
+      create_directory: data.can_write,
+      rename: data.can_write,
+      move_items: data.can_write,
+      copy: data.can_write,
+      delete: data.can_write,
+    }
     maxUploadBytes.value = data.max_upload_bytes
     maxArchiveBytes.value = data.max_archive_bytes
     maxArchiveEntries.value = data.max_archive_entries
@@ -141,6 +157,13 @@ async function refresh(): Promise<void> {
 async function navigate(destination: string): Promise<void> {
   path.value = destination.replace(/^\/+|\/+$/g, '')
   query.value = ''
+  await refresh()
+}
+
+async function switchStorage(): Promise<void> {
+  path.value = ''
+  query.value = ''
+  selected.value = new Set()
   await refresh()
 }
 
@@ -277,7 +300,7 @@ function openRowMenu(event: MouseEvent, entry: FileEntry): void {
 
 function openBackgroundMenu(event: MouseEvent): void {
   if ((event.target as HTMLElement).closest('.file-row')) return
-  if (!canWrite.value) return
+  if (!capabilities.value.upload && !capabilities.value.create_directory) return
   event.preventDefault()
   selected.value = new Set()
   contextEntry.value = null
@@ -305,13 +328,15 @@ function openEntry(entry: FileEntry): void {
     } else void navigate(entry.path)
     return
   }
-  window.open(`${appPath('/preview')}?path=${encodeURIComponent(`/${entry.path}`)}`, '_blank', 'noopener')
+  if (!capabilities.value.download) return
+  const params = new URLSearchParams({ path: `/${entry.path}`, storage_id: currentStorageId.value })
+  window.open(`${appPath('/preview')}?${params.toString()}`, '_blank', 'noopener')
 }
 
 async function submitUnlock(): Promise<void> {
   if (!unlockPassword.value) return
   try {
-    const result = await unlockFolder(unlockPath.value, unlockPassword.value)
+    const result = await unlockFolder(unlockPath.value, unlockPassword.value, currentStorageId.value)
     if (!result.success) throw new Error(result.message ?? locale.text('密码错误', 'Incorrect password'))
     showUnlock.value = false
     await navigate(unlockPath.value)
@@ -321,7 +346,7 @@ async function submitUnlock(): Promise<void> {
 }
 
 async function openAdmin(): Promise<void> {
-  if (canWrite.value) {
+  if (isAdministrator.value) {
     window.location.href = appPath('/admin/account')
     return
   }
@@ -339,20 +364,24 @@ async function submitAdmin(): Promise<void> {
   try {
     const result = await adminLogin(adminUser.value.trim(), adminPassword.value)
     if (!result.success) throw new Error(result.message ?? locale.text('登录失败', 'Sign-in failed'))
-    window.location.href = appPath('/admin/account')
+    showAdmin.value = false
+    adminPassword.value = ''
+    isAdministrator.value = result.is_admin
+    if (result.is_admin) window.location.href = appPath('/admin/account')
+    else await refresh()
   } catch (error) {
     adminError.value = error instanceof Error ? error.message : locale.text('登录失败', 'Sign-in failed')
   }
 }
 
-function requireWrite(): boolean {
-  if (canWrite.value) return true
+function requireCapability(action: keyof BrowserCapabilities): boolean {
+  if (capabilities.value[action]) return true
   void openAdmin()
   return false
 }
 
 function openFolderDialog(): void {
-  if (!requireWrite()) return
+  if (!requireCapability('create_directory')) return
   folderName.value = ''
   folderError.value = ''
   showFolder.value = true
@@ -364,7 +393,7 @@ async function submitFolder(): Promise<void> {
   creatingFolder.value = true
   folderError.value = ''
   try {
-    await createFolder(path.value, name)
+    await createFolder(path.value, name, currentStorageId.value)
     showFolder.value = false
     announce(locale.text('文件夹已创建', 'Folder created'))
     await refresh()
@@ -376,14 +405,14 @@ async function submitFolder(): Promise<void> {
 }
 
 function chooseFiles(): void {
-  if (requireWrite()) fileInput.value?.click()
+  if (requireCapability('upload')) fileInput.value?.click()
 }
 
 async function uploadFiles(event: Event): Promise<void> {
   const input = event.target as HTMLInputElement
   const files = Array.from(input.files ?? [])
   input.value = ''
-  if (!files.length || !canWrite.value || uploading.value) return
+  if (!files.length || !capabilities.value.upload || uploading.value) return
 
   const accepted = files.filter(file => !maxUploadBytes.value || file.size <= maxUploadBytes.value)
   const rejected = files.length - accepted.length
@@ -406,7 +435,7 @@ async function uploadFiles(event: Event): Promise<void> {
         await uploadFile(target, file, loaded => {
           currentLoaded = loaded
           uploadProcessed.value = completedBytes + loaded
-        })
+        }, currentStorageId.value)
         succeeded += 1
       } catch (error) {
         failed += 1
@@ -429,13 +458,14 @@ function entryForPath(entryPath: string): FileEntry | undefined {
 }
 
 function startDownload(entryPath: string): void {
-  window.location.href = downloadUrl(entryPath)
+  if (!capabilities.value.download) return
+  window.location.href = downloadUrl(entryPath, currentStorageId.value)
 }
 
 async function startArchive(paths: string[]): Promise<void> {
-  if (!paths.length) return
+  if (!paths.length || !capabilities.value.download) return
   try {
-    const result = await prepareArchive(paths)
+    const result = await prepareArchive(paths, currentStorageId.value)
     announce(locale.text(
       `正在打包 ${result.file_count} 个文件、${result.entry_count} 个条目（${formatSize(result.total_bytes)}）`,
       `Preparing ${result.file_count} file(s), ${result.entry_count} entries (${formatSize(result.total_bytes)})`,
@@ -450,7 +480,7 @@ async function startArchive(paths: string[]): Promise<void> {
 }
 
 function openRenameDialog(entryPath: string): void {
-  if (!requireWrite()) return
+  if (!requireCapability('rename')) return
   renameTarget.value = entryPath
   renameName.value = entryForPath(entryPath)?.name ?? entryPath.split('/').pop() ?? ''
   renameError.value = ''
@@ -463,7 +493,7 @@ async function submitRename(): Promise<void> {
   renaming.value = true
   renameError.value = ''
   try {
-    await renameItem(path.value, renameTarget.value, name)
+    await renameItem(path.value, renameTarget.value, name, currentStorageId.value)
     showRename.value = false
     announce(locale.text('重命名成功', 'Renamed'))
     await refresh()
@@ -475,14 +505,14 @@ async function submitRename(): Promise<void> {
 }
 
 function requestTransfer(operation: 'move' | 'copy', paths: string[]): void {
-  if (!paths.length || !requireWrite()) return
+  if (!paths.length || !requireCapability(operation === 'move' ? 'move_items' : 'copy')) return
   pickerOperation.value = operation
   pickerPaths.value = [...paths]
   operationError.value = ''
 }
 
 function requestDelete(paths: string[]): void {
-  if (!paths.length || !requireWrite()) return
+  if (!paths.length || !requireCapability('delete')) return
   pendingDelete.value = [...paths]
   operationError.value = ''
   showDelete.value = true
@@ -492,7 +522,7 @@ async function runBatch(operation: BatchOperation, paths: string[], target = '')
   operationBusy.value = true
   operationError.value = ''
   try {
-    const result = await batchOperation(operation, paths, target)
+    const result = await batchOperation(operation, paths, target, currentStorageId.value)
     const label = operation === 'move'
       ? locale.text('移动', 'Move')
       : operation === 'copy' ? locale.text('复制', 'Copy') : locale.text('删除', 'Delete')
@@ -604,9 +634,9 @@ onBeforeUnmount(() => {
       <input v-model="query" type="search" :placeholder="locale.text('搜索当前目录', 'Search this folder')" :aria-label="locale.text('搜索当前目录', 'Search this folder')">
     </label>
     <div class="top-actions">
-      <button class="icon-btn flat" type="button" :title="locale.text('管理员', 'Administrator')" :aria-label="locale.text('管理员', 'Administrator')" @click="openAdmin"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.2 1.2 0 0 1 1.52 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z" /><circle cx="12" cy="11" r="3" /></svg></button>
-      <button class="icon-btn flat" type="button" :title="locale.text('新建文件夹', 'New folder')" :aria-label="locale.text('新建文件夹', 'New folder')" @click="openFolderDialog"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M12 11v6M9 14h6" /></svg></button>
-      <button class="icon-btn flat" type="button" :title="locale.text('上传文件', 'Upload files')" :aria-label="locale.text('上传文件', 'Upload files')" @click="chooseFiles"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5" /><path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4" /></svg></button>
+      <button class="icon-btn flat" type="button" :title="locale.text('账号登录 / 管理员', 'Account sign-in / Administrator')" :aria-label="locale.text('账号登录 / 管理员', 'Account sign-in / Administrator')" @click="openAdmin"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.2 1.2 0 0 1 1.52 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z" /><circle cx="12" cy="11" r="3" /></svg></button>
+      <button v-if="capabilities.create_directory" class="icon-btn flat" type="button" :title="locale.text('新建文件夹', 'New folder')" :aria-label="locale.text('新建文件夹', 'New folder')" @click="openFolderDialog"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M12 11v6M9 14h6" /></svg></button>
+      <button v-if="capabilities.upload" class="icon-btn flat" type="button" :title="locale.text('上传文件', 'Upload files')" :aria-label="locale.text('上传文件', 'Upload files')" @click="chooseFiles"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5" /><path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4" /></svg></button>
       <ThemeToggle :theme="theme.current.value" class="flat" @toggle="theme.toggle" />
       <LocaleToggle class="flat" />
       <button class="icon-btn flat" type="button" :title="locale.text('退出登录', 'Sign out')" :aria-label="locale.text('退出登录', 'Sign out')" @click="signOut"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m16 17 5-5-5-5M21 12H9M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /></svg></button>
@@ -621,6 +651,14 @@ onBeforeUnmount(() => {
         <span class="crumb-separator" aria-hidden="true">›</span>
         <button class="crumb" :aria-current="crumb.path === path ? 'location' : undefined" type="button" @click="navigate(crumb.path)">{{ crumb.label }}</button>
       </template>
+      <label v-if="storages.length > 1" class="storage-switcher">
+        <span class="visually-hidden">{{ locale.text('当前存储', 'Current storage') }}</span>
+        <select v-model="currentStorageId" :aria-label="locale.text('切换存储', 'Switch storage')" @change="switchStorage">
+          <option v-for="storage in storages" :key="storage.id" :value="storage.id" :disabled="!storage.ready">
+            {{ storage.name }}{{ storage.is_default ? locale.text('（默认）', ' (default)') : '' }}{{ storage.ready ? '' : locale.text('（不可用）', ' (unavailable)') }}
+          </option>
+        </select>
+      </label>
     </nav>
 
     <section ref="filePanel" class="file-panel glass" :class="{ 'drag-selecting': dragSelecting }" :aria-busy="loading" @mousedown="startDragSelection" @contextmenu="openBackgroundMenu">
@@ -657,7 +695,7 @@ onBeforeUnmount(() => {
     v-if="contextVisible"
     :entry="contextEntry"
     :paths="selectedPaths"
-    :can-write="canWrite"
+    :capabilities="capabilities"
     :x="contextX"
     :y="contextY"
     @action="handleMenuAction"
@@ -677,7 +715,7 @@ onBeforeUnmount(() => {
 
   <div v-if="showAdmin" class="overlay active" @click.self="showAdmin = false">
     <form class="modal" @submit.prevent="submitAdmin">
-      <h2>{{ locale.text('管理员登录', 'Administrator sign-in') }}</h2>
+      <h2>{{ locale.text('账号登录', 'Account sign-in') }}</h2>
       <label>{{ locale.text('用户名', 'Username') }}<input v-model="adminUser" class="input" autocomplete="username"></label>
       <label>{{ locale.text('密码', 'Password') }}<input v-model="adminPassword" class="input" type="password" autocomplete="current-password"></label>
       <p class="modal-error">{{ adminError }}</p>

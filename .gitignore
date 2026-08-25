@@ -12,6 +12,7 @@
 /security-events.json
 /security-events.json.bak
 /security-events.jsonl
+/security-events.jsonl.bak
 /security-state.json
 /security-state.json.bak
 *.upload

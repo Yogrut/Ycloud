@@ -9,13 +9,27 @@ pub struct PropfindResponseEntry {
 
 // ── XML helpers ───────────────────────────────────────────────────
 
-/// Escape text for safe inclusion in XML.
+/// Escape text for safe inclusion in XML 1.0. Invalid control and noncharacter
+/// code points are replaced instead of emitting a malformed WebDAV response.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut escaped = String::with_capacity(s.len());
+    for character in s.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            character if is_xml_10_character(character) => escaped.push(character),
+            _ => escaped.push('\u{fffd}'),
+        }
+    }
+    escaped
+}
+
+fn is_xml_10_character(character: char) -> bool {
+    matches!(character, '\u{0009}' | '\u{000a}' | '\u{000d}')
+        || matches!(character as u32, 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)
 }
 
 pub fn build_multistatus(responses: &[PropfindResponseEntry], base_url: &str) -> String {
@@ -56,4 +70,17 @@ pub fn build_multistatus(responses: &[PropfindResponseEntry], base_url: &str) ->
 pub fn to_rfc1123(dt: &std::time::SystemTime) -> String {
     let datetime: chrono::DateTime<chrono::Utc> = (*dt).into();
     datetime.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xml_escape;
+
+    #[test]
+    fn xml_escape_encodes_entities_and_replaces_invalid_controls() {
+        assert_eq!(
+            xml_escape("a<&\"'\u{0001}\t"),
+            "a&lt;&amp;&quot;&apos;\u{fffd}\t"
+        );
+    }
 }

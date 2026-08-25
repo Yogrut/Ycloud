@@ -3,16 +3,105 @@ use serde::Deserialize;
 use std::collections::HashSet;
 
 use crate::{
-    auth,
-    config::{self, FolderLock, Share},
+    auth::{self, SessionPrincipal},
+    config::{self, FolderLock, Share, StoragePermission},
     error::{AppError, AppResult},
     state::AppState,
-    storage::ResolvedPath,
 };
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct FileQuery {
     pub path: Option<String>,
+    #[serde(default)]
+    pub storage_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum StorageAction {
+    Browse,
+    Download,
+    Upload,
+    CreateDirectory,
+    Rename,
+    Move,
+    Copy,
+    Delete,
+}
+
+fn action_allowed(permission: &StoragePermission, action: StorageAction) -> bool {
+    match action {
+        StorageAction::Browse => permission.browse,
+        StorageAction::Download => permission.download,
+        StorageAction::Upload => permission.upload,
+        StorageAction::CreateDirectory => permission.create_directory,
+        StorageAction::Rename => permission.rename,
+        StorageAction::Move => permission.move_items,
+        StorageAction::Copy => permission.copy,
+        StorageAction::Delete => permission.delete,
+    }
+}
+
+pub async fn storage_permission(
+    state: &AppState,
+    headers: &HeaderMap,
+    storage_id: &str,
+) -> Option<StoragePermission> {
+    match auth::current_principal(state, headers).await {
+        Some(SessionPrincipal::Administrator) => Some(StoragePermission {
+            storage_id: storage_id.into(),
+            browse: true,
+            download: true,
+            upload: true,
+            create_directory: true,
+            rename: true,
+            move_items: true,
+            copy: true,
+            delete: true,
+        }),
+        Some(SessionPrincipal::User(user_id)) => state
+            .config_file
+            .read()
+            .await
+            .user_accounts
+            .iter()
+            .find(|account| account.id == user_id && account.enabled)
+            .and_then(|account| {
+                account
+                    .permissions
+                    .iter()
+                    .find(|permission| permission.storage_id == storage_id)
+                    .cloned()
+            }),
+        None => {
+            let token = auth::extract_gate_token(headers)?;
+            state.gate_access.get_scope(&token).await?;
+            let default_storage_id = state.config_file.read().await.default_storage_id.clone();
+            (storage_id == default_storage_id).then_some(StoragePermission {
+                storage_id: storage_id.into(),
+                browse: true,
+                download: true,
+                upload: false,
+                create_directory: false,
+                rename: false,
+                move_items: false,
+                copy: false,
+                delete: false,
+            })
+        }
+    }
+}
+
+pub async fn ensure_storage_action(
+    state: &AppState,
+    headers: &HeaderMap,
+    storage_id: &str,
+    action: StorageAction,
+) -> AppResult<()> {
+    storage_permission(state, headers, storage_id)
+        .await
+        .filter(|permission| action_allowed(permission, action))
+        .map(|_| ())
+        .ok_or(AppError::Forbidden)
 }
 
 /// Browser file APIs always operate on the storage root. WebDAV mounts are a
@@ -20,25 +109,58 @@ pub struct FileQuery {
 pub async fn resolve_share(
     state: &AppState,
     headers: &HeaderMap,
-    _query: &FileQuery,
+    query: &FileQuery,
 ) -> Result<Share, StatusCode> {
-    if let Some(token) = auth::extract_session_token(headers) {
-        if state.sessions.validate(&token).await {
-            return Ok(root_share());
+    let default_storage_id = state.config_file.read().await.default_storage_id.clone();
+    if let Some(principal) = auth::current_principal(state, headers).await {
+        let selected = match (&principal, query.storage_id.as_deref()) {
+            (_, Some(requested)) => requested.to_string(),
+            (SessionPrincipal::Administrator, None) => default_storage_id.clone(),
+            (SessionPrincipal::User(user_id), None) => {
+                let config = state.config_file.read().await;
+                let account = config
+                    .user_accounts
+                    .iter()
+                    .find(|account| account.id == *user_id && account.enabled)
+                    .ok_or(StatusCode::UNAUTHORIZED)?;
+                if account.permissions.iter().any(|permission| {
+                    permission.storage_id == default_storage_id && permission.browse
+                }) {
+                    default_storage_id.clone()
+                } else {
+                    account
+                        .permissions
+                        .iter()
+                        .find(|permission| permission.browse)
+                        .map(|permission| permission.storage_id.clone())
+                        .ok_or(StatusCode::FORBIDDEN)?
+                }
+            }
+        };
+        let storage_id = selected.as_str();
+        if !state.backends.contains(storage_id).await {
+            return Err(StatusCode::FORBIDDEN);
         }
+        ensure_storage_action(state, headers, storage_id, StorageAction::Browse)
+            .await
+            .map_err(|_| StatusCode::FORBIDDEN)?;
+        return Ok(root_share(storage_id));
     }
     if let Some(token) = auth::extract_gate_token(headers) {
         if state.gate_access.get_scope(&token).await.is_some() {
-            return Ok(root_share());
+            // A browser access token is always pinned to the configured
+            // default storage. Query parameters cannot widen its scope.
+            return Ok(root_share(&default_storage_id));
         }
     }
 
     Err(StatusCode::UNAUTHORIZED)
 }
 
-fn root_share() -> Share {
+fn root_share(storage_id: &str) -> Share {
     Share {
         id: "root".into(),
+        storage_id: storage_id.into(),
         name: "__web__".into(),
         path: String::new(),
         username: None,
@@ -113,46 +235,34 @@ pub fn ensure_copy_target_outside_source(source: &str, destination: &str) -> App
     }
 }
 
-pub async fn resolve_existing_path(
-    state: &AppState,
-    share: &Share,
-    request_path: &str,
-) -> AppResult<ResolvedPath> {
-    state
-        .storage
-        .resolve_existing(&share_storage_path(share, request_path))
-        .await
-}
-
-pub async fn resolve_write_path(
-    state: &AppState,
-    share: &Share,
-    request_path: &str,
-) -> AppResult<ResolvedPath> {
-    state
-        .storage
-        .resolve_for_write(&share_storage_path(share, request_path))
-        .await
-}
-
 pub async fn check_folder_locks(
     state: &AppState,
     headers: &HeaderMap,
+    storage_id: &str,
     full_path: &str,
 ) -> AppResult<()> {
-    FolderLockAuthorizer::new(state, headers)
+    FolderLockAuthorizer::new(state, headers, storage_id)
         .await
         .ensure_access(full_path)
 }
 
 pub struct FolderLockAuthorizer {
+    storage_id: String,
     locks: Vec<FolderLock>,
     authorized: HashSet<String>,
 }
 
 impl FolderLockAuthorizer {
-    pub async fn new(state: &AppState, headers: &HeaderMap) -> Self {
-        let locks = state.config_file.read().await.folder_locks.clone();
+    pub async fn new(state: &AppState, headers: &HeaderMap, storage_id: &str) -> Self {
+        let locks = state
+            .config_file
+            .read()
+            .await
+            .folder_locks
+            .iter()
+            .filter(|lock| lock.storage_id == storage_id)
+            .cloned()
+            .collect::<Vec<_>>();
         let mut authorized = HashSet::new();
         for lock in &locks {
             let cookie_name = format!("folder_key_{}", lock.id);
@@ -163,7 +273,11 @@ impl FolderLockAuthorizer {
                 authorized.insert(lock.id.clone());
             }
         }
-        Self { locks, authorized }
+        Self {
+            storage_id: storage_id.into(),
+            locks,
+            authorized,
+        }
     }
 
     pub fn ensure_access(&self, full_path: &str) -> AppResult<()> {
@@ -177,7 +291,7 @@ impl FolderLockAuthorizer {
     pub fn is_locked(&self, full_path: &str) -> bool {
         self.locks
             .iter()
-            .filter(|lock| lock.matches(full_path))
+            .filter(|lock| lock.matches(&self.storage_id, full_path))
             .any(|lock| !self.authorized.contains(&lock.id))
     }
 }
@@ -195,6 +309,7 @@ mod tests {
     fn share(path: &str, readonly: bool) -> Share {
         Share {
             id: Uuid::new_v4().to_string(),
+            storage_id: "primary".into(),
             name: "test".into(),
             path: path.into(),
             username: None,
@@ -225,8 +340,10 @@ mod tests {
     #[test]
     fn folder_locks_require_an_explicit_unlock_for_every_browser_identity() {
         let authorizer = FolderLockAuthorizer {
+            storage_id: "primary".into(),
             locks: vec![FolderLock {
                 id: "lock-id".into(),
+                storage_id: "primary".into(),
                 path: "test".into(),
                 password_hash: "unused".into(),
             }],

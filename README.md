@@ -19,9 +19,11 @@ Ycloud 面向个人设备、家庭服务器和小规模私有部署，不以企�
 - 原子上传、文件操作事务、配置备份和启动恢复。
 - 可配置的网页登录保护、有界审计事件、IP 封禁与解除。
 - 全局流式上传和下载限速，WebDAV 与网页通道共享实际带宽预算。
+- 独立管理本地与多个 S3 兼容存储；管理员可切换存储，访客固定进入默认存储。
+- 管理员可在后台创建普通账号，并按存储授予浏览、下载和各类文件写入权限。
 - 生产静态资源编译进程序，运行时不需要 Node.js 或外部 CDN。
 
-网页访问密码只授予浏览、预览和下载权限；写入操作必须登录管理员。WebDAV 使用挂载自己的凭据，并且不能与网页文件夹锁保护的路径重叠。
+网页访问密码只授予默认存储的浏览、预览和下载权限；写入操作必须登录管理员或具有对应存储操作权限的普通账号。普通账号只能由管理员创建、改密和授权，不能进入管理后台。WebDAV 使用挂载自己的凭据，并且不能与网页文件夹锁保护的路径重叠。
 
 ## 快速开始
 
@@ -33,7 +35,7 @@ cd Ycloud
 cargo run --release --locked
 ```
 
-默认监听 `127.0.0.1:18473`，文件存储在 `./storage`，配置写入 `./config.json`。
+默认监听 `127.0.0.1:18473`，初始本地存储位于 `./storage`，配置写入 `./config.json`。部署时还可声明其他磁盘挂载地址，再由后台把每个地址添加为独立本地存储源；也可添加阿里云 OSS、腾讯云 COS、MinIO/RustFS 或通用 S3 兼容存储。各存储保持独立命名空间，不会合并成一个虚拟目录。
 
 首次启动会生成相互独立的管理员密码和首页访问密码，并写入配置目录下的 `initial-credentials.json`。日志只显示文件位置，不输出密码；修改两项初始密码后，该明文凭据文件会被自动删除。
 
@@ -77,10 +79,38 @@ TRUSTED_PROXY_IPS=127.0.0.1
 | `BIND_ADDRESS` | `127.0.0.1` | 监听地址 |
 | `PORT` | `18473` | HTTP 端口 |
 | `STORAGE_PATH` | `./storage` | 文件目录 |
+| `LOCAL_STORAGE_MOUNTS` | 空 | 额外本地挂载地址的 JSON 数组；字段为 `id`、`name`、`path` |
 | `CONFIG_PATH` | `./config.json` | 配置文件 |
 | `MAX_UPLOAD_BYTES` | `100 GiB` | 后台上传设置的部署级硬上限 |
 | `DISK_RESERVE_BYTES` | `512 MiB` | 文件提交后保留的磁盘空间 |
 | `S3_ALLOWED_ENDPOINTS` | 空 | MinIO、RustFS 与通用 S3 的精确 Endpoint 白名单 |
+
+### Linux 多磁盘部署
+
+Linux 可以把多块磁盘分别挂载到不同目录，但 Ycloud 不会把它们自动合并成一个容量池。`STORAGE_PATH` 对应第一个本地存储源；`LOCAL_STORAGE_MOUNTS` 只声明其他允许使用的挂载地址。启动后在“存储设置”中选择尚未添加的地址并点击“添加为存储源”，每个地址会得到独立的 `storage_id`、目录树、容量上限和用户权限。
+
+Docker Compose 示例：
+
+```yaml
+services:
+  ycloud:
+    environment:
+      STORAGE_PATH: /data/primary
+      LOCAL_STORAGE_MOUNTS: '[{"id":"archive","name":"归档盘","path":"/data/archive"}]'
+    volumes:
+      - type: bind
+        source: /mnt/disk1/ycloud
+        target: /data/primary
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /mnt/disk2/ycloud
+        target: /data/archive
+        bind:
+          create_host_path: false
+```
+
+先用 `/etc/fstab` 或等价方式稳定挂载磁盘，创建并授权源目录，再用 `findmnt` 确认挂载成功后启动容器。额外地址必须已经存在、必须是普通目录，不能是符号链接或重解析点；地址 ID 必须唯一，路径不能相同或互相嵌套。`create_host_path: false` 可避免磁盘未挂载时 Compose 静默创建宿主机目录。磁盘离线时对应存储源会不可用，不会回退到其他存储；当前禁止跨存储复制和移动。
 
 默认单文件上传上限为 5 GiB；普通单文件下载不限制大小；打包下载默认最多包含 3 GiB 文件内容和 1,000 个文件与文件夹条目。容量、打包范围及全局上下行速率可在管理后台的硬边界内调整；并发数、密码队列和磁盘预留保持程序固定。
 

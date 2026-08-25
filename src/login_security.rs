@@ -19,6 +19,7 @@ const MAX_RESTRICTIONS: usize = 20_000;
 #[serde(rename_all = "snake_case")]
 pub enum LoginEntry {
     Admin,
+    Account,
     Web,
     WebDav,
 }
@@ -34,6 +35,10 @@ impl LoginEntry {
         match self {
             Self::Admin => LoginPolicy {
                 maximum_failures: 3,
+                block_seconds: 60 * 60,
+            },
+            Self::Account => LoginPolicy {
+                maximum_failures: 5,
                 block_seconds: 60 * 60,
             },
             Self::Web => LoginPolicy {

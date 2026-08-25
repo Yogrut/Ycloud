@@ -5,6 +5,7 @@ use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
+use crate::storage::is_link_or_reparse_point;
 
 pub const SYSTEM_DIR: &str = ".ycloud-system";
 const MARKER: &str = "Ycloud storage metadata v1\n";
@@ -28,9 +29,52 @@ impl TransactionPaths {
     pub async fn initialize(root: &Path) -> AppResult<Self> {
         let system = root.join(SYSTEM_DIR);
         let marker = system.join("marker");
-        if fs::try_exists(&system)
+        match fs::symlink_metadata(&system).await {
+            Ok(metadata) => {
+                if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
+                    return Err(AppError::Conflict(
+                        "Reserved .ycloud-system path must be a private local directory".into(),
+                    ));
+                }
+                secure_directory_permissions(&system).await?;
+                let marker_metadata = fs::symlink_metadata(&marker).await.map_err(|_| {
+                    AppError::Conflict(
+                        "Reserved .ycloud-system directory is not owned by Ycloud".into(),
+                    )
+                })?;
+                if !marker_metadata.is_file() || is_link_or_reparse_point(&marker_metadata) {
+                    return Err(AppError::Conflict(
+                        "Reserved .ycloud-system marker must be a regular file".into(),
+                    ));
+                }
+                secure_file_permissions(&marker).await?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&system)
+                    .await
+                    .map_err(|e| AppError::with_source("failed to create storage metadata", e))?;
+                secure_directory_permissions(&system).await?;
+                let mut file = private_file_options()
+                    .open(&marker)
+                    .await
+                    .map_err(|e| AppError::with_source("failed to create storage marker", e))?;
+                file.write_all(MARKER.as_bytes())
+                    .await
+                    .map_err(|e| AppError::with_source("failed to write storage marker", e))?;
+                file.sync_all()
+                    .await
+                    .map_err(|e| AppError::with_source("failed to flush storage marker", e))?;
+            }
+            Err(error) => {
+                return Err(AppError::with_source(
+                    "failed to inspect storage metadata",
+                    error,
+                ))
+            }
+        }
+        if fs::try_exists(&marker)
             .await
-            .map_err(|e| AppError::with_source("failed to inspect storage metadata", e))?
+            .map_err(|e| AppError::with_source("failed to inspect storage marker", e))?
         {
             let existing = fs::read_to_string(&marker).await.map_err(|_| {
                 AppError::Conflict(
@@ -43,21 +87,9 @@ impl TransactionPaths {
                 ));
             }
         } else {
-            fs::create_dir(&system)
-                .await
-                .map_err(|e| AppError::with_source("failed to create storage metadata", e))?;
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&marker)
-                .await
-                .map_err(|e| AppError::with_source("failed to create storage marker", e))?;
-            file.write_all(MARKER.as_bytes())
-                .await
-                .map_err(|e| AppError::with_source("failed to write storage marker", e))?;
-            file.sync_all()
-                .await
-                .map_err(|e| AppError::with_source("failed to flush storage marker", e))?;
+            return Err(AppError::Conflict(
+                "Reserved .ycloud-system directory has no ownership marker".into(),
+            ));
         }
         let paths = Self {
             uploads: system.join("uploads"),
@@ -73,9 +105,7 @@ impl TransactionPaths {
             &paths.trash,
             &paths.journals,
         ] {
-            fs::create_dir_all(directory)
-                .await
-                .map_err(|e| AppError::with_source("failed to create transaction directory", e))?;
+            ensure_private_directory(directory).await?;
         }
         paths.recover(root).await?;
         Ok(paths)
@@ -205,9 +235,7 @@ async fn write_json_atomic(path: &Path, value: &impl Serialize) -> AppResult<()>
     let temporary = path.with_extension("tmp");
     let bytes = serde_json::to_vec(value)
         .map_err(|e| AppError::with_source("failed to encode transaction journal", e))?;
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
+    let mut file = private_file_options()
         .open(&temporary)
         .await
         .map_err(|e| AppError::with_source("failed to create transaction journal", e))?;
@@ -222,6 +250,82 @@ async fn write_json_atomic(path: &Path, value: &impl Serialize) -> AppResult<()>
         .await
         .map_err(|e| AppError::with_source("failed to publish transaction journal", e))?;
     sync_parent(path).await
+}
+
+fn private_file_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+}
+
+async fn ensure_private_directory(path: &Path) -> AppResult<()> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) => {
+            if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
+                return Err(AppError::Conflict(
+                    "Transaction path must be a private local directory".into(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).await.map_err(|error| {
+                AppError::with_source("failed to create transaction directory", error)
+            })?;
+            let metadata = fs::symlink_metadata(path).await.map_err(|error| {
+                AppError::with_source("failed to inspect transaction directory", error)
+            })?;
+            if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
+                return Err(AppError::Conflict(
+                    "Transaction path must be a private local directory".into(),
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(AppError::with_source(
+                "failed to inspect transaction directory",
+                error,
+            ))
+        }
+    }
+    secure_directory_permissions(path).await
+}
+
+#[cfg(unix)]
+async fn secure_directory_permissions(path: &Path) -> AppResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .await
+        .map_err(|error| {
+            AppError::with_source(
+                "failed to restrict transaction directory permissions",
+                error,
+            )
+        })
+}
+
+#[cfg(not(unix))]
+async fn secure_directory_permissions(_path: &Path) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn secure_file_permissions(path: &Path) -> AppResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .await
+        .map_err(|error| {
+            AppError::with_source("failed to restrict transaction file permissions", error)
+        })
+}
+
+#[cfg(not(unix))]
+async fn secure_file_permissions(_path: &Path) -> AppResult<()> {
+    Ok(())
 }
 
 pub async fn remove_any(path: &Path) -> AppResult<()> {
@@ -360,6 +464,62 @@ mod tests {
             .await
             .unwrap();
         assert!(TransactionPaths::initialize(&root).await.is_err());
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reserved_symlink_is_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "ycloud-transaction-symlink-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "ycloud-transaction-outside-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(outside.join("marker"), super::MARKER)
+            .await
+            .unwrap();
+        symlink(&outside, root.join(SYSTEM_DIR)).unwrap();
+
+        assert!(TransactionPaths::initialize(&root).await.is_err());
+        assert!(!outside.join("uploads").exists());
+        tokio::fs::remove_file(root.join(SYSTEM_DIR)).await.unwrap();
+        tokio::fs::remove_dir_all(root).await.unwrap();
+        tokio::fs::remove_dir_all(outside).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reserved_metadata_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "ycloud-transaction-permissions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        TransactionPaths::initialize(&root).await.unwrap();
+        let system = root.join(SYSTEM_DIR);
+        let directory_mode = tokio::fs::metadata(&system)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let marker_mode = tokio::fs::metadata(system.join("marker"))
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(marker_mode, 0o600);
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

@@ -21,7 +21,8 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, AppResult},
     file_access::{
-        resolve_share, share_storage_path, validate_batch_size, FileQuery, FolderLockAuthorizer,
+        ensure_storage_action, resolve_share, share_storage_path, validate_batch_size, FileQuery,
+        FolderLockAuthorizer, StorageAction,
     },
     state::AppState,
     storage::{attachment_header, FileResponseMode},
@@ -31,6 +32,7 @@ use crate::{
 const MAX_ARCHIVE_VISITED_ENTRIES: usize = 10_000;
 const MAX_PENDING_TICKETS: usize = 32;
 const TICKET_TTL: Duration = Duration::from_secs(120);
+const ARCHIVE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Clone)]
 pub struct ArchiveTicketStore {
@@ -41,6 +43,7 @@ pub struct ArchiveTicketStore {
 
 #[derive(Clone)]
 struct ArchiveTicket {
+    storage_id: String,
     files: Vec<ArchiveFile>,
     archive_name: String,
     created_at: Instant,
@@ -70,7 +73,12 @@ impl ArchiveTicketStore {
         }
     }
 
-    async fn create(&self, files: Vec<ArchiveFile>, archive_name: String) -> AppResult<String> {
+    async fn create(
+        &self,
+        storage_id: String,
+        files: Vec<ArchiveFile>,
+        archive_name: String,
+    ) -> AppResult<String> {
         let mut tickets = self.tickets.lock().await;
         tickets.retain(|_, ticket| ticket.created_at.elapsed() <= TICKET_TTL);
         if tickets.len() >= MAX_PENDING_TICKETS {
@@ -82,6 +90,7 @@ impl ArchiveTicketStore {
         tickets.insert(
             token.clone(),
             ArchiveTicket {
+                storage_id,
                 files,
                 archive_name,
                 created_at: Instant::now(),
@@ -139,12 +148,15 @@ pub struct ArchiveQuery {
 pub async fn prepare_archive(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<FileQuery>,
     Json(body): Json<PrepareArchiveBody>,
 ) -> AppResult<Json<PrepareArchiveResponse>> {
     let _prepare_permit = state.archive_tickets.acquire_prepare().await?;
     validate_batch_size(&body.paths)?;
-    let share = resolve_share(&state, &headers, &FileQuery { path: None }).await?;
-    let authorizer = FolderLockAuthorizer::new(&state, &headers).await;
+    let share = resolve_share(&state, &headers, &query).await?;
+    ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Download).await?;
+    let backend = state.storage_backend(&share.storage_id).await?;
+    let authorizer = FolderLockAuthorizer::new(&state, &headers, &share.storage_id).await;
     let normalized = body
         .paths
         .iter()
@@ -170,6 +182,7 @@ pub async fn prepare_archive(
         authorizer.ensure_access(&storage_path)?;
         collect_files(
             &state,
+            &backend,
             &authorizer,
             storage_path,
             path.clone(),
@@ -188,7 +201,10 @@ pub async fn prepare_archive(
     }
     let archive_name = archive_name(&normalized);
     let file_count = files.len();
-    let ticket = state.archive_tickets.create(files, archive_name).await?;
+    let ticket = state
+        .archive_tickets
+        .create(share.storage_id, files, archive_name)
+        .await?;
     Ok(Json(PrepareArchiveResponse {
         ticket,
         total_bytes,
@@ -202,6 +218,7 @@ pub async fn prepare_archive(
 #[allow(clippy::too_many_arguments)]
 async fn collect_files(
     state: &AppState,
+    backend: &StorageBackend,
     authorizer: &FolderLockAuthorizer,
     storage_path: String,
     request_path: String,
@@ -230,10 +247,9 @@ async fn collect_files(
             ));
         }
         authorizer.ensure_access(&storage_relative)?;
-        let metadata = state.backend.metadata(&storage_relative).await?;
+        let metadata = backend.metadata(&storage_relative).await?;
         if metadata.is_dir {
-            let (entries, truncated) = state
-                .backend
+            let (entries, truncated) = backend
                 .list_directory(&storage_relative, state.config.max_list_entries)
                 .await?;
             if truncated {
@@ -279,12 +295,12 @@ pub async fn download_archive(
         .take(&query.ticket)
         .await
         .ok_or(AppError::NotFound)?;
-    let authorizer = FolderLockAuthorizer::new(&state, &headers).await;
+    let authorizer = FolderLockAuthorizer::new(&state, &headers, &ticket.storage_id).await;
     for file in &ticket.files {
         authorizer.ensure_access(&file.storage_path)?;
     }
     let (writer_side, reader_side) = tokio::io::duplex(128 * 1024);
-    let storage = state.backend.clone();
+    let storage = state.storage_backend(&ticket.storage_id).await?;
     tokio::spawn(async move {
         let _stream_permit = stream_permit;
         if let Err(error) = write_archive(storage, ticket.files, writer_side).await {
@@ -333,7 +349,13 @@ async fn write_archive(
         }
         let mut transferred = 0_u64;
         let mut source = response.into_body().into_data_stream();
-        while let Some(chunk) = source.next().await {
+        loop {
+            let next = tokio::time::timeout(ARCHIVE_STREAM_IDLE_TIMEOUT, source.next())
+                .await
+                .map_err(|_| anyhow::anyhow!("archive source was idle for too long"))?;
+            let Some(chunk) = next else {
+                break;
+            };
             let chunk = chunk?;
             transferred = transferred
                 .checked_add(u64::try_from(chunk.len())?)
@@ -341,14 +363,20 @@ async fn write_archive(
             if transferred > file.size {
                 anyhow::bail!("archive source grew during download");
             }
-            entry_writer.write_all(&chunk).await?;
+            tokio::time::timeout(ARCHIVE_STREAM_IDLE_TIMEOUT, entry_writer.write_all(&chunk))
+                .await
+                .map_err(|_| anyhow::anyhow!("archive client was idle for too long"))??;
         }
         if transferred != file.size {
             anyhow::bail!("archive source changed during download");
         }
-        entry_writer.close().await?;
+        tokio::time::timeout(ARCHIVE_STREAM_IDLE_TIMEOUT, entry_writer.close())
+            .await
+            .map_err(|_| anyhow::anyhow!("archive client was idle for too long"))??;
     }
-    zip.close().await?;
+    tokio::time::timeout(ARCHIVE_STREAM_IDLE_TIMEOUT, zip.close())
+        .await
+        .map_err(|_| anyhow::anyhow!("archive client was idle for too long"))??;
     Ok(())
 }
 

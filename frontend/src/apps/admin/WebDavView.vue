@@ -1,17 +1,22 @@
 <script setup lang="ts">
 import { computed, nextTick, ref } from 'vue'
-import type { UpdateWebDavMountRequest, WebDavMountView } from '../../shared/api/admin'
+import type { StorageInstanceView, UpdateWebDavMountRequest, WebDavMountView } from '../../shared/api/admin'
 import { createWebDavMount, deleteWebDavMount, updateWebDavMount } from '../../shared/api/admin'
 import { useLocale } from '../../shared/i18n'
 
 const MASK = '••••••'
-const { mounts } = defineProps<{ mounts: WebDavMountView[] }>()
+const { mounts, storages, defaultStorageId } = defineProps<{
+  mounts: WebDavMountView[]
+  storages: StorageInstanceView[]
+  defaultStorageId: string
+}>()
 const emit = defineEmits<{ changed: [message: string] }>()
 const locale = useLocale()
 
 const editing = ref<WebDavMountView>()
 const showEditor = ref(false)
 const name = ref('')
+const storageId = ref('')
 const path = ref('/')
 const username = ref('')
 const password = ref('')
@@ -39,10 +44,15 @@ function initialPassword(mount: WebDavMountView): string {
   return mount.has_password ? MASK : ''
 }
 
+function storageName(id: string): string {
+  return storages.find((storage) => storage.id === id)?.name ?? id
+}
+
 const hasChanges = computed(() => {
   if (!showEditor.value) return false
   if (!editing.value) return true
   return name.value.trim() !== editing.value.name
+    || storageId.value !== editing.value.storage_id
     || normalizePath(path.value) !== editing.value.path
     || username.value.trim() !== (editing.value.username ?? '')
     || password.value !== initialPassword(editing.value)
@@ -53,6 +63,7 @@ const hasChanges = computed(() => {
 function openCreate(): void {
   editing.value = undefined
   name.value = ''
+  storageId.value = defaultStorageId || storages[0]?.id || ''
   path.value = '/'
   username.value = ''
   password.value = ''
@@ -65,6 +76,7 @@ function openCreate(): void {
 function openEdit(mount: WebDavMountView): void {
   editing.value = mount
   name.value = mount.name
+  storageId.value = mount.storage_id
   path.value = displayPath(mount.path)
   username.value = mount.username ?? ''
   password.value = initialPassword(mount)
@@ -89,6 +101,7 @@ function selectMask(event: FocusEvent): void {
 function validate(): string | undefined {
   const normalizedName = name.value.trim()
   if (!normalizedName) return locale.text('挂载名称不能为空', 'Mount name is required')
+  if (!storageId.value) return locale.text('请选择存储', 'Select a storage')
   if (normalizedName.includes('/') || normalizedName.includes('\\') || normalizedName.includes('\0')) return locale.text('挂载名称不能包含斜杠或空字符', 'Mount name cannot contain slashes or null characters')
   const hasUsablePassword = (editing.value?.has_password && password.value === MASK) || Boolean(password.value)
   if (webdavEnabled.value && (!username.value.trim() || !hasUsablePassword)) return locale.text('启用 WebDAV 必须设置用户名和密码', 'An enabled WebDAV mount requires a username and password')
@@ -112,6 +125,7 @@ async function submit(): Promise<void> {
   try {
     if (editing.value) {
       const body: UpdateWebDavMountRequest = {}
+      if (storageId.value !== editing.value.storage_id) body.storage_id = storageId.value
       if (normalizedName !== editing.value.name) body.name = normalizedName
       if (normalizedPath !== editing.value.path) body.path = normalizedPath
       if (normalizedUsername !== (editing.value.username ?? '')) body.username = normalizedUsername
@@ -123,6 +137,7 @@ async function submit(): Promise<void> {
       emit('changed', locale.text(`WebDAV 挂载“${normalizedName}”已更新`, `WebDAV mount “${normalizedName}” updated`))
     } else {
       await createWebDavMount({
+        storage_id: storageId.value,
         name: normalizedName,
         path: normalizedPath,
         username: normalizedUsername || undefined,
@@ -178,6 +193,7 @@ async function confirmDelete(): Promise<void> {
               <span v-if="mount.has_password" class="status-pill credential">{{ locale.text('密码已设置', 'Password set') }}</span>
             </div>
             <div class="webdav-record-meta">{{ locale.text('存储路径', 'Storage path') }} {{ displayPath(mount.path) }} · {{ locale.text('连接路径', 'Connection path') }} {{ connectionPath(mount.name) }}</div>
+            <div v-if="storages.length > 1" class="webdav-record-meta">{{ locale.text('所属存储', 'Storage') }} {{ storageName(mount.storage_id) }}</div>
             <div class="webdav-record-meta">{{ locale.text('用户', 'User') }} {{ mount.username || locale.text('未设置', 'Not set') }}</div>
           </div>
           <div class="webdav-actions">
@@ -193,6 +209,14 @@ async function confirmDelete(): Promise<void> {
     <form class="modal webdav-modal" role="dialog" aria-modal="true" aria-labelledby="webdav-editor-title" @submit.prevent="submit">
       <h2 id="webdav-editor-title">{{ editing ? locale.text('编辑 WebDAV 挂载', 'Edit WebDAV mount') : locale.text('新建 WebDAV 挂载', 'New WebDAV mount') }}</h2>
       <div class="webdav-form-grid">
+        <label class="full-field">
+          {{ locale.text('所属存储', 'Storage') }}
+          <select v-model="storageId" class="input" required>
+            <option v-for="storage in storages" :key="storage.id" :value="storage.id" :disabled="!storage.ready">
+              {{ storage.name }}{{ storage.ready ? '' : locale.text('（不可用）', ' (unavailable)') }}
+            </option>
+          </select>
+        </label>
         <label class="webdav-name-field">
           {{ locale.text('挂载名称', 'Mount name') }}
           <input v-model="name" class="input" required maxlength="128">

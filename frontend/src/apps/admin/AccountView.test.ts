@@ -37,19 +37,18 @@ function mountAccount(host: HTMLElement) {
 }
 
 describe('AccountView', () => {
-  it('groups credentials and sign-in protection into one compact settings pane', async () => {
+  it('contains administrator credentials without mixing in sign-in protection', async () => {
     const host = document.createElement('div')
     document.body.append(host)
     const app = mountAccount(host)
     await nextTick()
 
     expect(host.querySelectorAll('.admin-pane')).toHaveLength(1)
-    expect(host.querySelectorAll('.account-section')).toHaveLength(2)
-    expect(host.querySelectorAll('.settings-grid')).toHaveLength(2)
-    expect(host.querySelector('.account-sections')).not.toBeNull()
-    expect(host.textContent).toContain('账户与访问')
+    expect(host.querySelectorAll('.account-section')).toHaveLength(1)
+    expect(host.querySelectorAll('.settings-grid')).toHaveLength(1)
+    expect(host.textContent).toContain('管理员设置')
     expect(host.textContent).not.toContain('登录保护')
-    expect(host.textContent).toContain('保存登录限制')
+    expect(host.textContent).not.toContain('保存登录限制')
     app.unmount()
   })
 

@@ -20,6 +20,9 @@ export interface FileListResponse {
   current_path: string
   parent_path: string | null
   entries: FileEntry[]
+  page_start: number
+  page_size: number
+  next_cursor: string | null
   truncated: boolean
   can_write: boolean
   is_admin?: boolean
@@ -27,6 +30,14 @@ export interface FileListResponse {
   max_upload_bytes: number
   max_archive_bytes: number
   max_archive_entries: number
+}
+
+export interface FileListOptions {
+  limit?: 10 | 20 | 50 | 100
+  cursor?: string
+  search?: string
+  sort?: 'name' | 'size' | 'time'
+  direction?: 'asc' | 'desc'
 }
 
 export interface BrowserCapabilities {
@@ -42,8 +53,7 @@ export interface BrowserCapabilities {
 export interface BrowserStorage {
   id: string
   name: string
-  is_default: boolean
-  ready: boolean
+  requires_login: boolean
 }
 
 export interface ArchivePrepareResponse {
@@ -107,14 +117,26 @@ function withStorage(url: string, storageId?: string): string {
   return `${url}${url.includes('?') ? '&' : '?'}storage_id=${encodeURIComponent(storageId)}`
 }
 
-export function fileApi(path: string, storageId?: string): string {
+export function fileApi(path: string, storageId?: string, options: FileListOptions = {}): string {
   const clean = cleanPath(path)
-  const url = clean ? `/api/files?path=${encodeURIComponent(`/${clean}`)}` : '/api/files'
-  return withStorage(url, storageId)
+  const parameters = new URLSearchParams()
+  if (clean) parameters.set('path', `/${clean}`)
+  if (storageId) parameters.set('storage_id', storageId)
+  if (options.limit) parameters.set('limit', String(options.limit))
+  if (options.cursor) parameters.set('cursor', options.cursor)
+  if (options.search) parameters.set('search', options.search)
+  if (options.sort) parameters.set('sort', options.sort)
+  if (options.direction) parameters.set('direction', options.direction)
+  const query = parameters.toString()
+  return query ? `/api/files?${query}` : '/api/files'
 }
 
-export function listFiles(path: string, storageId?: string): Promise<FileListResponse> {
-  return apiRequest<FileListResponse>(fileApi(path, storageId))
+export function listFiles(path: string, storageId?: string, options: FileListOptions = {}): Promise<FileListResponse> {
+  return apiRequest<FileListResponse>(fileApi(path, storageId, options))
+}
+
+export function listStorages(): Promise<BrowserStorage[]> {
+  return apiRequest<BrowserStorage[]>('/api/storages')
 }
 
 function actionApi(action: string, path: string, storageId?: string): string {

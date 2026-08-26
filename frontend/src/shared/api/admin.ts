@@ -73,6 +73,9 @@ export interface StorageInstanceView {
   id: string
   name: string
   is_default: boolean
+  enabled?: boolean
+  allow_guest_access?: boolean
+  status?: 'enabled' | 'disabled' | 'abnormal' | 'pending'
   ready: boolean
   backend: StorageBackendView
   usage_bytes: number
@@ -294,35 +297,43 @@ export function testS3Storage(body: TestS3StorageRequest): Promise<{ success: bo
   })
 }
 
-export function stageS3Storage(name: string, body: TestS3StorageRequest): Promise<{ success: boolean }> {
+export function stageS3Storage(name: string, body: TestS3StorageRequest, enabled = true, allowGuestAccess = false): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/storage/pending', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, enabled, allow_guest_access: allowGuestAccess, ...body }),
+  })
+}
+
+export function updateS3Storage(storageId: string, name: string, body: TestS3StorageRequest): Promise<{ success: boolean }> {
+  return adminRequest(`/api/admin/storage/s3/${encodeURIComponent(storageId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, ...body }),
   })
 }
 
-export function addLocalStorage(mountId: string, name: string, capacityLimitBytes: number | null): Promise<{ storage_id: string }> {
+export function addLocalStorage(path: string, name: string, capacityLimitBytes: number | null, enabled = true, allowGuestAccess = false): Promise<{ storage_id: string }> {
   return adminRequest('/api/admin/storage/local', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mount_id: mountId, name, capacity_limit_bytes: capacityLimitBytes }),
+    body: JSON.stringify({ path, name, capacity_limit_bytes: capacityLimitBytes, enabled, allow_guest_access: allowGuestAccess }),
   })
 }
 
-export function updateLocalStorage(storageId: string, capacityLimitBytes: number | null): Promise<{ success: boolean }> {
+export function updateLocalStorage(storageId: string, name: string, path: string, capacityLimitBytes: number | null): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/storage/local', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ storage_id: storageId, capacity_limit_bytes: capacityLimitBytes }),
+    body: JSON.stringify({ storage_id: storageId, name, path, capacity_limit_bytes: capacityLimitBytes }),
   })
 }
 
-export function setDefaultStorage(storageId: string): Promise<{ success: boolean }> {
-  return adminRequest('/api/admin/storage/default', {
+export function updateStorageAccess(storageId: string, enabled: boolean, allowGuestAccess: boolean): Promise<{ success: boolean }> {
+  return adminRequest(`/api/admin/storage/${encodeURIComponent(storageId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ storage_id: storageId }),
+    body: JSON.stringify({ enabled, allow_guest_access: allowGuestAccess }),
   })
 }
 

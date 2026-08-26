@@ -47,14 +47,17 @@ function mountSecurity(host: HTMLElement) {
 
 describe('SecurityView', () => {
   it('loads successful and failed events separately from the server', async () => {
-    vi.stubGlobal('fetch', vi.fn((url: string) => Promise.resolve(eventResponse(url))))
+    const fetchMock = vi.fn((url: string) => Promise.resolve(eventResponse(url)))
+    vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
     const app = mountSecurity(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
+    expect(host.querySelector('#security-title')?.textContent).toBe('访问日志')
     expect(host.textContent).toContain('192.0.2.10')
+    expect(new URL(fetchMock.mock.calls[0]![0], 'http://localhost').searchParams.get('limit')).toBe('10')
     host.querySelectorAll<HTMLButtonElement>('.security-tabs button')[1]?.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()

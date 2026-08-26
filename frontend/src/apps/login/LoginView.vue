@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { nextTick, onMounted, ref } from 'vue'
-import CloudIcon from '../../shared/components/icons/CloudIcon.vue'
+import AppIcon from '../../shared/components/AppIcon.vue'
 import { enterGate, getIdentity } from '../../shared/api/auth'
 import { useLocale } from '../../shared/i18n'
 import { appPath } from '../../shared/routes'
@@ -56,7 +56,7 @@ onMounted(detectExistingAccess)
 <template>
   <main class="login-shell">
     <section class="login-panel glass" aria-labelledby="login-title">
-      <CloudIcon class="login-logo" />
+      <AppIcon name="cloud" :size="52" class="login-logo" />
       <h1 id="login-title">Ycloud</h1>
       <p>{{ locale.t('login.description') }}</p>
       <form @submit.prevent="submit">

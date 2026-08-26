@@ -11,7 +11,17 @@ describe('browser API paths', () => {
   })
 
   it('encodes complete nested paths as one query value', () => {
-    expect(fileApi('/中文/space name/')).toBe('/api/files?path=%2F%E4%B8%AD%E6%96%87%2Fspace%20name')
+    expect(fileApi('/中文/space name/')).toBe('/api/files?path=%2F%E4%B8%AD%E6%96%87%2Fspace+name')
+  })
+
+  it('encodes directory pagination, search, and sort as one listing request', () => {
+    expect(fileApi('', 'primary', {
+      limit: 20,
+      cursor: 'MjA',
+      search: '测试 文件',
+      sort: 'time',
+      direction: 'desc',
+    })).toBe('/api/files?storage_id=primary&limit=20&cursor=MjA&search=%E6%B5%8B%E8%AF%95+%E6%96%87%E4%BB%B6&sort=time&direction=desc')
   })
 
   it('creates a folder below the current path without client-side path concatenation', async () => {

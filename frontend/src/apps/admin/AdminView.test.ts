@@ -57,8 +57,14 @@ describe('AdminView', () => {
 
     const links = [...host.querySelectorAll<HTMLAnchorElement>('.admin-nav-item')]
     expect(links.map(link => link.getAttribute('href'))).toEqual([
-      '/v2/admin/storage', '/v2/admin/webdav', '/v2/admin/locks', '/v2/admin/limits', '/v2/admin/account', '/v2/admin/users', '/v2/admin/security',
+      '/v2/admin/storage', '/v2/admin/webdav', '/v2/admin/locks', '/v2/admin/limits', '/v2/admin/account', '/v2/admin/users', '/v2/admin/protection', '/v2/admin/security',
     ])
+    expect(host.querySelector('.admin-nav-heading')).toBeNull()
+    expect(host.querySelector('.admin-header .admin-nav-brand')?.textContent).toContain('Ycloud 管理')
+    expect(host.querySelector('.admin-header .top-actions')).not.toBeNull()
+    expect(host.querySelector('.admin-nav .admin-nav-brand')).toBeNull()
+    expect(host.querySelector('.admin-floating-actions')).toBeNull()
+    expect(host.querySelector('.topbar')).toBeNull()
     app.unmount()
   })
 
@@ -75,7 +81,8 @@ describe('AdminView', () => {
 
     expect(host.querySelector('#storage-title')?.textContent).toBe('存储设置')
     expect(host.textContent).toContain('每个存储拥有独立命名空间')
-    expect(host.querySelector<HTMLInputElement>('.storage-form input')?.value).toBe('./storage')
+    expect(host.querySelector('.storage-form')).toBeNull()
+    expect(host.querySelector('.storage-source-row')?.textContent).toContain('./storage')
     expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('存储设置')
     app.unmount()
   })
@@ -128,7 +135,7 @@ describe('AdminView', () => {
     app.unmount()
   })
 
-  it('renders the Vue login security page on its candidate route', async () => {
+  it('renders the Vue access logs page on its candidate route', async () => {
     window.history.replaceState(null, '', '/v2/admin/security')
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
       status: 200, headers: { 'Content-Type': 'application/json' },
@@ -139,8 +146,24 @@ describe('AdminView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    expect(host.querySelector('#security-title')?.textContent).toBe('登录安全')
-    expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('登录安全')
+    expect(host.querySelector('#security-title')?.textContent).toBe('访问日志')
+    expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('访问日志')
+    app.unmount()
+  })
+
+  it('renders sign-in protection on its own route', async () => {
+    window.history.replaceState(null, '', '/v2/admin/protection')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountAdmin(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('#protection-title')?.textContent).toBe('登录保护')
+    expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('登录保护')
     app.unmount()
   })
 })

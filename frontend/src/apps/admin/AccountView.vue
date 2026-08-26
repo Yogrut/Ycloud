@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
-import type { AdminInfo, UpdateAccountRequest, UpdateLoginSecuritySettingsRequest } from '../../shared/api/admin'
-import { updateAccount, updateLoginSecuritySettings } from '../../shared/api/admin'
+import type { AdminInfo, UpdateAccountRequest } from '../../shared/api/admin'
+import { updateAccount } from '../../shared/api/admin'
 import { useLocale } from '../../shared/i18n'
 
 const MASK = '••••••'
@@ -15,24 +15,11 @@ const webPassword = ref('')
 const saving = ref(false)
 const errorMessage = ref('')
 const confirmRemoval = ref(false)
-const adminFailures = ref<string | number>('')
-const adminBlockMinutes = ref<string | number>('')
-const webFailures = ref<string | number>('')
-const webBlockMinutes = ref<string | number>('')
-const savingSecurity = ref(false)
-const securityError = ref('')
 
 const hasAccountChanges = computed(() => (
   username.value.trim() !== props.info.username
   || adminPassword.value !== MASK
   || webPassword.value !== (props.info.has_global_web_password ? MASK : '')
-))
-
-const hasSecurityChanges = computed(() => (
-  Number(adminFailures.value) !== props.info.admin_login_failures
-  || Number(adminBlockMinutes.value) * 60 !== props.info.admin_login_block_seconds
-  || Number(webFailures.value) !== props.info.web_login_failures
-  || Number(webBlockMinutes.value) * 60 !== props.info.web_login_block_seconds
 ))
 
 function reset(): void {
@@ -41,11 +28,6 @@ function reset(): void {
   webPassword.value = props.info.has_global_web_password ? MASK : ''
   errorMessage.value = ''
   confirmRemoval.value = false
-  adminFailures.value = props.info.admin_login_failures
-  adminBlockMinutes.value = props.info.admin_login_block_seconds / 60
-  webFailures.value = props.info.web_login_failures
-  webBlockMinutes.value = props.info.web_login_block_seconds / 60
-  securityError.value = ''
 }
 
 watch(() => props.info, reset, { immediate: true })
@@ -98,60 +80,17 @@ async function submit(confirmed = false): Promise<void> {
   }
 }
 
-function securityRequest(): UpdateLoginSecuritySettingsRequest {
-  const adminAttempts = Number(adminFailures.value)
-  const webAttempts = Number(webFailures.value)
-  const adminMinutes = Number(adminBlockMinutes.value)
-  const webMinutes = Number(webBlockMinutes.value)
-  if (!Number.isInteger(adminAttempts) || adminAttempts < 3 || adminAttempts > 10) {
-    throw new Error(locale.text('管理员错误次数必须在 3 到 10 之间', 'Administrator failures must be between 3 and 10'))
-  }
-  if (!Number.isInteger(webAttempts) || webAttempts < 3 || webAttempts > 20) {
-    throw new Error(locale.text('首页错误次数必须在 3 到 20 之间', 'Browser failures must be between 3 and 20'))
-  }
-  if (!Number.isInteger(adminMinutes) || adminMinutes < 5 || adminMinutes > 1440
-    || !Number.isInteger(webMinutes) || webMinutes < 5 || webMinutes > 1440) {
-    throw new Error(locale.text('封禁时间必须在 5 到 1440 分钟之间', 'Block duration must be between 5 and 1440 minutes'))
-  }
-  return {
-    admin_login_failures: adminAttempts,
-    web_login_failures: webAttempts,
-    admin_login_block_seconds: adminMinutes * 60,
-    web_login_block_seconds: webMinutes * 60,
-  }
-}
-
-async function submitSecurity(): Promise<void> {
-  if (savingSecurity.value || !hasSecurityChanges.value) return
-  let body: UpdateLoginSecuritySettingsRequest
-  try {
-    body = securityRequest()
-  } catch (error) {
-    securityError.value = error instanceof Error ? error.message : locale.text('登录保护设置无效', 'Invalid sign-in protection settings')
-    return
-  }
-  savingSecurity.value = true
-  securityError.value = ''
-  try {
-    await updateLoginSecuritySettings(body)
-    emit('saved', locale.text('登录限制已保存', 'Sign-in limits saved'))
-  } catch (error) {
-    securityError.value = error instanceof Error ? error.message : locale.text('保存失败', 'Unable to save changes')
-  } finally {
-    savingSecurity.value = false
-  }
-}
 </script>
 
 <template>
   <section class="admin-pane form-pane account-pane glass" aria-labelledby="account-title">
     <header class="admin-pane-head">
       <div>
-        <h1 id="account-title">{{ locale.text('账户与访问', 'Account & access') }}</h1>
-        <p>{{ locale.text('管理管理员凭据、首页访问密码及登录错误限制。', 'Manage administrator credentials, the browser access password, and sign-in failure limits.') }}</p>
+        <h1 id="account-title">{{ locale.text('管理员设置', 'Administrator settings') }}</h1>
+        <p>{{ locale.text('管理管理员凭据和文件首页的访问密码。', 'Manage administrator credentials and the file browser access password.') }}</p>
       </div>
     </header>
-    <div class="admin-pane-body account-sections">
+    <div class="admin-pane-body">
       <form class="account-section" :aria-label="locale.text('账户设置', 'Account settings')" @submit.prevent="submit()">
         <div class="settings-grid account-grid">
           <label class="compact-field">
@@ -171,30 +110,6 @@ async function submitSecurity(): Promise<void> {
         <div class="admin-save-row">
           <button class="btn" type="submit" :disabled="saving || !hasAccountChanges">{{ saving ? locale.t('common.saving') : locale.text('保存账户设置', 'Save account settings') }}</button>
         </div>
-      </form>
-
-      <form class="account-section login-policy-section" :aria-label="locale.text('登录错误限制', 'Sign-in failure limits')" @submit.prevent="submitSecurity">
-        <div class="settings-grid security-settings-grid">
-          <label class="compact-field limits-field">
-            <span>{{ locale.text('管理员错误次数', 'Administrator failure limit') }}</span>
-            <span class="limits-control"><input v-model="adminFailures" type="number" min="3" max="10" step="1"><small>3–10</small></span>
-          </label>
-          <label class="compact-field limits-field">
-            <span>{{ locale.text('管理员封禁时间', 'Administrator block duration') }}</span>
-            <span class="limits-control"><span class="input-with-unit"><input v-model="adminBlockMinutes" type="number" min="5" max="1440" step="1"><span>{{ locale.text('分钟', 'min') }}</span></span><small>5–1440</small></span>
-          </label>
-          <label class="compact-field limits-field">
-            <span>{{ locale.text('首页错误次数', 'Browser failure limit') }}</span>
-            <span class="limits-control"><input v-model="webFailures" type="number" min="3" max="20" step="1"><small>3–20</small></span>
-          </label>
-          <label class="compact-field limits-field">
-            <span>{{ locale.text('首页封禁时间', 'Browser block duration') }}</span>
-            <span class="limits-control"><span class="input-with-unit"><input v-model="webBlockMinutes" type="number" min="5" max="1440" step="1"><span>{{ locale.text('分钟', 'min') }}</span></span><small>5–1440</small></span>
-          </label>
-        </div>
-        <p class="admin-form-error" role="alert">{{ securityError }}</p>
-        <p class="account-field-note">{{ locale.text('管理员和首页分别计数；WebDAV 固定为 5 次错误后限制 60 秒。', 'Administrator and browser failures are counted separately. WebDAV remains fixed at 5 failures and a 60-second restriction.') }}</p>
-        <div class="admin-save-row"><button class="btn" type="submit" :disabled="savingSecurity || !hasSecurityChanges">{{ savingSecurity ? locale.t('common.saving') : locale.text('保存登录限制', 'Save sign-in limits') }}</button></div>
       </form>
     </div>
   </section>

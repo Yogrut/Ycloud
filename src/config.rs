@@ -35,7 +35,7 @@ pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
 pub const MIN_STORAGE_CAPACITY_BYTES: u64 = 1024 * 1024;
 pub const HARD_MAX_STORAGE_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 8;
+pub const CONFIG_SCHEMA_VERSION: u32 = 9;
 pub const DEFAULT_STORAGE_ID: &str = "primary";
 pub const MAX_STORAGE_INSTANCES: usize = 16;
 pub const MAX_USER_ACCOUNTS: usize = 100;
@@ -159,6 +159,10 @@ pub enum StorageBackendConfig {
 pub struct StorageInstanceConfig {
     pub id: String,
     pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_guest_access: bool,
     pub backend: StorageBackendConfig,
 }
 
@@ -171,6 +175,8 @@ impl StorageInstanceConfig {
         Self {
             id: DEFAULT_STORAGE_ID.into(),
             name: name.into(),
+            enabled: true,
+            allow_guest_access: true,
             backend,
         }
     }
@@ -537,11 +543,8 @@ impl ConfigFile {
         )?;
         validate_transfer_rate(self.upload_rate_bytes_per_sec, "上传")?;
         validate_transfer_rate(self.download_rate_bytes_per_sec, "下载")?;
-        if self.storage_instances.is_empty() || self.storage_instances.len() > MAX_STORAGE_INSTANCES
-        {
-            return Err(AppError::BadRequest(
-                "存储实例数量必须在 1 到 16 之间".into(),
-            ));
+        if self.storage_instances.len() > MAX_STORAGE_INSTANCES {
+            return Err(AppError::BadRequest("存储实例数量不能超过 16 个".into()));
         }
         let mut storage_ids = HashSet::new();
         let mut storage_names = HashSet::new();
@@ -562,11 +565,6 @@ impl ConfigFile {
                     ));
                 }
             }
-        }
-        if !storage_ids.contains(self.default_storage_id.as_str()) {
-            return Err(AppError::BadRequest(
-                "默认展示存储必须引用现有存储实例".into(),
-            ));
         }
         let mut account_ids = HashSet::new();
         let mut account_names = HashSet::new();
@@ -1291,6 +1289,28 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
             raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
             migrated = true;
         }
+        if schema_version < 9 {
+            let former_default = raw
+                .get("default_storage_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or(DEFAULT_STORAGE_ID)
+                .to_string();
+            if let Some(instances) = raw
+                .get_mut("storage_instances")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for instance in instances {
+                    let is_former_default = instance
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|id| id == former_default);
+                    instance["enabled"] = serde_json::json!(true);
+                    instance["allow_guest_access"] = serde_json::json!(is_former_default);
+                }
+            }
+            raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
+            migrated = true;
+        }
         let config: ConfigFile =
             serde_json::from_value(raw).context("Failed to parse config.json")?;
         config
@@ -1697,6 +1717,8 @@ mod tests {
         config.storage_instances.push(StorageInstanceConfig {
             id: "archive".into(),
             name: "Archive disk".into(),
+            enabled: true,
+            allow_guest_access: false,
             backend: StorageBackendConfig::Local(LocalStorageConfig {
                 mount_id: "archive-disk".into(),
                 capacity_limit_bytes: None,
@@ -1854,6 +1876,8 @@ mod tests {
             pending_storage_instance: Some(StorageInstanceConfig {
                 id: "pending-local".into(),
                 name: "Second local".into(),
+                enabled: true,
+                allow_guest_access: false,
                 backend: StorageBackendConfig::Local(LocalStorageConfig::default()),
             }),
             ..ConfigFile::default()
@@ -1874,6 +1898,8 @@ mod tests {
         config.pending_storage_instance = Some(StorageInstanceConfig {
             id: "pending-s3".into(),
             name: "Remote storage".into(),
+            enabled: true,
+            allow_guest_access: false,
             backend: StorageBackendConfig::S3(pending),
         });
         assert!(config.validate().is_ok());
@@ -1913,6 +1939,8 @@ mod tests {
             storage_instances: vec![StorageInstanceConfig {
                 id: DEFAULT_STORAGE_ID.into(),
                 name: "S3 storage".into(),
+                enabled: true,
+                allow_guest_access: true,
                 backend: StorageBackendConfig::S3(settings.clone()),
             }],
             ..ConfigFile::default()

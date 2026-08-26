@@ -31,6 +31,9 @@ function listResponse(names: string[]) {
       icon: 'code',
       locked: false,
     })),
+    page_start: names.length ? 1 : 0,
+    page_size: 20,
+    next_cursor: null,
     truncated: false,
     can_write: true,
     max_upload_bytes: 1024,
@@ -70,6 +73,9 @@ describe('BrowserView', () => {
         icon: 'code',
         locked: false,
       }],
+      page_start: 1,
+      page_size: 20,
+      next_cursor: null,
       truncated: false,
       can_write: false,
       max_upload_bytes: 1024,
@@ -93,22 +99,46 @@ describe('BrowserView', () => {
     app.unmount()
   })
 
+  it('keeps page actions inside the file panel and uses only the row context menu', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['notes.txt'])), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('.browser-chrome .top-search')).toBeNull()
+    expect(host.querySelector('.file-toolbar .top-search')).not.toBeNull()
+    expect(host.querySelector('.file-toolbar')?.textContent).toContain('新建文件夹')
+    expect(host.querySelector('.file-toolbar')?.textContent).toContain('上传文件')
+    expect(host.querySelector('.file-row-menu')).toBeNull()
+    const row = host.querySelector('.file-row') as HTMLElement
+    row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, button: 2, clientX: 40, clientY: 40 }))
+    await nextTick()
+    expect(host.querySelector('.context-menu')).not.toBeNull()
+    expect(host.querySelector('.file-row.selected')).not.toBeNull()
+    app.unmount()
+  })
+
   it('lets an administrator switch storage without mixing the previous path or selection', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({
         ...listResponse(['one.txt']),
         current_path: 'games',
         storages: [
-          { id: 'primary', name: 'Local', is_default: true, ready: true },
-          { id: 'rustfs', name: 'RustFS', is_default: false, ready: true },
+          { id: 'primary', name: 'Local', requires_login: false },
+          { id: 'rustfs', name: 'RustFS', requires_login: false },
         ],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         ...listResponse(['remote.txt']),
         storage_id: 'rustfs',
         storages: [
-          { id: 'primary', name: 'Local', is_default: true, ready: true },
-          { id: 'rustfs', name: 'RustFS', is_default: false, ready: true },
+          { id: 'primary', name: 'Local', requires_login: false },
+          { id: 'rustfs', name: 'RustFS', requires_login: false },
         ],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
@@ -125,16 +155,121 @@ describe('BrowserView', () => {
     expect(firstRow.classList.contains('selected')).toBe(true)
 
     const selector = host.querySelector('.storage-switcher select') as HTMLSelectElement
+    expect(host.querySelector('.browser-chrome .storage-switcher')).not.toBeNull()
+    expect(host.querySelector('.breadcrumb .storage-switcher')).toBeNull()
+    expect(host.querySelector('.browser-chrome .storage-switcher svg')).toBeNull()
     selector.value = 'rustfs'
     selector.dispatchEvent(new Event('change', { bubbles: true }))
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=rustfs', { credentials: 'same-origin' })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=rustfs&limit=20&sort=name&direction=asc', { credentials: 'same-origin' })
     expect(host.textContent).toContain('remote.txt')
     expect(host.textContent).not.toContain('one.txt')
     expect(host.querySelector('.file-row.selected')).toBeNull()
-    expect(host.querySelector('[aria-current="location"]')?.textContent).toContain('/')
+    const home = host.querySelector<HTMLButtonElement>('.home-crumb[aria-current="location"]')
+    expect(home?.getAttribute('aria-label')).toBe('首页')
+    const homeIcon = home?.querySelector('[data-icon="home"][data-weight="duotone"]')
+    expect(homeIcon?.tagName.toLowerCase()).toBe('svg')
+    expect(home?.textContent?.trim()).toBe('')
+    app.unmount()
+  })
+
+  it('asks for an authorized account before opening a restricted storage', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      ...listResponse(['public.txt']),
+      storages: [
+        { id: 'primary', name: 'Public', requires_login: false },
+        { id: 'private', name: 'Private', requires_login: true },
+      ],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    const selector = host.querySelector('.storage-switcher select') as HTMLSelectElement
+    selector.value = 'private'
+    selector.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(selector.value).toBe('primary')
+    expect(host.querySelector<HTMLFormElement>('.overlay.active form')?.textContent).toContain('账号登录')
+    app.unmount()
+  })
+
+  it('uses server cursors for the next and previous directory pages', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ...listResponse(['first.txt']),
+        page_start: 1,
+        next_cursor: 'MjA',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ...listResponse(['second.txt']),
+        page_start: 21,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ...listResponse(['first.txt']),
+        page_start: 1,
+        next_cursor: 'MjA',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('.browser-chrome.glass')).not.toBeNull()
+    expect(host.textContent).not.toContain('显示第')
+    expect(host.querySelector('.page-size-select [data-icon]')).toBeNull()
+    expect(host.querySelectorAll('.page-chevron')).toHaveLength(2)
+    const arrows = host.querySelectorAll<HTMLButtonElement>('.page-arrow')
+    arrows[1]!.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=20&cursor=MjA&sort=name&direction=asc', { credentials: 'same-origin' })
+    expect(host.textContent).toContain('second.txt')
+    expect(host.querySelector('.current-page')?.textContent).toBe('2')
+
+    host.querySelector<HTMLButtonElement>('.page-arrow')!.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc', { credentials: 'same-origin' })
+    expect(host.textContent).toContain('first.txt')
+    app.unmount()
+  })
+
+  it('does not cancel the native page-size selector on desktop', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: false }))
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt'])), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    const selector = host.querySelector<HTMLSelectElement>('.page-size-select select')!
+    const down = new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0 })
+    selector.dispatchEvent(down)
+
+    expect(down.defaultPrevented).toBe(false)
+    selector.value = '10'
+    selector.dispatchEvent(new Event('change', { bubbles: true }))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=10&sort=name&direction=asc', { credentials: 'same-origin' })
     app.unmount()
   })
 
@@ -148,6 +283,9 @@ describe('BrowserView', () => {
       entries: [{
         name: 'one.txt', path: 'one.txt', is_dir: false, size: 1, modified: '', mime: 'text/plain', icon: 'code', locked: false,
       }],
+      page_start: 1,
+      page_size: 20,
+      next_cursor: null,
       truncated: false,
       can_write: true,
       max_upload_bytes: 1024,

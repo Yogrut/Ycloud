@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useLocale } from '../i18n'
+import AppIcon from './AppIcon.vue'
 
 const locale = useLocale()
 </script>
@@ -12,6 +13,6 @@ const locale = useLocale()
     :aria-label="locale.t(locale.isEnglish.value ? 'locale.switchToChinese' : 'locale.switchToEnglish')"
     @click="locale.toggle"
   >
-    <span aria-hidden="true">{{ locale.isEnglish.value ? '中' : 'EN' }}</span>
+    <AppIcon name="language" />
   </button>
 </template>

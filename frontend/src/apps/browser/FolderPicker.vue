@@ -18,9 +18,17 @@ async function load(destination: string): Promise<void> {
   loading.value = true
   error.value = ''
   try {
-    const data = await listFiles(destination)
-    path.value = data.current_path.replace(/^\/+|\/+$/g, '')
-    directories.value = data.entries.filter(entry => entry.is_dir && !entry.locked)
+    let cursor: string | undefined
+    let currentPath = destination
+    const found: FileEntry[] = []
+    do {
+      const data = await listFiles(destination, undefined, { limit: 100, cursor })
+      currentPath = data.current_path
+      found.push(...data.entries.filter(entry => entry.is_dir && !entry.locked))
+      cursor = data.next_cursor ?? undefined
+    } while (cursor)
+    path.value = currentPath.replace(/^\/+|\/+$/g, '')
+    directories.value = found
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : locale.t('picker.loadFailed')
   } finally {

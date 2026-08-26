@@ -11,9 +11,12 @@ afterEach(() => {
 const localInstance: StorageInstanceView = {
   id: 'primary',
   name: '本地存储',
-  is_default: true,
+  is_default: false,
+  enabled: true,
+  allow_guest_access: true,
+  status: 'enabled',
   ready: true,
-  backend: { type: 'local', path: './storage', capacity_limit_bytes: null },
+  backend: { type: 'local', mount_id: 'primary', path: './storage', capacity_limit_bytes: null },
   usage_bytes: 0,
   reserved_bytes: 0,
 }
@@ -28,7 +31,6 @@ function mountStorage(host: HTMLElement, pendingInstance: StorageInstanceView | 
   const app = createApp(StorageView, {
     instances: [localInstance],
     pendingInstance,
-    defaultStorageId: 'primary',
     localMounts,
     onChanged: changed,
   })
@@ -36,192 +38,140 @@ function mountStorage(host: HTMLElement, pendingInstance: StorageInstanceView | 
   return { app, changed }
 }
 
+function response(body: unknown = { success: true }, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+function button(host: HTMLElement, label: string): HTMLButtonElement | undefined {
+  return [...host.querySelectorAll<HTMLButtonElement>('button')].find(item => item.textContent?.trim().includes(label))
+}
+
+function setInput(input: HTMLInputElement | null, value: string): void {
+  if (!input) throw new Error(`input missing for ${value}`)
+  input.value = value
+  input.dispatchEvent(new Event('input'))
+}
+
+function setLabeledInput(host: HTMLElement, label: string, value: string): void {
+  const field = [...host.querySelectorAll<HTMLLabelElement>('.storage-form > label')]
+    .find(item => item.textContent?.trim().startsWith(label))
+    ?.querySelector('input')
+  setInput(field ?? null, value)
+}
+
 describe('StorageView', () => {
-  it('offers local storage and four constrained S3 profiles', async () => {
+  it('keeps setup collapsed until New storage is selected', async () => {
     const host = document.createElement('div')
     document.body.append(host)
     const { app } = mountStorage(host)
     await nextTick()
 
+    expect(host.querySelectorAll('.storage-source-row')).toHaveLength(1)
+    expect(host.textContent).toContain('启用')
+    expect(host.textContent).toContain('访客可访问')
+    expect(host.querySelectorAll('.storage-provider')).toHaveLength(0)
+    expect(button(host, '新建存储')?.querySelector('svg')).toBeNull()
+    expect(button(host, '设置')?.querySelector('svg')).toBeNull()
+
+    button(host, '新建存储')?.click()
+    await nextTick()
     expect(host.querySelectorAll('.storage-provider')).toHaveLength(5)
-    expect(host.textContent).toContain('本地存储')
-    expect(host.textContent).toContain('阿里云 OSS')
-    expect(host.textContent).toContain('腾讯云 COS')
     expect(host.textContent).toContain('MinIO / RustFS')
     expect(host.textContent).toContain('S3 通用协议')
-    expect(host.querySelectorAll('.local-mount-card')).toHaveLength(2)
-    expect(host.textContent).toContain('已声明 2 个挂载地址')
-    expect(host.querySelector<HTMLInputElement>('.local-path-input')?.value).toBe('./storage')
-    expect(host.textContent).toContain('LOCAL_STORAGE_MOUNTS')
     app.unmount()
   })
 
-  it('forces virtual-hosted addressing for official cloud profiles', async () => {
+  it('uses virtual-hosted addressing for official cloud profiles', async () => {
     const host = document.createElement('div')
     document.body.append(host)
     const { app } = mountStorage(host)
-    const providerButtons = host.querySelectorAll<HTMLButtonElement>('.storage-provider')
-    providerButtons[1]?.click()
+    button(host, '新建存储')?.click()
+    await nextTick()
+    host.querySelectorAll<HTMLButtonElement>('.storage-provider')[1]?.click()
     await nextTick()
 
-    const addressing = host.querySelector<HTMLSelectElement>('select')
+    const addressing = [...host.querySelectorAll<HTMLLabelElement>('.storage-form > label')]
+      .find(item => item.textContent?.includes('寻址方式'))?.querySelector('select')
     expect(addressing?.value).toBe('virtual_hosted')
     expect(addressing?.disabled).toBe(true)
     app.unmount()
   })
 
-  it('stages a local logical capacity without changing the storage path', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    }))
+  it('reconfigures the complete local storage settings', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(response()))
     vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
     const { app, changed } = mountStorage(host)
+    button(host, '设置')?.click()
     await nextTick()
-
-    const path = host.querySelector<HTMLInputElement>('.local-path-input')
-    const capacity = host.querySelector<HTMLInputElement>('.local-capacity-input')
-    if (!capacity) throw new Error('local capacity input missing')
-    capacity.value = '800'
-    capacity.dispatchEvent(new Event('input'))
-    await nextTick()
-    host.querySelector<HTMLButtonElement>('.local-save-button')?.click()
+    setLabeledInput(host, '存储名称', '主资料盘')
+    setLabeledInput(host, '本地存储路径', '/mnt/primary')
+    setInput(host.querySelector('.local-capacity-input'), '800')
+    button(host, '保存')?.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
-    expect(path?.value).toBe('./storage')
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/local', expect.objectContaining({
       method: 'PUT',
-      body: JSON.stringify({ storage_id: 'primary', capacity_limit_bytes: 800 * (1024 ** 3) }),
+      body: JSON.stringify({ storage_id: 'primary', name: '主资料盘', path: '/mnt/primary', capacity_limit_bytes: 800 * (1024 ** 3) }),
     }))
-    expect(changed).toHaveBeenCalledWith('本地存储容量设置已更新')
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/primary', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ enabled: true, allow_guest_access: true }),
+    }))
+    expect(changed).toHaveBeenCalledWith('存储设置已保存')
     app.unmount()
   })
 
-  it('adds a declared unused mount as a separate local storage source', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ storage_id: 'local-archive' }), {
-      status: 201,
-      headers: { 'Content-Type': 'application/json' },
-    }))
+  it('adds a local storage from an administrator-entered path without importing files', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(response({ storage_id: 'local-archive' }, 201)))
     vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
     const { app, changed } = mountStorage(host)
+    button(host, '新建存储')?.click()
     await nextTick()
-
-    host.querySelector<HTMLButtonElement>('[data-mount-id="archive"]')?.click()
-    await nextTick()
-    const name = host.querySelector<HTMLInputElement>('.local-storage-name')
-    const capacity = host.querySelector<HTMLInputElement>('.local-capacity-input')
-    if (!name || !capacity) throw new Error('local storage fields missing')
-    name.value = '冷数据归档'
-    name.dispatchEvent(new Event('input'))
-    capacity.value = '80'
-    capacity.dispatchEvent(new Event('input'))
-    host.querySelector<HTMLButtonElement>('.local-add-button')?.click()
+    setInput(host.querySelector('.local-storage-name'), '冷数据归档')
+    setInput(host.querySelector('.local-storage-path'), '/mnt/archive')
+    setInput(host.querySelector('.local-capacity-input'), '80')
+    button(host, '保存')?.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/local', expect.objectContaining({
       method: 'POST',
-      body: JSON.stringify({ mount_id: 'archive', name: '冷数据归档', capacity_limit_bytes: 80 * (1024 ** 3) }),
+      body: JSON.stringify({ path: '/mnt/archive', name: '冷数据归档', capacity_limit_bytes: 80 * (1024 ** 3), enabled: true, allow_guest_access: false }),
     }))
-    expect(changed).toHaveBeenCalledWith('本地存储源已添加；现有文件和默认存储均未改变')
+    expect(changed).toHaveBeenCalledWith(expect.stringContaining('文件未被移动或删除'))
     app.unmount()
   })
 
-  it('fully verifies and saves a MinIO or RustFS endpoint as pending', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    }))
+  it('verifies, saves, and activates S3 from one editor action', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(response()))
     vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
     const { app, changed } = mountStorage(host)
+    button(host, '新建存储')?.click()
+    await nextTick()
     host.querySelectorAll<HTMLButtonElement>('.storage-provider')[3]?.click()
     await nextTick()
-    const inputs = host.querySelectorAll<HTMLInputElement>('.storage-form input')
-    if (!inputs[0] || !inputs[1] || !inputs[2] || !inputs[3] || !inputs[4] || !inputs[5] || !inputs[6] || !inputs[7]) {
-      throw new Error('storage setup input missing')
-    }
-    const values = ['家庭 RustFS', '0', 'https://rustfs.internal.example', 'ycloud', 'us-east-1', 'files/', 'access-id', 'secret-value']
-    inputs.forEach((input, index) => {
-      input.value = values[index] ?? input.value
-      input.dispatchEvent(new Event('input'))
-    })
-    ;(host.querySelector('.storage-form') as HTMLFormElement).dispatchEvent(new Event('submit', { cancelable: true }))
+    setInput(host.querySelector('.local-storage-name'), '家庭 RustFS')
+    setLabeledInput(host, 'Endpoint', 'https://rustfs.internal.example')
+    setLabeledInput(host, 'Bucket', 'ycloud')
+    setLabeledInput(host, 'Region', 'us-east-1')
+    setLabeledInput(host, 'Prefix', 'files/')
+    setLabeledInput(host, 'Access Key ID', 'access-id')
+    setLabeledInput(host, 'Secret Access Key', 'secret-value')
+    button(host, '保存')?.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/pending', expect.objectContaining({
-      method: 'PUT',
-      body: JSON.stringify({
-        name: '家庭 RustFS',
-        provider: 'minio',
-        endpoint: 'https://rustfs.internal.example',
-        bucket: 'ycloud',
-        region: 'us-east-1',
-        prefix: 'files/',
-        addressing_style: 'path',
-        access_key_id: 'access-id',
-        secret_access_key: 'secret-value',
-        capacity_limit_bytes: null,
-      }),
-    }))
-    expect(inputs[7].value).toBe('')
-    expect(changed).toHaveBeenCalledWith('S3 完整能力验证通过，已保存为待添加存储')
-    app.unmount()
-  })
-
-  it('requires explicit confirmation before activating a pending backend', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    }))
-    vi.stubGlobal('fetch', fetchMock)
-    const host = document.createElement('div')
-    document.body.append(host)
-    const { app, changed } = mountStorage(host, {
-      id: 'rustfs',
-      name: '家庭 RustFS',
-      is_default: false,
-      ready: true,
-      backend: {
-        type: 's3',
-        provider: 'minio',
-        endpoint: 'https://rustfs.internal.example',
-        bucket: 'ycloud',
-        region: 'us-east-1',
-        prefix: 'files/',
-        addressing_style: 'path',
-        has_access_key_id: true,
-        has_secret_access_key: true,
-        capacity_limit_bytes: null,
-      },
-      usage_bytes: 0,
-      reserved_bytes: 0,
+    const pendingCall = fetchMock.mock.calls.find(call => call[0] === '/api/admin/storage/pending')
+    expect(JSON.parse(pendingCall?.[1]?.body as string)).toMatchObject({
+      name: '家庭 RustFS', provider: 'minio', endpoint: 'https://rustfs.internal.example', bucket: 'ycloud',
+      enabled: true, allow_guest_access: false, access_key_id: 'access-id', secret_access_key: 'secret-value',
     })
-    await nextTick()
-
-    expect(host.textContent).toContain('待添加：家庭 RustFS')
-    expect(host.textContent).not.toContain('pending-secret')
-    const activate = Array.from(host.querySelectorAll<HTMLButtonElement>('.storage-pending-actions button'))
-      .find(button => button.textContent?.trim() === '添加存储')
-    activate?.click()
-    await nextTick()
-    expect(host.querySelector('[role="dialog"]')).not.toBeNull()
-    expect(fetchMock).not.toHaveBeenCalled()
-
-    const confirm = Array.from(host.querySelectorAll<HTMLButtonElement>('.modal-actions button'))
-      .find(button => button.textContent?.trim() === '确认添加')
-    confirm?.click()
-    await new Promise(resolve => window.setTimeout(resolve, 0))
-
-    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/activate', expect.objectContaining({
-      method: 'POST',
-      credentials: 'same-origin',
-    }))
-    expect(changed).toHaveBeenCalledWith('新存储已添加；默认存储和现有文件均未改变')
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/activate', expect.objectContaining({ method: 'POST' }))
+    expect(changed).toHaveBeenCalledWith(expect.stringContaining('存储源已添加'))
     app.unmount()
   })
 })

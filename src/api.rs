@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{cmp::Ordering, path::PathBuf};
 
 use axum::{
     body::Body,
@@ -7,6 +7,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
@@ -21,7 +22,9 @@ use crate::storage::FileResponseMode;
 
 // ── Request / response types ──────────────────────────────────────
 
-#[derive(Serialize)]
+const DEFAULT_PAGE_SIZE: usize = 20;
+
+#[derive(Clone, Debug, Serialize)]
 pub struct FileEntry {
     pub name: String,
     pub path: String,
@@ -41,6 +44,9 @@ pub struct ListResponse {
     pub current_path: String,
     pub parent_path: Option<String>,
     pub entries: Vec<FileEntry>,
+    pub page_start: usize,
+    pub page_size: usize,
+    pub next_cursor: Option<String>,
     pub truncated: bool,
     pub can_write: bool,
     pub is_admin: bool,
@@ -48,6 +54,97 @@ pub struct ListResponse {
     pub max_upload_bytes: u64,
     pub max_archive_bytes: u64,
     pub max_archive_entries: usize,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DirectorySort {
+    #[default]
+    Name,
+    Size,
+    Time,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+#[derive(Default, Deserialize)]
+pub struct FileListQuery {
+    pub path: Option<String>,
+    #[serde(default)]
+    pub storage_id: Option<String>,
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+    pub search: Option<String>,
+    #[serde(default)]
+    sort: DirectorySort,
+    #[serde(default)]
+    direction: SortDirection,
+}
+
+impl FileListQuery {
+    fn file_query(&self) -> FileQuery {
+        FileQuery {
+            path: self.path.clone(),
+            storage_id: self.storage_id.clone(),
+        }
+    }
+}
+
+fn page_size(limit: Option<usize>) -> AppResult<usize> {
+    match limit.unwrap_or(DEFAULT_PAGE_SIZE) {
+        value @ (10 | 20 | 50 | 100) => Ok(value),
+        _ => Err(AppError::BadRequest(
+            "Page size must be one of 10, 20, 50, or 100".into(),
+        )),
+    }
+}
+
+fn encode_cursor(offset: usize) -> String {
+    URL_SAFE_NO_PAD.encode(offset.to_string())
+}
+
+fn decode_cursor(cursor: Option<&str>) -> AppResult<usize> {
+    let Some(cursor) = cursor else { return Ok(0) };
+    let decoded = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| AppError::BadRequest("Invalid directory cursor".into()))?;
+    std::str::from_utf8(&decoded)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| AppError::BadRequest("Invalid directory cursor".into()))
+}
+
+fn compare_entries(
+    left: &FileEntry,
+    right: &FileEntry,
+    sort: DirectorySort,
+    direction: SortDirection,
+) -> Ordering {
+    let kind_order = right.is_dir.cmp(&left.is_dir);
+    if kind_order != Ordering::Equal {
+        return kind_order;
+    }
+    let primary = match sort {
+        DirectorySort::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+        DirectorySort::Size => left.size.cmp(&right.size),
+        DirectorySort::Time => left.modified.cmp(&right.modified),
+    };
+    let primary = match direction {
+        SortDirection::Asc => primary,
+        SortDirection::Desc => primary.reverse(),
+    };
+    primary.then_with(|| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then(left.path.cmp(&right.path))
+    })
 }
 
 #[derive(Default, Serialize)]
@@ -65,8 +162,33 @@ pub struct BrowserCapabilities {
 pub struct BrowserStorageView {
     pub id: String,
     pub name: String,
-    pub is_default: bool,
-    pub ready: bool,
+    pub requires_login: bool,
+}
+
+async fn browser_storage_views(state: &AppState, headers: &HeaderMap) -> Vec<BrowserStorageView> {
+    let storage_configs = state.config_file.read().await.storage_instances.clone();
+    let mut storages = Vec::with_capacity(storage_configs.len());
+    for storage in storage_configs {
+        if !storage.enabled || !state.backends.is_ready(&storage.id).await {
+            continue;
+        }
+        let can_browse = storage_permission(state, headers, &storage.id)
+            .await
+            .is_some_and(|permission| permission.browse);
+        storages.push(BrowserStorageView {
+            id: storage.id,
+            name: storage.name,
+            requires_login: !can_browse,
+        });
+    }
+    storages
+}
+
+pub async fn browser_storages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<Vec<BrowserStorageView>> {
+    Json(browser_storage_views(&state, &headers).await)
 }
 
 #[derive(Deserialize)]
@@ -136,9 +258,10 @@ fn get_icon(name: &str, is_dir: bool, mime: &str) -> String {
 pub async fn list_files(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<FileQuery>,
+    Query(query): Query<FileListQuery>,
 ) -> AppResult<Json<ListResponse>> {
-    let share = resolve_share(&state, &headers, &query).await?;
+    let file_query = query.file_query();
+    let share = resolve_share(&state, &headers, &file_query).await?;
     let backend = state.storage_backend(&share.storage_id).await?;
     let request_path = query.path.as_deref().unwrap_or("");
     let storage_directory = share_storage_path(&share, request_path);
@@ -147,6 +270,8 @@ pub async fn list_files(
     }
     let lock_authorizer = FolderLockAuthorizer::new(&state, &headers, &share.storage_id).await;
     lock_authorizer.ensure_access(&share_storage_path(&share, request_path))?;
+    let page_size = page_size(query.limit)?;
+    let requested_offset = decode_cursor(query.cursor.as_deref())?;
 
     let limit = state.config.max_list_entries;
     let (backend_entries, truncated) = backend.list_directory(&storage_directory, limit).await?;
@@ -187,11 +312,24 @@ pub async fn list_files(
         });
     }
 
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    if let Some(search) = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let search = search.to_lowercase();
+        entries.retain(|entry| entry.name.to_lowercase().contains(&search));
+    }
+    entries.sort_by(|left, right| compare_entries(left, right, query.sort, query.direction));
+
+    let page_offset = requested_offset.min(entries.len());
+    let page_end = page_offset.saturating_add(page_size).min(entries.len());
+    let next_cursor = (page_end < entries.len()).then(|| encode_cursor(page_end));
+    let entries = entries[page_offset..page_end].to_vec();
+    let page_start = (!entries.is_empty())
+        .then_some(page_offset + 1)
+        .unwrap_or(0);
 
     let current_path = request_path.to_string();
     let parent_path = PathBuf::from(&current_path)
@@ -200,14 +338,12 @@ pub async fn list_files(
         .map(|s| s.to_string());
 
     let permission = storage_permission(&state, &headers, &share.storage_id).await;
-    let (max_upload_bytes, max_archive_bytes, max_archive_entries, storage_configs, default_id) = {
+    let (max_upload_bytes, max_archive_bytes, max_archive_entries) = {
         let config = state.config_file.read().await;
         (
             config.max_upload_bytes,
             config.max_archive_bytes,
             config.max_archive_entries,
-            config.storage_instances.clone(),
-            config.default_storage_id.clone(),
         )
     };
     let principal = crate::auth::current_principal(&state, &headers).await;
@@ -215,24 +351,7 @@ pub async fn list_files(
         principal,
         Some(crate::auth::SessionPrincipal::Administrator)
     );
-    let mut storages = Vec::new();
-    if principal.is_some() {
-        storages.reserve(storage_configs.len());
-        for storage in storage_configs {
-            if storage_permission(&state, &headers, &storage.id)
-                .await
-                .is_none_or(|permission| !permission.browse)
-            {
-                continue;
-            }
-            storages.push(BrowserStorageView {
-                id: storage.id.clone(),
-                name: storage.name,
-                is_default: storage.id == default_id,
-                ready: state.backends.is_ready(&storage.id).await,
-            });
-        }
-    }
+    let storages = browser_storage_views(&state, &headers).await;
     let mut capabilities = permission
         .as_ref()
         .map(|permission| BrowserCapabilities {
@@ -262,6 +381,9 @@ pub async fn list_files(
         current_path,
         parent_path,
         entries,
+        page_start,
+        page_size,
+        next_cursor,
         truncated,
         can_write: !share.readonly && can_write,
         is_admin,
@@ -270,6 +392,58 @@ pub async fn list_files(
         max_archive_bytes,
         max_archive_entries,
     }))
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool, size: u64, modified: &str) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            path: name.into(),
+            is_dir,
+            size,
+            modified: modified.into(),
+            mime: String::new(),
+            icon: String::new(),
+            locked: false,
+        }
+    }
+
+    #[test]
+    fn directory_cursor_is_opaque_and_round_trips() {
+        let cursor = encode_cursor(40);
+        assert_ne!(cursor, "40");
+        assert_eq!(decode_cursor(Some(&cursor)).unwrap(), 40);
+        assert!(decode_cursor(Some("not-a-cursor")).is_err());
+    }
+
+    #[test]
+    fn directory_sort_keeps_folders_first_and_orders_files() {
+        let mut entries = vec![
+            entry("small.txt", false, 2, "2026-01-01 00:00"),
+            entry("folder", true, 0, "2026-01-01 00:00"),
+            entry("large.txt", false, 9, "2026-01-02 00:00"),
+        ];
+        entries.sort_by(|left, right| {
+            compare_entries(left, right, DirectorySort::Size, SortDirection::Desc)
+        });
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["folder", "large.txt", "small.txt"]
+        );
+    }
+
+    #[test]
+    fn directory_page_size_rejects_unlisted_values() {
+        assert_eq!(page_size(None).unwrap(), 20);
+        assert_eq!(page_size(Some(100)).unwrap(), 100);
+        assert!(page_size(Some(25)).is_err());
+    }
 }
 
 pub async fn create_directory(

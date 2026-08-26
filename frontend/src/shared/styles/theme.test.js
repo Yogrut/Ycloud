@@ -9,4 +9,52 @@ describe('interactive focus styling', () => {
     expect(themeCss).toContain(':focus-visible')
     expect(themeCss).toContain('outline: 2px solid var(--accent)')
   })
+
+  it('defines one clean blue palette for light and dark themes', () => {
+    expect(themeCss).toContain('--bg: #f5f7fb')
+    expect(themeCss).toContain('--panel: #ffffff')
+    expect(themeCss).toContain('--accent: #0874f9')
+    expect(themeCss).toContain(':root[data-theme="dark"]')
+    expect(themeCss).toContain('--bg: #111722')
+    expect(themeCss).toContain('--panel: #171e2a')
+  })
+
+  it('keeps the desktop admin content aligned with the navigation panel', () => {
+    expect(themeCss).not.toContain('gap: 18px; padding-top: 64px;')
+  })
+
+  it('compacts every masked password input consistently', () => {
+    expect(themeCss).toMatch(/input\[type="password"\]\s*\{[^}]*letter-spacing: -\.18em;/s)
+    expect(themeCss).toMatch(/input\[type="password"\]::placeholder\s*\{[^}]*letter-spacing: normal;/s)
+  })
+
+  it('keeps the mobile login card horizontally centered and restores readable password tracking', () => {
+    const mobile = themeCss.match(/@media \(max-width: 560px\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(mobile).toContain('input[type="password"] { letter-spacing: normal; }')
+    expect(mobile).toContain('.login-panel { width: 100%; padding: 40px 24px; }')
+  })
+
+  it('keeps the file browser compact and exposes mobile actions below search', () => {
+    expect(themeCss).toContain('.file-row { min-height: 50px; cursor: default; user-select: none; }')
+    expect(themeCss).toContain('.file-pagination { min-height: 58px;')
+    const mobile = themeCss.match(/@media \(max-width: 760px\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(mobile).toContain('.file-toolbar-actions { width: 100%; }')
+    expect(mobile).toContain('.file-row { min-height: 48px; }')
+  })
+
+  it('uses matching compact pagination controls and a soft-blue current page', () => {
+    expect(themeCss).toContain('.page-size-select { position: relative; width: 60px; height: 34px;')
+    expect(themeCss).toContain('.current-page { flex: 0 0 34px; color: var(--icon-color); background: var(--accent-soft);')
+    expect(themeCss).toContain('.page-arrow:disabled { color: var(--muted-2); cursor: default; opacity: 1; }')
+  })
+
+  it('keeps the long WebDAV editor inside the mobile viewport with its own scroll', () => {
+    const mobile = themeCss.match(/@media \(max-width: 760px\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(mobile).toMatch(/\.webdav-modal\s*\{[^}]*max-height: calc\(100dvh - 36px\);[^}]*overflow-y: auto;/s)
+    expect(mobile).toContain('-webkit-overflow-scrolling: touch;')
+  })
+
+  it('keeps the storage editor wide on desktop', () => {
+    expect(themeCss).toMatch(/\.modal\.storage-editor\s*\{[^}]*width: min\(1120px, calc\(100vw - 48px\)\);/s)
+  })
 })

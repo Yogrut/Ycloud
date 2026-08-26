@@ -46,6 +46,14 @@ pub async fn storage_permission(
     headers: &HeaderMap,
     storage_id: &str,
 ) -> Option<StoragePermission> {
+    let storage = state
+        .config_file
+        .read()
+        .await
+        .storage_instances
+        .iter()
+        .find(|storage| storage.id == storage_id && storage.enabled)
+        .cloned()?;
     match auth::current_principal(state, headers).await {
         Some(SessionPrincipal::Administrator) => Some(StoragePermission {
             storage_id: storage_id.into(),
@@ -75,8 +83,7 @@ pub async fn storage_permission(
         None => {
             let token = auth::extract_gate_token(headers)?;
             state.gate_access.get_scope(&token).await?;
-            let default_storage_id = state.config_file.read().await.default_storage_id.clone();
-            (storage_id == default_storage_id).then_some(StoragePermission {
+            storage.allow_guest_access.then_some(StoragePermission {
                 storage_id: storage_id.into(),
                 browse: true,
                 download: true,
@@ -111,50 +118,41 @@ pub async fn resolve_share(
     headers: &HeaderMap,
     query: &FileQuery,
 ) -> Result<Share, StatusCode> {
-    let default_storage_id = state.config_file.read().await.default_storage_id.clone();
-    if let Some(principal) = auth::current_principal(state, headers).await {
-        let selected = match (&principal, query.storage_id.as_deref()) {
-            (_, Some(requested)) => requested.to_string(),
-            (SessionPrincipal::Administrator, None) => default_storage_id.clone(),
-            (SessionPrincipal::User(user_id), None) => {
-                let config = state.config_file.read().await;
-                let account = config
-                    .user_accounts
-                    .iter()
-                    .find(|account| account.id == *user_id && account.enabled)
-                    .ok_or(StatusCode::UNAUTHORIZED)?;
-                if account.permissions.iter().any(|permission| {
-                    permission.storage_id == default_storage_id && permission.browse
-                }) {
-                    default_storage_id.clone()
-                } else {
-                    account
-                        .permissions
-                        .iter()
-                        .find(|permission| permission.browse)
-                        .map(|permission| permission.storage_id.clone())
-                        .ok_or(StatusCode::FORBIDDEN)?
-                }
-            }
-        };
-        let storage_id = selected.as_str();
-        if !state.backends.contains(storage_id).await {
+    let candidates = state
+        .config_file
+        .read()
+        .await
+        .storage_instances
+        .iter()
+        .filter(|storage| storage.enabled)
+        .map(|storage| storage.id.clone())
+        .collect::<Vec<_>>();
+    let candidates = if let Some(requested) = query.storage_id.as_deref() {
+        if !candidates.iter().any(|storage_id| storage_id == requested) {
             return Err(StatusCode::FORBIDDEN);
         }
-        ensure_storage_action(state, headers, storage_id, StorageAction::Browse)
+        vec![requested.to_string()]
+    } else {
+        candidates
+    };
+    for storage_id in candidates {
+        if !state.backends.is_ready(&storage_id).await {
+            continue;
+        }
+        if storage_permission(state, headers, &storage_id)
             .await
-            .map_err(|_| StatusCode::FORBIDDEN)?;
-        return Ok(root_share(storage_id));
-    }
-    if let Some(token) = auth::extract_gate_token(headers) {
-        if state.gate_access.get_scope(&token).await.is_some() {
-            // A browser access token is always pinned to the configured
-            // default storage. Query parameters cannot widen its scope.
-            return Ok(root_share(&default_storage_id));
+            .is_some_and(|permission| permission.browse)
+        {
+            return Ok(root_share(&storage_id));
         }
     }
-
-    Err(StatusCode::UNAUTHORIZED)
+    if auth::current_principal(state, headers).await.is_some()
+        || auth::extract_gate_token(headers).is_some()
+    {
+        Err(StatusCode::FORBIDDEN)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
 }
 
 fn root_share(storage_id: &str) -> Share {

@@ -63,7 +63,7 @@ describe('UsersView', () => {
     const app = mountUsers(host)
     await nextTick()
 
-    expect(host.textContent).toContain('账号只能由管理员创建、授权和修改密码')
+    expect(host.textContent).toContain('用户只能由管理员创建、授权和修改密码')
     ;(host.querySelector('.user-row .btn') as HTMLButtonElement).click()
     await nextTick()
     const password = host.querySelector<HTMLInputElement>('input[type="password"]')

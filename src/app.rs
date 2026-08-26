@@ -55,6 +55,7 @@ pub fn build_router(state: AppState) -> Router {
         ));
 
     let read_api = Router::new()
+        .route("/storages", get(api::browser_storages))
         .route("/files", get(api::list_files))
         .route("/download", get(api::download_file))
         .route(
@@ -117,6 +118,7 @@ pub fn build_router(state: AppState) -> Router {
             put(admin_api::update_user_account).delete(admin_api::delete_user_account),
         )
         .route("/storage/test", post(admin_api::test_s3_storage))
+        .route("/storage/s3/{id}", put(admin_api::update_s3_storage))
         .route(
             "/storage/pending",
             put(admin_api::stage_s3_storage).delete(admin_api::discard_pending_storage),
@@ -129,10 +131,9 @@ pub fn build_router(state: AppState) -> Router {
             "/storage/activate",
             post(admin_api::activate_pending_storage),
         )
-        .route("/storage/default", put(admin_api::set_default_storage))
         .route(
             "/storage/{id}",
-            axum::routing::delete(admin_api::delete_storage),
+            put(admin_api::update_storage_access).delete(admin_api::delete_storage),
         )
         .route("/limits", put(admin_api::update_transfer_limits))
         .route(
@@ -410,6 +411,8 @@ mod tests {
                 pending_storage_instance: Some(crate::config::StorageInstanceConfig {
                     id: "pending-test".into(),
                     name: "Pending test".into(),
+                    enabled: true,
+                    allow_guest_access: false,
                     backend: StorageBackendConfig::S3(S3StorageConfig {
                         provider: S3Provider::AlibabaOss,
                         endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
@@ -523,6 +526,9 @@ mod tests {
         let reader_files_json: serde_json::Value =
             serde_json::from_slice(&reader_files_body).unwrap();
         assert_eq!(reader_files_json["is_admin"], false);
+        assert_eq!(reader_files_json["page_size"], 20);
+        assert!(reader_files_json.get("page_start").is_some());
+        assert!(reader_files_json.get("next_cursor").is_some());
         assert_eq!(reader_files_json["capabilities"]["download"], true);
         assert_eq!(reader_files_json["capabilities"]["upload"], false);
         assert_eq!(reader_files_json["capabilities"]["delete"], false);
@@ -647,6 +653,19 @@ mod tests {
         let gate_files_body = to_bytes(gate_files.into_body(), 4096).await.unwrap();
         let gate_files_json: serde_json::Value = serde_json::from_slice(&gate_files_body).unwrap();
         assert_eq!(gate_files_json["can_write"], false);
+
+        let invalid_page_size = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/files?limit=25")
+                    .header(header::COOKIE, format!("gate_access={gate_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_page_size.status(), StatusCode::BAD_REQUEST);
 
         let gate_write = app
             .clone()

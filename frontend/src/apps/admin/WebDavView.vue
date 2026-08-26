@@ -241,8 +241,8 @@ async function confirmDelete(): Promise<void> {
       <p class="field-hint">{{ locale.text('存储路径保存时自动统一。启用 WebDAV 时需要用户名和至少 12 位密码。', 'Storage paths are normalized when saved. An enabled mount requires a username and a password of at least 12 characters.') }}</p>
       <p class="field-hint">{{ locale.text('挂载路径不能与网页文件夹锁的父、当前或子目录重叠；编辑时保留密码掩码表示不修改密码。', 'A mount path cannot overlap a browser folder lock at any level. Leave the password mask unchanged while editing to keep the current password.') }}</p>
       <div class="webdav-options">
-        <label><input v-model="webdavEnabled" type="checkbox">{{ locale.text('启用 WebDAV', 'Enable WebDAV') }}</label>
-        <label><input v-model="readonly" type="checkbox">{{ locale.text('只读访问', 'Read-only access') }}</label>
+        <label><input v-model="webdavEnabled" type="checkbox">{{ locale.text('启动', 'Enabled') }}</label>
+        <label><input v-model="readonly" type="checkbox">{{ locale.text('只读', 'Read only') }}</label>
       </div>
       <p class="modal-error" role="alert" aria-live="polite">{{ errorMessage }}</p>
       <div class="modal-actions">

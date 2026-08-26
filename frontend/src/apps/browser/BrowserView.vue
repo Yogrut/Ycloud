@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { BatchOperation, BatchResponse, BrowserCapabilities, BrowserStorage, FileEntry } from '../../shared/api/browser'
-import { adminLogin, batchOperation, createFolder, downloadUrl, listFiles, logout, prepareArchive, renameItem, unlockFolder, uploadFile } from '../../shared/api/browser'
+import { adminLogin, batchOperation, createFolder, downloadUrl, listFiles, listStorages, logout, prepareArchive, renameItem, unlockFolder, uploadFile } from '../../shared/api/browser'
 import { appPath } from '../../shared/routes'
 import { formatSize } from '../../shared/format'
-import CloudIcon from '../../shared/components/icons/CloudIcon.vue'
+import AppIcon from '../../shared/components/AppIcon.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
 import type { ThemeController } from '../../shared/composables/useTheme'
@@ -15,9 +15,11 @@ import FileIcon from './FileIcon.vue'
 import FolderPicker from './FolderPicker.vue'
 
 type SortKey = 'name' | 'time' | 'size'
+type PageSize = 10 | 20 | 50 | 100
 type DragSession = { startX: number; startY: number; active: boolean; initialSelection: Set<string> }
 
 const DRAG_THRESHOLD = 6
+const PAGE_SIZES: PageSize[] = [10, 20, 50, 100]
 
 defineProps<{ theme: ThemeController }>()
 const locale = useLocale()
@@ -26,8 +28,13 @@ const currentStorageId = ref('')
 const storages = ref<BrowserStorage[]>([])
 const entries = ref<FileEntry[]>([])
 const query = ref('')
+const appliedQuery = ref('')
 const sort = ref<SortKey>('name')
 const ascending = ref(true)
+const pageSize = ref<PageSize>(20)
+const currentCursor = ref<string>()
+const nextCursor = ref<string | null>(null)
+const cursorHistory = ref<Array<string | undefined>>([])
 const selected = ref(new Set<string>())
 const loading = ref(true)
 const canWrite = ref(false)
@@ -46,6 +53,7 @@ const showAdmin = ref(false)
 const adminUser = ref('')
 const adminPassword = ref('')
 const adminError = ref('')
+const pendingStorageId = ref('')
 const fileInput = ref<HTMLInputElement>()
 const filePanel = ref<HTMLElement>()
 const showFolder = ref(false)
@@ -78,30 +86,13 @@ const dragSelecting = ref(false)
 let dragSession: DragSession | null = null
 let suppressRowClick = false
 let suppressRowClickTimer: number | undefined
+let searchTimer: number | undefined
+let refreshSequence = 0
 
 const uploadPercent = computed(() => uploadTotal.value ? Math.min(100, Math.round(uploadProcessed.value / uploadTotal.value * 100)) : 0)
 
-const visibleEntries = computed(() => {
-  const term = query.value.trim().toLocaleLowerCase()
-  const filtered = term ? entries.value.filter(entry => entry.name.toLocaleLowerCase().includes(term)) : entries.value
-  const direction = ascending.value ? 1 : -1
-  return [...filtered].sort((left, right) => {
-    if (left.is_dir !== right.is_dir) return left.is_dir ? -1 : 1
-    let a: string | number
-    let b: string | number
-    if (sort.value === 'time') {
-      a = left.modified
-      b = right.modified
-    } else if (sort.value === 'size') {
-      a = left.is_dir ? -1 : left.size
-      b = right.is_dir ? -1 : right.size
-    } else {
-      a = left.name.toLocaleLowerCase()
-      b = right.name.toLocaleLowerCase()
-    }
-    return a < b ? -direction : a > b ? direction : 0
-  })
-})
+const visibleEntries = computed(() => entries.value)
+const pageNumber = computed(() => cursorHistory.value.length + 1)
 
 const crumbs = computed(() => {
   let accumulated = ''
@@ -123,13 +114,22 @@ function announce(message: string): void {
 }
 
 async function refresh(): Promise<void> {
+  const sequence = ++refreshSequence
   loading.value = true
   try {
-    const data = await listFiles(path.value, currentStorageId.value || undefined)
+    const data = await listFiles(path.value, currentStorageId.value || undefined, {
+      limit: pageSize.value,
+      cursor: currentCursor.value,
+      search: appliedQuery.value || undefined,
+      sort: sort.value,
+      direction: ascending.value ? 'asc' : 'desc',
+    })
+    if (sequence !== refreshSequence) return
     currentStorageId.value = data.storage_id
     storages.value = data.storages ?? []
     path.value = data.current_path.replace(/^\/+|\/+$/g, '')
     entries.value = data.entries
+    nextCursor.value = data.next_cursor ?? null
     canWrite.value = data.can_write
     isAdministrator.value = Boolean(data.is_admin)
     capabilities.value = data.capabilities ?? {
@@ -148,22 +148,56 @@ async function refresh(): Promise<void> {
     selected.value = new Set()
     if (data.truncated) announce(locale.text('目录内容超过显示上限，当前仅显示部分项目', 'This folder exceeds the display limit; only some items are shown'))
   } catch (error) {
+    if (sequence !== refreshSequence) return
+    if (!storages.value.length) {
+      try { storages.value = await listStorages() } catch { /* Keep the original file-list error. */ }
+    }
     announce(error instanceof Error ? error.message : locale.text('目录加载失败', 'Unable to load this folder'))
   } finally {
-    loading.value = false
+    if (sequence === refreshSequence) loading.value = false
   }
+}
+
+function resetPagination(): void {
+  currentCursor.value = undefined
+  nextCursor.value = null
+  cursorHistory.value = []
+  selected.value = new Set()
+}
+
+function scheduleSearch(): void {
+  if (searchTimer !== undefined) window.clearTimeout(searchTimer)
+  searchTimer = window.setTimeout(() => {
+    appliedQuery.value = query.value.trim()
+    resetPagination()
+    void refresh()
+  }, 250)
 }
 
 async function navigate(destination: string): Promise<void> {
   path.value = destination.replace(/^\/+|\/+$/g, '')
   query.value = ''
+  appliedQuery.value = ''
+  if (searchTimer !== undefined) window.clearTimeout(searchTimer)
+  resetPagination()
   await refresh()
 }
 
-async function switchStorage(): Promise<void> {
+async function switchStorage(event: Event): Promise<void> {
+  const nextStorageId = (event.target as HTMLSelectElement).value
+  const nextStorage = storages.value.find(storage => storage.id === nextStorageId)
+  if (!nextStorage || nextStorage.requires_login) {
+    ;(event.target as HTMLSelectElement).value = currentStorageId.value
+    pendingStorageId.value = nextStorageId
+    void openAdmin(true)
+    return
+  }
+  currentStorageId.value = nextStorageId
   path.value = ''
   query.value = ''
-  selected.value = new Set()
+  appliedQuery.value = ''
+  if (searchTimer !== undefined) window.clearTimeout(searchTimer)
+  resetPagination()
   await refresh()
 }
 
@@ -173,6 +207,30 @@ function changeSort(key: SortKey): void {
     sort.value = key
     ascending.value = true
   }
+  resetPagination()
+  void refresh()
+}
+
+function changePageSize(): void {
+  resetPagination()
+  void refresh()
+}
+
+function nextPage(): void {
+  if (!nextCursor.value || loading.value) return
+  cursorHistory.value = [...cursorHistory.value, currentCursor.value]
+  currentCursor.value = nextCursor.value
+  selected.value = new Set()
+  void refresh()
+}
+
+function previousPage(): void {
+  if (!cursorHistory.value.length || loading.value) return
+  const history = [...cursorHistory.value]
+  currentCursor.value = history.pop()
+  cursorHistory.value = history
+  selected.value = new Set()
+  void refresh()
 }
 
 function toggleSelection(entryPath: string): void {
@@ -207,8 +265,8 @@ function isMobileLayout(): boolean {
 function startDragSelection(event: MouseEvent): void {
   if (event.button !== 0 || isMobileLayout() || loading.value || !visibleEntries.value.length) return
   const target = event.target as HTMLElement
-  const row = target.closest('.file-row')
-  if (target.closest('input, a') || (target.closest('button') && !row)) return
+  const button = target.closest('button')
+  if (target.closest('input, select, textarea, a') || (button && !button.classList.contains('select-box'))) return
   // Prevent the browser's native text/image drag before the movement threshold.
   // Row checkboxes remain valid drag starting points; an ordinary click still
   // reaches their click handler when no drag actually occurs.
@@ -345,8 +403,8 @@ async function submitUnlock(): Promise<void> {
   }
 }
 
-async function openAdmin(): Promise<void> {
-  if (isAdministrator.value) {
+async function openAdmin(forStorage = false): Promise<void> {
+  if (isAdministrator.value && !forStorage) {
     window.location.href = appPath('/admin/account')
     return
   }
@@ -367,7 +425,13 @@ async function submitAdmin(): Promise<void> {
     showAdmin.value = false
     adminPassword.value = ''
     isAdministrator.value = result.is_admin
-    if (result.is_admin) window.location.href = appPath('/admin/account')
+    if (pendingStorageId.value) {
+      currentStorageId.value = pendingStorageId.value
+      pendingStorageId.value = ''
+      path.value = ''
+      resetPagination()
+      await refresh()
+    } else if (result.is_admin) window.location.href = appPath('/admin/account')
     else await refresh()
   } catch (error) {
     adminError.value = error instanceof Error ? error.message : locale.text('登录失败', 'Sign-in failed')
@@ -623,53 +687,59 @@ onBeforeUnmount(() => {
   window.removeEventListener('dragover', blockExternalFileDrop)
   window.removeEventListener('drop', blockExternalFileDrop)
   if (suppressRowClickTimer !== undefined) window.clearTimeout(suppressRowClickTimer)
+  if (searchTimer !== undefined) window.clearTimeout(searchTimer)
 })
 </script>
 
 <template>
-  <header class="topbar browser-topbar">
-    <div class="brand"><CloudIcon /><span>Ycloud</span></div>
-    <label class="top-search">
-      <svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" /></svg>
-      <input v-model="query" type="search" :placeholder="locale.text('搜索当前目录', 'Search this folder')" :aria-label="locale.text('搜索当前目录', 'Search this folder')">
+  <header class="browser-chrome glass">
+    <div class="brand"><AppIcon name="cloud" :size="28" /><span>Ycloud</span></div>
+    <label v-if="storages.length" class="storage-switcher browser-storage-switcher">
+      <span class="visually-hidden">{{ locale.text('当前存储', 'Current storage') }}</span>
+      <select :value="currentStorageId" :aria-label="locale.text('切换存储', 'Switch storage')" @change="switchStorage">
+        <option v-for="storage in storages" :key="storage.id" :value="storage.id">
+          {{ storage.name }}{{ storage.requires_login ? locale.text('（需登录）', ' (sign in)') : '' }}
+        </option>
+      </select>
     </label>
     <div class="top-actions">
-      <button class="icon-btn flat" type="button" :title="locale.text('账号登录 / 管理员', 'Account sign-in / Administrator')" :aria-label="locale.text('账号登录 / 管理员', 'Account sign-in / Administrator')" @click="openAdmin"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.2 1.2 0 0 1 1.52 0C14.5 3.8 17 5 19 5a1 1 0 0 1 1 1z" /><circle cx="12" cy="11" r="3" /></svg></button>
-      <button v-if="capabilities.create_directory" class="icon-btn flat" type="button" :title="locale.text('新建文件夹', 'New folder')" :aria-label="locale.text('新建文件夹', 'New folder')" @click="openFolderDialog"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M12 11v6M9 14h6" /></svg></button>
-      <button v-if="capabilities.upload" class="icon-btn flat" type="button" :title="locale.text('上传文件', 'Upload files')" :aria-label="locale.text('上传文件', 'Upload files')" @click="chooseFiles"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4M7 9l5-5 5 5" /><path d="M20 15v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-4" /></svg></button>
+      <button class="icon-btn flat" type="button" :title="locale.text('账号登录 / 管理员', 'Account sign-in / Administrator')" :aria-label="locale.text('账号登录 / 管理员', 'Account sign-in / Administrator')" @click="openAdmin()"><AppIcon name="administrator" /></button>
       <ThemeToggle :theme="theme.current.value" class="flat" @toggle="theme.toggle" />
       <LocaleToggle class="flat" />
-      <button class="icon-btn flat" type="button" :title="locale.text('退出登录', 'Sign out')" :aria-label="locale.text('退出登录', 'Sign out')" @click="signOut"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m16 17 5-5-5-5M21 12H9M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /></svg></button>
+      <button class="icon-btn flat" type="button" :title="locale.text('退出登录', 'Sign out')" :aria-label="locale.text('退出登录', 'Sign out')" @click="signOut"><AppIcon name="sign-out" /></button>
     </div>
     <input ref="fileInput" class="visually-hidden" type="file" multiple @change="uploadFiles">
   </header>
 
   <main class="browser-page" :class="{ 'selection-active': selected.size > 0 }">
-    <nav class="breadcrumb" :aria-label="locale.text('当前位置', 'Current path')">
-      <button class="crumb" :aria-current="crumbs.length ? undefined : 'location'" type="button" @click="navigate('')">/</button>
-      <template v-for="crumb in crumbs" :key="crumb.path">
-        <span class="crumb-separator" aria-hidden="true">›</span>
-        <button class="crumb" :aria-current="crumb.path === path ? 'location' : undefined" type="button" @click="navigate(crumb.path)">{{ crumb.label }}</button>
-      </template>
-      <label v-if="storages.length > 1" class="storage-switcher">
-        <span class="visually-hidden">{{ locale.text('当前存储', 'Current storage') }}</span>
-        <select v-model="currentStorageId" :aria-label="locale.text('切换存储', 'Switch storage')" @change="switchStorage">
-          <option v-for="storage in storages" :key="storage.id" :value="storage.id" :disabled="!storage.ready">
-            {{ storage.name }}{{ storage.is_default ? locale.text('（默认）', ' (default)') : '' }}{{ storage.ready ? '' : locale.text('（不可用）', ' (unavailable)') }}
-          </option>
-        </select>
-      </label>
-    </nav>
-
     <section ref="filePanel" class="file-panel glass" :class="{ 'drag-selecting': dragSelecting }" :aria-busy="loading" @mousedown="startDragSelection" @contextmenu="openBackgroundMenu">
+      <div class="file-toolbar">
+        <label class="top-search file-search">
+          <AppIcon name="search" />
+          <input v-model="query" type="search" :placeholder="locale.text('搜索当前目录', 'Search this folder')" :aria-label="locale.text('搜索当前目录', 'Search this folder')" @input="scheduleSearch">
+        </label>
+        <div class="file-toolbar-actions">
+          <button v-if="capabilities.create_directory" class="btn secondary" type="button" @click="openFolderDialog"><AppIcon name="folder-plus" /><span>{{ locale.text('新建文件夹', 'New folder') }}</span></button>
+          <button v-if="capabilities.upload" class="btn" type="button" @click="chooseFiles"><AppIcon name="upload" /><span>{{ locale.text('上传文件', 'Upload files') }}</span></button>
+        </div>
+      </div>
+
+      <nav class="breadcrumb" :aria-label="locale.text('当前位置', 'Current path')">
+        <button class="crumb home-crumb" :aria-current="crumbs.length ? undefined : 'location'" :aria-label="locale.text('首页', 'Home')" :title="locale.text('首页', 'Home')" type="button" @click="navigate('')"><AppIcon name="home" /></button>
+        <template v-for="crumb in crumbs" :key="crumb.path">
+          <span class="crumb-separator" aria-hidden="true">›</span>
+          <button class="crumb" :aria-current="crumb.path === path ? 'location' : undefined" type="button" @click="navigate(crumb.path)">{{ crumb.label }}</button>
+        </template>
+      </nav>
+
       <div class="file-head">
         <button class="select-box" :class="{ checked: allSelected }" type="button" :aria-label="locale.text('全选', 'Select all')" @click="toggleSelectAll"><span class="visually-hidden">{{ locale.text('全选', 'Select all') }}</span></button>
         <button class="sort-btn" type="button" @click="changeSort('name')">{{ locale.text('名称', 'Name') }} <span>{{ sort === 'name' ? (ascending ? '▲' : '▼') : '' }}</span></button>
-        <button class="sort-btn right modified" type="button" @click="changeSort('time')">{{ locale.text('修改时间', 'Modified') }} <span>{{ sort === 'time' ? (ascending ? '▲' : '▼') : '' }}</span></button>
         <button class="sort-btn right" type="button" @click="changeSort('size')">{{ locale.text('大小', 'Size') }} <span>{{ sort === 'size' ? (ascending ? '▲' : '▼') : '' }}</span></button>
+        <button class="sort-btn right modified" type="button" @click="changeSort('time')">{{ locale.text('修改时间', 'Modified') }} <span>{{ sort === 'time' ? (ascending ? '▲' : '▼') : '' }}</span></button>
       </div>
       <div v-if="loading" class="empty">{{ locale.t('common.loading') }}</div>
-      <div v-else-if="!visibleEntries.length" class="empty">{{ query ? locale.text('没有匹配的文件', 'No matching files') : locale.text('此文件夹为空', 'This folder is empty') }}</div>
+      <div v-else-if="!visibleEntries.length" class="empty">{{ appliedQuery ? locale.text('没有匹配的文件', 'No matching files') : locale.text('此文件夹为空', 'This folder is empty') }}</div>
       <div v-else>
         <div
           v-for="entry in visibleEntries"
@@ -683,10 +753,25 @@ onBeforeUnmount(() => {
         >
           <button class="select-box" :class="{ checked: selected.has(entry.path) }" type="button" :aria-label="locale.text(`选择 ${entry.name}`, `Select ${entry.name}`)" @click.stop="toggleSelection(entry.path)"><span class="visually-hidden">{{ locale.text('选择', 'Select') }} {{ entry.name }}</span></button>
           <div class="file-name"><FileIcon :entry="entry" /><span class="file-label">{{ entry.name }}</span></div>
-          <div class="cell right modified">{{ entry.modified || '-' }}</div>
           <div class="cell right">{{ entry.is_dir ? '-' : formatSize(entry.size) }}</div>
+          <div class="cell right modified">{{ entry.modified || '-' }}</div>
         </div>
       </div>
+      <footer class="file-pagination">
+        <div class="pagination-summary">
+          <label class="page-size-select">
+            <span class="visually-hidden">{{ locale.text('每页显示数量', 'Items per page') }}</span>
+            <select v-model.number="pageSize" :aria-label="locale.text('每页显示数量', 'Items per page')" @change="changePageSize">
+              <option v-for="size in PAGE_SIZES" :key="size" :value="size">{{ size }}</option>
+            </select>
+          </label>
+        </div>
+        <nav class="pagination-controls" :aria-label="locale.text('文件翻页', 'File pagination')">
+          <button class="page-arrow" type="button" :disabled="!cursorHistory.length || loading" :title="locale.text('上一页', 'Previous page')" :aria-label="locale.text('上一页', 'Previous page')" @click="previousPage"><span class="page-chevron previous" aria-hidden="true" /></button>
+          <span class="current-page" :aria-label="locale.text(`第 ${pageNumber} 页`, `Page ${pageNumber}`)">{{ pageNumber }}</span>
+          <button class="page-arrow" type="button" :disabled="!nextCursor || loading" :title="locale.text('下一页', 'Next page')" :aria-label="locale.text('下一页', 'Next page')" @click="nextPage"><span class="page-chevron next" aria-hidden="true" /></button>
+        </nav>
+      </footer>
     </section>
     <p v-if="truncated" class="browser-warning">{{ locale.text('当前目录仅显示服务器允许的部分项目', 'Only the server-approved portion of this folder is shown') }}</p>
   </main>

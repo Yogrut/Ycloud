@@ -78,6 +78,9 @@ pub struct StorageInstanceView {
     pub id: String,
     pub name: String,
     pub is_default: bool,
+    pub enabled: bool,
+    pub allow_guest_access: bool,
+    pub status: &'static str,
     pub ready: bool,
     pub backend: StorageBackendView,
     pub usage_bytes: u64,
@@ -280,6 +283,9 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
         id: instance.id,
         name: instance.name,
         is_default: false,
+        enabled: instance.enabled,
+        allow_guest_access: instance.allow_guest_access,
+        status: "pending",
         ready: false,
         backend: StorageBackendView::from_config(&instance.backend, &state.config),
         usage_bytes: 0,
@@ -343,6 +349,15 @@ async fn storage_instance_view(
     };
     StorageInstanceView {
         is_default: instance.id == default_storage_id,
+        status: if !instance.enabled {
+            "disabled"
+        } else if ready {
+            "enabled"
+        } else {
+            "abnormal"
+        },
+        enabled: instance.enabled,
+        allow_guest_access: instance.allow_guest_access,
         id: instance.id,
         name: instance.name,
         ready,
@@ -370,21 +385,56 @@ pub async fn test_s3_storage(
 #[derive(Deserialize)]
 pub struct StageS3StorageRequest {
     pub name: String,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_guest_access: bool,
     #[serde(flatten)]
     pub settings: S3StorageConfig,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 pub async fn stage_s3_storage(
     State(state): State<AppState>,
     Json(body): Json<StageS3StorageRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.stage_s3_storage(body.name, body.settings).await?;
+    state
+        .stage_s3_storage(
+            body.name,
+            body.settings,
+            body.enabled,
+            body.allow_guest_access,
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateS3StorageRequest {
+    pub name: String,
+    #[serde(flatten)]
+    pub settings: S3StorageConfig,
+}
+
+pub async fn update_s3_storage(
+    State(state): State<AppState>,
+    Path(storage_id): Path<String>,
+    Json(body): Json<UpdateS3StorageRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    state
+        .update_s3_storage(&storage_id, body.name, body.settings)
+        .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
 #[derive(Deserialize)]
 pub struct UpdateLocalStorageRequest {
     pub storage_id: String,
+    pub name: String,
+    pub path: String,
     #[serde(default)]
     pub capacity_limit_bytes: Option<u64>,
 }
@@ -394,17 +444,26 @@ pub async fn update_local_storage(
     Json(settings): Json<UpdateLocalStorageRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     state
-        .update_local_storage(&settings.storage_id, settings.capacity_limit_bytes)
+        .update_local_storage(
+            &settings.storage_id,
+            settings.name,
+            settings.path,
+            settings.capacity_limit_bytes,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
 #[derive(Deserialize)]
 pub struct AddLocalStorageRequest {
-    pub mount_id: String,
+    pub path: String,
     pub name: String,
     #[serde(default)]
     pub capacity_limit_bytes: Option<u64>,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_guest_access: bool,
 }
 
 pub async fn add_local_storage(
@@ -413,9 +472,11 @@ pub async fn add_local_storage(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let storage_id = state
         .add_local_storage(
-            settings.mount_id,
+            settings.path,
             settings.name,
             settings.capacity_limit_bytes,
+            settings.enabled,
+            settings.allow_guest_access,
         )
         .await?;
     Ok((
@@ -425,15 +486,19 @@ pub async fn add_local_storage(
 }
 
 #[derive(Deserialize)]
-pub struct SetDefaultStorageRequest {
-    pub storage_id: String,
+pub struct UpdateStorageAccessRequest {
+    pub enabled: bool,
+    pub allow_guest_access: bool,
 }
 
-pub async fn set_default_storage(
+pub async fn update_storage_access(
     State(state): State<AppState>,
-    Json(body): Json<SetDefaultStorageRequest>,
+    Path(storage_id): Path<String>,
+    Json(body): Json<UpdateStorageAccessRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state.set_default_storage(body.storage_id).await?;
+    state
+        .update_storage_access(&storage_id, body.enabled, body.allow_guest_access)
+        .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 

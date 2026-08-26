@@ -82,6 +82,18 @@ impl LocalMountCatalog {
         self.mounts.iter().find(|mount| mount.id == mount_id)
     }
 
+    /// Resolve administrator-entered paths to a directory explicitly exposed
+    /// to Ycloud by deployment configuration. The UI accepts a path, while the
+    /// persisted storage instance keeps the stable deployment mount identity.
+    pub fn resolve_path(&self, path: &Path) -> anyhow::Result<Option<&DeploymentLocalMount>> {
+        let normalized = normalize_absolute_path(path)?;
+        let key = comparable_path(&normalized);
+        Ok(self
+            .mounts
+            .iter()
+            .find(|mount| comparable_path(&mount.path) == key))
+    }
+
     pub async fn status(&self, mount_id: &str) -> LocalMountStatus {
         let Some(mount) = self.resolve(mount_id) else {
             return LocalMountStatus::default();

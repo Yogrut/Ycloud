@@ -75,22 +75,22 @@ async function save(): Promise<void> {
       await createUserAccount({ username: username.value.trim(), password: password.value, enabled: enabled.value, permissions: activePermissions })
     }
     editing.value = undefined
-    emit('changed', locale.text('普通账号已保存，原会话已撤销', 'Account saved and its previous sessions were revoked.'))
+    emit('changed', locale.text('用户已保存，原会话已撤销', 'User saved and previous sessions were revoked.'))
   } catch (reason) { error.value = reason instanceof Error ? reason.message : locale.t('common.requestFailed', { status: '' }) }
   finally { saving.value = false }
 }
 async function remove(account: UserAccountView): Promise<void> {
-  if (!window.confirm(locale.text(`删除普通账号“${account.username}”？`, `Delete account “${account.username}”?`))) return
-  try { await deleteUserAccount(account.id); emit('changed', locale.text('普通账号已删除', 'Account deleted.')) }
+  if (!window.confirm(locale.text(`删除用户“${account.username}”？`, `Delete user “${account.username}”?`))) return
+  try { await deleteUserAccount(account.id); emit('changed', locale.text('用户已删除', 'User deleted.')) }
   catch (reason) { window.alert(reason instanceof Error ? reason.message : locale.text('删除失败', 'Delete failed.')) }
 }
 </script>
 
 <template>
   <section class="admin-pane glass" aria-labelledby="users-title">
-    <header class="admin-pane-head"><div><h1 id="users-title">{{ locale.text('普通账号', 'User accounts') }}</h1><p>{{ locale.text('账号只能由管理员创建、授权和修改密码，且不能进入管理后台。', 'Only administrators can create accounts, assign permissions, or change passwords. These accounts cannot open the admin console.') }}</p></div><button class="btn" type="button" @click="openEditor()">{{ locale.text('新建账号', 'New account') }}</button></header>
+    <header class="admin-pane-head"><div><h1 id="users-title">{{ locale.text('用户管理', 'User management') }}</h1><p>{{ locale.text('用户只能由管理员创建、授权和修改密码，且不能进入管理后台。', 'Only administrators can create users, assign permissions, or change passwords. Users cannot open the admin console.') }}</p></div><button class="btn" type="button" @click="openEditor()">{{ locale.text('新建用户', 'New user') }}</button></header>
     <div class="admin-pane-body user-list">
-      <div v-if="!accounts.length" class="admin-empty">{{ locale.text('暂无普通账号', 'No user accounts') }}</div>
+      <div v-if="!accounts.length" class="admin-empty">{{ locale.text('暂无用户', 'No users') }}</div>
       <article v-for="account in accounts" :key="account.id" class="user-row">
         <div><strong>{{ account.username }}</strong><p>{{ account.enabled ? locale.text('已启用', 'Enabled') : locale.text('已停用', 'Disabled') }} · {{ locale.text(`可访问 ${account.permissions.length} 个存储`, `${account.permissions.length} storage permission(s)`) }}</p></div>
         <div class="row-actions"><button class="btn secondary" type="button" @click="openEditor(account)">{{ locale.t('common.edit') }}</button><button class="btn danger" type="button" @click="remove(account)">{{ locale.t('common.delete') }}</button></div>
@@ -100,7 +100,7 @@ async function remove(account: UserAccountView): Promise<void> {
 
   <div v-if="editing !== undefined" class="overlay" @click.self="editing = undefined">
     <form class="modal user-editor" @submit.prevent="save">
-      <h2>{{ editing ? locale.text('编辑普通账号', 'Edit account') : locale.text('新建普通账号', 'New account') }}</h2>
+      <h2>{{ editing ? locale.text('编辑用户', 'Edit user') : locale.text('新建用户', 'New user') }}</h2>
       <div class="user-basic-grid"><label>{{ locale.text('用户名', 'Username') }}<input v-model="username" class="input" maxlength="128" autocomplete="off"></label><label>{{ editing ? locale.text('新密码（留空不改）', 'New password (leave blank to keep)') : locale.text('密码（至少 12 位）', 'Password (12+ characters)') }}<input v-model="password" class="input" type="password" autocomplete="new-password"></label></div>
       <label class="toggle-line"><input v-model="enabled" type="checkbox">{{ locale.text('启用账号', 'Enable account') }}</label>
       <div class="storage-grant-list">

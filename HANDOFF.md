@@ -12,9 +12,9 @@
 
 - 删除 `.agents/`、`.obsidian/`、`skills-lock.json`、旧计划和旧术语文档。
 - 删除可重建的 `target/` 与 `frontend/node_modules/`。
-- 运行配置、日志和用户存储已移到：
-  `D:\SYStemFiles\文档\open_code\Ycloud-v2-runtime-backup-20260827-011511`
-- 项目内 `storage/` 只保留 `.gitkeep`。
+- 删除旧 `Ycloud` 工作树、旧本地分支和旧运行备份。
+- `Ycloud-v2` 已转换为独立仓库，当前只保留 `main`。
+- 当前运行配置和存储仍由 `.gitignore` 排除，不进入源码提交。
 
 ## 约束
 

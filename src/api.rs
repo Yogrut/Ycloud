@@ -327,9 +327,11 @@ pub async fn list_files(
     let page_end = page_offset.saturating_add(page_size).min(entries.len());
     let next_cursor = (page_end < entries.len()).then(|| encode_cursor(page_end));
     let entries = entries[page_offset..page_end].to_vec();
-    let page_start = (!entries.is_empty())
-        .then_some(page_offset + 1)
-        .unwrap_or(0);
+    let page_start = if entries.is_empty() {
+        0
+    } else {
+        page_offset + 1
+    };
 
     let current_path = request_path.to_string();
     let parent_path = PathBuf::from(&current_path)
@@ -392,58 +394,6 @@ pub async fn list_files(
         max_archive_bytes,
         max_archive_entries,
     }))
-}
-
-#[cfg(test)]
-mod pagination_tests {
-    use super::*;
-
-    fn entry(name: &str, is_dir: bool, size: u64, modified: &str) -> FileEntry {
-        FileEntry {
-            name: name.into(),
-            path: name.into(),
-            is_dir,
-            size,
-            modified: modified.into(),
-            mime: String::new(),
-            icon: String::new(),
-            locked: false,
-        }
-    }
-
-    #[test]
-    fn directory_cursor_is_opaque_and_round_trips() {
-        let cursor = encode_cursor(40);
-        assert_ne!(cursor, "40");
-        assert_eq!(decode_cursor(Some(&cursor)).unwrap(), 40);
-        assert!(decode_cursor(Some("not-a-cursor")).is_err());
-    }
-
-    #[test]
-    fn directory_sort_keeps_folders_first_and_orders_files() {
-        let mut entries = vec![
-            entry("small.txt", false, 2, "2026-01-01 00:00"),
-            entry("folder", true, 0, "2026-01-01 00:00"),
-            entry("large.txt", false, 9, "2026-01-02 00:00"),
-        ];
-        entries.sort_by(|left, right| {
-            compare_entries(left, right, DirectorySort::Size, SortDirection::Desc)
-        });
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["folder", "large.txt", "small.txt"]
-        );
-    }
-
-    #[test]
-    fn directory_page_size_rejects_unlisted_values() {
-        assert_eq!(page_size(None).unwrap(), 20);
-        assert_eq!(page_size(Some(100)).unwrap(), 100);
-        assert!(page_size(Some(25)).is_err());
-    }
 }
 
 pub async fn create_directory(
@@ -699,4 +649,56 @@ pub async fn unlock_folder(
         .map_err(|error| AppError::with_source("failed to build lock cookie", error))?;
     response.headers_mut().append(header::SET_COOKIE, value);
     Ok(response)
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool, size: u64, modified: &str) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            path: name.into(),
+            is_dir,
+            size,
+            modified: modified.into(),
+            mime: String::new(),
+            icon: String::new(),
+            locked: false,
+        }
+    }
+
+    #[test]
+    fn directory_cursor_is_opaque_and_round_trips() {
+        let cursor = encode_cursor(40);
+        assert_ne!(cursor, "40");
+        assert_eq!(decode_cursor(Some(&cursor)).unwrap(), 40);
+        assert!(decode_cursor(Some("not-a-cursor")).is_err());
+    }
+
+    #[test]
+    fn directory_sort_keeps_folders_first_and_orders_files() {
+        let mut entries = [
+            entry("small.txt", false, 2, "2026-01-01 00:00"),
+            entry("folder", true, 0, "2026-01-01 00:00"),
+            entry("large.txt", false, 9, "2026-01-02 00:00"),
+        ];
+        entries.sort_by(|left, right| {
+            compare_entries(left, right, DirectorySort::Size, SortDirection::Desc)
+        });
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["folder", "large.txt", "small.txt"]
+        );
+    }
+
+    #[test]
+    fn directory_page_size_rejects_unlisted_values() {
+        assert_eq!(page_size(None).unwrap(), 20);
+        assert_eq!(page_size(Some(100)).unwrap(), 100);
+        assert!(page_size(Some(25)).is_err());
+    }
 }

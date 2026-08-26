@@ -1,9 +1,11 @@
 {
-  "schema_version": 8,
+  "schema_version": 9,
   "storage_instances": [
     {
       "id": "primary",
       "name": "Local storage",
+      "enabled": true,
+      "allow_guest_access": true,
       "backend": {
         "type": "local",
         "settings": {

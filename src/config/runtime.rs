@@ -1,0 +1,184 @@
+use std::collections::HashSet;
+use std::net::IpAddr;
+use std::path::PathBuf;
+
+use anyhow::Context;
+
+use super::{
+    AppError, AppResult, Config, LocalMountCatalog, S3Provider, StorageBackendConfig,
+    HARD_MAX_UPLOAD_BYTES,
+};
+
+impl Config {
+    pub fn from_env() -> anyhow::Result<Self> {
+        let bind_address = env_parse("BIND_ADDRESS", IpAddr::from([127, 0, 0, 1]))?;
+        let port = env_parse("PORT", 18_473_u16)?;
+        let storage_path =
+            PathBuf::from(std::env::var("STORAGE_PATH").unwrap_or_else(|_| "./storage".into()));
+        let additional_local_mounts = std::env::var("LOCAL_STORAGE_MOUNTS").ok();
+        let local_mounts =
+            LocalMountCatalog::from_json(storage_path.clone(), additional_local_mounts.as_deref())?;
+        let config_path =
+            PathBuf::from(std::env::var("CONFIG_PATH").unwrap_or_else(|_| "./config.json".into()));
+        // This is an absolute transport envelope. The administrator-facing,
+        // persisted upload limit is enforced by StorageService and can be
+        // changed without exposing concurrency/resource protection controls.
+        let max_upload_bytes = env_parse("MAX_UPLOAD_BYTES", HARD_MAX_UPLOAD_BYTES)?;
+        let io_concurrency = env_parse("IO_CONCURRENCY", 4_usize)?;
+        let max_list_entries = env_parse("MAX_LIST_ENTRIES", 10_000_usize)?;
+        let request_timeout_secs = env_parse("REQUEST_TIMEOUT_SECS", 300_u64)?;
+        let upload_timeout_secs = env_parse("UPLOAD_TIMEOUT_SECS", 6_u64 * 60 * 60)?;
+        let disk_reserve_bytes = env_parse("DISK_RESERVE_BYTES", 512_u64 * 1024 * 1024)?;
+        let secure_cookies = env_parse("SECURE_COOKIES", false)?;
+        let allow_lan_http = env_parse("ALLOW_LAN_HTTP", false)?;
+        let (public_base_url, public_host, trusted_proxy_ips) =
+            public_proxy_config(bind_address, secure_cookies, allow_lan_http)?;
+        let s3_allowed_endpoints = s3_allowed_endpoints()?;
+        Ok(Self {
+            bind_address,
+            port,
+            storage_path,
+            local_mounts,
+            config_path,
+            max_upload_bytes,
+            io_concurrency,
+            max_list_entries,
+            request_timeout_secs,
+            upload_timeout_secs,
+            disk_reserve_bytes,
+            secure_cookies,
+            allow_lan_http,
+            public_base_url,
+            public_host,
+            trusted_proxy_ips,
+            s3_allowed_endpoints,
+        })
+    }
+
+    pub fn is_public_mode(&self) -> bool {
+        self.public_base_url.is_some()
+    }
+
+    pub fn allows_storage_backend(&self, backend: &StorageBackendConfig) -> AppResult<()> {
+        let StorageBackendConfig::S3(settings) = backend else {
+            return Ok(());
+        };
+        if matches!(
+            settings.provider,
+            S3Provider::AlibabaOss | S3Provider::TencentCos
+        ) {
+            return Ok(());
+        }
+        let endpoint = normalize_s3_endpoint(&settings.endpoint)?;
+        if self.s3_allowed_endpoints.contains(&endpoint) {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden)
+        }
+    }
+}
+
+fn s3_allowed_endpoints() -> anyhow::Result<HashSet<String>> {
+    std::env::var("S3_ALLOWED_ENDPOINTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            normalize_s3_endpoint(value)
+                .map_err(|_| anyhow::anyhow!("Invalid S3_ALLOWED_ENDPOINTS origin: {value}"))
+        })
+        .collect()
+}
+
+pub fn normalize_s3_endpoint(endpoint: &str) -> AppResult<String> {
+    let uri: axum::http::Uri = endpoint
+        .parse()
+        .map_err(|_| AppError::BadRequest("S3 Endpoint 地址无效".into()))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| AppError::BadRequest("S3 Endpoint 必须包含 http:// 或 https://".into()))?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| AppError::BadRequest("S3 Endpoint 缺少主机".into()))?;
+    if !matches!(scheme, "http" | "https")
+        || !matches!(uri.path(), "" | "/")
+        || uri.query().is_some()
+        || authority.as_str().contains('@')
+    {
+        return Err(AppError::BadRequest(
+            "S3 Endpoint 只能是无凭据、无路径和无查询参数的 HTTP(S) 地址".into(),
+        ));
+    }
+    Ok(format!(
+        "{}://{}",
+        scheme.to_ascii_lowercase(),
+        authority.as_str().to_ascii_lowercase()
+    ))
+}
+
+fn public_proxy_config(
+    bind_address: IpAddr,
+    secure_cookies: bool,
+    allow_lan_http: bool,
+) -> anyhow::Result<(Option<String>, Option<String>, HashSet<IpAddr>)> {
+    if bind_address.is_loopback() {
+        return Ok((None, None, HashSet::new()));
+    }
+    if allow_lan_http {
+        if secure_cookies {
+            anyhow::bail!(
+                "SECURE_COOKIES must be false for direct LAN HTTP; use public HTTPS proxy mode instead"
+            );
+        }
+        return Ok((None, None, HashSet::new()));
+    }
+    if !secure_cookies {
+        anyhow::bail!("SECURE_COOKIES=true is required when BIND_ADDRESS is not loopback");
+    }
+    let raw_url = std::env::var("PUBLIC_BASE_URL")
+        .context("PUBLIC_BASE_URL=https://your-domain is required for public mode")?;
+    let uri: axum::http::Uri = raw_url
+        .parse()
+        .context("PUBLIC_BASE_URL must be a valid HTTPS origin")?;
+    if uri.scheme_str() != Some("https")
+        || uri.authority().is_none()
+        || !matches!(uri.path(), "" | "/")
+        || uri.query().is_some()
+    {
+        anyhow::bail!("PUBLIC_BASE_URL must be an HTTPS origin without a path or query");
+    }
+    let host = uri
+        .authority()
+        .expect("authority checked above")
+        .as_str()
+        .to_string();
+    let origin = format!("https://{host}");
+    let raw_proxies = std::env::var("TRUSTED_PROXY_IPS")
+        .context("TRUSTED_PROXY_IPS is required for public mode")?;
+    let trusted_proxy_ips: HashSet<IpAddr> = raw_proxies
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .with_context(|| format!("Invalid trusted proxy IP: {value}"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if trusted_proxy_ips.is_empty() {
+        anyhow::bail!("TRUSTED_PROXY_IPS must contain at least one exact IP address");
+    }
+    Ok((Some(origin), Some(host), trusted_proxy_ips))
+}
+
+fn env_parse<T>(name: &str, default: T) -> anyhow::Result<T>
+where
+    T: std::str::FromStr + ToString,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    std::env::var(name)
+        .unwrap_or_else(|_| default.to_string())
+        .parse()
+        .with_context(|| format!("Invalid {name}"))
+}

@@ -19,6 +19,7 @@
 - `app.rs`：路由、中间件、存活与就绪探针。
 - `api.rs`、`admin_api.rs`：网页及管理 API。
 - `auth.rs`、`login_security.rs`、`security.rs`：会话、密码、登录限制和代理边界。
+- `config.rs`、`config/`：配置公共入口，以及持久化模型、校验、环境参数、schema 迁移、原子保存和密码处理模块。
 - `directory_listing.rs`：统一目录排序、搜索和游标分页。
 - `storage_backend.rs`：多存储注册与统一操作接口。
 - `capacity.rs`：存储容量预留、持久账本和后台核对。

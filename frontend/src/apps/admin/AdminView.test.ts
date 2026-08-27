@@ -57,7 +57,7 @@ describe('AdminView', () => {
 
     const links = [...host.querySelectorAll<HTMLAnchorElement>('.admin-nav-item')]
     expect(links.map(link => link.getAttribute('href'))).toEqual([
-      '/v2/admin/storage', '/v2/admin/webdav', '/v2/admin/locks', '/v2/admin/limits', '/v2/admin/account', '/v2/admin/users', '/v2/admin/protection', '/v2/admin/security',
+      '/admin/storage', '/admin/webdav', '/admin/locks', '/admin/limits', '/admin/account', '/admin/users', '/admin/protection', '/admin/security',
     ])
     expect(host.querySelector('.admin-nav-heading')).toBeNull()
     expect(host.querySelector('.admin-header .admin-nav-brand')?.textContent).toContain('Ycloud 管理')
@@ -69,7 +69,7 @@ describe('AdminView', () => {
   })
 
   it('renders the guarded storage setup page without exposing credentials', async () => {
-    window.history.replaceState(null, '', '/v2/admin/storage')
+    window.history.replaceState(null, '', '/admin/storage')
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
       status: 200, headers: { 'Content-Type': 'application/json' },
     })))
@@ -88,7 +88,7 @@ describe('AdminView', () => {
   })
 
   it('renders the Vue transfer limits page on its candidate route', async () => {
-    window.history.replaceState(null, '', '/v2/admin/limits')
+    window.history.replaceState(null, '', '/admin/limits')
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
       status: 200, headers: { 'Content-Type': 'application/json' },
     })))
@@ -104,7 +104,7 @@ describe('AdminView', () => {
   })
 
   it('renders the Vue WebDAV page on its candidate route', async () => {
-    window.history.replaceState(null, '', '/v2/admin/webdav')
+    window.history.replaceState(null, '', '/admin/webdav')
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
       status: 200, headers: { 'Content-Type': 'application/json' },
     })))
@@ -120,7 +120,7 @@ describe('AdminView', () => {
   })
 
   it('renders the Vue folder locks page on its candidate route', async () => {
-    window.history.replaceState(null, '', '/v2/admin/locks')
+    window.history.replaceState(null, '', '/admin/locks')
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
       status: 200, headers: { 'Content-Type': 'application/json' },
     })))
@@ -136,7 +136,7 @@ describe('AdminView', () => {
   })
 
   it('renders the Vue access logs page on its candidate route', async () => {
-    window.history.replaceState(null, '', '/v2/admin/security')
+    window.history.replaceState(null, '', '/admin/security')
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
       status: 200, headers: { 'Content-Type': 'application/json' },
     })))
@@ -152,7 +152,7 @@ describe('AdminView', () => {
   })
 
   it('renders sign-in protection on its own route', async () => {
-    window.history.replaceState(null, '', '/v2/admin/protection')
+    window.history.replaceState(null, '', '/admin/protection')
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), {
       status: 200, headers: { 'Content-Type': 'application/json' },
     })))

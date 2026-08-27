@@ -672,7 +672,6 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .current-page { flex: 0 0 34px; color: var(--icon-color); background: var(--accent-soft); font-size: 14px; font-weight: 720; }
 .lock-dot { position: absolute; right: -4px; bottom: -3px; width: 13px; height: 13px; display: grid; place-items: center; background: var(--panel); border-radius: 50%; }
 .empty { padding: 88px 20px; color: var(--muted); text-align: center; }
-.browser-warning { margin: 12px 4px 0; color: var(--muted); font-size: 13px; }
 
 .toast {
   position: fixed;

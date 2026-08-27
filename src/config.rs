@@ -1215,10 +1215,6 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
                 "Configuration schema version {schema_version} is newer than this Ycloud build"
             );
         }
-        if schema_version < 2 {
-            raw["schema_version"] = serde_json::json!(2);
-            migrated = true;
-        }
         if schema_version < 5 {
             if raw.get("storage_backend").is_none() {
                 raw["storage_backend"] = serde_json::json!({
@@ -1277,16 +1273,10 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
                 object.remove("storage_backend");
                 object.remove("pending_storage_backend");
             }
-            raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
             migrated = true;
         }
         if schema_version < 7 {
             raw["user_accounts"] = serde_json::json!([]);
-            raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
-            migrated = true;
-        }
-        if schema_version < 8 {
-            raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
             migrated = true;
         }
         if schema_version < 9 {
@@ -1308,6 +1298,9 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
                     instance["allow_guest_access"] = serde_json::json!(is_former_default);
                 }
             }
+            migrated = true;
+        }
+        if schema_version < CONFIG_SCHEMA_VERSION as u64 {
             raw["schema_version"] = serde_json::json!(CONFIG_SCHEMA_VERSION);
             migrated = true;
         }
@@ -1434,6 +1427,7 @@ async fn load_or_create_initial_credentials(path: &Path) -> anyhow::Result<Initi
         return Err(error).context("Failed to publish initial credentials file");
     }
     secure_file_permissions(path).await?;
+    sync_parent_directory(path.parent().unwrap_or_else(|| Path::new("."))).await?;
     Ok(credentials)
 }
 
@@ -1459,7 +1453,10 @@ fn random_password(bytes: usize) -> String {
 pub async fn remove_initial_credentials(config_path: &Path) -> anyhow::Result<bool> {
     let path = initial_credentials_path(config_path);
     match tokio::fs::remove_file(&path).await {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            sync_parent_directory(path.parent().unwrap_or_else(|| Path::new("."))).await?;
+            Ok(true)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error).with_context(|| {
             format!(
@@ -1513,7 +1510,8 @@ pub async fn save_config(path: &Path, config: &ConfigFile) -> anyhow::Result<()>
         tokio::fs::rename(&temporary, path)
             .await
             .context("Failed to commit configuration")?;
-        secure_file_permissions(path).await
+        secure_file_permissions(path).await?;
+        sync_parent_directory(path.parent().unwrap_or_else(|| Path::new("."))).await
     }
     .await;
     if let Err(error) = commit_result {
@@ -1521,10 +1519,27 @@ pub async fn save_config(path: &Path, config: &ConfigFile) -> anyhow::Result<()>
             && tokio::fs::try_exists(&backup).await.unwrap_or(false)
         {
             let _ = tokio::fs::rename(&backup, path).await;
+            let _ = sync_parent_directory(path.parent().unwrap_or_else(|| Path::new("."))).await;
         }
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error);
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+    let directory = tokio::fs::File::open(path)
+        .await
+        .context("Failed to open configuration directory for synchronization")?;
+    directory
+        .sync_all()
+        .await
+        .context("Failed to synchronize configuration directory")
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 

@@ -169,7 +169,8 @@ async function clearPending(): Promise<void> {
           <div class="storage-source-main">
             <div class="storage-source-title"><strong>{{ instance.name }}</strong><span class="status-pill" :class="{ warning: instance.status === 'abnormal', muted: instance.status === 'disabled' }">{{ statusLabel(instance) }}</span><span v-if="instance.allow_guest_access" class="status-pill">{{ locale.text('访客可访问', 'Guest access') }}</span></div>
             <p>{{ backendLabel(instance) }}<template v-if="instance.backend.type === 's3'"> · {{ instance.backend.bucket }} · {{ instance.backend.endpoint }}</template><template v-else> · {{ instance.backend.path }}</template></p>
-            <small>{{ locale.text('已使用：', 'Used: ') }}{{ formatBytes(instance.usage_bytes) }} · {{ locale.text('预留：', 'Reserved: ') }}{{ formatBytes(instance.reserved_bytes) }} · {{ locale.text('上限：', 'Limit: ') }}{{ instance.backend.capacity_limit_bytes ? formatBytes(instance.backend.capacity_limit_bytes) : locale.text('未设置', 'Unlimited') }}</small>
+            <small v-if="instance.capacity_accurate !== false">{{ locale.text('已使用：', 'Used: ') }}{{ formatBytes(instance.usage_bytes) }} · {{ locale.text('预留：', 'Reserved: ') }}{{ formatBytes(instance.reserved_bytes) }} · {{ locale.text('上限：', 'Limit: ') }}{{ instance.backend.capacity_limit_bytes ? formatBytes(instance.backend.capacity_limit_bytes) : locale.text('未设置', 'Unlimited') }}</small>
+            <small v-else>{{ locale.text('容量正在后台核对', 'Capacity reconciliation in progress') }}</small>
           </div>
           <div class="storage-instance-actions"><button class="btn secondary" type="button" :disabled="busy" @click="openSettings(instance)">{{ locale.text('设置', 'Settings') }}</button><button class="btn danger" type="button" :disabled="busy" @click="removeInstance(instance)">{{ locale.text('删除', 'Remove') }}</button></div>
         </article>

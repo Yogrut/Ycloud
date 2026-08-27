@@ -7,6 +7,7 @@ pub mod batch_operations;
 pub mod bootstrap;
 pub mod capacity;
 pub mod config;
+pub mod directory_listing;
 pub mod error;
 pub mod file_access;
 pub mod login_security;

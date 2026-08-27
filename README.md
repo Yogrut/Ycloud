@@ -47,4 +47,4 @@ cargo build --release --locked
 
 生产前端已内嵌到 Rust 程序，日常启动不需要 Node.js 或第二个终端。
 
-结构和安全边界见 [ARCHITECTURE.md](ARCHITECTURE.md)，维护状态见 [HANDOFF.md](HANDOFF.md)。
+结构和安全边界见 [ARCHITECTURE.md](ARCHITECTURE.md)，维护结论见 [MAINTENANCE_REPORT.md](MAINTENANCE_REPORT.md)。

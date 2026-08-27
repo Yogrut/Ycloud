@@ -85,6 +85,7 @@ pub struct StorageInstanceView {
     pub backend: StorageBackendView,
     pub usage_bytes: u64,
     pub reserved_bytes: u64,
+    pub capacity_accurate: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -290,6 +291,7 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
         backend: StorageBackendView::from_config(&instance.backend, &state.config),
         usage_bytes: 0,
         reserved_bytes: 0,
+        capacity_accurate: false,
     });
     let mut local_mounts = Vec::with_capacity(state.config.local_mounts.all().len());
     for mount in state.config.local_mounts.all() {
@@ -340,13 +342,14 @@ async fn storage_instance_view(
     default_storage_id: &str,
 ) -> StorageInstanceView {
     let backend_view = StorageBackendView::from_config(&instance.backend, &state.config);
-    let (ready, usage_bytes, reserved_bytes) = match state.storage_backend(&instance.id).await {
-        Ok(backend) => {
-            let capacity = backend.capacity_status().await;
-            (true, capacity.used, capacity.reserved)
-        }
-        Err(_) => (false, 0, 0),
-    };
+    let (ready, usage_bytes, reserved_bytes, capacity_accurate) =
+        match state.storage_backend(&instance.id).await {
+            Ok(backend) => {
+                let capacity = backend.capacity_status();
+                (true, capacity.used, capacity.reserved, capacity.accurate)
+            }
+            Err(_) => (false, 0, 0, false),
+        };
     StorageInstanceView {
         is_default: instance.id == default_storage_id,
         status: if !instance.enabled {
@@ -364,6 +367,7 @@ async fn storage_instance_view(
         backend: backend_view,
         usage_bytes,
         reserved_bytes,
+        capacity_accurate,
     }
 }
 

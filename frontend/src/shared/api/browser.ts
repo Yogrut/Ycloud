@@ -23,7 +23,6 @@ export interface FileListResponse {
   page_start: number
   page_size: number
   next_cursor: string | null
-  truncated: boolean
   can_write: boolean
   is_admin?: boolean
   capabilities?: BrowserCapabilities

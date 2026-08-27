@@ -15,6 +15,7 @@
 /security-events.jsonl.bak
 /security-state.json
 /security-state.json.bak
+/.ycloud-system/
 *.upload
 *.tmp
 

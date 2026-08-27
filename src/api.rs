@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, path::PathBuf};
+use std::path::PathBuf;
 
 use axum::{
     body::Body,
@@ -10,6 +10,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
+use crate::directory_listing::{DirectoryListRequest, DirectorySort, EntryPosition, SortDirection};
 use crate::error::{AppError, AppResult};
 use crate::file_access::{
     check_folder_locks, ensure_non_root, ensure_storage_action, ensure_writable, join_request_path,
@@ -23,6 +24,8 @@ use crate::storage::FileResponseMode;
 // ── Request / response types ──────────────────────────────────────
 
 const DEFAULT_PAGE_SIZE: usize = 20;
+const MAX_DIRECTORY_SEARCH_CHARS: usize = 256;
+const MAX_DIRECTORY_CURSOR_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct FileEntry {
@@ -47,30 +50,12 @@ pub struct ListResponse {
     pub page_start: usize,
     pub page_size: usize,
     pub next_cursor: Option<String>,
-    pub truncated: bool,
     pub can_write: bool,
     pub is_admin: bool,
     pub capabilities: BrowserCapabilities,
     pub max_upload_bytes: u64,
     pub max_archive_bytes: u64,
     pub max_archive_entries: usize,
-}
-
-#[derive(Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum DirectorySort {
-    #[default]
-    Name,
-    Size,
-    Time,
-}
-
-#[derive(Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SortDirection {
-    #[default]
-    Asc,
-    Desc,
 }
 
 #[derive(Default, Deserialize)]
@@ -105,46 +90,65 @@ fn page_size(limit: Option<usize>) -> AppResult<usize> {
     }
 }
 
-fn encode_cursor(offset: usize) -> String {
-    URL_SAFE_NO_PAD.encode(offset.to_string())
+const DIRECTORY_CURSOR_VERSION: u8 = 1;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DirectoryCursorToken {
+    version: u8,
+    storage_id: String,
+    directory: String,
+    search: Option<String>,
+    sort: DirectorySort,
+    direction: SortDirection,
+    delivered: usize,
+    position: EntryPosition,
 }
 
-fn decode_cursor(cursor: Option<&str>) -> AppResult<usize> {
-    let Some(cursor) = cursor else { return Ok(0) };
+fn normalized_search(search: Option<&str>) -> Option<String> {
+    search
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase)
+}
+
+fn encode_cursor(cursor: &DirectoryCursorToken) -> AppResult<String> {
+    serde_json::to_vec(cursor)
+        .map(|value| URL_SAFE_NO_PAD.encode(value))
+        .map_err(|error| AppError::with_source("failed to encode directory cursor", error))
+}
+
+fn decode_cursor(
+    cursor: Option<&str>,
+    storage_id: &str,
+    directory: &str,
+    search: Option<&str>,
+    sort: DirectorySort,
+    direction: SortDirection,
+) -> AppResult<Option<DirectoryCursorToken>> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    if cursor.len() > MAX_DIRECTORY_CURSOR_BYTES {
+        return Err(AppError::BadRequest("Invalid directory cursor".into()));
+    }
     let decoded = URL_SAFE_NO_PAD
         .decode(cursor)
         .map_err(|_| AppError::BadRequest("Invalid directory cursor".into()))?;
-    std::str::from_utf8(&decoded)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .ok_or_else(|| AppError::BadRequest("Invalid directory cursor".into()))
-}
-
-fn compare_entries(
-    left: &FileEntry,
-    right: &FileEntry,
-    sort: DirectorySort,
-    direction: SortDirection,
-) -> Ordering {
-    let kind_order = right.is_dir.cmp(&left.is_dir);
-    if kind_order != Ordering::Equal {
-        return kind_order;
+    let token: DirectoryCursorToken = serde_json::from_slice(&decoded)
+        .map_err(|_| AppError::BadRequest("Invalid directory cursor".into()))?;
+    if token.version != DIRECTORY_CURSOR_VERSION
+        || token.storage_id != storage_id
+        || token.directory != directory
+        || token.search != normalized_search(search)
+        || token.sort != sort
+        || token.direction != direction
+    {
+        return Err(AppError::BadRequest(
+            "Directory cursor does not match this listing request".into(),
+        ));
     }
-    let primary = match sort {
-        DirectorySort::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
-        DirectorySort::Size => left.size.cmp(&right.size),
-        DirectorySort::Time => left.modified.cmp(&right.modified),
-    };
-    let primary = match direction {
-        SortDirection::Asc => primary,
-        SortDirection::Desc => primary.reverse(),
-    };
-    primary.then_with(|| {
-        left.name
-            .to_lowercase()
-            .cmp(&right.name.to_lowercase())
-            .then(left.path.cmp(&right.path))
-    })
+    Ok(Some(token))
 }
 
 #[derive(Default, Serialize)]
@@ -260,6 +264,15 @@ pub async fn list_files(
     headers: HeaderMap,
     Query(query): Query<FileListQuery>,
 ) -> AppResult<Json<ListResponse>> {
+    if query
+        .search
+        .as_deref()
+        .is_some_and(|search| search.chars().count() > MAX_DIRECTORY_SEARCH_CHARS)
+    {
+        return Err(AppError::BadRequest(
+            "Directory search must contain at most 256 characters".into(),
+        ));
+    }
     let file_query = query.file_query();
     let share = resolve_share(&state, &headers, &file_query).await?;
     let backend = state.storage_backend(&share.storage_id).await?;
@@ -271,10 +284,45 @@ pub async fn list_files(
     let lock_authorizer = FolderLockAuthorizer::new(&state, &headers, &share.storage_id).await;
     lock_authorizer.ensure_access(&share_storage_path(&share, request_path))?;
     let page_size = page_size(query.limit)?;
-    let requested_offset = decode_cursor(query.cursor.as_deref())?;
-
-    let limit = state.config.max_list_entries;
-    let (backend_entries, truncated) = backend.list_directory(&storage_directory, limit).await?;
+    let cursor = decode_cursor(
+        query.cursor.as_deref(),
+        &share.storage_id,
+        &storage_directory,
+        query.search.as_deref(),
+        query.sort,
+        query.direction,
+    )?;
+    let delivered = cursor.as_ref().map_or(0, |cursor| cursor.delivered);
+    let page = backend
+        .list_directory_page(
+            &storage_directory,
+            DirectoryListRequest {
+                limit: page_size,
+                search: normalized_search(query.search.as_deref()),
+                sort: query.sort,
+                direction: query.direction,
+                after: cursor.map(|cursor| cursor.position),
+            },
+        )
+        .await?;
+    let next_cursor = page
+        .next_position
+        .map(|position| {
+            encode_cursor(&DirectoryCursorToken {
+                version: DIRECTORY_CURSOR_VERSION,
+                storage_id: share.storage_id.clone(),
+                directory: storage_directory.clone(),
+                search: normalized_search(query.search.as_deref()),
+                sort: query.sort,
+                direction: query.direction,
+                delivered: delivered
+                    .checked_add(page.entries.len())
+                    .ok_or_else(|| AppError::BadRequest("Invalid directory cursor".into()))?,
+                position,
+            })
+        })
+        .transpose()?;
+    let backend_entries = page.entries;
     let mut entries = Vec::with_capacity(backend_entries.len());
     for entry in backend_entries {
         let name = entry.name;
@@ -312,25 +360,12 @@ pub async fn list_files(
         });
     }
 
-    if let Some(search) = query
-        .search
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let search = search.to_lowercase();
-        entries.retain(|entry| entry.name.to_lowercase().contains(&search));
-    }
-    entries.sort_by(|left, right| compare_entries(left, right, query.sort, query.direction));
-
-    let page_offset = requested_offset.min(entries.len());
-    let page_end = page_offset.saturating_add(page_size).min(entries.len());
-    let next_cursor = (page_end < entries.len()).then(|| encode_cursor(page_end));
-    let entries = entries[page_offset..page_end].to_vec();
     let page_start = if entries.is_empty() {
         0
     } else {
-        page_offset + 1
+        delivered
+            .checked_add(1)
+            .ok_or_else(|| AppError::BadRequest("Invalid directory cursor".into()))?
     };
 
     let current_path = request_path.to_string();
@@ -386,7 +421,6 @@ pub async fn list_files(
         page_start,
         page_size,
         next_cursor,
-        truncated,
         can_write: !share.readonly && can_write,
         is_admin,
         capabilities,
@@ -655,44 +689,55 @@ pub async fn unlock_folder(
 mod pagination_tests {
     use super::*;
 
-    fn entry(name: &str, is_dir: bool, size: u64, modified: &str) -> FileEntry {
-        FileEntry {
-            name: name.into(),
-            path: name.into(),
-            is_dir,
-            size,
-            modified: modified.into(),
-            mime: String::new(),
-            icon: String::new(),
-            locked: false,
-        }
-    }
-
     #[test]
     fn directory_cursor_is_opaque_and_round_trips() {
-        let cursor = encode_cursor(40);
+        let token = DirectoryCursorToken {
+            version: DIRECTORY_CURSOR_VERSION,
+            storage_id: "primary".into(),
+            directory: "docs".into(),
+            search: Some("log".into()),
+            sort: DirectorySort::Time,
+            direction: SortDirection::Desc,
+            delivered: 40,
+            position: EntryPosition::from(&crate::directory_listing::BackendEntry {
+                name: "server.log".into(),
+                relative: "docs/server.log".into(),
+                is_dir: false,
+                size: 10,
+                modified_unix: Some(1),
+            }),
+        };
+        let cursor = encode_cursor(&token).unwrap();
         assert_ne!(cursor, "40");
-        assert_eq!(decode_cursor(Some(&cursor)).unwrap(), 40);
-        assert!(decode_cursor(Some("not-a-cursor")).is_err());
-    }
-
-    #[test]
-    fn directory_sort_keeps_folders_first_and_orders_files() {
-        let mut entries = [
-            entry("small.txt", false, 2, "2026-01-01 00:00"),
-            entry("folder", true, 0, "2026-01-01 00:00"),
-            entry("large.txt", false, 9, "2026-01-02 00:00"),
-        ];
-        entries.sort_by(|left, right| {
-            compare_entries(left, right, DirectorySort::Size, SortDirection::Desc)
-        });
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["folder", "large.txt", "small.txt"]
-        );
+        let decoded = decode_cursor(
+            Some(&cursor),
+            "primary",
+            "docs",
+            Some("LOG"),
+            DirectorySort::Time,
+            SortDirection::Desc,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(decoded.delivered, 40);
+        assert!(decode_cursor(
+            Some("not-a-cursor"),
+            "primary",
+            "docs",
+            None,
+            DirectorySort::Name,
+            SortDirection::Asc,
+        )
+        .is_err());
+        assert!(decode_cursor(
+            Some(&"x".repeat(MAX_DIRECTORY_CURSOR_BYTES + 1)),
+            "primary",
+            "docs",
+            None,
+            DirectorySort::Name,
+            SortDirection::Asc,
+        )
+        .is_err());
     }
 
     #[test]

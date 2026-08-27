@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 
@@ -54,6 +54,7 @@ impl AppState {
                 &config,
                 &local_io_gate,
                 max_upload_bytes,
+                &instance.id,
                 &instance.backend,
             )
             .await
@@ -150,6 +151,7 @@ impl AppState {
                     &self.config,
                     &self.local_io_gate,
                     next.max_upload_bytes,
+                    &storage_id,
                     &backend_config,
                 )
                 .await?,
@@ -263,6 +265,7 @@ impl AppState {
             &self.config,
             &self.local_io_gate,
             next.max_upload_bytes,
+            storage_id,
             &backend_config,
         )
         .await?;
@@ -340,6 +343,7 @@ impl AppState {
                     &self.config,
                     &self.local_io_gate,
                     next.max_upload_bytes,
+                    storage_id,
                     &backend_config,
                 )
                 .await?,
@@ -392,6 +396,7 @@ impl AppState {
                     &self.config,
                     &self.local_io_gate,
                     next.max_upload_bytes,
+                    &pending.id,
                     &pending.backend,
                 )
                 .await?,
@@ -444,6 +449,7 @@ impl AppState {
                 &self.config,
                 &self.local_io_gate,
                 next.max_upload_bytes,
+                storage_id,
                 &backend_config,
             )
             .await
@@ -533,8 +539,10 @@ async fn prepare_storage_backend(
     config: &Config,
     local_io_gate: &Arc<Semaphore>,
     max_upload_bytes: u64,
+    storage_id: &str,
     backend: &StorageBackendConfig,
 ) -> AppResult<StorageBackend> {
+    let ledger_path = capacity_ledger_path(config, storage_id);
     config.allows_storage_backend(backend)?;
     match backend {
         StorageBackendConfig::Local(settings) => {
@@ -563,7 +571,8 @@ async fn prepare_storage_backend(
                 )
                 .await?
             };
-            StorageBackend::local_configured(storage, settings.capacity_limit_bytes).await
+            StorageBackend::local_configured(storage, settings.capacity_limit_bytes, ledger_path)
+                .await
         }
         StorageBackendConfig::S3(settings) => {
             let backend = crate::s3_backend::S3Backend::new(settings, config)?;
@@ -572,9 +581,19 @@ async fn prepare_storage_backend(
             if recovered > 0 {
                 tracing::warn!(recovered, "recovered pending S3 storage transactions");
             }
-            StorageBackend::s3_configured(backend, settings.capacity_limit_bytes).await
+            StorageBackend::s3_configured(backend, settings.capacity_limit_bytes, ledger_path).await
         }
     }
+}
+
+fn capacity_ledger_path(config: &Config, storage_id: &str) -> PathBuf {
+    config
+        .config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(".ycloud-system")
+        .join("capacity")
+        .join(format!("{storage_id}.json"))
 }
 
 #[cfg(test)]

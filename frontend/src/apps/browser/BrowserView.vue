@@ -43,7 +43,6 @@ const capabilities = ref<BrowserCapabilities>({ download: false, upload: false, 
 const maxUploadBytes = ref(0)
 const maxArchiveBytes = ref(0)
 const maxArchiveEntries = ref(0)
-const truncated = ref(false)
 const notice = ref('')
 const showUnlock = ref(false)
 const unlockPath = ref('')
@@ -144,9 +143,7 @@ async function refresh(): Promise<void> {
     maxUploadBytes.value = data.max_upload_bytes
     maxArchiveBytes.value = data.max_archive_bytes
     maxArchiveEntries.value = data.max_archive_entries
-    truncated.value = data.truncated
     selected.value = new Set()
-    if (data.truncated) announce(locale.text('目录内容超过显示上限，当前仅显示部分项目', 'This folder exceeds the display limit; only some items are shown'))
   } catch (error) {
     if (sequence !== refreshSequence) return
     if (!storages.value.length) {
@@ -773,7 +770,6 @@ onBeforeUnmount(() => {
         </nav>
       </footer>
     </section>
-    <p v-if="truncated" class="browser-warning">{{ locale.text('当前目录仅显示服务器允许的部分项目', 'Only the server-approved portion of this folder is shown') }}</p>
   </main>
 
   <BrowserContextMenu

@@ -1,10 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    extract::{DefaultBodyLimit, OriginalUri, Request, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::{header, HeaderName, Method, StatusCode},
     middleware,
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Router,
 };
@@ -42,6 +42,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let public_api = Router::new()
         .route("/health", get(health_handler))
+        .route("/ready", get(readiness_handler))
         .route("/logout", post(auth::logout_handler))
         .route("/me", get(me_handler))
         .merge(auth_routes);
@@ -183,21 +184,13 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(serve_index))
         .route("/index.html", get(serve_index))
-        .route("/login", get(|| async { Redirect::to("/") }))
-        .route("/login.html", get(|| async { Redirect::to("/") }))
         .route("/browse", get(serve_index))
-        .route("/browser.html", get(serve_index))
         .route("/admin", get(serve_index))
-        .route("/admin.html", get(serve_index))
         .route("/admin/{*rest}", get(serve_index))
         .route("/preview", get(serve_index))
-        .route("/preview.html", get(serve_index))
         .route("/assets/app.css", get(serve_app_css))
         .route("/assets/app.js", get(serve_app_js))
         .route("/favicon.svg", get(serve_favicon))
-        .route("/v2", get(redirect_legacy_vue_path))
-        .route("/v2/", get(redirect_legacy_vue_path))
-        .route("/v2/{*rest}", get(redirect_legacy_vue_path))
         .nest("/api/admin", admin_routes)
         .nest("/api", api_routes)
         .merge(dav_router)
@@ -218,11 +211,19 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let ready = match state
-        .storage_backend(crate::config::DEFAULT_STORAGE_ID)
-        .await
-    {
+async fn health_handler() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        axum::Json(JsonStatus {
+            status: "ok",
+            storage: "unchecked",
+        }),
+    )
+}
+
+async fn readiness_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let default_storage_id = state.config_file.read().await.default_storage_id.clone();
+    let ready = match state.storage_backend(&default_storage_id).await {
         Ok(backend) => backend.ready().await,
         Err(_) => false,
     };
@@ -307,20 +308,6 @@ embedded_handler!(
     "../static/app/assets/app.js"
 );
 embedded_handler!(serve_favicon, "image/svg+xml", "../static/favicon.svg");
-
-async fn redirect_legacy_vue_path(OriginalUri(uri): OriginalUri) -> Response {
-    let path = uri.path().strip_prefix("/v2").unwrap_or(uri.path());
-    let mut target = if path.is_empty() {
-        "/".to_string()
-    } else {
-        path.to_string()
-    };
-    if let Some(query) = uri.query() {
-        target.push('?');
-        target.push_str(query);
-    }
-    Redirect::permanent(&target).into_response()
-}
 
 async fn not_found(_request: Request) -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "Not Found")
@@ -453,6 +440,18 @@ mod tests {
                 .unwrap(),
             "nosniff"
         );
+
+        let readiness = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::OK);
 
         let admin_info = app
             .clone()
@@ -1011,7 +1010,7 @@ mod tests {
             "application/javascript; charset=utf-8"
         );
 
-        let legacy_vue = app
+        let removed_legacy_vue = app
             .clone()
             .oneshot(
                 Request::builder()
@@ -1021,11 +1020,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(legacy_vue.status(), StatusCode::PERMANENT_REDIRECT);
-        assert_eq!(
-            legacy_vue.headers().get(header::LOCATION).unwrap(),
-            "/admin/security"
-        );
+        assert_eq!(removed_legacy_vue.status(), StatusCode::NOT_FOUND);
 
         tokio::fs::write(root.join("duplicate-delete.txt"), b"data")
             .await

@@ -441,6 +441,64 @@ impl S3Backend {
         Ok(S3ListResult { entries, truncated })
     }
 
+    /// Stream all direct children through a bounded consumer. The caller can
+    /// implement exact sorting and cursor pagination without retaining the
+    /// complete directory in memory.
+    pub async fn scan_directory_entries<F>(&self, relative: &str, mut consume: F) -> AppResult<()>
+    where
+        F: FnMut(S3Entry),
+    {
+        let relative = StorageService::normalize_relative(relative)?;
+        let directory_prefix = list_prefix(&self.prefix, &relative)?;
+        let _permit = self.acquire_request().await?;
+        let mut continuation_token: Option<String> = None;
+
+        for _ in 0..S3_MAX_CAPACITY_SCAN_PAGES {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&directory_prefix)
+                .delimiter("/")
+                .max_keys(i32::try_from(S3_PAGE_SIZE).unwrap_or(1_000));
+            if let Some(token) = continuation_token.as_deref() {
+                request = request.continuation_token(token);
+            }
+            let output = request.send().await.map_err(|error| {
+                tracing::warn!(
+                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                    "S3 directory scan failed"
+                );
+                AppError::ServiceUnavailable("无法读取对象存储目录".into())
+            })?;
+            let mut page = BTreeMap::new();
+            collect_page_entries(
+                &relative,
+                &directory_prefix,
+                output.common_prefixes(),
+                output.contents(),
+                &mut page,
+            )?;
+            page.into_values().for_each(&mut consume);
+
+            if !output.is_truncated().unwrap_or(false) {
+                return Ok(());
+            }
+            let next = output.next_continuation_token().ok_or_else(|| {
+                AppError::ServiceUnavailable("对象存储返回了无效的分页结果".into())
+            })?;
+            if continuation_token.as_deref() == Some(next) {
+                return Err(AppError::ServiceUnavailable(
+                    "对象存储目录分页未前进".into(),
+                ));
+            }
+            continuation_token = Some(next.to_owned());
+        }
+        Err(AppError::ServiceUnavailable(
+            "对象存储目录超过单次安全扫描上限".into(),
+        ))
+    }
+
     /// Resolve an object or an emulated directory prefix without allowing an
     /// ambiguous `name` object and `name/` directory to masquerade as one path.
     pub async fn metadata(&self, relative: &str) -> AppResult<S3Metadata> {

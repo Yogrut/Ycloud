@@ -80,6 +80,7 @@ export interface StorageInstanceView {
   backend: StorageBackendView
   usage_bytes: number
   reserved_bytes: number
+  capacity_accurate?: boolean
 }
 
 export type S3Provider = 'alibaba_oss' | 'tencent_cos' | 'minio' | 's3_compatible'

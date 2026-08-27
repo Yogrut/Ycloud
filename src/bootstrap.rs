@@ -49,12 +49,21 @@ fn spawn_cleanup_task(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut capacity_interval =
+            tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+        capacity_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // `interval` ticks immediately; consume the first capacity tick because
+        // backend startup already loads or starts an initial reconciliation.
+        capacity_interval.tick().await;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
                     state.sessions.cleanup().await;
                     state.gate_access.cleanup().await;
                     state.folder_access.cleanup().await;
+                }
+                _ = capacity_interval.tick() => {
+                    state.backends.reconcile_capacities().await;
                 }
                 changed = stop.changed() => {
                     if changed.is_err() || *stop.borrow() {

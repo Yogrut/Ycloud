@@ -102,6 +102,10 @@ pub async fn rate_limit_middleware(
 /// Session lifetime: 24 hours for admin sessions, 7 days for share/gate access.
 const SESSION_TTL: chrono::Duration = chrono::Duration::hours(24);
 const ACCESS_TOKEN_TTL: chrono::Duration = chrono::Duration::days(7);
+const MAX_SESSIONS: usize = 4_096;
+const MAX_SESSIONS_PER_PRINCIPAL: usize = 16;
+const MAX_ACCESS_TOKENS: usize = 4_096;
+const MAX_ACCESS_TOKENS_PER_SCOPE: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -115,14 +119,22 @@ pub enum SessionPrincipal {
     User(String),
 }
 
-#[derive(Default)]
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, Session>>,
+    max_total: usize,
+    max_per_principal: usize,
 }
 
 impl SessionStore {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limits(MAX_SESSIONS, MAX_SESSIONS_PER_PRINCIPAL)
+    }
+    fn with_limits(max_total: usize, max_per_principal: usize) -> Self {
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            max_total: max_total.max(1),
+            max_per_principal: max_per_principal.max(1),
+        }
     }
     pub async fn create(&self) -> String {
         self.create_for(SessionPrincipal::Administrator).await
@@ -132,10 +144,24 @@ impl SessionStore {
     }
     async fn create_for(&self, principal: SessionPrincipal) -> String {
         let token = Uuid::new_v4().to_string();
-        self.sessions.write().await.insert(
+        let now = chrono::Utc::now();
+        let mut sessions = self.sessions.write().await;
+        sessions.retain(|_, session| now - session.created_at <= SESSION_TTL);
+        while sessions
+            .values()
+            .filter(|session| session.principal == principal)
+            .count()
+            >= self.max_per_principal
+        {
+            remove_oldest_where(&mut sessions, |session| session.principal == principal);
+        }
+        while sessions.len() >= self.max_total {
+            remove_oldest_where(&mut sessions, |_| true);
+        }
+        sessions.insert(
             token.clone(),
             Session {
-                created_at: chrono::Utc::now(),
+                created_at: now,
                 principal,
             },
         );
@@ -190,6 +216,12 @@ impl SessionStore {
             .retain(|_, s| s.created_at > cutoff);
     }
 }
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 pub type SharedSessionStore = Arc<SessionStore>;
 
 #[derive(Clone, Debug)]
@@ -198,22 +230,44 @@ pub struct AccessGrant {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Default)]
 pub struct AccessTokenStore {
     accesses: RwLock<HashMap<String, AccessGrant>>,
+    max_total: usize,
+    max_per_scope: usize,
 }
 
 impl AccessTokenStore {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limits(MAX_ACCESS_TOKENS, MAX_ACCESS_TOKENS_PER_SCOPE)
+    }
+    fn with_limits(max_total: usize, max_per_scope: usize) -> Self {
+        Self {
+            accesses: RwLock::new(HashMap::new()),
+            max_total: max_total.max(1),
+            max_per_scope: max_per_scope.max(1),
+        }
     }
     pub async fn create(&self, scope: String) -> String {
         let token = Uuid::new_v4().to_string();
-        self.accesses.write().await.insert(
+        let now = chrono::Utc::now();
+        let mut accesses = self.accesses.write().await;
+        accesses.retain(|_, access| now - access.created_at <= ACCESS_TOKEN_TTL);
+        while accesses
+            .values()
+            .filter(|access| access.scope == scope)
+            .count()
+            >= self.max_per_scope
+        {
+            remove_oldest_where(&mut accesses, |access| access.scope == scope);
+        }
+        while accesses.len() >= self.max_total {
+            remove_oldest_where(&mut accesses, |_| true);
+        }
+        accesses.insert(
             token.clone(),
             AccessGrant {
                 scope,
-                created_at: chrono::Utc::now(),
+                created_at: now,
             },
         );
         token
@@ -254,7 +308,43 @@ impl AccessTokenStore {
             .retain(|_, a| a.created_at > cutoff);
     }
 }
+
+impl Default for AccessTokenStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 pub type SharedAccessTokenStore = Arc<AccessTokenStore>;
+
+fn remove_oldest_where<T>(entries: &mut HashMap<String, T>, matches: impl Fn(&T) -> bool)
+where
+    T: CreatedAt,
+{
+    let oldest = entries
+        .iter()
+        .filter(|(_, value)| matches(value))
+        .min_by_key(|(_, value)| value.created_at())
+        .map(|(token, _)| token.clone());
+    if let Some(token) = oldest {
+        entries.remove(&token);
+    }
+}
+
+trait CreatedAt {
+    fn created_at(&self) -> chrono::DateTime<chrono::Utc>;
+}
+
+impl CreatedAt for Session {
+    fn created_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.created_at
+    }
+}
+
+impl CreatedAt for AccessGrant {
+    fn created_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.created_at
+    }
+}
 
 #[derive(Clone)]
 pub struct PasswordService {
@@ -881,5 +971,38 @@ mod tests {
             accesses.get_scope(&other).await.as_deref(),
             Some("locked/b")
         );
+    }
+
+    #[tokio::test]
+    async fn sessions_are_bounded_per_principal_and_globally() {
+        let sessions = SessionStore::with_limits(3, 2);
+        let first = sessions.create_user("same-user".into()).await;
+        let second = sessions.create_user("same-user".into()).await;
+        let newest = sessions.create_user("same-user".into()).await;
+        let surviving_same_user = usize::from(sessions.validate(&first).await)
+            + usize::from(sessions.validate(&second).await)
+            + usize::from(sessions.validate(&newest).await);
+        assert_eq!(surviving_same_user, 2);
+        assert!(sessions.validate(&newest).await);
+
+        let administrator = sessions.create().await;
+        let other = sessions.create_user("other-user".into()).await;
+        assert!(sessions.validate(&administrator).await);
+        assert!(sessions.validate(&other).await);
+        assert!(sessions.sessions.read().await.len() <= 3);
+    }
+
+    #[tokio::test]
+    async fn access_tokens_are_bounded_per_scope() {
+        let accesses = AccessTokenStore::with_limits(3, 2);
+        let first = accesses.create("same-scope".into()).await;
+        let second = accesses.create("same-scope".into()).await;
+        let newest = accesses.create("same-scope".into()).await;
+
+        let first_valid = accesses.get_scope(&first).await.is_some();
+        let second_valid = accesses.get_scope(&second).await.is_some();
+        assert_eq!(usize::from(first_valid) + usize::from(second_valid), 1);
+        assert!(accesses.get_scope(&newest).await.is_some());
+        assert!(accesses.accesses.read().await.len() <= 2);
     }
 }

@@ -1,10 +1,18 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
 
 use crate::error::{AppError, AppResult};
 
 #[derive(Clone, Debug)]
 pub struct CapacityTracker {
     state: Arc<Mutex<CapacityState>>,
+    ledger_path: Option<Arc<PathBuf>>,
+    persist_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -12,6 +20,8 @@ struct CapacityState {
     limit: Option<u64>,
     used: u64,
     reserved: u64,
+    accurate: bool,
+    reconciling: bool,
 }
 
 #[derive(Debug)]
@@ -27,6 +37,16 @@ pub struct CapacityStatus {
     pub limit: Option<u64>,
     pub used: u64,
     pub reserved: u64,
+    pub accurate: bool,
+}
+
+const CAPACITY_LEDGER_VERSION: u8 = 1;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityLedger {
+    version: u8,
+    used: u64,
 }
 
 impl CapacityTracker {
@@ -37,12 +57,25 @@ impl CapacityTracker {
     }
 
     pub fn new(limit: Option<u64>, used: u64) -> Self {
+        Self::new_with_ledger(limit, used, true, None)
+    }
+
+    pub fn new_with_ledger(
+        limit: Option<u64>,
+        used: u64,
+        accurate: bool,
+        ledger_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(CapacityState {
                 limit,
                 used,
                 reserved: 0,
+                accurate,
+                reconciling: false,
             })),
+            ledger_path: ledger_path.map(Arc::new),
+            persist_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -67,7 +100,29 @@ impl CapacityTracker {
     }
 
     pub fn reconcile(&self, used: u64) {
-        self.lock_state().used = used;
+        let mut state = self.lock_state();
+        state.used = used;
+        state.accurate = true;
+        state.reconciling = false;
+    }
+
+    pub fn mark_uncertain(&self) {
+        self.lock_state().accurate = false;
+    }
+
+    pub fn begin_reconciliation(&self) -> bool {
+        let mut state = self.lock_state();
+        if state.reconciling {
+            return false;
+        }
+        state.reconciling = true;
+        true
+    }
+
+    pub fn reconciliation_failed(&self) {
+        let mut state = self.lock_state();
+        state.accurate = false;
+        state.reconciling = false;
     }
 
     pub fn status(&self) -> CapacityStatus {
@@ -76,19 +131,23 @@ impl CapacityTracker {
             limit: state.limit,
             used: state.used,
             reserved: state.reserved,
+            accurate: state.accurate,
         }
     }
 
-    pub fn set_limit(&self, limit: Option<u64>) -> AppResult<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| AppError::internal("storage capacity state is unavailable"))?;
-        if limit.is_some_and(|limit| state.used.saturating_add(state.reserved) > limit) {
-            return Err(AppError::InsufficientStorage);
+    pub async fn persist(&self) -> AppResult<()> {
+        let Some(path) = self.ledger_path.as_deref() else {
+            return Ok(());
+        };
+        // Serialize writers and read the latest state only after acquiring the
+        // gate. Concurrent mutations can finish in either order, but an older
+        // snapshot must never overwrite a newer capacity value.
+        let _persist = self.persist_gate.lock().await;
+        let status = self.status();
+        if !status.accurate {
+            return Ok(());
         }
-        state.limit = limit;
-        Ok(())
+        save_capacity_ledger(path, status.used).await
     }
 }
 
@@ -104,6 +163,11 @@ impl CapacityReservation {
             .state
             .lock()
             .map_err(|_| AppError::internal("storage capacity state is unavailable"))?;
+        if state.limit.is_some() && !state.accurate {
+            return Err(AppError::ServiceUnavailable(
+                "存储容量状态需要核对，写入暂时不可用".into(),
+            ));
+        }
         if state.limit.is_some_and(|limit| {
             state
                 .used
@@ -131,6 +195,99 @@ impl CapacityReservation {
     }
 }
 
+pub async fn load_capacity_ledger(path: &Path) -> AppResult<Option<u64>> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::with_source(
+                "failed to read capacity ledger",
+                error,
+            ))
+        }
+    };
+    let ledger: CapacityLedger = serde_json::from_slice(&bytes)
+        .map_err(|error| AppError::with_source("invalid capacity ledger", error))?;
+    if ledger.version != CAPACITY_LEDGER_VERSION {
+        return Err(AppError::ServiceUnavailable(
+            "存储容量记录版本不受支持".into(),
+        ));
+    }
+    Ok(Some(ledger.used))
+}
+
+async fn save_capacity_ledger(path: &Path, used: u64) -> AppResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::internal("capacity ledger has no parent directory"))?;
+    tokio::fs::create_dir_all(parent).await.map_err(|error| {
+        AppError::with_source("failed to create capacity ledger directory", error)
+    })?;
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec(&CapacityLedger {
+        version: CAPACITY_LEDGER_VERSION,
+        used,
+    })
+    .map_err(|error| AppError::with_source("failed to encode capacity ledger", error))?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .await
+        .map_err(|error| AppError::with_source("failed to create capacity ledger", error))?;
+    if let Err(error) = async {
+        file.write_all(&bytes).await?;
+        file.sync_all().await
+    }
+    .await
+    {
+        drop(file);
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(AppError::with_source(
+            "failed to flush capacity ledger",
+            error,
+        ));
+    }
+    drop(file);
+    if let Err(error) = tokio::fs::rename(&temporary, path).await {
+        if error.kind() == std::io::ErrorKind::AlreadyExists
+            || tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
+            tokio::fs::remove_file(path).await.map_err(|remove| {
+                AppError::with_source("failed to replace capacity ledger", remove)
+            })?;
+            tokio::fs::rename(&temporary, path)
+                .await
+                .map_err(|rename| {
+                    AppError::with_source("failed to commit capacity ledger", rename)
+                })?;
+        } else {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(AppError::with_source(
+                "failed to commit capacity ledger",
+                error,
+            ));
+        }
+    }
+    sync_parent_directory(parent).await
+}
+
+#[cfg(unix)]
+async fn sync_parent_directory(path: &Path) -> AppResult<()> {
+    let directory = tokio::fs::File::open(path).await.map_err(|error| {
+        AppError::with_source("failed to open capacity ledger directory", error)
+    })?;
+    directory
+        .sync_all()
+        .await
+        .map_err(|error| AppError::with_source("failed to flush capacity ledger directory", error))
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_path: &Path) -> AppResult<()> {
+    Ok(())
+}
+
 impl Drop for CapacityReservation {
     fn drop(&mut self) {
         if self.completed || self.reserved == 0 {
@@ -143,7 +300,7 @@ impl Drop for CapacityReservation {
 
 #[cfg(test)]
 mod tests {
-    use super::CapacityTracker;
+    use super::{load_capacity_ledger, CapacityTracker};
 
     #[test]
     fn replacement_reserves_only_growth_and_releases_on_drop() {
@@ -179,13 +336,33 @@ mod tests {
         assert_eq!(tracker.status().used, 85);
     }
 
-    #[test]
-    fn capacity_limit_cannot_be_lowered_below_committed_and_reserved_bytes() {
-        let tracker = CapacityTracker::new(None, 80);
-        let reservation = tracker.reserve_replacement(0, 15).unwrap();
-        assert!(tracker.set_limit(Some(94)).is_err());
-        tracker.set_limit(Some(95)).unwrap();
-        assert_eq!(tracker.status().limit, Some(95));
-        drop(reservation);
+    #[tokio::test]
+    async fn ledger_round_trip_keeps_latest_capacity() {
+        let root =
+            std::env::temp_dir().join(format!("ycloud-capacity-ledger-{}", uuid::Uuid::new_v4()));
+        let path = root.join("capacity.json");
+        let tracker = CapacityTracker::new_with_ledger(None, 10, true, Some(path.clone()));
+        tracker.persist().await.unwrap();
+        tracker.reserve_replacement(0, 7).unwrap().commit(0, 7);
+        tracker.persist().await.unwrap();
+
+        assert_eq!(load_capacity_ledger(&path).await.unwrap(), Some(17));
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_ledger_is_rejected() {
+        let root = std::env::temp_dir().join(format!(
+            "ycloud-invalid-capacity-ledger-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("capacity.json");
+        tokio::fs::write(&path, br#"{"version":2,"used":1}"#)
+            .await
+            .unwrap();
+
+        assert!(load_capacity_ledger(&path).await.is_err());
+        tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

@@ -23,7 +23,7 @@
 - `storage_backend.rs`：多存储注册与统一操作接口。
 - `capacity.rs`：存储容量预留、持久账本和后台核对。
 - `storage.rs`、`storage_transaction.rs`：本地路径边界、流式 I/O 和事务恢复。
-- `s3_backend.rs`：S3 分页、对象操作和恢复事务。
+- `s3_backend.rs`、`s3_backend/`：统一 S3 后端入口，以及客户端、键空间、目录分页、容量扫描、对象读取、响应体和目录事务模块。
 - `webdav.rs`、`archive.rs`：WebDAV 与流式 ZIP。
 
 Vue 页面直接使用正式 URL，由小型路由函数选择视图；共享状态留在组件或 composable，不额外引入全局状态库。

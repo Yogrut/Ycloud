@@ -2,6 +2,7 @@
 import { computed, nextTick, ref } from 'vue'
 import type { FolderLockView, StorageInstanceView, UpdateFolderLockRequest } from '../../shared/api/admin'
 import { createFolderLock, deleteFolderLock, updateFolderLock } from '../../shared/api/admin'
+import AppIcon from '../../shared/components/AppIcon.vue'
 import { useLocale } from '../../shared/i18n'
 
 const MASK = '••••••'
@@ -144,14 +145,17 @@ async function confirmDelete(): Promise<void> {
       <div v-if="!locks.length" class="admin-empty">{{ locale.text('暂无网页文件夹锁', 'No browser folder locks') }}</div>
       <div v-else class="locks-list">
         <article v-for="lock in locks" :key="lock.id" class="lock-record">
-          <div class="lock-record-main">
-            <strong>{{ displayPath(lock.path) }}</strong>
-            <span class="status-pill">{{ locale.text('网页保护', 'Browser protected') }}</span>
-            <span v-if="storages.length > 1" class="lock-storage-name">{{ storageName(lock.storage_id) }}</span>
+          <strong class="admin-record-name">{{ displayPath(lock.path) }}</strong>
+          <div class="admin-record-value">
+            <span>{{ locale.text('所属存储', 'Storage') }}</span>
+            <strong>{{ storageName(lock.storage_id) }}</strong>
           </div>
-          <div class="lock-actions">
-            <button class="btn secondary" type="button" @click="openEdit(lock)">{{ locale.t('common.edit') }}</button>
-            <button class="btn danger-outline" type="button" @click="pendingDelete = lock; errorMessage = ''">{{ locale.t('common.delete') }}</button>
+          <div class="admin-record-end">
+            <div class="admin-record-status"><span class="status-pill">{{ locale.text('网页保护', 'Browser protected') }}</span></div>
+            <div class="lock-actions">
+              <button class="record-icon-btn" type="button" :title="locale.text('编辑文件夹锁', 'Edit folder lock')" :aria-label="locale.text('编辑文件夹锁', 'Edit folder lock')" @click="openEdit(lock)"><AppIcon name="rename" :size="18" /></button>
+              <button class="record-icon-btn danger" type="button" :title="locale.text('删除文件夹锁', 'Delete folder lock')" :aria-label="locale.text('删除文件夹锁', 'Delete folder lock')" @click="pendingDelete = lock; errorMessage = ''"><AppIcon name="delete" :size="18" /></button>
+            </div>
           </div>
         </article>
       </div>

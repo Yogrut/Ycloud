@@ -36,16 +36,20 @@ function respondJson(body: unknown): Response {
 }
 
 describe('WebDavView', () => {
-  it('renders connection, storage and permission state without a password value', async () => {
+  it('renders a compact connection and permission row without credential details', async () => {
     const host = document.createElement('div')
     document.body.append(host)
     const { app } = mountWebDav(host, [mountView])
     await nextTick()
 
     expect(host.textContent).toContain('/dav/media')
-    expect(host.textContent).toContain('存储路径 /files')
-    expect(host.textContent).toContain('密码已设置')
+    expect(host.textContent).toContain('已启用')
+    expect(host.textContent).toContain('读写')
+    expect(host.textContent).not.toContain('存储路径 /files')
+    expect(host.textContent).not.toContain('密码已设置')
     expect(host.textContent).not.toContain('secure-dav-password')
+    expect(host.querySelector('button[aria-label="编辑 WebDAV 挂载"] svg')).not.toBeNull()
+    expect(host.querySelector('button[aria-label="删除 WebDAV 挂载"] svg')).not.toBeNull()
     app.unmount()
   })
 
@@ -102,7 +106,7 @@ describe('WebDavView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const { app } = mountWebDav(host, [mountView])
-    ;(host.querySelector('.webdav-actions .btn') as HTMLButtonElement).click()
+    ;(host.querySelector('button[aria-label="编辑 WebDAV 挂载"]') as HTMLButtonElement).click()
     await nextTick()
     const options = host.querySelectorAll<HTMLInputElement>('.webdav-options input')
     if (!options[1]) throw new Error('readonly input missing')
@@ -145,7 +149,7 @@ describe('WebDavView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const { app } = mountWebDav(host, [mountView])
-    ;(host.querySelector('.webdav-actions .btn') as HTMLButtonElement).click()
+    ;(host.querySelector('button[aria-label="编辑 WebDAV 挂载"]') as HTMLButtonElement).click()
     await nextTick()
     const fields = host.querySelectorAll<HTMLInputElement>('.webdav-form-grid input')
     const enabled = host.querySelector<HTMLInputElement>('.webdav-options input')
@@ -169,7 +173,7 @@ describe('WebDavView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const { app, changed } = mountWebDav(host, [mountView])
-    ;(host.querySelector('.webdav-actions .danger-outline') as HTMLButtonElement).click()
+    ;(host.querySelector('button[aria-label="删除 WebDAV 挂载"]') as HTMLButtonElement).click()
     await nextTick()
     ;(host.querySelector('.modal .btn.danger') as HTMLButtonElement).click()
     await new Promise(resolve => window.setTimeout(resolve, 0))

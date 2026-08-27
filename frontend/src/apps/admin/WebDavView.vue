@@ -2,6 +2,7 @@
 import { computed, nextTick, ref } from 'vue'
 import type { StorageInstanceView, UpdateWebDavMountRequest, WebDavMountView } from '../../shared/api/admin'
 import { createWebDavMount, deleteWebDavMount, updateWebDavMount } from '../../shared/api/admin'
+import AppIcon from '../../shared/components/AppIcon.vue'
 import { useLocale } from '../../shared/i18n'
 
 const MASK = '••••••'
@@ -42,10 +43,6 @@ function connectionPath(value: string): string {
 
 function initialPassword(mount: WebDavMountView): string {
   return mount.has_password ? MASK : ''
-}
-
-function storageName(id: string): string {
-  return storages.find((storage) => storage.id === id)?.name ?? id
 }
 
 const hasChanges = computed(() => {
@@ -185,20 +182,17 @@ async function confirmDelete(): Promise<void> {
       <div v-if="!mounts.length" class="admin-empty">{{ locale.text('暂无 WebDAV 挂载', 'No WebDAV mounts') }}</div>
       <div v-else class="webdav-list">
         <article v-for="mount in mounts" :key="mount.id" class="webdav-record">
-          <div class="webdav-record-main">
-            <div class="webdav-record-title">
-              <strong>{{ mount.name }}</strong>
-              <span class="status-pill" :class="{ inactive: !mount.webdav_enabled }">{{ mount.webdav_enabled ? locale.text('已启用', 'Enabled') : locale.text('已停用', 'Disabled') }}</span>
-              <span class="status-pill permission">{{ mount.readonly ? locale.text('只读', 'Read only') : locale.text('读写', 'Read/write') }}</span>
-              <span v-if="mount.has_password" class="status-pill credential">{{ locale.text('密码已设置', 'Password set') }}</span>
-            </div>
-            <div class="webdav-record-meta">{{ locale.text('存储路径', 'Storage path') }} {{ displayPath(mount.path) }} · {{ locale.text('连接路径', 'Connection path') }} {{ connectionPath(mount.name) }}</div>
-            <div v-if="storages.length > 1" class="webdav-record-meta">{{ locale.text('所属存储', 'Storage') }} {{ storageName(mount.storage_id) }}</div>
-            <div class="webdav-record-meta">{{ locale.text('用户', 'User') }} {{ mount.username || locale.text('未设置', 'Not set') }}</div>
+          <strong class="admin-record-name">{{ mount.name }}</strong>
+          <div class="admin-record-value">
+            <span>{{ locale.text('连接地址', 'Address') }}</span>
+            <strong>{{ connectionPath(mount.name) }}</strong>
           </div>
-          <div class="webdav-actions">
-            <button class="btn secondary" type="button" @click="openEdit(mount)">{{ locale.t('common.edit') }}</button>
-            <button class="btn danger-outline" type="button" @click="pendingDelete = mount; errorMessage = ''">{{ locale.t('common.delete') }}</button>
+          <div class="admin-record-end">
+            <div class="admin-record-status"><span class="status-pill" :class="{ inactive: !mount.webdav_enabled }">{{ mount.webdav_enabled ? locale.text('已启用', 'Enabled') : locale.text('已停用', 'Disabled') }}</span><span class="status-pill permission">{{ mount.readonly ? locale.text('只读', 'Read only') : locale.text('读写', 'Read/write') }}</span></div>
+            <div class="webdav-actions">
+              <button class="record-icon-btn" type="button" :title="locale.text('编辑 WebDAV 挂载', 'Edit WebDAV mount')" :aria-label="locale.text('编辑 WebDAV 挂载', 'Edit WebDAV mount')" @click="openEdit(mount)"><AppIcon name="rename" :size="18" /></button>
+              <button class="record-icon-btn danger" type="button" :title="locale.text('删除 WebDAV 挂载', 'Delete WebDAV mount')" :aria-label="locale.text('删除 WebDAV 挂载', 'Delete WebDAV mount')" @click="pendingDelete = mount; errorMessage = ''"><AppIcon name="delete" :size="18" /></button>
+            </div>
           </div>
         </article>
       </div>

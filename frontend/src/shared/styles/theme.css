@@ -423,7 +423,7 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .limits-control small { color: var(--muted-2); font-size: 11px; line-height: 1.55; }
 .safety-note { margin-top: 22px; padding: 13px 15px; color: var(--muted); background: var(--panel-soft); border: 1px solid var(--line); border-radius: 10px; font-size: 12px; line-height: 1.65; }
 .locks-head { align-items: center; }
-.locks-body { padding-top: 16px; padding-bottom: 18px; }
+.locks-body { padding-top: 14px; padding-bottom: 16px; }
 .admin-empty { min-height: 190px; display: grid; place-items: center; color: var(--muted); text-align: center; }
 .user-list { display: grid; gap: 0; }
 .user-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 0; border-bottom: 1px solid var(--line); }
@@ -442,24 +442,51 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .user-editor .storage-access-option { font-weight: 700; }
 .storage-grant-row input[type="checkbox"] { width: 16px; height: 16px; flex: 0 0 16px; margin: 0; }
 .storage-grant-row.disabled .storage-grant-option { opacity: .48; }
-.locks-list { border-top: 1px solid var(--line); }
-.lock-record { min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 10px 0; border-bottom: 1px solid var(--line); }
-.lock-record-main { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
-.lock-record-main strong { overflow-wrap: anywhere; color: var(--text); font-size: 15px; }
+.locks-list { display: grid; gap: 8px; }
+.lock-record,
+.webdav-record,
+.storage-instance-card {
+  min-height: 64px;
+  display: grid;
+  grid-template-columns: minmax(150px, 1.1fr) minmax(190px, 1fr) auto;
+  align-items: center;
+  gap: 24px;
+  padding: 11px 14px;
+  background: var(--panel-soft);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+.admin-record-name { min-width: 0; overflow: hidden; color: var(--text); font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.admin-record-value { min-width: 0; display: grid; gap: 3px; }
+.admin-record-value > span { color: var(--muted-2); font-size: 10px; }
+.admin-record-value > strong { overflow: hidden; color: var(--muted); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.admin-record-end { display: flex; align-items: center; justify-content: flex-end; gap: 13px; }
+.admin-record-status { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
 .lock-actions { display: flex; gap: 8px; flex: 0 0 auto; }
+.record-icon-btn {
+  width: 34px;
+  height: 34px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease, border-color .16s ease;
+}
+.record-icon-btn:hover:not(:disabled) { color: var(--accent); background: var(--accent-soft); border-color: rgba(64, 158, 255, .35); }
+.record-icon-btn.danger { color: var(--danger); }
+.record-icon-btn.danger:hover:not(:disabled) { color: var(--danger); background: rgba(228, 86, 107, .1); border-color: rgba(228, 86, 107, .35); }
+.record-icon-btn:disabled { opacity: .5; cursor: wait; }
 .danger-outline { color: var(--danger); background: rgba(228, 86, 107, .06); border-color: rgba(228, 86, 107, .28); }
 .danger-outline:hover:not(:disabled) { background: rgba(228, 86, 107, .12); border-color: rgba(228, 86, 107, .4); }
 .webdav-head { align-items: center; }
-.webdav-body { padding-top: 16px; padding-bottom: 18px; }
-.webdav-list { border-top: 1px solid var(--line); }
-.webdav-record { min-height: 92px; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 13px 0; border-bottom: 1px solid var(--line); }
-.webdav-record-main { min-width: 0; }
-.webdav-record-title { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-bottom: 5px; }
-.webdav-record-title strong { overflow-wrap: anywhere; color: var(--text); font-size: 15px; }
+.webdav-body { padding-top: 14px; padding-bottom: 16px; }
+.webdav-list { display: grid; gap: 8px; }
 .status-pill.inactive { color: var(--muted); background: var(--panel-soft); border-color: var(--line); }
 .status-pill.permission { color: var(--accent); background: var(--accent-soft); border-color: rgba(64, 158, 255, .25); }
-.status-pill.credential { color: var(--text); background: var(--panel-soft); border-color: var(--line); }
-.webdav-record-meta { margin-top: 4px; overflow-wrap: anywhere; color: var(--muted); font-size: 12px; line-height: 1.55; }
 .webdav-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 .webdav-modal { width: min(720px, 100%); }
 .webdav-form-grid { display: grid; grid-template-columns: minmax(180px, .75fr) minmax(240px, 1fr); gap: 0 16px; }
@@ -507,17 +534,15 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .status-pill.warning { color: #b57900; background: rgba(181, 121, 0, .1); border-color: rgba(181, 121, 0, .25); }
 .status-pill.muted { color: var(--muted); background: var(--panel-soft); border-color: var(--line); }
 
-.storage-instance-list { display: grid; gap: 10px; }
-.storage-instance-card { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel-soft); }
-.storage-instance-card > div:first-child { min-width: 0; }
-.storage-instance-card strong { margin-right: 8px; }
-.storage-instance-card p { margin: 7px 0 4px; overflow-wrap: anywhere; color: var(--muted); }
-.storage-instance-card small { color: var(--muted); }
+.storage-pane { width: 100% !important; }
+.storage-pane .admin-pane-head,
+.webdav-head,
+.locks-head { min-height: 88px; padding: 20px 24px 17px; }
+.storage-pane .admin-pane-body { padding: 14px 24px 16px; }
+.storage-instance-list { display: grid; gap: 8px; }
 .storage-instance-actions { display: flex; flex: 0 0 auto; gap: 8px; }
 .storage-page-head { align-items: center; }
-.storage-source-title { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
-.storage-source-main { min-width: 0; }
-.storage-empty { min-height: 300px; display: grid; place-items: center; align-content: center; gap: 10px; color: var(--muted); text-align: center; }
+.storage-empty { min-height: 180px; display: grid; place-items: center; align-content: center; gap: 10px; color: var(--muted); text-align: center; }
 .storage-empty strong { color: var(--text); font-size: 16px; }
 .storage-boundary-note { justify-content: space-between; gap: 12px; }
 .modal.storage-editor { width: min(1120px, calc(100vw - 48px)); max-height: calc(100vh - 36px); overflow-x: hidden; overflow-y: auto; }
@@ -530,7 +555,6 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .storage-access-option input { width: 17px; height: 17px; flex: 0 0 17px; accent-color: var(--accent); }
 .storage-access-option span { display: grid; gap: 4px; }
 .storage-access-option small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
-.lock-storage-name { margin-left: 8px; color: var(--muted); font-size: 12px; }
 .security-filters { display: grid; grid-template-columns: 140px 150px minmax(180px, 1fr) auto; align-items: end; gap: 12px; margin-bottom: 18px; }
 .security-filters label, .security-retention label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 650; }
 .security-filters select, .security-filters input, .security-retention select, .security-retention input {
@@ -816,8 +840,12 @@ input[type="password"]::placeholder { letter-spacing: normal; }
   .storage-provider { min-height: 66px; padding: 9px; }
   .storage-form { grid-template-columns: 1fr; gap: 15px; }
   .local-mount-grid { grid-template-columns: 1fr; }
-  .storage-instance-card { align-items: flex-start; flex-direction: column; gap: 12px; }
-  .storage-instance-actions { width: 100%; }
+  .lock-record,
+  .webdav-record,
+  .storage-instance-card { grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 12px; }
+  .admin-record-name { font-size: 14px; }
+  .admin-record-end { justify-content: space-between; gap: 10px; padding-top: 3px; }
+  .admin-record-status { justify-content: flex-start; }
   .storage-wide { grid-column: auto; }
   .storage-boundary-note { grid-column: auto; }
   .storage-pending-card { align-items: stretch; flex-direction: column; }
@@ -840,12 +868,10 @@ input[type="password"]::placeholder { letter-spacing: normal; }
   .security-retention .btn { width: 100%; }
   .locks-head { align-items: stretch; flex-direction: column; }
   .locks-head .btn { width: 100%; }
-  .lock-record { align-items: stretch; flex-direction: column; gap: 13px; }
-  .lock-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .lock-actions { display: flex; }
   .webdav-head { align-items: stretch; flex-direction: column; }
   .webdav-head .btn { width: 100%; }
-  .webdav-record { align-items: stretch; flex-direction: column; gap: 14px; }
-  .webdav-actions { display: grid; grid-template-columns: 1fr 1fr; }
+  .webdav-actions { display: flex; }
   .webdav-modal { max-height: calc(100dvh - 36px); overflow-x: hidden; overflow-y: auto; overscroll-behavior-y: contain; -webkit-overflow-scrolling: touch; touch-action: pan-y; }
   .webdav-form-grid { grid-template-columns: 1fr; }
   .user-basic-grid { grid-template-columns: 1fr; }

@@ -71,7 +71,7 @@ describe('StorageView', () => {
     expect(host.textContent).toContain('访客可访问')
     expect(host.querySelectorAll('.storage-provider')).toHaveLength(0)
     expect(button(host, '新建存储')?.querySelector('svg')).toBeNull()
-    expect(button(host, '设置')?.querySelector('svg')).toBeNull()
+    expect(host.querySelector('button[aria-label="编辑存储"] svg')).not.toBeNull()
 
     button(host, '新建存储')?.click()
     await nextTick()
@@ -103,7 +103,7 @@ describe('StorageView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const { app, changed } = mountStorage(host)
-    button(host, '设置')?.click()
+    host.querySelector<HTMLButtonElement>('button[aria-label="编辑存储"]')?.click()
     await nextTick()
     setLabeledInput(host, '存储名称', '主资料盘')
     setLabeledInput(host, '本地存储路径', '/mnt/primary')

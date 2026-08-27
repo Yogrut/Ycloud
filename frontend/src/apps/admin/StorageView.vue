@@ -47,13 +47,6 @@ function formatBytes(value: number): string {
   if (value >= 1024 ** 2) return `${(value / (1024 ** 2)).toFixed(2)} MiB`
   return `${value} B`
 }
-function providerLabel(value: S3Provider): string {
-  const item = providers.find(candidate => candidate.id === value)
-  return item ? locale.text(item.zh, item.en) : 'S3'
-}
-function backendLabel(instance: StorageInstanceView): string {
-  return instance.backend.type === 'local' ? locale.text('本地存储', 'Local storage') : providerLabel(instance.backend.provider)
-}
 function statusLabel(instance: StorageInstanceView): string {
   if (instance.status === 'disabled') return locale.text('停用', 'Disabled')
   if (instance.status === 'abnormal') return locale.text('异常', 'Abnormal')
@@ -166,13 +159,19 @@ async function clearPending(): Promise<void> {
       </div>
       <div v-if="instances.length" class="storage-instance-list storage-wide">
         <article v-for="instance in instances" :key="instance.id" class="storage-instance-card storage-source-row">
-          <div class="storage-source-main">
-            <div class="storage-source-title"><strong>{{ instance.name }}</strong><span class="status-pill" :class="{ warning: instance.status === 'abnormal', muted: instance.status === 'disabled' }">{{ statusLabel(instance) }}</span><span v-if="instance.allow_guest_access" class="status-pill">{{ locale.text('访客可访问', 'Guest access') }}</span></div>
-            <p>{{ backendLabel(instance) }}<template v-if="instance.backend.type === 's3'"> · {{ instance.backend.bucket }} · {{ instance.backend.endpoint }}</template><template v-else> · {{ instance.backend.path }}</template></p>
-            <small v-if="instance.capacity_accurate !== false">{{ locale.text('已使用：', 'Used: ') }}{{ formatBytes(instance.usage_bytes) }} · {{ locale.text('预留：', 'Reserved: ') }}{{ formatBytes(instance.reserved_bytes) }} · {{ locale.text('上限：', 'Limit: ') }}{{ instance.backend.capacity_limit_bytes ? formatBytes(instance.backend.capacity_limit_bytes) : locale.text('未设置', 'Unlimited') }}</small>
-            <small v-else>{{ locale.text('容量正在后台核对', 'Capacity reconciliation in progress') }}</small>
+          <strong class="admin-record-name">{{ instance.name }}</strong>
+          <div class="admin-record-value">
+            <span>{{ locale.text('存储用量', 'Storage used') }}</span>
+            <strong v-if="instance.capacity_accurate !== false">{{ formatBytes(instance.usage_bytes) }}</strong>
+            <strong v-else>{{ locale.text('核对中', 'Checking') }}</strong>
           </div>
-          <div class="storage-instance-actions"><button class="btn secondary" type="button" :disabled="busy" @click="openSettings(instance)">{{ locale.text('设置', 'Settings') }}</button><button class="btn danger" type="button" :disabled="busy" @click="removeInstance(instance)">{{ locale.text('删除', 'Remove') }}</button></div>
+          <div class="admin-record-end">
+            <div class="admin-record-status"><span class="status-pill" :class="{ warning: instance.status === 'abnormal', muted: instance.status === 'disabled' }">{{ statusLabel(instance) }}</span><span v-if="instance.allow_guest_access" class="status-pill">{{ locale.text('访客可访问', 'Guest access') }}</span></div>
+            <div class="storage-instance-actions">
+              <button class="record-icon-btn" type="button" :disabled="busy" :title="locale.text('编辑存储', 'Edit storage')" :aria-label="locale.text('编辑存储', 'Edit storage')" @click="openSettings(instance)"><AppIcon name="rename" :size="18" /></button>
+              <button class="record-icon-btn danger" type="button" :disabled="busy" :title="locale.text('删除存储', 'Delete storage')" :aria-label="locale.text('删除存储', 'Delete storage')" @click="removeInstance(instance)"><AppIcon name="delete" :size="18" /></button>
+            </div>
+          </div>
         </article>
       </div>
       <div v-else class="storage-empty storage-wide"><AppIcon name="storage" :size="40" /><strong>{{ locale.text('尚未添加存储源', 'No storage sources') }}</strong><span>{{ locale.text('点击右上角“新建存储”开始配置。', 'Use “New storage” to add one.') }}</span></div>

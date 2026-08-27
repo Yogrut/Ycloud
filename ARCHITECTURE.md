@@ -23,7 +23,7 @@
 - `directory_listing.rs`：统一目录排序、搜索和游标分页。
 - `storage_backend.rs`：多存储注册与统一操作接口。
 - `capacity.rs`：存储容量预留、持久账本和后台核对。
-- `storage.rs`、`storage_transaction.rs`：本地路径边界、流式 I/O 和事务恢复。
+- `storage.rs`、`storage/`、`storage_transaction.rs`：本地存储入口，以及路径边界、流式响应、原子写入、磁盘预留和事务恢复模块。
 - `s3_backend.rs`、`s3_backend/`：统一 S3 后端入口，以及客户端、键空间、目录分页、容量扫描、对象读取、响应体和目录事务模块。
 - `webdav.rs`、`archive.rs`：WebDAV 与流式 ZIP。
 

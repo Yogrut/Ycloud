@@ -216,7 +216,7 @@ onMounted(() => load())
       <nav class="security-pagination"><button class="btn secondary" type="button" :disabled="!cursorHistory.length || loading" @click="previousPage">{{ locale.text('上一页', 'Previous') }}</button><span>{{ locale.text(`第 ${pageNumber} 页`, `Page ${pageNumber}`) }}</span><button class="btn secondary" type="button" :disabled="nextCursor === null || loading" @click="nextPage">{{ locale.text('下一页', 'Next') }}</button></nav>
 
       <form class="security-retention" @submit.prevent="saveRetention">
-        <label><span>{{ locale.text('日志保存时间', 'Log retention') }}</span><AppSelect v-model="retentionDays" :options="retentionOptions" :label="locale.text('日志保存时间', 'Log retention')" /></label>
+        <label><span>{{ locale.text('日志保存时间', 'Log retention') }}</span><AppSelect v-model="retentionDays" placement="top" :options="retentionOptions" :label="locale.text('日志保存时间', 'Log retention')" /></label>
         <label><span>{{ locale.text('最多保存条目', 'Maximum entries') }}</span><input v-model="maxEntries" type="number" min="500" max="20000" step="100"></label>
         <button class="btn" type="submit" :disabled="savingRetention">{{ savingRetention ? locale.t('common.saving') : locale.text('保存日志设置', 'Save log settings') }}</button>
         <p class="admin-form-error">{{ retentionError }}</p>

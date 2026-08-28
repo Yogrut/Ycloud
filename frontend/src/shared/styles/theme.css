@@ -1,14 +1,14 @@
 :root {
   color-scheme: only light;
-  --bg: #f5f7fb;
+  --bg: #f1f3f6;
   --panel: #ffffff;
-  --panel-soft: #f2f5f9;
-  --field: #fff;
-  --line: #e7ebf2;
-  --line-strong: #dce2eb;
-  --text: #27334d;
-  --muted: #768199;
-  --muted-2: #9aa4b6;
+  --panel-soft: #f5f6f8;
+  --field: #fbfcfd;
+  --line: #e3e6eb;
+  --line-strong: #d7dce4;
+  --text: #30343b;
+  --muted: #747b87;
+  --muted-2: #9aa1ac;
   --accent: #0874f9;
   --icon-color: #0564e1;
   --accent-strong: #0667db;
@@ -16,7 +16,7 @@
   --danger: #e05267;
   --success: #2da66e;
   --selected-row: #eef5ff;
-  --shadow: 0 12px 34px rgba(39, 51, 77, .06);
+  --shadow: 0 12px 34px rgba(35, 42, 54, .07);
   --font: Inter, "Noto Sans SC", "Microsoft YaHei", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
@@ -589,7 +589,7 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .storage-access-option input { width: 17px; height: 17px; flex: 0 0 17px; accent-color: var(--accent); }
 .storage-access-option span { display: grid; gap: 4px; }
 .storage-access-option small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
-.security-filters { display: grid; grid-template-columns: 140px 150px minmax(180px, 1fr) auto; align-items: end; gap: 12px; margin-bottom: 18px; }
+.security-filters { display: grid; grid-template-columns: 176px 160px minmax(180px, 1fr) auto; align-items: end; gap: 12px; margin-bottom: 18px; }
 .security-filters label, .security-retention label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 650; }
 .security-filters input, .security-retention input {
   width: 100%; height: 38px; padding: 0 11px; color: var(--text); background: var(--field);
@@ -616,8 +616,8 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .security-pagination { display: flex; align-items: center; justify-content: center; gap: 14px; padding-top: 20px; }
 .security-pagination span { color: var(--muted); font-size: 12px; }
 .security-pagination .btn { min-height: 36px; padding: 6px 12px; }
-.security-retention { display: grid; grid-template-columns: minmax(160px, 220px) minmax(180px, 240px) auto; align-items: end; gap: 12px; margin-top: 24px; padding-top: 22px; border-top: 1px solid var(--line); }
-.security-retention .btn { min-height: 38px; }
+.security-retention { display: grid; grid-template-columns: 176px 220px minmax(132px, 1fr); align-items: end; gap: 12px; margin-top: 24px; padding-top: 22px; border-top: 1px solid var(--line); }
+.security-retention .btn { width: auto; min-width: 132px; min-height: 38px; justify-self: end; }
 .security-retention .admin-form-error { grid-column: 1 / -1; margin: 0; }
 
 .browser-page { width: min(1280px, calc(100% - 32px)); margin: 0 auto; padding: 12px 0 54px; }
@@ -647,7 +647,7 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .breadcrumb::-webkit-scrollbar { display: none; }
 .storage-switcher { margin-left: auto; padding-left: 8px; flex: 0 0 auto; }
 .browser-storage-switcher { min-width: 0; display: flex; align-items: center; padding: 0; color: var(--accent); }
-.browser-storage-switcher .app-select { width: min(230px, 30vw); min-width: 120px; }
+.browser-storage-switcher .app-select { width: min(176px, 24vw); min-width: 116px; }
 .browser-storage-switcher .app-select-trigger { min-height: 34px; padding: 4px 10px; border-color: var(--line); border-radius: 7px; }
 .crumb {
   min-width: 32px;
@@ -709,7 +709,7 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .pagination-summary { min-width: 0; display: flex; align-items: center; }
 .page-size-select { width: 60px; height: 34px; flex: 0 0 60px; }
 .page-size-select .app-select-trigger { min-height: 34px; height: 34px; padding: 0 9px; background: var(--panel-soft); border-color: transparent; border-radius: 8px; }
-.page-size-select .app-select-menu { right: 0; left: auto; width: 76px; }
+.page-size-select .app-select-menu { right: 0; left: auto; width: 100%; }
 .pagination-controls { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .page-arrow,
 .current-page { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 8px; }

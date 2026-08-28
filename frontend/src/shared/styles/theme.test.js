@@ -11,7 +11,7 @@ describe('interactive focus styling', () => {
   })
 
   it('defines one clean blue palette for light and dark themes', () => {
-    expect(themeCss).toContain('--bg: #f5f7fb')
+    expect(themeCss).toContain('--bg: #f1f3f6')
     expect(themeCss).toContain('--panel: #ffffff')
     expect(themeCss).toContain('--accent: #0874f9')
     expect(themeCss).toContain(':root[data-theme="dark"]')
@@ -51,8 +51,14 @@ describe('interactive focus styling', () => {
   it('uses matching compact pagination controls and a soft-blue current page', () => {
     expect(themeCss).toContain('.page-size-select { width: 60px; height: 34px;')
     expect(themeCss).toContain('.page-size-select .app-select-trigger { min-height: 34px; height: 34px;')
+    expect(themeCss).toContain('.page-size-select .app-select-menu { right: 0; left: auto; width: 100%; }')
     expect(themeCss).toContain('.current-page { flex: 0 0 34px; color: var(--icon-color); background: var(--accent-soft);')
     expect(themeCss).toContain('.page-arrow:disabled { color: var(--muted-2); cursor: default; opacity: 1; }')
+  })
+
+  it('keeps browser and security selectors compact without stretching action buttons', () => {
+    expect(themeCss).toContain('.browser-storage-switcher .app-select { width: min(176px, 24vw); min-width: 116px; }')
+    expect(themeCss).toContain('.security-retention .btn { width: auto; min-width: 132px; min-height: 38px; justify-self: end; }')
   })
 
   it('keeps the long WebDAV editor inside the mobile viewport with its own scroll', () => {

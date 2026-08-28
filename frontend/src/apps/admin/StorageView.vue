@@ -3,6 +3,7 @@ import { computed, ref } from 'vue'
 import type { LocalMountView, S3AddressingStyle, S3Provider, StorageInstanceView, TestS3StorageRequest } from '../../shared/api/admin'
 import { activatePendingStorage, addLocalStorage, deleteStorage, discardPendingStorage, stageS3Storage, testS3Storage, updateLocalStorage, updateS3Storage, updateStorageAccess } from '../../shared/api/admin'
 import AppIcon from '../../shared/components/AppIcon.vue'
+import AppSelect from '../../shared/components/AppSelect.vue'
 import { useLocale } from '../../shared/i18n'
 
 const props = defineProps<{ instances: StorageInstanceView[]; pendingInstance: StorageInstanceView | null; localMounts: LocalMountView[] }>()
@@ -39,6 +40,10 @@ const errorMessage = ref('')
 const editingInstance = computed(() => props.instances.find(instance => instance.id === editingId.value))
 const isS3 = computed(() => provider.value !== 'local')
 const isOfficialCloud = computed(() => provider.value === 'alibaba_oss' || provider.value === 'tencent_cos')
+const addressingOptions = [
+  { value: 'path', label: 'Path Style' },
+  { value: 'virtual_hosted', label: 'Virtual Hosted' },
+]
 
 function bytesToGiB(value: number | null): number { return value ? value / (1024 ** 3) : 0 }
 function formatBytes(value: number): string {
@@ -189,7 +194,7 @@ async function clearPending(): Promise<void> {
         <label v-if="provider === 'local'">{{ locale.text('本地存储路径', 'Local storage path') }}<input v-model="localPath" class="input local-storage-path" maxlength="4096" :placeholder="locale.text('例如 /mnt/data', 'For example /mnt/data')"><small>{{ locale.text('填写已通过系统或容器挂载并在部署配置中声明的目录。', 'Enter a directory mounted into Ycloud and declared by deployment configuration.') }}</small></label>
         <label v-if="provider === 'local'">{{ locale.text('容量上限（GiB）', 'Capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input local-capacity-input" type="number" min="0" max="4194304" step="1"><small>{{ locale.text('0 表示不设置逻辑上限。', '0 disables the logical limit.') }}</small></label>
         <template v-if="isS3">
-          <label class="storage-wide">{{ locale.text('Endpoint 完整地址', 'Full endpoint URL') }}<input v-model="endpoint" class="input" type="url" maxlength="2048" placeholder="https://s3.example.com"></label><label>Bucket<input v-model="bucket" class="input" maxlength="63"></label><label>Region<input v-model="region" class="input" maxlength="64"></label><label class="storage-wide">Prefix<input v-model="prefix" class="input" maxlength="1024" placeholder="ycloud/"></label><label>Access Key ID<input v-model="accessKeyId" class="input" maxlength="256" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>Secret Access Key<input v-model="secretAccessKey" class="input" type="password" maxlength="4096" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>{{ locale.text('寻址方式', 'Addressing style') }}<select v-model="addressingStyle" class="input" :disabled="isOfficialCloud"><option value="path">Path Style</option><option value="virtual_hosted">Virtual Hosted</option></select></label><label>{{ locale.text('容量上限（GiB）', 'Capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input" type="number" min="0" max="4194304" step="1"></label>
+          <label class="storage-wide">{{ locale.text('Endpoint 完整地址', 'Full endpoint URL') }}<input v-model="endpoint" class="input" type="url" maxlength="2048" placeholder="https://s3.example.com"></label><label>Bucket<input v-model="bucket" class="input" maxlength="63"></label><label>Region<input v-model="region" class="input" maxlength="64"></label><label class="storage-wide">Prefix<input v-model="prefix" class="input" maxlength="1024" placeholder="ycloud/"></label><label>Access Key ID<input v-model="accessKeyId" class="input" maxlength="256" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>Secret Access Key<input v-model="secretAccessKey" class="input" type="password" maxlength="4096" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>{{ locale.text('寻址方式', 'Addressing style') }}<AppSelect v-model="addressingStyle" :options="addressingOptions" :label="locale.text('寻址方式', 'Addressing style')" :disabled="isOfficialCloud" /></label><label>{{ locale.text('容量上限（GiB）', 'Capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input" type="number" min="0" max="4194304" step="1"></label>
         </template>
         <div class="storage-access-options storage-wide"><label class="storage-access-option"><input v-model="enabled" type="checkbox"><span><strong>{{ locale.text('启动', 'Enabled') }}</strong><small>{{ locale.text('停用后不会出现在文件页切换器中。', 'Disabled storage is hidden from the file browser.') }}</small></span></label><label class="storage-access-option"><input v-model="allowGuestAccess" type="checkbox"><span><strong>{{ locale.text('允许访客访问', 'Allow guest access') }}</strong><small>{{ locale.text('关闭后需要管理员或已授权用户账号。', 'When off, an administrator or authorized user must sign in.') }}</small></span></label></div>
         <div v-if="provider === 'local' && localPath.trim()" class="storage-boundary-note storage-wide">{{ locale.text('保存后直接展示该路径中的现有文件，不进行导入、移动或删除。', 'Existing files at this path are shown directly; nothing is imported, moved, or deleted.') }}</div>

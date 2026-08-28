@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import type { AdminInfo, LoginEntry, LoginEvent, UpdateLoginSecuritySettingsRequest } from '../../shared/api/admin'
 import { AdminApiError, getLoginEvents, updateLoginRestriction, updateLoginSecuritySettings } from '../../shared/api/admin'
+import AppSelect from '../../shared/components/AppSelect.vue'
 import { useLocale } from '../../shared/i18n'
 
 type RecordKind = 'normal' | 'error'
@@ -30,6 +31,21 @@ const savingRetention = ref(false)
 const retentionError = ref('')
 
 const pageNumber = computed(() => cursorHistory.value.length + 1)
+const dayOptions = computed(() => [1, 3, 7, 15, 30].map(value => ({
+  value: String(value),
+  label: value === 1 ? locale.text('最近 1 天', 'Last day') : locale.text(`最近 ${value} 天`, `Last ${value} days`),
+})))
+const entryOptions = computed(() => [
+  { value: '', label: locale.text('全部', 'All') },
+  { value: 'admin', label: locale.text('管理员', 'Administrator') },
+  { value: 'account', label: locale.text('用户账号', 'User account') },
+  { value: 'web', label: locale.text('首页', 'Browser') },
+  { value: 'web_dav', label: 'WebDAV' },
+])
+const retentionOptions = computed(() => [1, 3, 5, 7, 15, 30].map(value => ({
+  value,
+  label: `${value} ${locale.text('天', 'days')}`,
+})))
 
 function entryLabel(value: LoginEntry): string {
   if (value === 'admin') return locale.text('管理员', 'Administrator')
@@ -172,8 +188,8 @@ onMounted(() => load())
       </div>
 
       <div class="security-filters">
-        <label><span>{{ locale.text('查看时间', 'Time range') }}</span><select v-model="days"><option value="1">{{ locale.text('最近 1 天', 'Last day') }}</option><option value="3">{{ locale.text('最近 3 天', 'Last 3 days') }}</option><option value="7">{{ locale.text('最近 7 天', 'Last 7 days') }}</option><option value="15">{{ locale.text('最近 15 天', 'Last 15 days') }}</option><option value="30">{{ locale.text('最近 30 天', 'Last 30 days') }}</option></select></label>
-        <label><span>{{ locale.text('登录入口', 'Entry') }}</span><select v-model="entry"><option value="">{{ locale.text('全部', 'All') }}</option><option value="admin">{{ locale.text('管理员', 'Administrator') }}</option><option value="account">{{ locale.text('用户账号', 'User account') }}</option><option value="web">{{ locale.text('首页', 'Browser') }}</option><option value="web_dav">WebDAV</option></select></label>
+        <label><span>{{ locale.text('查看时间', 'Time range') }}</span><AppSelect v-model="days" :options="dayOptions" :label="locale.text('查看时间', 'Time range')" /></label>
+        <label><span>{{ locale.text('登录入口', 'Entry') }}</span><AppSelect v-model="entry" :options="entryOptions" :label="locale.text('登录入口', 'Entry')" /></label>
         <label class="security-ip-filter"><span>IP</span><input v-model="ip" maxlength="64" :placeholder="locale.text('筛选 IP', 'Filter IP')" @keyup.enter="resetAndLoad"></label>
         <button class="btn secondary" type="button" @click="resetAndLoad">{{ locale.text('查询', 'Search') }}</button>
       </div>
@@ -200,7 +216,7 @@ onMounted(() => load())
       <nav class="security-pagination"><button class="btn secondary" type="button" :disabled="!cursorHistory.length || loading" @click="previousPage">{{ locale.text('上一页', 'Previous') }}</button><span>{{ locale.text(`第 ${pageNumber} 页`, `Page ${pageNumber}`) }}</span><button class="btn secondary" type="button" :disabled="nextCursor === null || loading" @click="nextPage">{{ locale.text('下一页', 'Next') }}</button></nav>
 
       <form class="security-retention" @submit.prevent="saveRetention">
-        <label><span>{{ locale.text('日志保存时间', 'Log retention') }}</span><select v-model="retentionDays"><option v-for="value in [1, 3, 5, 7, 15, 30]" :key="value" :value="value">{{ value }} {{ locale.text('天', 'days') }}</option></select></label>
+        <label><span>{{ locale.text('日志保存时间', 'Log retention') }}</span><AppSelect v-model="retentionDays" :options="retentionOptions" :label="locale.text('日志保存时间', 'Log retention')" /></label>
         <label><span>{{ locale.text('最多保存条目', 'Maximum entries') }}</span><input v-model="maxEntries" type="number" min="500" max="20000" step="100"></label>
         <button class="btn" type="submit" :disabled="savingRetention">{{ savingRetention ? locale.t('common.saving') : locale.text('保存日志设置', 'Save log settings') }}</button>
         <p class="admin-form-error">{{ retentionError }}</p>

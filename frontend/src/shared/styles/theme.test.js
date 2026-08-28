@@ -42,8 +42,15 @@ describe('interactive focus styling', () => {
     expect(mobile).toContain('.file-row { min-height: 48px; }')
   })
 
+  it('keeps the folder lock indicator smaller than the file icon', () => {
+    expect(themeCss).toContain('.file-icon svg { width: 23px; height: 23px; }')
+    expect(themeCss).toContain('.file-lock-indicator svg { width: 12px; height: 12px; }')
+    expect(themeCss).not.toContain('.lock-dot')
+  })
+
   it('uses matching compact pagination controls and a soft-blue current page', () => {
-    expect(themeCss).toContain('.page-size-select { position: relative; width: 60px; height: 34px;')
+    expect(themeCss).toContain('.page-size-select { width: 60px; height: 34px;')
+    expect(themeCss).toContain('.page-size-select .app-select-trigger { min-height: 34px; height: 34px;')
     expect(themeCss).toContain('.current-page { flex: 0 0 34px; color: var(--icon-color); background: var(--accent-soft);')
     expect(themeCss).toContain('.page-arrow:disabled { color: var(--muted-2); cursor: default; opacity: 1; }')
   })

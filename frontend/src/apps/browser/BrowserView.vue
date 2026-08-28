@@ -5,6 +5,7 @@ import { adminLogin, batchOperation, createFolder, downloadUrl, listFiles, listS
 import { appPath } from '../../shared/routes'
 import { formatSize } from '../../shared/format'
 import AppIcon from '../../shared/components/AppIcon.vue'
+import AppSelect from '../../shared/components/AppSelect.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
 import type { ThemeController } from '../../shared/composables/useTheme'
@@ -92,6 +93,11 @@ const uploadPercent = computed(() => uploadTotal.value ? Math.min(100, Math.roun
 
 const visibleEntries = computed(() => entries.value)
 const pageNumber = computed(() => cursorHistory.value.length + 1)
+const storageOptions = computed(() => storages.value.map(storage => ({
+  value: storage.id,
+  label: `${storage.name}${storage.requires_login ? locale.text('（需登录）', ' (sign in)') : ''}`,
+})))
+const pageSizeOptions = PAGE_SIZES.map(size => ({ value: size, label: String(size) }))
 
 const crumbs = computed(() => {
   let accumulated = ''
@@ -180,11 +186,10 @@ async function navigate(destination: string): Promise<void> {
   await refresh()
 }
 
-async function switchStorage(event: Event): Promise<void> {
-  const nextStorageId = (event.target as HTMLSelectElement).value
+async function switchStorage(value: string | number): Promise<void> {
+  const nextStorageId = String(value)
   const nextStorage = storages.value.find(storage => storage.id === nextStorageId)
   if (!nextStorage || nextStorage.requires_login) {
-    ;(event.target as HTMLSelectElement).value = currentStorageId.value
     pendingStorageId.value = nextStorageId
     void openAdmin(true)
     return
@@ -691,14 +696,9 @@ onBeforeUnmount(() => {
 <template>
   <header class="browser-chrome glass">
     <div class="brand"><AppIcon name="cloud" :size="28" /><span>Ycloud</span></div>
-    <label v-if="storages.length" class="storage-switcher browser-storage-switcher">
-      <span class="visually-hidden">{{ locale.text('当前存储', 'Current storage') }}</span>
-      <select :value="currentStorageId" :aria-label="locale.text('切换存储', 'Switch storage')" @change="switchStorage">
-        <option v-for="storage in storages" :key="storage.id" :value="storage.id">
-          {{ storage.name }}{{ storage.requires_login ? locale.text('（需登录）', ' (sign in)') : '' }}
-        </option>
-      </select>
-    </label>
+    <div v-if="storages.length" class="storage-switcher browser-storage-switcher">
+      <AppSelect :model-value="currentStorageId" :options="storageOptions" :label="locale.text('切换存储', 'Switch storage')" @change="switchStorage" />
+    </div>
     <div class="top-actions">
       <button class="icon-btn flat" type="button" :title="locale.text('账号登录 / 管理员', 'Account sign-in / Administrator')" :aria-label="locale.text('账号登录 / 管理员', 'Account sign-in / Administrator')" @click="openAdmin()"><AppIcon name="administrator" /></button>
       <ThemeToggle :theme="theme.current.value" class="flat" @toggle="theme.toggle" />
@@ -749,19 +749,14 @@ onBeforeUnmount(() => {
           @contextmenu.stop="openRowMenu($event, entry)"
         >
           <button class="select-box" :class="{ checked: selected.has(entry.path) }" type="button" :aria-label="locale.text(`选择 ${entry.name}`, `Select ${entry.name}`)" @click.stop="toggleSelection(entry.path)"><span class="visually-hidden">{{ locale.text('选择', 'Select') }} {{ entry.name }}</span></button>
-          <div class="file-name"><FileIcon :entry="entry" /><span class="file-label">{{ entry.name }}</span></div>
+          <div class="file-name"><FileIcon :entry="entry" /><span class="file-label">{{ entry.name }}</span><span v-if="entry.locked" class="file-lock-indicator" :title="locale.t('file.lockedFolder')"><AppIcon name="lock" :size="12" /></span></div>
           <div class="cell right">{{ entry.is_dir ? '-' : formatSize(entry.size) }}</div>
           <div class="cell right modified">{{ entry.modified || '-' }}</div>
         </div>
       </div>
       <footer class="file-pagination">
         <div class="pagination-summary">
-          <label class="page-size-select">
-            <span class="visually-hidden">{{ locale.text('每页显示数量', 'Items per page') }}</span>
-            <select v-model.number="pageSize" :aria-label="locale.text('每页显示数量', 'Items per page')" @change="changePageSize">
-              <option v-for="size in PAGE_SIZES" :key="size" :value="size">{{ size }}</option>
-            </select>
-          </label>
+          <AppSelect v-model="pageSize" class="page-size-select" placement="top" :options="pageSizeOptions" :label="locale.text('每页显示数量', 'Items per page')" @change="changePageSize" />
         </div>
         <nav class="pagination-controls" :aria-label="locale.text('文件翻页', 'File pagination')">
           <button class="page-arrow" type="button" :disabled="!cursorHistory.length || loading" :title="locale.text('上一页', 'Previous page')" :aria-label="locale.text('上一页', 'Previous page')" @click="previousPage"><span class="page-chevron previous" aria-hidden="true" /></button>

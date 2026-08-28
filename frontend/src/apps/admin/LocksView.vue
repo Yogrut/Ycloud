@@ -3,6 +3,7 @@ import { computed, nextTick, ref } from 'vue'
 import type { FolderLockView, StorageInstanceView, UpdateFolderLockRequest } from '../../shared/api/admin'
 import { createFolderLock, deleteFolderLock, updateFolderLock } from '../../shared/api/admin'
 import AppIcon from '../../shared/components/AppIcon.vue'
+import AppSelect from '../../shared/components/AppSelect.vue'
 import { useLocale } from '../../shared/i18n'
 
 const MASK = '••••••'
@@ -23,6 +24,11 @@ const saving = ref(false)
 const errorMessage = ref('')
 const pendingDelete = ref<FolderLockView>()
 const deleting = ref(false)
+const storageOptions = computed(() => storages.map(storage => ({
+  value: storage.id,
+  label: `${storage.name}${storage.ready ? '' : locale.text('（不可用）', ' (unavailable)')}`,
+  disabled: !storage.ready,
+})))
 
 function normalizePath(value: string): string {
   return value.replace(/\\/g, '/').split('/').filter(Boolean).join('/')
@@ -167,11 +173,7 @@ async function confirmDelete(): Promise<void> {
       <h2 id="lock-editor-title">{{ editing ? locale.text('编辑文件夹锁', 'Edit folder lock') : locale.text('新建文件夹锁', 'New folder lock') }}</h2>
       <label>
         {{ locale.text('所属存储', 'Storage') }}
-        <select v-model="storageId" class="input" required>
-          <option v-for="storage in storages" :key="storage.id" :value="storage.id" :disabled="!storage.ready">
-            {{ storage.name }}{{ storage.ready ? '' : locale.text('（不可用）', ' (unavailable)') }}
-          </option>
-        </select>
+        <AppSelect v-model="storageId" :options="storageOptions" :label="locale.text('所属存储', 'Storage')" />
       </label>
       <label>
         {{ locale.text('网页文件夹路径', 'Browser folder path') }}

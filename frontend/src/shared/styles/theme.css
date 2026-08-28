@@ -174,6 +174,40 @@ input[type="password"]::placeholder { letter-spacing: normal; }
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+.app-select { position: relative; width: 100%; min-width: 0; color: var(--text); }
+.app-select-trigger {
+  width: 100%; min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 0 13px; color: var(--text); text-align: left; background: var(--field);
+  border: 1px solid var(--line-strong); border-radius: 11px; cursor: pointer;
+  transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+}
+.app-select-trigger:hover:not(:disabled) { border-color: var(--muted-2); }
+.app-select.open .app-select-trigger,
+.app-select-trigger:focus-visible { border-color: var(--accent); outline: 0; box-shadow: 0 0 0 3px var(--accent-soft); }
+.app-select.disabled { opacity: .55; }
+.app-select-trigger:disabled { cursor: not-allowed; }
+.app-select-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-select-chevron {
+  width: 8px; height: 8px; flex: 0 0 8px; margin: -4px 2px 0 0;
+  border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted);
+  transform: rotate(45deg); transition: transform .16s ease, margin .16s ease;
+}
+.app-select.open .app-select-chevron { margin: 4px 2px 0 0; transform: rotate(225deg); }
+.app-select-menu {
+  position: absolute; z-index: 95; top: calc(100% + 7px); left: 0; right: 0;
+  max-height: 240px; overflow-x: hidden; overflow-y: auto; padding: 6px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow);
+}
+.app-select.placement-top .app-select-menu { top: auto; bottom: calc(100% + 7px); }
+.app-select-option {
+  width: 100%; min-height: 36px; display: flex; align-items: center; padding: 7px 10px;
+  color: var(--text); text-align: left; background: transparent; border: 0; border-radius: 7px; cursor: pointer;
+}
+.app-select-option:hover:not(:disabled),
+.app-select-option.active:not(:disabled) { background: var(--panel-soft); outline: 0; }
+.app-select-option.selected { color: var(--accent); background: var(--accent-soft); font-weight: 700; }
+.app-select-option:disabled { color: var(--muted-2); cursor: not-allowed; }
+
 .btn {
   width: auto;
   min-height: 44px;
@@ -557,11 +591,12 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .storage-access-option small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
 .security-filters { display: grid; grid-template-columns: 140px 150px minmax(180px, 1fr) auto; align-items: end; gap: 12px; margin-bottom: 18px; }
 .security-filters label, .security-retention label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 650; }
-.security-filters select, .security-filters input, .security-retention select, .security-retention input {
+.security-filters input, .security-retention input {
   width: 100%; height: 38px; padding: 0 11px; color: var(--text); background: var(--field);
   border: 1px solid var(--line-strong); border-radius: 9px; outline: 0;
 }
-.security-filters select:focus, .security-filters input:focus, .security-retention select:focus, .security-retention input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.security-filters .app-select-trigger, .security-retention .app-select-trigger { min-height: 38px; border-radius: 9px; }
+.security-filters input:focus, .security-retention input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .security-filters .btn { min-height: 38px; }
 .security-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
 .security-table { width: 100%; min-width: 980px; border-collapse: collapse; table-layout: fixed; }
@@ -612,16 +647,8 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .breadcrumb::-webkit-scrollbar { display: none; }
 .storage-switcher { margin-left: auto; padding-left: 8px; flex: 0 0 auto; }
 .browser-storage-switcher { min-width: 0; display: flex; align-items: center; padding: 0; color: var(--accent); }
-.storage-switcher select {
-  max-width: 230px;
-  min-height: 30px;
-  padding: 4px 28px 4px 10px;
-  color: var(--text);
-  background: var(--field);
-  border: 1px solid var(--line);
-  border-radius: 7px;
-}
-.browser-storage-switcher select { min-width: 120px; color: var(--text); }
+.browser-storage-switcher .app-select { width: min(230px, 30vw); min-width: 120px; }
+.browser-storage-switcher .app-select-trigger { min-height: 34px; padding: 4px 10px; border-color: var(--line); border-radius: 7px; }
 .crumb {
   min-width: 32px;
   min-height: 30px;
@@ -680,10 +707,9 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .file-icon svg { width: 23px; height: 23px; }
 .file-pagination { min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 8px 0; color: var(--muted); font-size: 13px; }
 .pagination-summary { min-width: 0; display: flex; align-items: center; }
-.page-size-select { position: relative; width: 60px; height: 34px; flex: 0 0 60px; }
-.page-size-select select { width: 100%; height: 100%; padding: 0 25px 0 10px; color: var(--text); background: var(--panel-soft); border: 1px solid transparent; border-radius: 8px; appearance: none; cursor: pointer; }
-.page-size-select::after { content: ''; position: absolute; top: 50%; right: 10px; width: 7px; height: 7px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); pointer-events: none; transform: translateY(-70%) rotate(45deg); }
-.page-size-select select:focus-visible { border-color: var(--accent); outline: 3px solid var(--accent-soft); }
+.page-size-select { width: 60px; height: 34px; flex: 0 0 60px; }
+.page-size-select .app-select-trigger { min-height: 34px; height: 34px; padding: 0 9px; background: var(--panel-soft); border-color: transparent; border-radius: 8px; }
+.page-size-select .app-select-menu { right: 0; left: auto; width: 76px; }
 .pagination-controls { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .page-arrow,
 .current-page { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 8px; }
@@ -694,7 +720,8 @@ input[type="password"]::placeholder { letter-spacing: normal; }
 .page-chevron.previous { transform: rotate(-135deg); }
 .page-chevron.next { transform: rotate(45deg); }
 .current-page { flex: 0 0 34px; color: var(--icon-color); background: var(--accent-soft); font-size: 14px; font-weight: 720; }
-.lock-dot { position: absolute; right: -4px; bottom: -3px; width: 13px; height: 13px; display: grid; place-items: center; background: var(--panel); border-radius: 50%; }
+.file-lock-indicator { width: 14px; height: 14px; display: inline-grid; place-items: center; flex: 0 0 14px; margin-left: -4px; color: var(--icon-color); }
+.file-lock-indicator svg { width: 12px; height: 12px; }
 .empty { padding: 88px 20px; color: var(--muted); text-align: center; }
 
 .toast {
@@ -782,7 +809,8 @@ input[type="password"]::placeholder { letter-spacing: normal; }
   .browser-chrome .brand span { display: none; }
   .browser-chrome .brand svg { width: 24px; height: 24px; }
   .browser-storage-switcher { margin-left: 0; }
-  .browser-storage-switcher select { width: 102px; min-width: 0; max-width: 102px; min-height: 34px; padding-left: 8px; font-size: 12px; }
+  .browser-storage-switcher .app-select { width: 112px; min-width: 0; max-width: 112px; }
+  .browser-storage-switcher .app-select-trigger { min-height: 34px; padding-left: 8px; font-size: 12px; }
   .top-actions { gap: 2px; }
   .browser-chrome .icon-btn { width: 36px; height: 36px; }
   .top-search { width: 100%; height: 40px; padding: 0 10px; }
@@ -803,8 +831,7 @@ input[type="password"]::placeholder { letter-spacing: normal; }
   .cell.right { font-size: 13px; }
   .file-pagination { min-height: 54px; gap: 10px; padding: 12px 4px 0; font-size: 12px; }
   .page-size-select { width: 56px; height: 32px; flex-basis: 56px; }
-  .page-size-select select { padding: 0 23px 0 9px; }
-  .page-size-select::after { right: 9px; width: 6px; height: 6px; }
+  .page-size-select .app-select-trigger { min-height: 32px; height: 32px; padding: 0 8px; }
   .page-arrow,
   .current-page { width: 32px; height: 32px; }
   .current-page { flex-basis: 32px; }

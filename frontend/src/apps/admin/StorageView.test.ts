@@ -91,8 +91,8 @@ describe('StorageView', () => {
     await nextTick()
 
     const addressing = [...host.querySelectorAll<HTMLLabelElement>('.storage-form > label')]
-      .find(item => item.textContent?.includes('寻址方式'))?.querySelector('select')
-    expect(addressing?.value).toBe('virtual_hosted')
+      .find(item => item.textContent?.includes('寻址方式'))?.querySelector<HTMLButtonElement>('.app-select-trigger')
+    expect(addressing?.textContent).toContain('Virtual Hosted')
     expect(addressing?.disabled).toBe(true)
     app.unmount()
   })

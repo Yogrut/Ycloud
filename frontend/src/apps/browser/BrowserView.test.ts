@@ -15,6 +15,15 @@ function mountBrowser(host: HTMLElement) {
   return app
 }
 
+async function chooseOption(host: HTMLElement, selector: string, label: string): Promise<void> {
+  host.querySelector<HTMLButtonElement>(`${selector} .app-select-trigger`)?.click()
+  await nextTick()
+  const option = [...host.querySelectorAll<HTMLButtonElement>(`${selector} .app-select-option`)]
+    .find(item => item.textContent?.trim() === label)
+  if (!option) throw new Error(`select option missing: ${label}`)
+  option.click()
+}
+
 function listResponse(names: string[]) {
   return {
     storage_id: 'primary',
@@ -56,6 +65,29 @@ function domRect(left: number, top: number, right: number, bottom: number): DOMR
 }
 
 describe('BrowserView', () => {
+  it('places a compact lock indicator after a locked folder name', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      ...listResponse([]),
+      entries: [{
+        name: 'private', path: 'private', is_dir: true, size: 0, modified: '', mime: '', icon: 'folder', locked: true,
+      }],
+      page_start: 1,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    const name = host.querySelector('.file-name')!
+    const label = name.querySelector('.file-label')!
+    const lock = name.querySelector('.file-lock-indicator')!
+    expect(label.nextElementSibling).toBe(lock)
+    expect(name.querySelector('.file-icon .file-lock-indicator')).toBeNull()
+    expect(lock.querySelector('[data-icon="lock"]')).not.toBeNull()
+    app.unmount()
+  })
+
   it('renders a directory response without trusting HTML from file names', async () => {
     const response = {
       storage_id: 'primary',
@@ -152,12 +184,10 @@ describe('BrowserView', () => {
     await nextTick()
     expect(firstRow.classList.contains('selected')).toBe(true)
 
-    const selector = host.querySelector('.storage-switcher select') as HTMLSelectElement
     expect(host.querySelector('.browser-chrome .storage-switcher')).not.toBeNull()
     expect(host.querySelector('.breadcrumb .storage-switcher')).toBeNull()
     expect(host.querySelector('.browser-chrome .storage-switcher svg')).toBeNull()
-    selector.value = 'rustfs'
-    selector.dispatchEvent(new Event('change', { bubbles: true }))
+    await chooseOption(host, '.storage-switcher', 'RustFS')
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -188,13 +218,11 @@ describe('BrowserView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    const selector = host.querySelector('.storage-switcher select') as HTMLSelectElement
-    selector.value = 'private'
-    selector.dispatchEvent(new Event('change', { bubbles: true }))
+    await chooseOption(host, '.storage-switcher', 'Private（需登录）')
     await nextTick()
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(selector.value).toBe('primary')
+    expect(host.querySelector('.storage-switcher .app-select-trigger')?.textContent).toContain('Public')
     expect(host.querySelector<HTMLFormElement>('.overlay.active form')?.textContent).toContain('账号登录')
     app.unmount()
   })
@@ -244,7 +272,7 @@ describe('BrowserView', () => {
     app.unmount()
   })
 
-  it('does not cancel the native page-size selector on desktop', async () => {
+  it('changes page size through the project dropdown on desktop', async () => {
     vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: false }))
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt'])), {
       status: 200,
@@ -258,13 +286,8 @@ describe('BrowserView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    const selector = host.querySelector<HTMLSelectElement>('.page-size-select select')!
-    const down = new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0 })
-    selector.dispatchEvent(down)
-
-    expect(down.defaultPrevented).toBe(false)
-    selector.value = '10'
-    selector.dispatchEvent(new Event('change', { bubbles: true }))
+    expect(host.querySelector('.page-size-select select')).toBeNull()
+    await chooseOption(host, '.page-size-select', '10')
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
     expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=10&sort=name&direction=asc', { credentials: 'same-origin' })

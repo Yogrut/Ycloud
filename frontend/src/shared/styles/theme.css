@@ -1,11 +1,11 @@
 :root {
   color-scheme: only light;
-  --bg: #f1f3f6;
-  --panel: #ffffff;
-  --panel-soft: #f5f6f8;
-  --field: #fbfcfd;
-  --line: #e3e6eb;
-  --line-strong: #d7dce4;
+  --bg: #f3f4f6;
+  --panel: #fcfcfd;
+  --panel-soft: #f6f7f9;
+  --field: #f9fafb;
+  --line: #e4e7eb;
+  --line-strong: #d9dde4;
   --text: #30343b;
   --muted: #747b87;
   --muted-2: #9aa1ac;
@@ -16,7 +16,7 @@
   --danger: #e05267;
   --success: #2da66e;
   --selected-row: #eef5ff;
-  --shadow: 0 12px 34px rgba(35, 42, 54, .07);
+  --shadow: 0 12px 34px rgba(35, 42, 54, .055);
   --font: Inter, "Noto Sans SC", "Microsoft YaHei", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 

@@ -10,9 +10,11 @@ describe('interactive focus styling', () => {
     expect(themeCss).toContain('outline: 2px solid var(--accent)')
   })
 
-  it('defines one clean blue palette for light and dark themes', () => {
-    expect(themeCss).toContain('--bg: #f1f3f6')
-    expect(themeCss).toContain('--panel: #ffffff')
+  it('defines a low-contrast neutral light hierarchy and a separate dark theme', () => {
+    expect(themeCss).toContain('--bg: #f3f4f6')
+    expect(themeCss).toContain('--panel: #fcfcfd')
+    expect(themeCss).toContain('--panel-soft: #f6f7f9')
+    expect(themeCss).toContain('--field: #f9fafb')
     expect(themeCss).toContain('--accent: #0874f9')
     expect(themeCss).toContain(':root[data-theme="dark"]')
     expect(themeCss).toContain('--bg: #111722')

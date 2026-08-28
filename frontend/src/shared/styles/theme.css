@@ -893,8 +893,10 @@ input[type="password"]::placeholder { letter-spacing: normal; }
   .security-filters > .btn { grid-column: 1 / -1; width: 100%; }
   .security-retention { grid-template-columns: 1fr; }
   .security-retention .btn { width: 100%; }
-  .locks-head { align-items: stretch; flex-direction: column; }
-  .locks-head .btn { width: 100%; }
+  .locks-head,
+  .storage-page-head { align-items: stretch; flex-direction: column; }
+  .locks-head .btn,
+  .storage-page-head .btn { width: 100%; white-space: nowrap; }
   .lock-actions { display: flex; }
   .webdav-head { align-items: stretch; flex-direction: column; }
   .webdav-head .btn { width: 100%; }

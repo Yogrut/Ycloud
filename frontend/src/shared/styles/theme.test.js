@@ -70,4 +70,10 @@ describe('interactive focus styling', () => {
   it('keeps the storage editor wide on desktop', () => {
     expect(themeCss).toMatch(/\.modal\.storage-editor\s*\{[^}]*width: min\(1120px, calc\(100vw - 48px\)\);/s)
   })
+
+  it('moves the new storage action below its description on mobile', () => {
+    const mobile = themeCss.match(/@media \(max-width: 760px\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(mobile).toMatch(/\.locks-head,\s*\.storage-page-head\s*\{[^}]*flex-direction: column;/s)
+    expect(mobile).toMatch(/\.storage-page-head \.btn\s*\{[^}]*width: 100%;[^}]*white-space: nowrap;/s)
+  })
 })

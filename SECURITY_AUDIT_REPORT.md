@@ -1,6 +1,6 @@
 # Ycloud 安全审查执行报告
 
-> 本报告始于 2026-08-30 对原始功能基线 `4fa46f69c070` 的预审，并记录安全加固代码基线 `7994d40d4fe5` 的复测证据。它不是安全认证，也不是 Release 签字。由于部分隔离动态用例和 RustSec 在线公告数据仍不完整，本报告不作“通过”结论。
+> 本报告始于 2026-08-30 对原始功能基线 `4fa46f69c070` 的预审，并记录安全加固代码基线 `7994d40d4fe5` 与容器部署基线 `23b4bff998d2` 的阶段性证据。它不是安全认证，也不是 Release 签字。由于部分隔离动态用例和实际 Linux 容器验收仍不完整，本报告不作“通过”结论。
 
 正式生产审核范围为 Linux 原生进程、Docker 和 Docker Compose。Windows 仅用于开发编译与本机回归，其服务安装、ACL/DACL 和生产运维不属于发布门禁。
 
@@ -11,7 +11,8 @@
 | 分支 | `main` |
 | 原始功能基线 | `4fa46f69c07042ae01212eba662594b2877144b9` |
 | 安全加固代码基线 | `7994d40d4fe5c14670f1f145e034aab1742704e3` |
-| 基线状态 | 首批安全加固已提交并冻结；本报告的代码复测结论绑定上述安全加固基线 |
+| 容器部署基线 | `23b4bff998d29ad687d6d37c29b741a3b6e42243` |
+| 基线状态 | 安全加固与 Docker/Compose 部署配置均已提交；容器运行结论仍待 Linux CI 或部署机证据 |
 | `git diff --check` | 通过；仅报告 Git 的 LF/CRLF 提示 |
 | Rust | `rustc 1.96.1` / `cargo 1.96.1` |
 | Node/npm | `node v24.19.0` / `npm 11.17.0` |
@@ -44,13 +45,17 @@
 | `npm run check` | 通过 | lint、27 个测试文件/110 项测试、typecheck、build 均通过 |
 | `cargo deny check bans licenses sources` | 通过 | 许可证、来源和禁用依赖通过；存在重复依赖警告 |
 | `npm audit --audit-level=moderate` | 通过 | 0 vulnerabilities |
+| `cargo audit` | 通过 | 联网更新 RustSec 官方公告库后扫描 253 个锁定依赖，无漏洞命中；数据库 HEAD `b331df68b3ed`，提交时间 2026-08-29 |
+| 隔离 HTTP Host/CSRF/代理检查 | 阶段通过 | 本地模式：健康 200、恶意 Host 403、匿名管理接口 401、缺失同源信息 403；代理模式：正确代理头 200、缺失 Proto 400、恶意 Host 403、多值转发头 400 |
+| Cookie 属性检查 | 通过 | 本地 Gate Cookie 为 HttpOnly/SameSite=Strict 且无 Secure；HTTPS 代理模式增加 Secure |
+| 票据/TOTP/密钥专项回归 | 通过 | 上传批次 3 项、归档主体绑定 1 项、TOTP 重放 1 项、安全边界 9 项、S3 凭据加密和 TOTP 主密钥测试均通过 |
 | 静态敏感信息扫描 | 未发现匹配 | 扫描了提交文件中的常见 Access Key、私钥和明文 Secret 模式；不替代 Git 历史专用扫描器 |
 
-## 3. 未完成或受阻检查
+## 3. 环境与动态验证状态
 
 ### 3.1 RustSec 公告数据库
 
-`cargo deny check` 和 `cargo audit` 均尝试访问 RustSec/GitHub，但当前环境无法完成 GitHub 公告数据库拉取。许可证、来源和禁用依赖检查已单独通过；不能据此声称 RustSec 漏洞检查通过。
+2026-08-31 已获准联网更新 RustSec 官方公告数据库，数据库 HEAD 为 `b331df68b3ed0e99594d259040bdcb9de3c7c8a4`（提交时间 2026-08-29）。`cargo audit 0.22.2` 扫描 `Cargo.lock` 中 253 个依赖，无漏洞命中。该结论仅绑定本次锁文件和上述公告快照；后续 Release 仍需重新联网执行。
 
 ### 3.2 S3 真实环境
 
@@ -86,7 +91,13 @@
 
 ### 3.3 动态安全矩阵
 
-SECURITY_AUDIT.md 中 T-01 至 T-41 的适用隔离动态用例本次未全部执行，原因是没有专用管理员/普通账号、隔离本地目录、WebDAV 客户端、反向代理、公网 HTTPS 和故障注入环境。涉及认证竞态、CSRF/Host/DNS Rebinding、票据交换、Linux 路径 TOCTOU、预览隔离和恢复演练的结论均应保持“待动态验证”。Windows ACL 用例已按正式平台范围标记为不适用。
+SECURITY_AUDIT.md 中 T-01 至 T-41 的适用隔离动态用例仍未全部执行。2026-08-31 已用临时目录和随机端口启动两个真实 Ycloud 进程，分别验证本地模式和 HTTPS 代理模式的代表性 Host、CSRF、匿名管理接口、转发头及 Cookie 属性；同时补跑票据主体绑定、TOTP 重放和密钥静态加密回归。尚缺专用管理员/普通账号完整权限矩阵、实际 Nginx/Caddy、公网 HTTPS、Linux 路径 TOCTOU、预览隔离和恢复演练。Windows ACL 用例已按正式平台范围标记为不适用。
+
+### 3.4 Linux 与容器
+
+容器部署基线新增多阶段 Linux `Dockerfile`、默认仅发布宿主机回环地址的 `compose.yaml`、独立 HTTPS 代理覆盖、非 root UID/GID 10001、只读根文件系统、Capability 全移除、`no-new-privileges`、PID 上限、健康检查和 Compose Secret 文件注入。CI 已加入 Compose 模型解析、镜像构建、用户元数据检查以及只读容器 `/api/ready` 验证。
+
+当前 Windows 审核机没有 Docker 或 WSL，因此本轮不能把上述容器配置记为运行通过；必须等待 Linux CI 或部署机实际执行并记录镜像 Digest、容器日志、卷权限和健康状态。
 
 ## 4. 需要优先验证的静态候选项
 
@@ -98,9 +109,9 @@ SECURITY_AUDIT.md 中 T-01 至 T-41 的适用隔离动态用例本次未全部�
 | 高 | 文件夹锁后代目录的删除/移动/复制、Linux 路径别名和链接竞态（PRE-06/07/08） | 待动态验证 |
 | 高 | S3 凭据轮换、配置备份和旧明文迁移的崩溃窗口（PRE-12/13） | 待动态验证 |
 | 高 | 不同 `storage_id` 指向相同或重叠本地/S3 命名空间（PRE-25） | 待动态验证 |
-| 中高 | 归档票据、上传批次票据是否绑定发起主体/会话（PRE-09/10） | 已绑定具体 Session/Gate；归档消费重新检查下载权限；单元测试通过，待跨账号动态复测 |
+| 中高 | 归档票据、上传批次票据是否绑定发起主体/会话（PRE-09/10） | 已绑定具体 Session/Gate；专项回归证明错误主体拒绝且归档票据单次使用，待真实跨账号和撤权 API 复测 |
 | 中高 | 自定义 S3 Endpoint 的 DNS 变化、重定向、TLS/SNI 和 HTTP 明文边界（PRE-14） | 待动态验证 |
-| 高/网络 | 回环或 LAN 模式下恶意 Host、Origin 和 DNS Rebinding 是否能借自动 Gate 或 Cookie 写请求越界（PRE-23/26） | 已增加 Host 精确边界并修正回环后端代理模式；单元测试通过，待真实代理/DNS 复测 |
+| 高/网络 | 回环或 LAN 模式下恶意 Host、Origin 和 DNS Rebinding 是否能借自动 Gate 或 Cookie 写请求越界（PRE-23/26） | 隔离真实监听器已验证恶意 Host、错误/多值代理头和缺失同源信息被拒绝，待实际反向代理、浏览器和 DNS 变化复测 |
 
 ### 4.1 冻结基线后的首批修复
 
@@ -113,15 +124,15 @@ SECURITY_AUDIT.md 中 T-01 至 T-41 的适用隔离动态用例本次未全部�
 ## 5. 当前结论
 
 - 代码质量和现有自动化回归是绿色的。
-- 依赖许可证、来源、npm 公告和静态敏感信息扫描没有发现当前证据下的阻断项。
-- 腾讯 COS、阿里 OSS、MinIO 与 RustFS 基础真实兼容性已通过，通用 S3 配置分支已基于 MinIO 通过；AWS S3 和未测试第三方实现不在通过范围内。RustSec 在线公告检查和其他 P0/P1 动态安全用例尚未取得完整证据。
+- 依赖许可证、来源、npm 公告、RustSec 公告和静态敏感信息扫描没有发现当前证据下的阻断项。
+- 腾讯 COS、阿里 OSS、MinIO 与 RustFS 基础真实兼容性已通过，通用 S3 配置分支已基于 MinIO 通过；AWS S3 和未测试第三方实现不在通过范围内。其他 P0/P1 动态安全用例尚未取得完整证据。
 - 安全加固代码基线已经冻结，但动态证据仍不完整，不能发布 Critical/High 为零或 Release 通过的结论。
 
 ## 6. 下一步建议
 
-1. 保留 `4fa46f69c070` 作为原始功能预审起点，以 `7994d40d4fe5` 作为后续动态审核和修复复测基线；正式发布时记录 Linux 二进制或容器镜像 Digest。
-2. 在隔离环境执行适用的 T-01 至 T-41，优先复测认证转换、会话、权限、路径、票据和 Host/Origin 用例。
+1. 保留 `4fa46f69c070` 作为原始功能预审起点，以 `7994d40d4fe5` 作为安全复测基线、`23b4bff998d2` 作为容器部署基线；正式发布时记录 Linux 二进制或容器镜像 Digest。
+2. 在 Linux Docker/Compose 主机运行新容器门禁，保存 Compose 解析、镜像构建、非 root/只读运行、卷权限、健康检查和镜像 Digest 证据。
 3. 保留已通过的 OSS、COS、MinIO、RustFS 和通用配置分支脱敏证据；继续执行大文件 Multipart、限流、网络中断、凭据轮换和恢复测试。
-4. 在可联网审核机重新执行 `cargo audit`、`cargo deny check`，记录公告数据库日期。
-5. 完成 Linux/容器权限、反向代理/DNS、主密钥恢复和备份恢复演练。
+4. 继续执行适用的 T-01 至 T-41，优先完成真实账号权限矩阵、认证竞态、Linux 路径 TOCTOU、预览隔离和实际反向代理/DNS 用例。
+5. 完成主密钥、配置和数据卷的成套备份恢复演练，并验证外部 Secret 丢失时明确拒绝而非静默重置。
 6. 对确认的 Critical/High 修复后由非原实现者复测，再更新 SECURITY_AUDIT.md 的执行记录和发现项总表。

@@ -54,7 +54,7 @@ TRUSTED_PROXY_IPS=172.18.0.1
 
 不启用注释参数时不会进入 HTTPS 代理模式；只配置其中一项或安全参数组合不完整时，Ycloud 会拒绝启动。反向代理必须保留原始 `Host`，设置单值 `X-Forwarded-For` 和 `X-Forwarded-Proto: https`，且其实际容器侧 IP 必须包含在 `TRUSTED_PROXY_IPS` 中。这些变量只配置 Ycloud 的信任边界，不会自动部署或替代 Caddy、Nginx、Cloudflare Tunnel 或云负载均衡器。
 
-单机默认把自动生成的配置主密钥保存在 `ycloud-data` 卷中。`YCLOUD_CONFIG_KEY` 和 `YCLOUD_CONFIG_KEY_FILE` 均为可选覆盖项，需要时按 `compose.yaml` 中的注释启用；专业部署使用 `YCLOUD_CONFIG_KEY_FILE` 时还必须自行把对应只读 Secret 文件挂载进容器。基础 Compose 配置含非 root 用户、只读根文件系统、全部 Capability 移除、`no-new-privileges` 和 PID 上限。使用宿主机 bind mount 代替 named volume 时，目录必须预先归属 UID/GID `10001:10001` 且权限不得向其他用户开放。
+单机默认把自动生成的配置主密钥保存在 `ycloud-data` 卷中。`YCLOUD_CONFIG_KEY` 和 `YCLOUD_CONFIG_KEY_FILE` 均为可选覆盖项，需要时按 `compose.yaml` 中的注释启用；专业部署使用 `YCLOUD_CONFIG_KEY_FILE` 时还必须自行把对应只读 Secret 文件挂载进容器。基础 Compose 配置含非 root 用户、全部 Capability 移除、`no-new-privileges` 和 PID 上限。使用宿主机 bind mount 代替 named volume 时，目录必须预先归属 UID/GID `10001:10001` 且权限不得向其他用户开放。
 
 局域网测试：
 

@@ -83,11 +83,9 @@ jobs:
         run: |
           docker volume create ycloud-ci-data
           docker run --detach --name ycloud-ci \
-            --read-only \
             --cap-drop ALL \
             --security-opt no-new-privileges \
             --pids-limit 256 \
-            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777 \
             --volume ycloud-ci-data:/var/lib/ycloud \
             --env ALLOW_LAN_HTTP=true \
             --env SECURE_COOKIES=false \

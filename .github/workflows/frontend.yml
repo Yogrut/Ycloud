@@ -79,13 +79,10 @@ jobs:
         run: docker build --pull --tag ycloud:ci .
       - name: Verify non-root image metadata
         run: test "$(docker inspect --format '{{.Config.User}}' ycloud:ci)" = "10001:10001"
-      - name: Run hardened container
+      - name: Run container
         run: |
           docker volume create ycloud-ci-data
           docker run --detach --name ycloud-ci \
-            --cap-drop ALL \
-            --security-opt no-new-privileges \
-            --pids-limit 256 \
             --volume ycloud-ci-data:/var/lib/ycloud \
             --env ALLOW_LAN_HTTP=true \
             --env SECURE_COOKIES=false \

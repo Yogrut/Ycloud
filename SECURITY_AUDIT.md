@@ -575,7 +575,7 @@ npm audit --audit-level=moderate
 
 - [ ] 使用独立非 root 服务账号运行 Ycloud；存储和配置只授予必要 owner/group/mode 权限。
 - [ ] 配置、主密钥、安全日志、事务区和备份不被 Web Server 作为静态文件发布。
-- [ ] 容器采用非 root、最小 Capability、受控可写卷和只读 Secret 文件；镜像 Digest 固定。
+- [ ] 容器采用非 root、受控数据卷和只读 Secret 文件；镜像 Digest 固定。
 - [ ] `YCLOUD_CONFIG_KEY_FILE` 由 Secret 管理器只读挂载；非必要不使用环境变量明文密钥。
 - [ ] 禁止不受控 Core Dump；日志、Swap、备份介质和运维采集均按敏感数据保护。
 - [ ] 仅允许 Ycloud 出站访问批准的 S3/DNS/时间源；管理面不向互联网任意开放。

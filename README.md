@@ -26,7 +26,7 @@ cargo run --release --locked
 
 ## Docker Compose 部署
 
-默认 Compose 配置仅把服务发布到宿主机回环地址，适合本机访问或由同机反向代理转发：
+项目只使用一份 Compose。默认以直接 HTTP 模式运行，并仅把端口发布到宿主机回环地址，适合本机访问或由同机服务转发：
 
 ```bash
 docker compose up -d --build
@@ -43,16 +43,18 @@ chmod 600 ./initial-credentials.json
 
 登录并修改管理员密码与网页访问密码后，确认容器内的初始凭据文件已经被删除，再删除宿主机复制件。`ycloud-data` 卷同时保存配置、自动主密钥、本地文件和安全状态，备份与恢复时必须作为同一单元处理。
 
-公网 HTTPS 反向代理使用额外覆盖文件。先复制 `.env.example` 为 `.env`，只填写外部 HTTPS Origin 和代理到容器时呈现的精确源 IP。再从长期保存的 Secret 管理器加载配置主密钥；首次部署可生成后立即保存到 Secret 管理器：
+需要从其他局域网设备直接访问时，只需在 `.env` 中设置 `YCLOUD_PUBLISH_ADDRESS=0.0.0.0`；不要配置公网 HTTPS 参数。公网部署仍运行同一条 Compose 命令，只需在 `.env` 或部署环境中同时设置：
 
-```bash
-export YCLOUD_CONFIG_KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
-# 在继续前把 YCLOUD_CONFIG_KEY 保存到长期 Secret 管理器；丢失后无法解密已有 S3/TOTP 配置。
-docker compose -f compose.yaml -f compose.proxy.yaml up -d --build
-unset YCLOUD_CONFIG_KEY
+```env
+ALLOW_LAN_HTTP=false
+SECURE_COOKIES=true
+PUBLIC_BASE_URL=https://cloud.example.com
+TRUSTED_PROXY_IPS=172.18.0.1
 ```
 
-Compose 从宿主机的 `YCLOUD_CONFIG_KEY` 创建 Secret，并只以 `/run/secrets/ycloud-config-key` 文件提供给 Ycloud；该变量不写入容器环境。反向代理必须保留原始 `Host`，设置单值 `X-Forwarded-For` 和 `X-Forwarded-Proto: https`，且其实际容器侧 IP 必须包含在 `TRUSTED_PROXY_IPS` 中。基础 Compose 配置含非 root 用户、只读根文件系统、全部 Capability 移除、`no-new-privileges` 和 PID 上限。使用宿主机 bind mount 代替 named volume 时，目录必须预先归属 UID/GID `10001:10001` 且权限不得向其他用户开放。
+`PUBLIC_BASE_URL` 与 `TRUSTED_PROXY_IPS` 未设置时不会进入公网代理模式；只配置其中一项或安全参数组合不完整时，Ycloud 会拒绝启动。反向代理必须保留原始 `Host`，设置单值 `X-Forwarded-For` 和 `X-Forwarded-Proto: https`，且其实际容器侧 IP 必须包含在 `TRUSTED_PROXY_IPS` 中。这些变量只配置 Ycloud 的信任边界，不会自动部署或替代 Caddy、Nginx、Cloudflare Tunnel 或云负载均衡器。
+
+单机默认把自动生成的配置主密钥保存在 `ycloud-data` 卷中。`YCLOUD_CONFIG_KEY` 和 `YCLOUD_CONFIG_KEY_FILE` 均为可选覆盖项，Compose 仅在部署环境实际提供它们时才转发；专业部署使用 `YCLOUD_CONFIG_KEY_FILE` 时还必须自行把对应只读 Secret 文件挂载进容器。基础 Compose 配置含非 root 用户、只读根文件系统、全部 Capability 移除、`no-new-privileges` 和 PID 上限。使用宿主机 bind mount 代替 named volume 时，目录必须预先归属 UID/GID `10001:10001` 且权限不得向其他用户开放。
 
 局域网测试：
 

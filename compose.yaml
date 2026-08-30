@@ -17,13 +17,17 @@ services:
     pids_limit: 256
     stop_grace_period: 30s
     environment:
-      BIND_ADDRESS: 0.0.0.0
-      PORT: 18473
-      STORAGE_PATH: /var/lib/ycloud/storage
-      CONFIG_PATH: /var/lib/ycloud/config.json
-      ALLOW_LAN_HTTP: "true"
-      SECURE_COOKIES: "false"
-      RUST_LOG: info
+      - BIND_ADDRESS=0.0.0.0
+      - PORT=18473
+      - STORAGE_PATH=/var/lib/ycloud/storage
+      - CONFIG_PATH=/var/lib/ycloud/config.json
+      - ALLOW_LAN_HTTP=${ALLOW_LAN_HTTP:-true}
+      - SECURE_COOKIES=${SECURE_COOKIES:-false}
+      - RUST_LOG=${RUST_LOG:-info}
+      - PUBLIC_BASE_URL
+      - TRUSTED_PROXY_IPS
+      - YCLOUD_CONFIG_KEY
+      - YCLOUD_CONFIG_KEY_FILE
     ports:
       - "${YCLOUD_PUBLISH_ADDRESS:-127.0.0.1}:${YCLOUD_PORT:-18473}:18473"
     volumes:

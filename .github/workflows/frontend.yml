@@ -74,13 +74,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Validate Compose models
-        env:
-          PUBLIC_BASE_URL: https://cloud.example.test
-          TRUSTED_PROXY_IPS: 172.18.0.1
-          YCLOUD_CONFIG_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         run: |
-          docker compose -f compose.yaml config --quiet
-          docker compose -f compose.yaml -f compose.proxy.yaml config --quiet
+          docker compose config --quiet
+          ALLOW_LAN_HTTP=false \
+          SECURE_COOKIES=true \
+          PUBLIC_BASE_URL=https://cloud.example.test \
+          TRUSTED_PROXY_IPS=172.18.0.1 \
+          docker compose config --quiet
       - name: Build production image
         run: docker build --pull --tag ycloud:ci .
       - name: Verify non-root image metadata

@@ -36,4 +36,3 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18473/api/health"]
 
 ENTRYPOINT ["/usr/local/bin/ycloud"]
-

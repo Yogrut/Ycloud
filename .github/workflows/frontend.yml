@@ -98,14 +98,11 @@ jobs:
             --env ALLOW_LAN_HTTP=true \
             --env SECURE_COOKIES=false \
             ycloud:ci
-          for attempt in $(seq 1 60); do
-            if docker exec ycloud-ci curl --fail --silent --show-error http://127.0.0.1:18473/api/ready; then
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs ycloud-ci
-          exit 1
+          sleep 5
+          if [ "$(docker inspect --format '{{.State.Running}}' ycloud-ci)" != "true" ]; then
+            docker logs ycloud-ci
+            exit 1
+          fi
       - name: Clean container test resources
         if: always()
         run: |

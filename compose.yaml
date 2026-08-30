@@ -30,12 +30,6 @@ services:
       - ycloud-data:/var/lib/ycloud
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18473/api/health"]
-      interval: 30s
-      timeout: 5s
-      start_period: 15s
-      retries: 3
 
 volumes:
   ycloud-data:

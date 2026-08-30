@@ -52,7 +52,7 @@ docker compose -f compose.yaml -f compose.proxy.yaml up -d --build
 unset YCLOUD_CONFIG_KEY
 ```
 
-Compose 从宿主机的 `YCLOUD_CONFIG_KEY` 创建 Secret，并只以 `/run/secrets/ycloud-config-key` 文件提供给 Ycloud；该变量不写入容器环境。反向代理必须保留原始 `Host`，设置单值 `X-Forwarded-For` 和 `X-Forwarded-Proto: https`，且其实际容器侧 IP 必须包含在 `TRUSTED_PROXY_IPS` 中。基础 Compose 配置含非 root 用户、只读根文件系统、全部 Capability 移除、`no-new-privileges`、PID 上限和健康检查。使用宿主机 bind mount 代替 named volume 时，目录必须预先归属 UID/GID `10001:10001` 且权限不得向其他用户开放。
+Compose 从宿主机的 `YCLOUD_CONFIG_KEY` 创建 Secret，并只以 `/run/secrets/ycloud-config-key` 文件提供给 Ycloud；该变量不写入容器环境。反向代理必须保留原始 `Host`，设置单值 `X-Forwarded-For` 和 `X-Forwarded-Proto: https`，且其实际容器侧 IP 必须包含在 `TRUSTED_PROXY_IPS` 中。基础 Compose 配置含非 root 用户、只读根文件系统、全部 Capability 移除、`no-new-privileges` 和 PID 上限。使用宿主机 bind mount 代替 named volume 时，目录必须预先归属 UID/GID `10001:10001` 且权限不得向其他用户开放。
 
 局域网测试：
 

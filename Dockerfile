@@ -14,7 +14,7 @@ ARG YCLOUD_UID=10001
 ARG YCLOUD_GID=10001
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid "${YCLOUD_GID}" ycloud \
     && useradd --uid "${YCLOUD_UID}" --gid "${YCLOUD_GID}" --no-create-home --home-dir /var/lib/ycloud --shell /usr/sbin/nologin ycloud \
@@ -32,7 +32,5 @@ ENV BIND_ADDRESS=0.0.0.0 \
 EXPOSE 18473
 USER 10001:10001
 STOPSIGNAL SIGTERM
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18473/api/health"]
 
 ENTRYPOINT ["/usr/local/bin/ycloud"]

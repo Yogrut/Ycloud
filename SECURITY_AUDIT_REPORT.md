@@ -95,9 +95,9 @@ SECURITY_AUDIT.md 中 T-01 至 T-41 的适用隔离动态用例仍未全部执�
 
 ### 3.4 Linux 与容器
 
-容器部署基线新增多阶段 Linux `Dockerfile`、默认仅发布宿主机回环地址的 `compose.yaml`、独立 HTTPS 代理覆盖、非 root UID/GID 10001、只读根文件系统、Capability 全移除、`no-new-privileges`、PID 上限、健康检查和 Compose Secret 文件注入。CI 已加入 Compose 模型解析、镜像构建、用户元数据检查以及只读容器 `/api/ready` 验证。
+容器部署基线新增多阶段 Linux `Dockerfile`、默认仅发布宿主机回环地址的 `compose.yaml`、独立 HTTPS 代理覆盖、非 root UID/GID 10001、只读根文件系统、Capability 全移除、`no-new-privileges`、PID 上限和 Compose Secret 文件注入。CI 已加入 Compose 模型解析、镜像构建、用户元数据检查以及只读容器进程稳定运行验证。
 
-当前 Windows 审核机没有 Docker 或 WSL，因此本轮不能把上述容器配置记为运行通过；必须等待 Linux CI 或部署机实际执行并记录镜像 Digest、容器日志、卷权限和健康状态。
+当前 Windows 审核机没有 Docker 或 WSL，因此本轮不能把上述容器配置记为运行通过；必须等待 Linux CI 或部署机实际执行并记录镜像 Digest、容器日志、卷权限和进程状态。
 
 ## 4. 需要优先验证的静态候选项
 
@@ -131,7 +131,7 @@ SECURITY_AUDIT.md 中 T-01 至 T-41 的适用隔离动态用例仍未全部执�
 ## 6. 下一步建议
 
 1. 保留 `4fa46f69c070` 作为原始功能预审起点，以 `7994d40d4fe5` 作为安全复测基线、`23b4bff998d2` 作为容器部署基线；正式发布时记录 Linux 二进制或容器镜像 Digest。
-2. 在 Linux Docker/Compose 主机运行新容器门禁，保存 Compose 解析、镜像构建、非 root/只读运行、卷权限、健康检查和镜像 Digest 证据。
+2. 在 Linux Docker/Compose 主机运行新容器门禁，保存 Compose 解析、镜像构建、非 root/只读运行、卷权限、进程状态和镜像 Digest 证据。
 3. 保留已通过的 OSS、COS、MinIO、RustFS 和通用配置分支脱敏证据；继续执行大文件 Multipart、限流、网络中断、凭据轮换和恢复测试。
 4. 继续执行适用的 T-01 至 T-41，优先完成真实账号权限矩阵、认证竞态、Linux 路径 TOCTOU、预览隔离和实际反向代理/DNS 用例。
 5. 完成主密钥、配置和数据卷的成套备份恢复演练，并验证外部 Secret 丢失时明确拒绝而非静默重置。

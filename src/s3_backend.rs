@@ -6,13 +6,15 @@ use aws_sdk_s3::{
     Client,
 };
 use aws_smithy_types::byte_stream::ByteStream;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use axum::{body::Body, http::HeaderValue};
 use bytes::BytesMut;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
+    config::S3Provider,
     error::{AppError, AppResult},
     storage::StorageService,
 };
@@ -111,6 +113,15 @@ struct S3UploadTransaction {
     previous: Option<S3ObjectSnapshot>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct S3MultipartSession {
+    schema_version: u32,
+    id: String,
+    key: String,
+    upload_id: String,
+}
+
 /// One reusable S3 client and its confined namespace.
 ///
 /// Provider presets are validated before construction and all object keys are
@@ -119,6 +130,7 @@ struct S3UploadTransaction {
 #[derive(Clone)]
 pub struct S3Backend {
     client: Client,
+    provider: S3Provider,
     bucket: String,
     prefix: String,
     request_gate: std::sync::Arc<Semaphore>,
@@ -127,6 +139,10 @@ pub struct S3Backend {
 }
 
 impl S3Backend {
+    fn is_alibaba_oss(&self) -> bool {
+        uses_oss_native_write_conditions(self.provider)
+    }
+
     pub fn object_key(&self, relative: &str) -> AppResult<String> {
         object_key(&self.prefix, relative)
     }
@@ -382,23 +398,34 @@ impl S3Backend {
 
         let marker = list_prefix(&self.prefix, &relative)?;
         let _permit = self.acquire_request().await?;
-        self.client
+        let request = self
+            .client
             .put_object()
             .bucket(&self.bucket)
             .key(marker)
             .content_length(0)
             .content_type("application/x-directory")
-            .if_none_match("*")
-            .body(ByteStream::from_static(&[]))
-            .send()
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
-                    "S3 directory marker creation failed"
-                );
-                AppError::ServiceUnavailable("对象存储无法创建目录".into())
-            })?;
+            .body(ByteStream::from_static(&[]));
+        let result = if self.is_alibaba_oss() {
+            request
+                .customize()
+                .mutate_request(|request| {
+                    request
+                        .headers_mut()
+                        .insert("x-oss-forbid-overwrite", HeaderValue::from_static("true"));
+                })
+                .send()
+                .await
+        } else {
+            request.if_none_match("*").send().await
+        };
+        result.map_err(|error| {
+            tracing::warn!(
+                error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                "S3 directory marker creation failed"
+            );
+            AppError::ServiceUnavailable("对象存储无法创建目录".into())
+        })?;
         Ok(())
     }
 
@@ -407,8 +434,15 @@ impl S3Backend {
     /// newly uploaded object. Anything else stops activation for inspection.
     pub async fn recover_transactions(&self) -> AppResult<usize> {
         let _mutation = self.mutation_gate.lock().await;
+        let multipart_sessions = self.list_multipart_session_keys().await?;
+        let mut recovered = multipart_sessions.len();
+        for key in multipart_sessions {
+            let (session, journal_etag) = self.read_multipart_session(&key).await?;
+            self.recover_multipart_session(&key, &journal_etag, &session)
+                .await?;
+        }
         let transaction_keys = self.list_transaction_keys().await?;
-        let recovered = transaction_keys.len();
+        recovered = recovered.saturating_add(transaction_keys.len());
         for key in transaction_keys {
             let (transaction, journal_etag) = self.read_upload_transaction(&key).await?;
             self.recover_upload_transaction(&key, &journal_etag, &transaction)
@@ -632,10 +666,23 @@ impl S3Backend {
         if let Some(etag) = source_etag {
             request = request.copy_source_if_match(etag);
         }
-        if destination_must_not_exist {
+        if destination_must_not_exist && !self.is_alibaba_oss() {
             request = request.if_none_match("*");
         }
-        let output = request.send().await.map_err(|error| {
+        let result = if destination_must_not_exist && self.is_alibaba_oss() {
+            request
+                .customize()
+                .mutate_request(|request| {
+                    request
+                        .headers_mut()
+                        .insert("x-oss-forbid-overwrite", HeaderValue::from_static("true"));
+                })
+                .send()
+                .await
+        } else {
+            request.send().await
+        };
+        let output = result.map_err(|error| {
             tracing::warn!(
                 error_kind = %error.as_service_error().map_or("transport", |_| "service"),
                 "S3 server-side copy failed"
@@ -712,11 +759,29 @@ impl S3Backend {
                 .map(str::to_owned)
                 .ok_or_else(|| AppError::ServiceUnavailable("对象存储未返回分片上传 ID".into()))?
         };
+        let (session_key, session_etag) =
+            match self.register_multipart_session_task(key, &upload_id).await {
+                Ok(session) => session,
+                Err(error) => {
+                    self.abort_multipart_best_effort(key, &upload_id).await;
+                    return Err(error);
+                }
+            };
         let result = self
             .upload_multipart_parts(key, &upload_id, body, content_length)
             .await;
         if result.is_err() {
-            self.abort_multipart_best_effort(key, &upload_id).await;
+            if self
+                .abort_multipart_operation(key, &upload_id)
+                .await
+                .is_ok()
+            {
+                self.delete_transaction_best_effort(&session_key, session_etag.as_deref())
+                    .await;
+            }
+        } else {
+            self.delete_transaction_best_effort(&session_key, session_etag.as_deref())
+                .await;
         }
         result
     }
@@ -850,6 +915,17 @@ impl S3Backend {
                 .map(str::to_owned)
                 .ok_or_else(|| AppError::ServiceUnavailable("对象存储未返回分片复制 ID".into()))?
         };
+        let (session_key, session_etag) = match self
+            .register_multipart_session_task(destination_key, &upload_id)
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                self.abort_multipart_best_effort(destination_key, &upload_id)
+                    .await;
+                return Err(error);
+            }
+        };
         let result = async {
             let part_size = multipart_part_size(source_size)? as u64;
             let mut completed = Vec::new();
@@ -908,27 +984,56 @@ impl S3Backend {
         }
         .await;
         if result.is_err() {
-            self.abort_multipart_best_effort(destination_key, &upload_id)
+            if self
+                .abort_multipart_operation(destination_key, &upload_id)
+                .await
+                .is_ok()
+            {
+                self.delete_transaction_best_effort(&session_key, session_etag.as_deref())
+                    .await;
+            }
+        } else {
+            self.delete_transaction_best_effort(&session_key, session_etag.as_deref())
                 .await;
         }
         result
     }
 
     async fn abort_multipart_best_effort(&self, key: &str, upload_id: &str) {
-        let Ok(_permit) = self.acquire_request().await else {
-            return;
-        };
-        if self
+        if let Err(error) = self.abort_multipart_operation(key, upload_id).await {
+            tracing::warn!(%error, "failed to abort an incomplete S3 multipart operation");
+        }
+    }
+
+    async fn abort_multipart_operation(&self, key: &str, upload_id: &str) -> AppResult<()> {
+        let _permit = self.acquire_request().await?;
+        let result = self
             .client
             .abort_multipart_upload()
             .bucket(&self.bucket)
             .key(key)
             .upload_id(upload_id)
             .send()
-            .await
-            .is_err()
-        {
-            tracing::warn!("failed to abort an incomplete S3 multipart operation");
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .and_then(ProvideErrorMetadata::code)
+                    == Some("NoSuchUpload") =>
+            {
+                Ok(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                    "S3 multipart abort failed"
+                );
+                Err(AppError::ServiceUnavailable(
+                    "对象存储分片会话暂时无法终止".into(),
+                ))
+            }
         }
     }
 
@@ -950,10 +1055,26 @@ impl S3Backend {
     }
 
     async fn delete_key(&self, key: &str, etag: Option<&str>) -> AppResult<()> {
+        if self.is_alibaba_oss() {
+            if let Some(expected_etag) = etag {
+                let current = self.head_key(key).await?;
+                if current
+                    .as_ref()
+                    .and_then(|metadata| metadata.etag.as_deref())
+                    != Some(expected_etag)
+                {
+                    return Err(AppError::Conflict(
+                        "对象在删除前已经发生变化，请刷新后重试".into(),
+                    ));
+                }
+            }
+        }
         let _permit = self.acquire_request().await?;
         let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
-        if let Some(etag) = etag {
-            request = request.if_match(etag);
+        if !self.is_alibaba_oss() {
+            if let Some(etag) = etag {
+                request = request.if_match(etag);
+            }
         }
         request.send().await.map_err(|error| {
             tracing::warn!(
@@ -971,8 +1092,18 @@ impl S3Backend {
         transaction: &S3UploadTransaction,
         previous_etag: Option<&str>,
     ) -> AppResult<Option<String>> {
-        let data = serde_json::to_vec(transaction)
-            .map_err(|error| AppError::with_source("failed to encode S3 transaction", error))?;
+        self.write_json_journal(key, transaction, previous_etag)
+            .await
+    }
+
+    async fn write_json_journal<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        previous_etag: Option<&str>,
+    ) -> AppResult<Option<String>> {
+        let data = serde_json::to_vec(value)
+            .map_err(|error| AppError::with_source("failed to encode S3 journal", error))?;
         if data.len() > S3_MAX_TRANSACTION_BYTES {
             return Err(AppError::ServiceUnavailable(
                 "对象存储事务记录超过安全上限".into(),
@@ -980,6 +1111,20 @@ impl S3Backend {
         }
         let content_length = i64::try_from(data.len())
             .map_err(|_| AppError::ServiceUnavailable("对象存储事务记录过大".into()))?;
+        if self.is_alibaba_oss() {
+            if let Some(expected_etag) = previous_etag {
+                let current = self.head_key(key).await?;
+                if current
+                    .as_ref()
+                    .and_then(|metadata| metadata.etag.as_deref())
+                    != Some(expected_etag)
+                {
+                    return Err(AppError::ServiceUnavailable(
+                        "对象存储事务记录在更新前发生变化".into(),
+                    ));
+                }
+            }
+        }
         let _permit = self.acquire_request().await?;
         let mut request = self
             .client
@@ -989,12 +1134,27 @@ impl S3Backend {
             .content_length(content_length)
             .content_type("application/json")
             .body(ByteStream::from(data));
-        request = if let Some(etag) = previous_etag {
-            request.if_match(etag)
+        if !self.is_alibaba_oss() {
+            request = if let Some(etag) = previous_etag {
+                request.if_match(etag)
+            } else {
+                request.if_none_match("*")
+            };
+        }
+        let result = if self.is_alibaba_oss() && previous_etag.is_none() {
+            request
+                .customize()
+                .mutate_request(|request| {
+                    request
+                        .headers_mut()
+                        .insert("x-oss-forbid-overwrite", HeaderValue::from_static("true"));
+                })
+                .send()
+                .await
         } else {
-            request.if_none_match("*")
+            request.send().await
         };
-        let output = request.send().await.map_err(|error| {
+        let output = result.map_err(|error| {
             tracing::error!(
                 error_kind = %error.as_service_error().map_or("transport", |_| "service"),
                 "S3 transaction journal write failed"
@@ -1008,6 +1168,39 @@ impl S3Backend {
         Ok(Some(etag))
     }
 
+    async fn register_multipart_session(
+        &self,
+        key: &str,
+        upload_id: &str,
+    ) -> AppResult<(String, Option<String>)> {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let journal_key = internal_key(&self.prefix, "multipart-sessions", &id);
+        let session = S3MultipartSession {
+            schema_version: S3_TRANSACTION_SCHEMA_VERSION,
+            id,
+            key: key.to_owned(),
+            upload_id: upload_id.to_owned(),
+        };
+        validate_multipart_session(&self.prefix, &journal_key, &session)?;
+        let etag = self
+            .write_json_journal(&journal_key, &session, None)
+            .await?;
+        Ok((journal_key, etag))
+    }
+
+    async fn register_multipart_session_task(
+        &self,
+        key: &str,
+        upload_id: &str,
+    ) -> AppResult<(String, Option<String>)> {
+        let backend = self.clone();
+        let key = key.to_owned();
+        let upload_id = upload_id.to_owned();
+        tokio::spawn(async move { backend.register_multipart_session(&key, &upload_id).await })
+            .await
+            .map_err(|error| AppError::with_source("S3 multipart journal task failed", error))?
+    }
+
     async fn delete_transaction_best_effort(&self, key: &str, etag: Option<&str>) {
         if let Err(error) = self.delete_key(key, etag).await {
             tracing::warn!(%error, "failed to clean up an S3 transaction journal");
@@ -1015,7 +1208,15 @@ impl S3Backend {
     }
 
     async fn list_transaction_keys(&self) -> AppResult<Vec<String>> {
-        let prefix = internal_key(&self.prefix, "transactions", "");
+        self.list_recovery_journal_keys("transactions").await
+    }
+
+    async fn list_multipart_session_keys(&self) -> AppResult<Vec<String>> {
+        self.list_recovery_journal_keys("multipart-sessions").await
+    }
+
+    async fn list_recovery_journal_keys(&self, area: &str) -> AppResult<Vec<String>> {
+        let prefix = internal_key(&self.prefix, area, "");
         let mut continuation_token: Option<String> = None;
         let mut keys = Vec::new();
         for _ in 0..S3_MAX_LIST_PAGES {
@@ -1024,11 +1225,11 @@ impl S3Backend {
                 .saturating_sub(keys.len());
             if remaining == 0 {
                 return Err(AppError::ServiceUnavailable(
-                    "待恢复对象存储事务超过安全上限".into(),
+                    "待恢复对象存储记录超过安全上限".into(),
                 ));
             }
             let max_keys = i32::try_from(remaining.min(S3_PAGE_SIZE))
-                .map_err(|_| AppError::internal("invalid S3 transaction list page size"))?;
+                .map_err(|_| AppError::internal("invalid S3 recovery list page size"))?;
             let permit = self.acquire_request().await?;
             let mut request = self
                 .client
@@ -1042,27 +1243,27 @@ impl S3Backend {
             let output = request.send().await.map_err(|error| {
                 tracing::error!(
                     error_kind = %error.as_service_error().map_or("transport", |_| "service"),
-                    "S3 transaction journal listing failed"
+                    "S3 recovery journal listing failed"
                 );
-                AppError::ServiceUnavailable("无法列举对象存储事务记录".into())
+                AppError::ServiceUnavailable("无法列举对象存储恢复记录".into())
             })?;
             drop(permit);
 
             for object in output.contents() {
                 if keys.len() == S3_MAX_PENDING_TRANSACTIONS {
                     return Err(AppError::ServiceUnavailable(
-                        "待恢复对象存储事务超过安全上限".into(),
+                        "待恢复对象存储记录超过安全上限".into(),
                     ));
                 }
                 let key = object.key().ok_or_else(|| {
-                    AppError::ServiceUnavailable("对象存储事务记录缺少键名".into())
+                    AppError::ServiceUnavailable("对象存储恢复记录缺少键名".into())
                 })?;
                 let id = key.strip_prefix(&prefix).ok_or_else(|| {
-                    AppError::ServiceUnavailable("对象存储事务记录越出保留前缀".into())
+                    AppError::ServiceUnavailable("对象存储恢复记录越出保留前缀".into())
                 })?;
                 if !valid_transaction_id(id) {
                     return Err(AppError::ServiceUnavailable(
-                        "对象存储事务区包含无法识别的记录".into(),
+                        "对象存储恢复区包含无法识别的记录".into(),
                     ));
                 }
                 keys.push(key.to_owned());
@@ -1072,20 +1273,32 @@ impl S3Backend {
             }
             let next = output
                 .next_continuation_token()
-                .ok_or_else(|| AppError::ServiceUnavailable("对象存储事务分页结果无效".into()))?;
+                .ok_or_else(|| AppError::ServiceUnavailable("对象存储恢复分页结果无效".into()))?;
             if continuation_token.as_deref() == Some(next) {
                 return Err(AppError::ServiceUnavailable(
-                    "对象存储事务分页未前进".into(),
+                    "对象存储恢复分页未前进".into(),
                 ));
             }
             continuation_token = Some(next.to_owned());
         }
         Err(AppError::ServiceUnavailable(
-            "对象存储事务分页超过安全页数上限".into(),
+            "对象存储恢复分页超过安全页数上限".into(),
         ))
     }
 
     async fn read_upload_transaction(&self, key: &str) -> AppResult<(S3UploadTransaction, String)> {
+        let (transaction, etag) = self.read_json_journal(key).await?;
+        validate_upload_transaction(&self.prefix, key, &transaction)?;
+        Ok((transaction, etag))
+    }
+
+    async fn read_multipart_session(&self, key: &str) -> AppResult<(S3MultipartSession, String)> {
+        let (session, etag) = self.read_json_journal(key).await?;
+        validate_multipart_session(&self.prefix, key, &session)?;
+        Ok((session, etag))
+    }
+
+    async fn read_json_journal<T: DeserializeOwned>(&self, key: &str) -> AppResult<(T, String)> {
         let _permit = self.acquire_request().await?;
         let output = self
             .client
@@ -1097,35 +1310,46 @@ impl S3Backend {
             .map_err(|error| {
                 tracing::error!(
                     error_kind = %error.as_service_error().map_or("transport", |_| "service"),
-                    "S3 transaction journal read failed"
+                    "S3 recovery journal read failed"
                 );
-                AppError::ServiceUnavailable("无法读取对象存储事务记录".into())
+                AppError::ServiceUnavailable("无法读取对象存储恢复记录".into())
             })?;
         if output.content_length().is_some_and(|length| {
             length < 0
                 || usize::try_from(length).map_or(true, |value| value > S3_MAX_TRANSACTION_BYTES)
         }) {
             return Err(AppError::ServiceUnavailable(
-                "对象存储事务记录超过安全上限".into(),
+                "对象存储恢复记录超过安全上限".into(),
             ));
         }
         let etag = output
             .e_tag()
             .map(str::to_owned)
-            .ok_or_else(|| AppError::ServiceUnavailable("事务记录缺少 ETag".into()))?;
+            .ok_or_else(|| AppError::ServiceUnavailable("恢复记录缺少 ETag".into()))?;
         let data = output.body.collect().await.map_err(|error| {
-            AppError::with_source("failed to stream S3 transaction journal", error)
+            AppError::with_source("failed to stream S3 recovery journal", error)
         })?;
         let data = data.into_bytes();
         if data.len() > S3_MAX_TRANSACTION_BYTES {
             return Err(AppError::ServiceUnavailable(
-                "对象存储事务记录超过安全上限".into(),
+                "对象存储恢复记录超过安全上限".into(),
             ));
         }
-        let transaction: S3UploadTransaction = serde_json::from_slice(&data)
-            .map_err(|error| AppError::with_source("invalid S3 transaction journal", error))?;
-        validate_upload_transaction(&self.prefix, key, &transaction)?;
-        Ok((transaction, etag))
+        let value = serde_json::from_slice(&data)
+            .map_err(|error| AppError::with_source("invalid S3 recovery journal", error))?;
+        Ok((value, etag))
+    }
+
+    async fn recover_multipart_session(
+        &self,
+        journal_key: &str,
+        journal_etag: &str,
+        session: &S3MultipartSession,
+    ) -> AppResult<()> {
+        self.abort_multipart_operation(&session.key, &session.upload_id)
+            .await?;
+        self.delete_key(journal_key, Some(journal_etag)).await?;
+        Ok(())
     }
 
     async fn recover_upload_transaction(
@@ -1175,6 +1399,10 @@ impl S3Backend {
     }
 }
 
+fn uses_oss_native_write_conditions(provider: S3Provider) -> bool {
+    provider == S3Provider::AlibabaOss
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RawS3Metadata {
     size: u64,
@@ -1196,6 +1424,37 @@ fn non_negative_size(size: Option<i64>) -> AppResult<u64> {
     size.ok_or_else(|| AppError::ServiceUnavailable("对象存储未返回内容长度".into()))?
         .try_into()
         .map_err(|_| AppError::ServiceUnavailable("对象存储返回了无效的内容长度".into()))
+}
+
+fn validate_multipart_session(
+    prefix: &str,
+    journal_key: &str,
+    session: &S3MultipartSession,
+) -> AppResult<()> {
+    let upload_prefix = internal_key(prefix, "uploads", "");
+    let internal_upload = session
+        .key
+        .strip_prefix(&upload_prefix)
+        .is_some_and(valid_transaction_id);
+    let regular_object = session.key.strip_prefix(prefix).is_some_and(|relative| {
+        !relative.is_empty()
+            && !relative.starts_with(".ycloud-system/")
+            && StorageService::normalize_relative(relative)
+                .is_ok_and(|normalized| normalized == relative)
+    });
+    if session.schema_version != S3_TRANSACTION_SCHEMA_VERSION
+        || !valid_transaction_id(&session.id)
+        || journal_key != internal_key(prefix, "multipart-sessions", &session.id)
+        || session.upload_id.is_empty()
+        || session.upload_id.len() > 4_096
+        || session.upload_id.chars().any(char::is_control)
+        || (!internal_upload && !regular_object)
+    {
+        return Err(AppError::ServiceUnavailable(
+            "对象存储分片恢复记录无法安全处理".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_upload_transaction(
@@ -1256,14 +1515,26 @@ mod tests {
         collections::{BTreeMap, HashSet},
         net::IpAddr,
         path::PathBuf,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
     };
 
     use aws_sdk_s3::types::{CommonPrefix, Object};
     use aws_smithy_types::error::metadata::ProvideErrorMetadata;
-    use axum::{body::Body, http::HeaderMap};
+    use axum::{
+        body::Body,
+        http::{HeaderMap, Uri},
+    };
     use bytes::Bytes;
-    use futures_util::stream;
+    use futures_util::{stream, StreamExt};
     use http_body_util::BodyExt;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        task::JoinHandle,
+    };
 
     use crate::{
         config::{normalize_s3_endpoint, Config, S3AddressingStyle, S3Provider, S3StorageConfig},
@@ -1273,10 +1544,212 @@ mod tests {
 
     use super::{
         copy_source, internal_key, list_prefix, listing::collect_page_entries, multipart_part_size,
-        object_key, parent_relative, snapshot_matches, valid_transaction_id,
-        validate_upload_transaction, ExactLengthBody, RawS3Metadata, S3Backend, S3ObjectSnapshot,
+        object_key, parent_relative, snapshot_matches, uses_oss_native_write_conditions,
+        valid_transaction_id, validate_multipart_session, validate_upload_transaction,
+        ExactLengthBody, RawS3Metadata, S3Backend, S3MultipartSession, S3ObjectSnapshot,
         S3UploadStage, S3UploadTransaction, S3_MULTIPART_MAX_PARTS, S3_MULTIPART_MAX_PART_BYTES,
+        S3_MULTIPART_THRESHOLD,
     };
+
+    const SMOKE_STREAM_CHUNK_BYTES: u64 = 1024 * 1024;
+    const SMOKE_UPLOAD_PART_QUERY: &[u8] = b"partNumber=1";
+
+    struct SmokeFaultProxy {
+        endpoint: String,
+        armed: Arc<AtomicBool>,
+        fired: Arc<AtomicBool>,
+        offline: Arc<AtomicBool>,
+        sustain_after_cut: Arc<AtomicBool>,
+        task: JoinHandle<()>,
+    }
+
+    impl SmokeFaultProxy {
+        async fn start(target_endpoint: &str) -> AppResult<Self> {
+            let uri = target_endpoint.parse::<Uri>().map_err(|error| {
+                AppError::with_source("failed to parse fault-proxy target endpoint", error)
+            })?;
+            if uri.scheme_str() != Some("http") {
+                return Err(AppError::ServiceUnavailable(
+                    "传输层故障代理仅允许隔离环境中的 HTTP Endpoint".into(),
+                ));
+            }
+            let authority = uri.authority().ok_or_else(|| {
+                AppError::ServiceUnavailable("传输层故障代理 Endpoint 缺少地址".into())
+            })?;
+            let port = authority.port_u16().unwrap_or(80);
+            let mut targets = tokio::net::lookup_host((authority.host(), port))
+                .await
+                .map_err(|error| {
+                    AppError::with_source("failed to resolve fault-proxy target", error)
+                })?;
+            let target = targets.next().ok_or_else(|| {
+                AppError::ServiceUnavailable("传输层故障代理无法解析目标地址".into())
+            })?;
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|error| {
+                    AppError::with_source("failed to bind local S3 fault proxy", error)
+                })?;
+            let local = listener.local_addr().map_err(|error| {
+                AppError::with_source("failed to read local S3 fault-proxy address", error)
+            })?;
+            let armed = Arc::new(AtomicBool::new(false));
+            let fired = Arc::new(AtomicBool::new(false));
+            let offline = Arc::new(AtomicBool::new(false));
+            let sustain_after_cut = Arc::new(AtomicBool::new(false));
+            let task_armed = armed.clone();
+            let task_fired = fired.clone();
+            let task_offline = offline.clone();
+            let task_sustain_after_cut = sustain_after_cut.clone();
+            let task = tokio::spawn(async move {
+                while let Ok((client, _)) = listener.accept().await {
+                    if task_offline.load(Ordering::SeqCst) {
+                        drop(client);
+                        continue;
+                    }
+                    let connection_armed = task_armed.clone();
+                    let connection_fired = task_fired.clone();
+                    let connection_offline = task_offline.clone();
+                    let connection_sustain_after_cut = task_sustain_after_cut.clone();
+                    tokio::spawn(async move {
+                        let Ok(upstream) = TcpStream::connect(target).await else {
+                            return;
+                        };
+                        let _ = forward_fault_proxy_connection(
+                            client,
+                            upstream,
+                            connection_armed,
+                            connection_fired,
+                            connection_offline,
+                            connection_sustain_after_cut,
+                        )
+                        .await;
+                    });
+                }
+            });
+            Ok(Self {
+                endpoint: format!("http://{local}"),
+                armed,
+                fired,
+                offline,
+                sustain_after_cut,
+                task,
+            })
+        }
+
+        fn arm(&self) {
+            self.arm_with_outage(false);
+        }
+
+        fn arm_sustained(&self) {
+            self.arm_with_outage(true);
+        }
+
+        fn arm_with_outage(&self, sustained: bool) {
+            self.fired.store(false, Ordering::SeqCst);
+            self.offline.store(false, Ordering::SeqCst);
+            self.sustain_after_cut.store(sustained, Ordering::SeqCst);
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        fn fired(&self) -> bool {
+            self.fired.load(Ordering::SeqCst)
+        }
+
+        fn restore(&self) {
+            self.armed.store(false, Ordering::SeqCst);
+            self.sustain_after_cut.store(false, Ordering::SeqCst);
+            self.offline.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for SmokeFaultProxy {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn forward_fault_proxy_connection(
+        client: TcpStream,
+        upstream: TcpStream,
+        armed: Arc<AtomicBool>,
+        fired: Arc<AtomicBool>,
+        offline: Arc<AtomicBool>,
+        sustain_after_cut: Arc<AtomicBool>,
+    ) -> std::io::Result<()> {
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut upstream_read, mut upstream_write) = upstream.into_split();
+        tokio::select! {
+            result = forward_fault_proxy_requests(
+                &mut client_read,
+                &mut upstream_write,
+                &armed,
+                &fired,
+                &offline,
+                &sustain_after_cut,
+            ) => result,
+            result = tokio::io::copy(&mut upstream_read, &mut client_write) => {
+                result.map(|_| ())
+            },
+        }
+    }
+
+    async fn forward_fault_proxy_requests(
+        client: &mut tokio::net::tcp::OwnedReadHalf,
+        upstream: &mut tokio::net::tcp::OwnedWriteHalf,
+        armed: &AtomicBool,
+        fired: &AtomicBool,
+        offline: &AtomicBool,
+        sustain_after_cut: &AtomicBool,
+    ) -> std::io::Result<()> {
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let mut tail = Vec::with_capacity(SMOKE_UPLOAD_PART_QUERY.len().saturating_sub(1));
+        let mut bytes_before_cut = None::<usize>;
+        loop {
+            let read = client.read(&mut buffer).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            if offline.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            if let Some(remaining) = bytes_before_cut.as_mut() {
+                let forward = (*remaining).min(read);
+                upstream.write_all(&buffer[..forward]).await?;
+                *remaining -= forward;
+                if *remaining == 0 {
+                    fired.store(true, Ordering::SeqCst);
+                    if sustain_after_cut.load(Ordering::SeqCst) {
+                        offline.store(true, Ordering::SeqCst);
+                    }
+                    return Ok(());
+                }
+                continue;
+            }
+
+            if armed.load(Ordering::SeqCst) {
+                let mut searchable = Vec::with_capacity(tail.len() + read);
+                searchable.extend_from_slice(&tail);
+                searchable.extend_from_slice(&buffer[..read]);
+                if searchable
+                    .windows(SMOKE_UPLOAD_PART_QUERY.len())
+                    .any(|window| window == SMOKE_UPLOAD_PART_QUERY)
+                    && armed
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    upstream.write_all(&buffer[..read]).await?;
+                    bytes_before_cut = Some(SMOKE_STREAM_CHUNK_BYTES as usize);
+                    tail.clear();
+                    continue;
+                }
+                let keep = SMOKE_UPLOAD_PART_QUERY.len().saturating_sub(1);
+                tail.clear();
+                tail.extend_from_slice(&searchable[searchable.len().saturating_sub(keep)..]);
+            }
+            upstream.write_all(&buffer[..read]).await?;
+        }
+    }
 
     #[test]
     fn multipart_part_sizing_stays_within_provider_limits() {
@@ -1294,6 +1767,172 @@ mod tests {
     fn required_smoke_env(name: &str) -> String {
         std::env::var(name)
             .unwrap_or_else(|_| panic!("missing required smoke-test variable {name}"))
+    }
+
+    fn smoke_flag(name: &str) -> bool {
+        match std::env::var(name).ok().as_deref() {
+            None | Some("") | Some("0") | Some("false") => false,
+            Some("1") | Some("true") => true,
+            Some(value) => panic!("invalid {name} value {value:?}; expected true, false, 1, or 0"),
+        }
+    }
+
+    fn smoke_pattern_body(content_length: u64) -> Body {
+        let chunks = stream::unfold(0_u64, move |offset| async move {
+            if offset >= content_length {
+                return None;
+            }
+            let length = SMOKE_STREAM_CHUNK_BYTES.min(content_length - offset) as usize;
+            let value = ((offset / SMOKE_STREAM_CHUNK_BYTES) % 251) as u8;
+            let next = offset + length as u64;
+            Some((
+                Ok::<_, std::io::Error>(Bytes::from(vec![value; length])),
+                next,
+            ))
+        });
+        Body::from_stream(chunks)
+    }
+
+    fn interrupted_smoke_body(bytes_before_failure: u64) -> Body {
+        let chunks = stream::unfold(
+            (0_u64, false),
+            move |(offset, failure_emitted)| async move {
+                if failure_emitted {
+                    return None;
+                }
+                if offset >= bytes_before_failure {
+                    return Some((
+                        Err::<Bytes, _>(std::io::Error::other(
+                            "injected multipart request-body interruption",
+                        )),
+                        (offset, true),
+                    ));
+                }
+                let length = SMOKE_STREAM_CHUNK_BYTES.min(bytes_before_failure - offset) as usize;
+                let next = offset + length as u64;
+                Some((Ok(Bytes::from(vec![0xA5; length])), (next, false)))
+            },
+        );
+        Body::from_stream(chunks)
+    }
+
+    async fn verify_smoke_pattern_download(
+        backend: &S3Backend,
+        relative: &str,
+        expected_length: u64,
+    ) -> AppResult<()> {
+        let response = backend
+            .stream_file(relative, &HeaderMap::new(), FileResponseMode::Attachment)
+            .await?;
+        let mut body = response.into_body().into_data_stream();
+        let mut received = 0_u64;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| {
+                AppError::with_source("failed to stream multipart smoke download", error)
+            })?;
+            let mut local_offset = 0_usize;
+            while local_offset < chunk.len() {
+                let absolute_offset = received + local_offset as u64;
+                let expected = ((absolute_offset / SMOKE_STREAM_CHUNK_BYTES) % 251) as u8;
+                let until_boundary =
+                    SMOKE_STREAM_CHUNK_BYTES - (absolute_offset % SMOKE_STREAM_CHUNK_BYTES);
+                let length = (until_boundary as usize).min(chunk.len() - local_offset);
+                if !chunk[local_offset..local_offset + length]
+                    .iter()
+                    .all(|value| *value == expected)
+                {
+                    return Err(AppError::ServiceUnavailable(
+                        "对象存储 Multipart 下载内容校验失败".into(),
+                    ));
+                }
+                local_offset += length;
+            }
+            received = received
+                .checked_add(chunk.len() as u64)
+                .ok_or(AppError::PayloadTooLarge)?;
+        }
+        if received != expected_length {
+            return Err(AppError::ServiceUnavailable(
+                "对象存储 Multipart 下载长度校验失败".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn cleanup_smoke_multipart_state(backend: &S3Backend) {
+        if let Ok(output) = backend
+            .client
+            .list_multipart_uploads()
+            .bucket(&backend.bucket)
+            .prefix(&backend.prefix)
+            .max_uploads(1_000)
+            .send()
+            .await
+        {
+            let uploads = output
+                .uploads()
+                .iter()
+                .filter_map(|upload| {
+                    Some((upload.key()?.to_owned(), upload.upload_id()?.to_owned()))
+                })
+                .collect::<Vec<_>>();
+            for (key, upload_id) in uploads {
+                let _ = backend.abort_multipart_operation(&key, &upload_id).await;
+            }
+        }
+        if let Ok(keys) = backend.list_multipart_session_keys().await {
+            for key in keys {
+                let _ = backend.delete_key(&key, None).await;
+            }
+        }
+    }
+
+    async fn cleanup_smoke_base_multipart_state(backend: &S3Backend, base_prefix: &str) {
+        if let Ok(output) = backend
+            .client
+            .list_multipart_uploads()
+            .bucket(&backend.bucket)
+            .prefix(base_prefix)
+            .max_uploads(1_000)
+            .send()
+            .await
+        {
+            let uploads = output
+                .uploads()
+                .iter()
+                .filter_map(|upload| {
+                    Some((upload.key()?.to_owned(), upload.upload_id()?.to_owned()))
+                })
+                .collect::<Vec<_>>();
+            for (key, upload_id) in uploads {
+                let _ = backend.abort_multipart_operation(&key, &upload_id).await;
+            }
+        }
+
+        if let Ok(output) = backend
+            .client
+            .list_objects_v2()
+            .bucket(&backend.bucket)
+            .prefix(base_prefix)
+            .max_keys(1_000)
+            .send()
+            .await
+        {
+            const MARKER: &str = "/.ycloud-system/multipart-sessions/";
+            let keys = output
+                .contents()
+                .iter()
+                .filter_map(|object| object.key())
+                .filter(|key| {
+                    key.rsplit_once(MARKER)
+                        .is_some_and(|(_, id)| valid_transaction_id(id))
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            for key in keys {
+                let _ = backend.delete_key(&key, None).await;
+            }
+        }
     }
 
     fn smoke_provider(value: Option<&str>) -> S3Provider {
@@ -1346,11 +1985,20 @@ mod tests {
     ///
     /// The test never runs in the normal suite and creates a unique Prefix for
     /// every execution. Credentials are read only from process environment
-    /// variables and are never printed.
+    /// variables and are never printed. Set `YCLOUD_S3_SMOKE_MULTIPART=1`
+    /// to add a streamed upload larger than the 64 MiB Multipart threshold,
+    /// `YCLOUD_S3_SMOKE_CHECK_INVALID_CREDENTIALS=1` verifies that the service
+    /// rejects a valid access-key ID paired with an invalid secret. Set
+    /// `YCLOUD_S3_SMOKE_INTERRUPTED_MULTIPART=1` to fail the request body after
+    /// the first part and verify that Ycloud aborts the Multipart session. Set
+    /// `YCLOUD_S3_SMOKE_TRANSPORT_CUT=1` for HTTP test endpoints to route the
+    /// test through a loopback proxy that cuts the first UploadPart connection.
+    /// `YCLOUD_S3_SMOKE_SUSTAINED_OUTAGE=1` keeps that proxy offline while the
+    /// immediate Abort fails, restores it, and exercises persisted recovery.
     #[tokio::test]
     #[ignore = "requires an isolated S3 test bucket and explicit credentials"]
     async fn s3_compatibility_smoke() {
-        let endpoint = required_smoke_env("YCLOUD_S3_SMOKE_ENDPOINT");
+        let configured_endpoint = required_smoke_env("YCLOUD_S3_SMOKE_ENDPOINT");
         let bucket = required_smoke_env("YCLOUD_S3_SMOKE_BUCKET");
         let access_key_id = required_smoke_env("YCLOUD_S3_SMOKE_ACCESS_KEY_ID");
         let secret_access_key = required_smoke_env("YCLOUD_S3_SMOKE_SECRET_ACCESS_KEY");
@@ -1364,13 +2012,40 @@ mod tests {
         let region = std::env::var("YCLOUD_S3_SMOKE_REGION").unwrap_or_else(|_| "us-east-1".into());
         let base_prefix =
             std::env::var("YCLOUD_S3_SMOKE_PREFIX").unwrap_or_else(|_| "ycloud-smoke/".into());
+        let multipart_length = smoke_flag("YCLOUD_S3_SMOKE_MULTIPART")
+            .then_some(S3_MULTIPART_THRESHOLD + SMOKE_STREAM_CHUNK_BYTES);
+        let check_invalid_credentials = smoke_flag("YCLOUD_S3_SMOKE_CHECK_INVALID_CREDENTIALS");
+        let check_interrupted_multipart = smoke_flag("YCLOUD_S3_SMOKE_INTERRUPTED_MULTIPART");
+        let check_transport_cut = smoke_flag("YCLOUD_S3_SMOKE_TRANSPORT_CUT");
+        let check_sustained_outage = smoke_flag("YCLOUD_S3_SMOKE_SUSTAINED_OUTAGE");
+        let fault_proxy = if check_transport_cut || check_sustained_outage {
+            Some(SmokeFaultProxy::start(&configured_endpoint).await.unwrap())
+        } else {
+            None
+        };
+        let endpoint = fault_proxy.as_ref().map_or_else(
+            || configured_endpoint.clone(),
+            |proxy| proxy.endpoint.clone(),
+        );
+        let large_object_length = multipart_length.or_else(|| {
+            (check_interrupted_multipart || check_transport_cut || check_sustained_outage)
+                .then_some(S3_MULTIPART_THRESHOLD + SMOKE_STREAM_CHUNK_BYTES)
+        });
         let base_prefix = base_prefix.trim_matches('/');
+        let smoke_root_prefix = if base_prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{base_prefix}/")
+        };
         let run_id = uuid::Uuid::new_v4().simple().to_string();
         let prefix = if base_prefix.is_empty() {
             format!("{run_id}/")
         } else {
             format!("{base_prefix}/{run_id}/")
         };
+        let capacity_limit = large_object_length
+            .and_then(|length| length.checked_mul(4))
+            .unwrap_or(1024 * 1024);
         let settings = S3StorageConfig {
             provider,
             endpoint: endpoint.clone(),
@@ -1380,7 +2055,7 @@ mod tests {
             addressing_style,
             access_key_id,
             secret_access_key,
-            capacity_limit_bytes: Some(1024 * 1024),
+            capacity_limit_bytes: Some(capacity_limit),
         };
         let runtime = Config {
             bind_address: IpAddr::from([127, 0, 0, 1]),
@@ -1392,7 +2067,7 @@ mod tests {
             )
             .unwrap(),
             config_path: PathBuf::from("unused-smoke-config.json"),
-            max_upload_bytes: 1024 * 1024,
+            max_upload_bytes: large_object_length.unwrap_or(1024 * 1024),
             max_upload_batch_bytes: 100 * 1024 * 1024 * 1024,
             max_upload_batch_entries: 10_000,
             max_archive_bytes: 100 * 1024 * 1024 * 1024,
@@ -1400,19 +2075,36 @@ mod tests {
             io_concurrency: 2,
             max_list_entries: 100,
             request_timeout_secs: 30,
-            upload_timeout_secs: 30,
+            upload_timeout_secs: if large_object_length.is_some() {
+                120
+            } else {
+                30
+            },
             disk_reserve_bytes: 0,
             secure_cookies: false,
             allow_lan_http: true,
             public_base_url: None,
             public_host: None,
             trusted_proxy_ips: HashSet::new(),
+            allowed_hosts: HashSet::new(),
             s3_allowed_endpoints: HashSet::from([normalize_s3_endpoint(&endpoint).unwrap()]),
         };
         let backend = S3Backend::new(&settings, &runtime).unwrap();
         let payload = Bytes::from_static(b"ycloud-s3-compatibility-smoke");
 
         let result: AppResult<()> = async {
+            cleanup_smoke_base_multipart_state(&backend, &smoke_root_prefix).await;
+            if check_invalid_credentials {
+                let mut invalid_settings = settings.clone();
+                invalid_settings.secret_access_key =
+                    format!("invalid-{}", uuid::Uuid::new_v4().simple());
+                let invalid_backend = S3Backend::new(&invalid_settings, &runtime)?;
+                if invalid_backend.probe().await.is_ok() {
+                    return Err(AppError::ServiceUnavailable(
+                        "对象存储接受了错误凭据".into(),
+                    ));
+                }
+            }
             if let Err(error) = backend
                 .client
                 .list_objects_v2()
@@ -1510,6 +2202,203 @@ mod tests {
                 replacement.len() as u64
             );
             assert_eq!(backend.user_data_size().await?, 0);
+
+            if let Some(content_length) = multipart_length {
+                backend.create_directory("multipart").await?;
+                let uploaded = backend
+                    .upload_file(
+                        "multipart/source.bin",
+                        smoke_pattern_body(content_length),
+                        content_length,
+                        content_length,
+                        Some("application/octet-stream"),
+                    )
+                    .await?;
+                assert_eq!(uploaded.previous_size, 0);
+                assert_eq!(uploaded.size, content_length);
+                verify_smoke_pattern_download(
+                    &backend,
+                    "multipart/source.bin",
+                    content_length,
+                )
+                .await?;
+
+                backend
+                    .copy_file("multipart/source.bin", "multipart/copied.bin")
+                    .await?;
+                backend
+                    .move_file("multipart/copied.bin", "multipart/moved.bin")
+                    .await?;
+                assert_eq!(
+                    backend.delete_file("multipart/moved.bin").await?,
+                    content_length
+                );
+                assert_eq!(
+                    backend.delete_file("multipart/source.bin").await?,
+                    content_length
+                );
+                assert_eq!(backend.delete_directory("multipart").await?, 0);
+                assert_eq!(backend.user_data_size().await?, 0);
+            }
+
+            if check_interrupted_multipart {
+                let content_length = S3_MULTIPART_THRESHOLD + SMOKE_STREAM_CHUNK_BYTES;
+                backend.create_directory("interrupted").await?;
+                let upload = backend
+                    .upload_file(
+                        "interrupted/source.bin",
+                        interrupted_smoke_body(S3_MULTIPART_THRESHOLD),
+                        content_length,
+                        content_length,
+                        Some("application/octet-stream"),
+                    )
+                    .await;
+                if upload.is_ok() {
+                    return Err(AppError::ServiceUnavailable(
+                        "对象存储接受了中途断流的 Multipart 上传".into(),
+                    ));
+                }
+                match backend.metadata("interrupted/source.bin").await {
+                    Err(AppError::NotFound) => {}
+                    Ok(_) => {
+                        return Err(AppError::ServiceUnavailable(
+                            "中途断流后目标对象仍然可见".into(),
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+                let pending = backend
+                    .client
+                    .list_multipart_uploads()
+                    .bucket(&backend.bucket)
+                    .prefix(&backend.prefix)
+                    .max_uploads(1)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        AppError::with_source(
+                            "failed to inspect interrupted multipart uploads",
+                            error,
+                        )
+                    })?;
+                if !pending.uploads().is_empty() {
+                    return Err(AppError::ServiceUnavailable(
+                        "中途断流后遗留了未完成的 Multipart 会话".into(),
+                    ));
+                }
+                assert_eq!(backend.delete_directory("interrupted").await?, 0);
+                assert_eq!(backend.user_data_size().await?, 0);
+            }
+
+            if check_transport_cut {
+                let proxy = fault_proxy.as_ref().expect("fault proxy is configured");
+                let content_length = S3_MULTIPART_THRESHOLD + SMOKE_STREAM_CHUNK_BYTES;
+                backend.create_directory("transport-cut").await?;
+                proxy.arm();
+                let upload = backend
+                    .upload_file(
+                        "transport-cut/source.bin",
+                        smoke_pattern_body(content_length),
+                        content_length,
+                        content_length,
+                        Some("application/octet-stream"),
+                    )
+                    .await;
+                if upload.is_ok() || !proxy.fired() {
+                    return Err(AppError::ServiceUnavailable(
+                        "传输层故障代理没有中断 Multipart 上传".into(),
+                    ));
+                }
+                match backend.metadata("transport-cut/source.bin").await {
+                    Err(AppError::NotFound) => {}
+                    Ok(_) => {
+                        return Err(AppError::ServiceUnavailable(
+                            "传输层中断后目标对象仍然可见".into(),
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+                let pending = backend
+                    .client
+                    .list_multipart_uploads()
+                    .bucket(&backend.bucket)
+                    .prefix(&backend.prefix)
+                    .max_uploads(1)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        AppError::with_source(
+                            "failed to inspect transport-cut multipart uploads",
+                            error,
+                        )
+                    })?;
+                if !pending.uploads().is_empty() {
+                    return Err(AppError::ServiceUnavailable(
+                        "传输层中断后遗留了未完成的 Multipart 会话".into(),
+                    ));
+                }
+                assert_eq!(backend.delete_directory("transport-cut").await?, 0);
+                assert_eq!(backend.user_data_size().await?, 0);
+            }
+
+            if check_sustained_outage {
+                let proxy = fault_proxy.as_ref().expect("fault proxy is configured");
+                let content_length = S3_MULTIPART_THRESHOLD + SMOKE_STREAM_CHUNK_BYTES;
+                backend.create_directory("sustained-outage").await?;
+                proxy.arm_sustained();
+                let upload = backend
+                    .upload_file(
+                        "sustained-outage/source.bin",
+                        smoke_pattern_body(content_length),
+                        content_length,
+                        content_length,
+                        Some("application/octet-stream"),
+                    )
+                    .await;
+                let fault_fired = proxy.fired();
+                proxy.restore();
+                if upload.is_ok() || !fault_fired {
+                    return Err(AppError::ServiceUnavailable(
+                        "持续断网代理没有中断 Multipart 上传".into(),
+                    ));
+                }
+                let recovered = backend.recover_transactions().await?;
+                if recovered == 0 {
+                    return Err(AppError::ServiceUnavailable(
+                        "持续断网后没有发现持久化的 Multipart 恢复记录".into(),
+                    ));
+                }
+                match backend.metadata("sustained-outage/source.bin").await {
+                    Err(AppError::NotFound) => {}
+                    Ok(_) => {
+                        return Err(AppError::ServiceUnavailable(
+                            "持续断网恢复后目标对象仍然可见".into(),
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
+                let pending = backend
+                    .client
+                    .list_multipart_uploads()
+                    .bucket(&backend.bucket)
+                    .prefix(&backend.prefix)
+                    .max_uploads(1)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        AppError::with_source(
+                            "failed to inspect sustained-outage multipart uploads",
+                            error,
+                        )
+                    })?;
+                if !pending.uploads().is_empty() {
+                    return Err(AppError::ServiceUnavailable(
+                        "持续断网恢复后仍遗留未完成的 Multipart 会话".into(),
+                    ));
+                }
+                assert_eq!(backend.delete_directory("sustained-outage").await?, 0);
+                assert_eq!(backend.user_data_size().await?, 0);
+            }
             Ok(())
         }
         .await;
@@ -1518,7 +2407,16 @@ mod tests {
         // ordinary test paths so successful and simple failed runs do not
         // contaminate later capacity scans.
         let _ = backend.recover_transactions().await;
-        for path in ["suite-moved", "suite-copy", "suite"] {
+        cleanup_smoke_multipart_state(&backend).await;
+        for path in [
+            "sustained-outage",
+            "transport-cut",
+            "interrupted",
+            "multipart",
+            "suite-moved",
+            "suite-copy",
+            "suite",
+        ] {
             let _ = backend.delete_directory(path).await;
         }
         result.unwrap();
@@ -1539,6 +2437,10 @@ mod tests {
             smoke_addressing_style(None, S3Provider::AlibabaOss),
             S3AddressingStyle::VirtualHosted
         );
+        assert!(uses_oss_native_write_conditions(S3Provider::AlibabaOss));
+        assert!(!uses_oss_native_write_conditions(S3Provider::TencentCos));
+        assert!(!uses_oss_native_write_conditions(S3Provider::Minio));
+        assert!(!uses_oss_native_write_conditions(S3Provider::S3Compatible));
     }
 
     #[test]
@@ -1670,6 +2572,32 @@ mod tests {
         let mut unverifiable = transaction.clone();
         unverifiable.temporary.etag = None;
         assert!(validate_upload_transaction("tenant/", &key, &unverifiable).is_err());
+    }
+
+    #[test]
+    fn multipart_recovery_records_are_confined_to_the_backend_namespace() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut session = S3MultipartSession {
+            schema_version: 1,
+            id: id.into(),
+            key: format!("tenant/.ycloud-system/uploads/{id}"),
+            upload_id: "provider-upload-id".into(),
+        };
+        let journal_key = internal_key("tenant/", "multipart-sessions", id);
+        assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
+
+        session.key = "tenant/folder/file.bin".into();
+        assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
+
+        session.key = "other-tenant/file.bin".into();
+        assert!(validate_multipart_session("tenant/", &journal_key, &session).is_err());
+
+        session.key = "tenant/.ycloud-system/transactions/forged".into();
+        assert!(validate_multipart_session("tenant/", &journal_key, &session).is_err());
+
+        session.key = "tenant/folder/file.bin".into();
+        session.upload_id = "bad\nupload-id".into();
+        assert!(validate_multipart_session("tenant/", &journal_key, &session).is_err());
     }
 
     #[test]

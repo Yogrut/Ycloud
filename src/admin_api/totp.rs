@@ -64,6 +64,7 @@ pub async fn enable_admin_totp(
     State(state): State<AppState>,
     Json(body): Json<TotpEnableRequest>,
 ) -> AppResult<Json<TotpEnableResponse>> {
+    let _auth_guard = state.auth_transitions.lock().await;
     verify_current_admin_password(&state, body.current_password).await?;
     crate::totp::validate_secret(&body.secret)?;
     if !crate::totp::verify_now(&body.secret, &body.code) {
@@ -90,6 +91,7 @@ pub async fn enable_admin_totp(
             Ok(())
         })
         .await?;
+    state.admin_totp_replay.clear().await;
     state.sessions.clear().await;
     Ok(Json(TotpEnableResponse {
         success: true,
@@ -101,6 +103,7 @@ pub async fn disable_admin_totp(
     State(state): State<AppState>,
     Json(body): Json<TotpDisableRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let _auth_guard = state.auth_transitions.lock().await;
     verify_current_admin_password(&state, body.current_password).await?;
     let (secret, recovery_hashes) = {
         let config = state.config_file.read().await;
@@ -122,6 +125,7 @@ pub async fn disable_admin_totp(
             Ok(())
         })
         .await?;
+    state.admin_totp_replay.clear().await;
     state.sessions.clear().await;
     Ok(Json(serde_json::json!({ "success": true })))
 }

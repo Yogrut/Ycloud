@@ -201,7 +201,7 @@ pub fn build_router(state: AppState) -> Router {
                 tracing::info_span!(
                     "http_request",
                     method = %request.method(),
-                    uri = %request.uri(),
+                    path = %request.uri().path(),
                     request_id = %request_id,
                 )
             }),
@@ -356,11 +356,15 @@ mod tests {
     use axum::{
         body::{to_bytes, Body},
         extract::ConnectInfo,
-        http::{header, Request, StatusCode},
+        http::{header, request::Builder, StatusCode},
     };
     use std::{net::SocketAddr, sync::Arc};
     use tokio::sync::RwLock;
     use tower::ServiceExt;
+
+    fn test_request() -> Builder {
+        axum::http::Request::builder().header(header::HOST, "ycloud.test")
+    }
 
     #[tokio::test]
     async fn router_exposes_health_and_protects_storage_api() {
@@ -391,6 +395,7 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 trusted_proxy_ips: Default::default(),
+                allowed_hosts: ["ycloud.test".to_string()].into_iter().collect(),
                 s3_allowed_endpoints: Default::default(),
             },
             Arc::new(RwLock::new(ConfigFile {
@@ -459,7 +464,7 @@ mod tests {
         let health = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/api/health")
                     .body(Body::empty())
                     .unwrap(),
@@ -479,7 +484,7 @@ mod tests {
         let readiness = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/api/ready")
                     .body(Body::empty())
                     .unwrap(),
@@ -491,7 +496,7 @@ mod tests {
         let admin_info = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/api/admin/info")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .body(Body::empty())
@@ -534,7 +539,7 @@ mod tests {
         let reader_admin_info = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/api/admin/info")
                     .header(header::COOKIE, format!("session={reader_token}"))
                     .body(Body::empty())
@@ -547,7 +552,7 @@ mod tests {
         let reader_files = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/api/files")
                     .header(header::COOKIE, format!("session={reader_token}"))
                     .body(Body::empty())
@@ -570,10 +575,9 @@ mod tests {
         let reader_write = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/mkdir")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("session={reader_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -587,10 +591,9 @@ mod tests {
         let unapproved_s3_test = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/admin/storage/test")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -610,7 +613,7 @@ mod tests {
         let webdav_challenge = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("PROPFIND")
                     .uri("/dav/open")
                     .body(Body::empty())
@@ -627,10 +630,9 @@ mod tests {
             "Basic realm=\"Ycloud WebDAV\", charset=\"UTF-8\""
         );
 
-        let mut remote_gate_request = Request::builder()
+        let mut remote_gate_request = test_request()
             .method("POST")
             .uri("/api/gate")
-            .header(header::HOST, "ycloud.test")
             .header(header::ORIGIN, "http://ycloud.test")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"username":"","password":""}"#))
@@ -644,10 +646,9 @@ mod tests {
             serde_json::from_slice(&remote_gate_body).unwrap();
         assert_eq!(remote_gate_json["success"], false);
 
-        let mut local_gate_request = Request::builder()
+        let mut local_gate_request = test_request()
             .method("POST")
             .uri("/api/gate")
-            .header(header::HOST, "ycloud.test")
             .header(header::ORIGIN, "http://ycloud.test")
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(r#"{"username":"","password":""}"#))
@@ -663,7 +664,7 @@ mod tests {
         let files = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/api/files")
                     .body(Body::empty())
                     .unwrap(),
@@ -675,7 +676,7 @@ mod tests {
         let gate_files = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/api/files")
                     .header(header::COOKIE, format!("gate_access={gate_token}"))
                     .body(Body::empty())
@@ -691,7 +692,7 @@ mod tests {
         let invalid_page_size = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/api/files?limit=25")
                     .header(header::COOKIE, format!("gate_access={gate_token}"))
                     .body(Body::empty())
@@ -704,10 +705,9 @@ mod tests {
         let gate_write = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/mkdir")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("gate_access={gate_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -721,10 +721,9 @@ mod tests {
         let basic_write = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/mkdir")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::AUTHORIZATION, "Basic YWRtaW46dGVzdC1wYXNzd29yZA==")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -738,10 +737,9 @@ mod tests {
         let admin_write = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/mkdir")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -755,10 +753,9 @@ mod tests {
         let nested_admin_write = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/mkdir?path=%2Fallowed")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -777,7 +774,7 @@ mod tests {
         let webdav_mkcol = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("MKCOL")
                     .uri("/dav/open/dav-test")
                     .header(header::AUTHORIZATION, WEBDAV_AUTH)
@@ -791,7 +788,7 @@ mod tests {
         let webdav_put = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("PUT")
                     .uri("/dav/open/dav-test/file.txt")
                     .header(header::AUTHORIZATION, WEBDAV_AUTH)
@@ -807,7 +804,7 @@ mod tests {
         let webdav_propfind = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("PROPFIND")
                     .uri("/dav/open/dav-test")
                     .header(header::AUTHORIZATION, WEBDAV_AUTH)
@@ -826,7 +823,7 @@ mod tests {
         let webdav_get = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/dav/open/dav-test/file.txt")
                     .header(header::AUTHORIZATION, WEBDAV_AUTH)
                     .body(Body::empty())
@@ -843,11 +840,10 @@ mod tests {
         let webdav_copy = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("COPY")
                     .uri("/dav/open/dav-test/file.txt")
                     .header(header::AUTHORIZATION, WEBDAV_AUTH)
-                    .header(header::HOST, "ycloud.test")
                     .header(
                         "destination",
                         "http://ycloud.test/dav/open/dav-test/copy.txt",
@@ -863,11 +859,10 @@ mod tests {
         let webdav_move = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("MOVE")
                     .uri("/dav/open/dav-test/copy.txt")
                     .header(header::AUTHORIZATION, WEBDAV_AUTH)
-                    .header(header::HOST, "ycloud.test")
                     .header(
                         "destination",
                         "http://ycloud.test/dav/open/dav-test/moved.txt",
@@ -883,7 +878,7 @@ mod tests {
         let webdav_delete = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("DELETE")
                     .uri("/dav/open/dav-test/moved.txt")
                     .header(header::AUTHORIZATION, WEBDAV_AUTH)
@@ -897,10 +892,9 @@ mod tests {
         let limits_update = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("PUT")
                     .uri("/api/admin/limits")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -916,7 +910,7 @@ mod tests {
         let limits_list = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/api/files")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .body(Body::empty())
@@ -936,10 +930,9 @@ mod tests {
         let manual_block = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/admin/security/block")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -953,10 +946,9 @@ mod tests {
         let manual_unblock = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/admin/security/unblock")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -976,10 +968,9 @@ mod tests {
         let archive_entry_limit = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/archive/prepare")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -993,7 +984,7 @@ mod tests {
         let favicon = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/favicon.svg")
                     .body(Body::empty())
                     .unwrap(),
@@ -1008,12 +999,7 @@ mod tests {
 
         let anonymous_admin = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/admin")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(test_request().uri("/admin").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(anonymous_admin.status(), StatusCode::OK);
@@ -1021,7 +1007,7 @@ mod tests {
         let authenticated_admin = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/admin")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .body(Body::empty())
@@ -1034,7 +1020,7 @@ mod tests {
         let app_asset = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/assets/app.js")
                     .body(Body::empty())
                     .unwrap(),
@@ -1050,7 +1036,7 @@ mod tests {
         let removed_legacy_vue = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .uri("/v2/admin/security")
                     .body(Body::empty())
                     .unwrap(),
@@ -1065,10 +1051,9 @@ mod tests {
         let oversized_batch = app
             .clone()
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/batch/delete")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
@@ -1084,10 +1069,9 @@ mod tests {
 
         let partial_batch = app
             .oneshot(
-                Request::builder()
+                test_request()
                     .method("POST")
                     .uri("/api/batch/delete")
-                    .header(header::HOST, "ycloud.test")
                     .header(header::ORIGIN, "http://ycloud.test")
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .header(header::CONTENT_TYPE, "application/json")

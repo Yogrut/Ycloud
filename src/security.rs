@@ -41,9 +41,49 @@ pub async fn proxy_boundary_middleware(
                 .then_some(config.bind_address)
         })
         .ok_or(StatusCode::FORBIDDEN)?;
+    validate_request_host(&config, request.headers())?;
     let client_ip = validated_client_ip(&config, peer_ip, request.headers())?;
     request.extensions_mut().insert(ClientIp(client_ip));
     Ok(next.run(request).await)
+}
+
+fn validate_request_host(
+    config: &Config,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), StatusCode> {
+    let raw_host = single_header(headers, header::HOST.as_str())?;
+    let normalized = raw_host.to_ascii_lowercase();
+    if let Some(public_host) = config.public_host.as_deref() {
+        return (normalized == public_host.to_ascii_lowercase())
+            .then_some(())
+            .ok_or(StatusCode::FORBIDDEN);
+    }
+    if config.allowed_hosts.contains(&normalized) {
+        return Ok(());
+    }
+    let authority = raw_host
+        .parse::<axum::http::uri::Authority>()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let port_matches = authority.port_u16() == Some(config.port)
+        || (authority.port_u16().is_none() && config.port == 80);
+    if !port_matches {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let host = authority.host();
+    if host.eq_ignore_ascii_case("localhost") {
+        return config
+            .bind_address
+            .is_loopback()
+            .then_some(())
+            .ok_or(StatusCode::FORBIDDEN);
+    }
+    let ip = host.parse::<IpAddr>().map_err(|_| StatusCode::FORBIDDEN)?;
+    let allowed = if config.allow_lan_http {
+        trusted_lan_client(ip)
+    } else {
+        config.bind_address.is_loopback() && ip.is_loopback()
+    };
+    allowed.then_some(()).ok_or(StatusCode::FORBIDDEN)
 }
 
 fn validated_client_ip(
@@ -207,7 +247,7 @@ fn origin_matches(config: &Config, headers: &axum::http::HeaderMap) -> bool {
 mod tests {
     use super::{
         clear_cookie, origin_matches, session_cookie, single_header, trusted_lan_client,
-        validated_client_ip,
+        validate_request_host, validated_client_ip,
     };
     use crate::config::Config;
     use axum::http::{header, HeaderMap, HeaderValue};
@@ -235,6 +275,36 @@ mod tests {
             HeaderValue::from_static("http://evil.cloud.local:18473"),
         );
         assert!(!origin_matches(&local_config(), &headers));
+    }
+
+    #[test]
+    fn local_mode_rejects_dns_rebinding_hosts() {
+        let config = local_config();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:18473"));
+        assert!(validate_request_host(&config, &headers).is_ok());
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("attacker.example:18473"),
+        );
+        assert_eq!(
+            validate_request_host(&config, &headers),
+            Err(axum::http::StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn explicit_local_host_is_exact_and_port_bound() {
+        let mut config = local_config();
+        config.allowed_hosts.insert("ycloud.test:18473".into());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("ycloud.test:18473"));
+        assert!(validate_request_host(&config, &headers).is_ok());
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_static("sub.ycloud.test:18473"),
+        );
+        assert!(validate_request_host(&config, &headers).is_err());
     }
 
     #[test]
@@ -329,6 +399,7 @@ mod tests {
             public_base_url: None,
             public_host: None,
             trusted_proxy_ips: Default::default(),
+            allowed_hosts: Default::default(),
             s3_allowed_endpoints: Default::default(),
         }
     }

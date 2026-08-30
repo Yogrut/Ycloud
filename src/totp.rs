@@ -1,6 +1,8 @@
 use qrcode::{render::svg, QrCode};
 use rand_core::{OsRng, RngCore};
 use ring::hmac;
+use std::{collections::HashSet, sync::Arc};
+use tokio::sync::Mutex;
 
 use crate::error::{AppError, AppResult};
 
@@ -8,6 +10,25 @@ const STEP_SECONDS: i64 = 30;
 const DIGITS: u32 = 6;
 const BASE32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const RECOVERY_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+#[derive(Clone, Default)]
+pub struct TotpReplayStore {
+    consumed: Arc<Mutex<HashSet<u64>>>,
+}
+
+impl TotpReplayStore {
+    /// Atomically marks a valid TOTP counter as consumed for this process.
+    pub async fn consume(&self, counter: u64) -> bool {
+        let current = current_counter();
+        let mut consumed = self.consumed.lock().await;
+        consumed.retain(|value| value.saturating_add(2) >= current);
+        consumed.insert(counter)
+    }
+
+    pub async fn clear(&self) {
+        self.consumed.lock().await.clear();
+    }
+}
 
 pub fn generate_secret() -> String {
     let mut bytes = [0_u8; 20];
@@ -46,7 +67,11 @@ pub fn validate_secret(secret: &str) -> AppResult<()> {
 }
 
 pub fn verify_now(secret: &str, code: &str) -> bool {
-    verify_at(secret, code.trim(), chrono::Utc::now().timestamp())
+    verify_now_counter(secret, code).is_some()
+}
+
+pub fn verify_now_counter(secret: &str, code: &str) -> Option<u64> {
+    verify_at_counter(secret, code.trim(), chrono::Utc::now().timestamp())
 }
 
 pub fn provisioning_uri(secret: &str, username: &str) -> String {
@@ -67,24 +92,30 @@ pub fn provisioning_qr_svg(uri: &str) -> AppResult<String> {
         .build())
 }
 
+#[cfg(test)]
 fn verify_at(secret: &str, code: &str, unix_seconds: i64) -> bool {
+    verify_at_counter(secret, code, unix_seconds).is_some()
+}
+
+fn verify_at_counter(secret: &str, code: &str, unix_seconds: i64) -> Option<u64> {
     if code.len() != DIGITS as usize || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
+        return None;
     }
     let Ok(secret) = decode_base32(secret) else {
-        return false;
+        return None;
     };
     let counter = unix_seconds.div_euclid(STEP_SECONDS);
-    (-1_i64..=1).any(|offset| {
-        let Some(counter) = counter
+    (-1_i64..=1).find_map(|offset| {
+        let counter = counter
             .checked_add(offset)
-            .and_then(|value| u64::try_from(value).ok())
-        else {
-            return false;
-        };
+            .and_then(|value| u64::try_from(value).ok())?;
         let expected = totp_code(&secret, counter);
-        expected == code
+        (expected == code).then_some(counter)
     })
+}
+
+fn current_counter() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp().div_euclid(STEP_SECONDS)).unwrap_or_default()
 }
 
 fn totp_code(secret: &[u8], counter: u64) -> String {
@@ -181,5 +212,15 @@ mod tests {
         let svg = provisioning_qr_svg(&uri).unwrap();
         assert!(svg.starts_with("<?xml"));
         assert!(svg.contains("<svg"));
+    }
+
+    #[tokio::test]
+    async fn replay_store_consumes_each_counter_once() {
+        let store = TotpReplayStore::default();
+        let counter = current_counter();
+        assert!(store.consume(counter).await);
+        assert!(!store.consume(counter).await);
+        store.clear().await;
+        assert!(store.consume(counter).await);
     }
 }

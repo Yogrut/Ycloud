@@ -57,6 +57,7 @@ impl Config {
         let allow_lan_http = env_parse("ALLOW_LAN_HTTP", false)?;
         let (public_base_url, public_host, trusted_proxy_ips) =
             public_proxy_config(bind_address, secure_cookies, allow_lan_http)?;
+        let allowed_hosts = allowed_hosts()?;
         let s3_allowed_endpoints = s3_allowed_endpoints()?;
         Ok(Self {
             bind_address,
@@ -79,6 +80,7 @@ impl Config {
             public_base_url,
             public_host,
             trusted_proxy_ips,
+            allowed_hosts,
             s3_allowed_endpoints,
         })
     }
@@ -144,6 +146,24 @@ fn s3_allowed_endpoints() -> anyhow::Result<HashSet<String>> {
         .collect()
 }
 
+fn allowed_hosts() -> anyhow::Result<HashSet<String>> {
+    std::env::var("ALLOWED_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let authority = value
+                .parse::<axum::http::uri::Authority>()
+                .with_context(|| format!("Invalid ALLOWED_HOSTS authority: {value}"))?;
+            if authority.as_str().contains('@') {
+                anyhow::bail!("ALLOWED_HOSTS cannot contain user information: {value}");
+            }
+            Ok(authority.as_str().to_ascii_lowercase())
+        })
+        .collect()
+}
+
 pub fn normalize_s3_endpoint(endpoint: &str) -> AppResult<String> {
     let uri: axum::http::Uri = endpoint
         .parse()
@@ -175,6 +195,17 @@ fn public_proxy_config(
     secure_cookies: bool,
     allow_lan_http: bool,
 ) -> anyhow::Result<(Option<String>, Option<String>, HashSet<IpAddr>)> {
+    let public_requested = std::env::var_os("PUBLIC_BASE_URL").is_some()
+        || std::env::var_os("TRUSTED_PROXY_IPS").is_some();
+    if public_requested {
+        if allow_lan_http {
+            anyhow::bail!("ALLOW_LAN_HTTP cannot be combined with public HTTPS proxy mode");
+        }
+        if !secure_cookies {
+            anyhow::bail!("SECURE_COOKIES=true is required for public HTTPS proxy mode");
+        }
+        return configured_public_proxy();
+    }
     if bind_address.is_loopback() {
         return Ok((None, None, HashSet::new()));
     }
@@ -189,6 +220,12 @@ fn public_proxy_config(
     if !secure_cookies {
         anyhow::bail!("SECURE_COOKIES=true is required when BIND_ADDRESS is not loopback");
     }
+    anyhow::bail!(
+        "PUBLIC_BASE_URL and TRUSTED_PROXY_IPS are required when BIND_ADDRESS is not loopback"
+    )
+}
+
+fn configured_public_proxy() -> anyhow::Result<(Option<String>, Option<String>, HashSet<IpAddr>)> {
     let raw_url = std::env::var("PUBLIC_BASE_URL")
         .context("PUBLIC_BASE_URL=https://your-domain is required for public mode")?;
     let uri: axum::http::Uri = raw_url

@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
+    auth::{self, RequestSubject},
     error::{AppError, AppResult},
     file_access::{
         check_folder_locks, ensure_non_root, ensure_storage_action, resolve_share,
@@ -33,6 +34,7 @@ pub struct UploadBatchStore {
 }
 
 struct UploadBatch {
+    subject: RequestSubject,
     storage_id: String,
     expires_at: Instant,
     items: HashMap<String, UploadItem>,
@@ -60,6 +62,7 @@ impl UploadBatchStore {
 
     pub async fn create(
         &self,
+        subject: RequestSubject,
         storage_id: String,
         items: HashMap<String, u64>,
     ) -> AppResult<String> {
@@ -80,6 +83,7 @@ impl UploadBatchStore {
         batches.insert(
             token.clone(),
             UploadBatch {
+                subject,
                 storage_id,
                 expires_at: now + self.ttl,
                 items: items
@@ -102,6 +106,7 @@ impl UploadBatchStore {
     pub async fn begin(
         &self,
         token: &str,
+        subject: &RequestSubject,
         storage_id: &str,
         path: &str,
         size: u64,
@@ -112,7 +117,7 @@ impl UploadBatchStore {
         let batch = batches
             .get_mut(token)
             .ok_or_else(|| AppError::BadRequest("上传批次不存在或已过期".into()))?;
-        if batch.storage_id != storage_id {
+        if &batch.subject != subject || batch.storage_id != storage_id {
             return Err(AppError::Forbidden);
         }
         let item = batch
@@ -129,14 +134,19 @@ impl UploadBatchStore {
         Ok(())
     }
 
-    pub async fn cancel(&self, token: &str, storage_id: &str) -> AppResult<()> {
+    pub async fn cancel(
+        &self,
+        token: &str,
+        subject: &RequestSubject,
+        storage_id: &str,
+    ) -> AppResult<()> {
         let mut batches = self.batches.lock().await;
         let now = Instant::now();
         batches.retain(|_, batch| batch.expires_at > now);
         let Some(batch) = batches.get(token) else {
             return Ok(());
         };
-        if batch.storage_id != storage_id {
+        if &batch.subject != subject || batch.storage_id != storage_id {
             return Err(AppError::Forbidden);
         }
         batches.remove(token);
@@ -195,6 +205,9 @@ pub async fn prepare_upload_batch(
 ) -> AppResult<Json<PrepareUploadBatchResponse>> {
     let share = resolve_share(&state, &headers, &query).await?;
     ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Upload).await?;
+    let subject = auth::current_request_subject(&state, &headers)
+        .await
+        .ok_or(AppError::Forbidden)?;
     let policy = state.config_file.read().await.clone();
     if body.items.is_empty() || body.items.len() > policy.max_upload_batch_entries {
         return Err(AppError::PayloadTooLarge);
@@ -229,7 +242,7 @@ pub async fn prepare_upload_batch(
     }
     let ticket = state
         .upload_batches
-        .create(share.storage_id, validated)
+        .create(subject, share.storage_id, validated)
         .await?;
     Ok(Json(PrepareUploadBatchResponse { ticket }))
 }
@@ -242,9 +255,12 @@ pub async fn cancel_upload_batch(
 ) -> AppResult<Json<serde_json::Value>> {
     let share = resolve_share(&state, &headers, &query).await?;
     ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Upload).await?;
+    let subject = auth::current_request_subject(&state, &headers)
+        .await
+        .ok_or(AppError::Forbidden)?;
     state
         .upload_batches
-        .cancel(&body.ticket, &share.storage_id)
+        .cancel(&body.ticket, &subject, &share.storage_id)
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
@@ -252,6 +268,10 @@ pub async fn cancel_upload_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn subject(value: &str) -> RequestSubject {
+        RequestSubject::Session(value.into())
+    }
 
     fn items() -> HashMap<String, u64> {
         HashMap::from([
@@ -263,28 +283,44 @@ mod tests {
     #[tokio::test]
     async fn ticket_is_bound_to_storage_path_and_size() {
         let store = UploadBatchStore::new(Duration::from_secs(60));
-        let ticket = store.create("local".into(), items()).await.unwrap();
+        let owner = subject("owner");
+        let ticket = store
+            .create(owner.clone(), "local".into(), items())
+            .await
+            .unwrap();
 
         assert!(matches!(
-            store.begin(&ticket, "other", "folder/one.txt", 11).await,
+            store
+                .begin(&ticket, &owner, "other", "folder/one.txt", 11)
+                .await,
             Err(AppError::Forbidden)
         ));
         assert!(matches!(
             store
-                .begin(&ticket, "local", "folder/unknown.txt", 11)
+                .begin(&ticket, &subject("attacker"), "local", "folder/one.txt", 11,)
+                .await,
+            Err(AppError::Forbidden)
+        ));
+        assert!(matches!(
+            store
+                .begin(&ticket, &owner, "local", "folder/unknown.txt", 11)
                 .await,
             Err(AppError::BadRequest(_))
         ));
         assert!(matches!(
-            store.begin(&ticket, "local", "folder/one.txt", 12).await,
+            store
+                .begin(&ticket, &owner, "local", "folder/one.txt", 12)
+                .await,
             Err(AppError::BadRequest(_))
         ));
         store
-            .begin(&ticket, "local", "folder/one.txt", 11)
+            .begin(&ticket, &owner, "local", "folder/one.txt", 11)
             .await
             .unwrap();
         assert!(matches!(
-            store.begin(&ticket, "local", "folder/one.txt", 11).await,
+            store
+                .begin(&ticket, &owner, "local", "folder/one.txt", 11)
+                .await,
             Err(AppError::Conflict(_))
         ));
     }
@@ -292,26 +328,32 @@ mod tests {
     #[tokio::test]
     async fn failed_item_can_retry_and_completed_batch_is_removed() {
         let store = UploadBatchStore::new(Duration::from_secs(60));
-        let ticket = store.create("local".into(), items()).await.unwrap();
+        let owner = subject("owner");
+        let ticket = store
+            .create(owner.clone(), "local".into(), items())
+            .await
+            .unwrap();
 
         store
-            .begin(&ticket, "local", "folder/one.txt", 11)
+            .begin(&ticket, &owner, "local", "folder/one.txt", 11)
             .await
             .unwrap();
         store.finish(&ticket, "folder/one.txt", false).await;
         store
-            .begin(&ticket, "local", "folder/one.txt", 11)
+            .begin(&ticket, &owner, "local", "folder/one.txt", 11)
             .await
             .unwrap();
         store.finish(&ticket, "folder/one.txt", true).await;
 
         store
-            .begin(&ticket, "local", "folder/two.txt", 22)
+            .begin(&ticket, &owner, "local", "folder/two.txt", 22)
             .await
             .unwrap();
         store.finish(&ticket, "folder/two.txt", true).await;
         assert!(matches!(
-            store.begin(&ticket, "local", "folder/one.txt", 11).await,
+            store
+                .begin(&ticket, &owner, "local", "folder/one.txt", 11)
+                .await,
             Err(AppError::BadRequest(_))
         ));
     }
@@ -319,16 +361,26 @@ mod tests {
     #[tokio::test]
     async fn cancellation_is_storage_bound_and_idempotent() {
         let store = UploadBatchStore::new(Duration::from_secs(60));
-        let ticket = store.create("local".into(), items()).await.unwrap();
+        let owner = subject("owner");
+        let ticket = store
+            .create(owner.clone(), "local".into(), items())
+            .await
+            .unwrap();
 
         assert!(matches!(
-            store.cancel(&ticket, "other").await,
+            store.cancel(&ticket, &owner, "other").await,
             Err(AppError::Forbidden)
         ));
-        store.cancel(&ticket, "local").await.unwrap();
-        store.cancel(&ticket, "local").await.unwrap();
         assert!(matches!(
-            store.begin(&ticket, "local", "folder/one.txt", 11).await,
+            store.cancel(&ticket, &subject("attacker"), "local").await,
+            Err(AppError::Forbidden)
+        ));
+        store.cancel(&ticket, &owner, "local").await.unwrap();
+        store.cancel(&ticket, &owner, "local").await.unwrap();
+        assert!(matches!(
+            store
+                .begin(&ticket, &owner, "local", "folder/one.txt", 11)
+                .await,
             Err(AppError::BadRequest(_))
         ));
     }

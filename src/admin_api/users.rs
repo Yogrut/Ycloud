@@ -63,6 +63,7 @@ pub async fn update_user_account(
         _ => None,
     };
     let user_id = id.clone();
+    let _auth_guard = state.auth_transitions.lock().await;
     let view = state
         .update_config(move |config| {
             let account = config
@@ -94,6 +95,7 @@ pub async fn delete_user_account(
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
     let user_id = id.clone();
+    let _auth_guard = state.auth_transitions.lock().await;
     state
         .update_config(move |config| {
             let before = config.user_accounts.len();

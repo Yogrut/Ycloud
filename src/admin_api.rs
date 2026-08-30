@@ -940,6 +940,7 @@ pub async fn update_admin_account(
             .as_deref()
             .is_some_and(|username| !username.trim().is_empty());
     let gate_changed = global_web_password_hash.is_some();
+    let _auth_guard = state.auth_transitions.lock().await;
     state
         .update_config(move |config| {
             if let Some(username) = body.username {
@@ -1033,6 +1034,7 @@ pub async fn update_lock(
         }
         _ => None,
     };
+    let _auth_guard = state.auth_transitions.lock().await;
     let result = state
         .update_config(move |config| {
             if let Some(path) = body.path.as_ref() {
@@ -1071,6 +1073,7 @@ pub async fn delete_lock(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> AppResult<StatusCode> {
     let revoked_id = id.clone();
+    let _auth_guard = state.auth_transitions.lock().await;
     state
         .update_config(move |config| {
             let original_length = config.folder_locks.len();

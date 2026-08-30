@@ -163,6 +163,9 @@ pub struct Config {
     pub public_base_url: Option<String>,
     pub public_host: Option<String>,
     pub trusted_proxy_ips: HashSet<IpAddr>,
+    /// Additional exact Host authorities accepted only in local/LAN mode.
+    /// Public proxy mode always uses `public_host` exclusively.
+    pub allowed_hosts: HashSet<String>,
     /// Exact origins that administrators may use for MinIO/RustFS or generic
     /// S3 endpoints. Official Alibaba and Tencent endpoints are constrained by
     /// their provider presets instead.
@@ -702,6 +705,7 @@ mod tests {
             public_base_url: None,
             public_host: None,
             trusted_proxy_ips: Default::default(),
+            allowed_hosts: Default::default(),
             s3_allowed_endpoints: [endpoint].into_iter().collect(),
         };
         let settings = S3StorageConfig {

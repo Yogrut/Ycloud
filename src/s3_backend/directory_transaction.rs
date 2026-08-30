@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use aws_smithy_types::byte_stream::ByteStream;
+use axum::http::HeaderValue;
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -502,6 +503,20 @@ impl S3Backend {
         }
         let content_length = i64::try_from(data.len())
             .map_err(|_| AppError::ServiceUnavailable("对象存储目录事务记录过大".into()))?;
+        if self.is_alibaba_oss() {
+            if let Some(expected_etag) = previous_etag {
+                let current = self.head_key(key).await?;
+                if current
+                    .as_ref()
+                    .and_then(|metadata| metadata.etag.as_deref())
+                    != Some(expected_etag)
+                {
+                    return Err(AppError::ServiceUnavailable(
+                        "对象存储目录事务记录在更新前发生变化".into(),
+                    ));
+                }
+            }
+        }
         let _permit = self.acquire_request().await?;
         let mut request = self
             .client
@@ -511,14 +526,27 @@ impl S3Backend {
             .content_length(content_length)
             .content_type("application/json")
             .body(ByteStream::from(data));
-        request = if let Some(etag) = previous_etag {
-            request.if_match(etag)
+        if !self.is_alibaba_oss() {
+            request = if let Some(etag) = previous_etag {
+                request.if_match(etag)
+            } else {
+                request.if_none_match("*")
+            };
+        }
+        let result = if self.is_alibaba_oss() && previous_etag.is_none() {
+            request
+                .customize()
+                .mutate_request(|request| {
+                    request
+                        .headers_mut()
+                        .insert("x-oss-forbid-overwrite", HeaderValue::from_static("true"));
+                })
+                .send()
+                .await
         } else {
-            request.if_none_match("*")
+            request.send().await
         };
-        request
-            .send()
-            .await
+        result
             .map_err(|error| {
                 tracing::error!(
                     error_kind = %error.as_service_error().map_or("transport", |_| "service"),

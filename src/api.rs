@@ -537,9 +537,12 @@ pub async fn upload_file(
         ));
     }
     if let (Some(ticket), Some(size)) = (query.batch.as_deref(), expected_bytes) {
+        let subject = crate::auth::current_request_subject(&state, &headers)
+            .await
+            .ok_or(AppError::Forbidden)?;
         state
             .upload_batches
-            .begin(ticket, &share.storage_id, &storage_path, size)
+            .begin(ticket, &subject, &share.storage_id, &storage_path, size)
             .await?;
     }
     let upload_result = backend
@@ -701,16 +704,41 @@ pub async fn unlock_folder(
         )
         .into_response());
     };
-    if body.password.len() > 1_024 || !state.passwords.verify(password_hash, body.password).await {
+    if body.password.len() > 1_024
+        || !state
+            .passwords
+            .verify(password_hash.clone(), body.password)
+            .await
+    {
         return Ok(
             Json(serde_json::json!({ "success": false, "message": "Wrong password" }))
                 .into_response(),
         );
     }
 
+    let auth_guard = state.auth_transitions.lock().await;
+    let lock_is_current = state
+        .config_file
+        .read()
+        .await
+        .folder_locks
+        .iter()
+        .any(|lock| {
+            lock.id == lock_id
+                && lock.password_hash == password_hash
+                && lock.matches(&share.storage_id, &storage_path)
+        });
+    if !lock_is_current {
+        drop(auth_guard);
+        return Ok(
+            Json(serde_json::json!({ "success": false, "message": "Wrong password" }))
+                .into_response(),
+        );
+    }
     let mut response =
         Json(serde_json::json!({ "success": true, "message": "Folder unlocked" })).into_response();
     let token = state.folder_access.create(lock_id.clone()).await;
+    drop(auth_guard);
     let cookie = session_cookie(
         &format!("folder_key_{lock_id}"),
         &token,

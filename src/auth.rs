@@ -119,6 +119,17 @@ pub enum SessionPrincipal {
     User(String),
 }
 
+/// Exact browser credential that initiated a short-lived server-side task.
+///
+/// Tickets bind to the credential token rather than only the account so a
+/// leaked ticket cannot be consumed from another session of the same account.
+/// The value remains in memory and must never be logged or serialized.
+#[derive(Clone, Eq, PartialEq)]
+pub enum RequestSubject {
+    Session(String),
+    Gate(String),
+}
+
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, Session>>,
     max_total: usize,
@@ -493,7 +504,7 @@ pub async fn login_handler(
         ordinary_candidate
             .as_ref()
             .map(|(_, hash, _)| hash.clone())
-            .unwrap_or(admin_hash)
+            .unwrap_or_else(|| admin_hash.clone())
     };
     let password_valid = valid_password_length(&body.password)
         && state.passwords.verify(password_hash, body.password).await;
@@ -517,17 +528,19 @@ pub async fn login_handler(
         .into_response();
     }
     let mut second_factor_valid = !administrator || admin_totp_secret.is_none();
+    let mut used_totp_counter = None;
     let mut used_recovery_hash = None;
     if administrator && password_valid {
         if let Some(secret) = admin_totp_secret.as_deref() {
             let supplied = body.totp_code.as_deref().unwrap_or("").trim();
-            second_factor_valid = crate::totp::verify_now(secret, supplied);
+            used_totp_counter = crate::totp::verify_now_counter(secret, supplied);
+            second_factor_valid = used_totp_counter.is_some();
             if !second_factor_valid {
                 let recovery = crate::totp::normalize_recovery_code(supplied);
                 if recovery.len() == 10 {
-                    for hash in recovery_hashes {
+                    for hash in &recovery_hashes {
                         if state.passwords.verify(hash.clone(), recovery.clone()).await {
-                            used_recovery_hash = Some(hash);
+                            used_recovery_hash = Some(hash.clone());
                             second_factor_valid = true;
                             break;
                         }
@@ -544,12 +557,71 @@ pub async fn login_handler(
                 .is_some_and(|(_, _, enabled)| *enabled));
 
     if authenticated {
+        // Credential verification is intentionally expensive and happens
+        // outside this lock. Before issuing a session, serialize against all
+        // credential changes and prove that the verified snapshot is still
+        // current. This closes the "verify old credential, then revoke, then
+        // issue a new session" race.
+        let auth_guard = state.auth_transitions.lock().await;
+        let snapshot_is_current = {
+            let config = state.config_file.read().await;
+            if administrator {
+                config.admin_username == admin_username
+                    && config.admin_password_hash == admin_hash
+                    && config.admin_totp_secret == admin_totp_secret
+                    && used_recovery_hash.as_ref().is_none_or(|used_hash| {
+                        config.admin_recovery_code_hashes.contains(used_hash)
+                    })
+            } else {
+                ordinary_candidate
+                    .as_ref()
+                    .and_then(|(id, password_hash, _)| {
+                        config
+                            .user_accounts
+                            .iter()
+                            .find(|account| account.id == *id)
+                            .map(|account| {
+                                account.enabled
+                                    && account.username == supplied_username
+                                    && account.password_hash == *password_hash
+                            })
+                    })
+                    .unwrap_or(false)
+            }
+        };
+        if !snapshot_is_current {
+            drop(auth_guard);
+            if let Err(error) = state
+                .login_security
+                .record_failure(entry, ip, user_agent, policy)
+                .await
+            {
+                return login_security_error(error);
+            }
+            return invalid_login_response(entry);
+        }
+        if let Some(counter) = used_totp_counter {
+            if !state.admin_totp_replay.consume(counter).await {
+                drop(auth_guard);
+                if let Err(error) = state
+                    .login_security
+                    .record_failure(entry, ip, user_agent, policy)
+                    .await
+                {
+                    return login_security_error(error);
+                }
+                return invalid_login_response(entry);
+            }
+        }
         if let Some(used_hash) = used_recovery_hash {
             if let Err(error) = state
                 .update_config(move |config| {
-                    config
+                    let index = config
                         .admin_recovery_code_hashes
-                        .retain(|hash| hash != &used_hash);
+                        .iter()
+                        .position(|hash| hash == &used_hash)
+                        .ok_or(AppError::Forbidden)?;
+                    config.admin_recovery_code_hashes.remove(index);
                     Ok(())
                 })
                 .await
@@ -577,6 +649,7 @@ pub async fn login_handler(
                 )
                 .await
         };
+        drop(auth_guard);
         json_with_cookie(
             LoginResponse {
                 success: true,
@@ -748,9 +821,9 @@ pub async fn gate_handler(
         Ok(false) => {}
         Err(error) => return login_security_error(error),
     }
-    let authenticated = match password_hash {
+    let authenticated = match password_hash.as_ref() {
         Some(hash) if valid_password_length(&body.password) => {
-            state.passwords.verify(hash, body.password).await
+            state.passwords.verify(hash.clone(), body.password).await
         }
         Some(_) => false,
         None => is_loopback,
@@ -766,6 +839,18 @@ pub async fn gate_handler(
         return invalid_login_response(LoginEntry::Web);
     }
 
+    let auth_guard = state.auth_transitions.lock().await;
+    if state.config_file.read().await.global_web_password_hash != password_hash {
+        drop(auth_guard);
+        if let Err(error) = state
+            .login_security
+            .record_failure(LoginEntry::Web, ip, user_agent, web_policy)
+            .await
+        {
+            return login_security_error(error);
+        }
+        return invalid_login_response(LoginEntry::Web);
+    }
     if let Err(error) = state
         .login_security
         .record_success(LoginEntry::Web, ip, user_agent)
@@ -775,6 +860,7 @@ pub async fn gate_handler(
     }
 
     let token = state.gate_access.create("__gate__".into()).await;
+    drop(auth_guard);
     json_with_cookie(
         LoginResponse {
             success: true,
@@ -933,6 +1019,23 @@ pub async fn current_principal(
             .any(|account| account.id == *id && account.enabled)
             .then_some(principal),
     }
+}
+
+pub async fn current_request_subject(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<RequestSubject> {
+    if let Some(token) = extract_session_token(headers) {
+        if current_principal(state, headers).await.is_some() {
+            return Some(RequestSubject::Session(token));
+        }
+    }
+    if let Some(token) = extract_gate_token(headers) {
+        if state.gate_access.get_scope(&token).await.is_some() {
+            return Some(RequestSubject::Gate(token));
+        }
+    }
+    None
 }
 
 pub async fn is_admin_authenticated(state: &AppState, headers: &axum::http::HeaderMap) -> bool {

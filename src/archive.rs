@@ -19,6 +19,7 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::{
+    auth::{self, RequestSubject},
     error::{AppError, AppResult},
     file_access::{
         ensure_storage_action, resolve_share, share_storage_path, validate_batch_size, FileQuery,
@@ -42,6 +43,7 @@ pub struct ArchiveTicketStore {
 
 #[derive(Clone)]
 struct ArchiveTicket {
+    subject: RequestSubject,
     storage_id: String,
     files: Vec<ArchiveFile>,
     archive_name: String,
@@ -74,6 +76,7 @@ impl ArchiveTicketStore {
 
     async fn create(
         &self,
+        subject: RequestSubject,
         storage_id: String,
         files: Vec<ArchiveFile>,
         archive_name: String,
@@ -89,6 +92,7 @@ impl ArchiveTicketStore {
         tickets.insert(
             token.clone(),
             ArchiveTicket {
+                subject,
                 storage_id,
                 files,
                 archive_name,
@@ -98,10 +102,17 @@ impl ArchiveTicketStore {
         Ok(token)
     }
 
-    async fn take(&self, token: &str) -> Option<ArchiveTicket> {
+    async fn take(&self, token: &str, subject: &RequestSubject) -> Option<ArchiveTicket> {
         let mut tickets = self.tickets.lock().await;
-        let ticket = tickets.remove(token)?;
-        (ticket.created_at.elapsed() <= TICKET_TTL).then_some(ticket)
+        let ticket = tickets.get(token)?;
+        if ticket.created_at.elapsed() > TICKET_TTL {
+            tickets.remove(token);
+            return None;
+        }
+        if &ticket.subject != subject {
+            return None;
+        }
+        tickets.remove(token)
     }
 
     pub async fn clear(&self) {
@@ -154,6 +165,9 @@ pub async fn prepare_archive(
     validate_batch_size(&body.paths)?;
     let share = resolve_share(&state, &headers, &query).await?;
     ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Download).await?;
+    let subject = auth::current_request_subject(&state, &headers)
+        .await
+        .ok_or(AppError::Forbidden)?;
     let backend = state.storage_backend(&share.storage_id).await?;
     let authorizer = FolderLockAuthorizer::new(&state, &headers, &share.storage_id).await;
     let normalized = body
@@ -202,7 +216,7 @@ pub async fn prepare_archive(
     let file_count = files.len();
     let ticket = state
         .archive_tickets
-        .create(share.storage_id, files, archive_name)
+        .create(subject, share.storage_id, files, archive_name)
         .await?;
     Ok(Json(PrepareArchiveResponse {
         ticket,
@@ -284,11 +298,21 @@ pub async fn download_archive(
     Query(query): Query<ArchiveQuery>,
 ) -> AppResult<Response<Body>> {
     let stream_permit = state.archive_tickets.acquire_stream()?;
+    let subject = auth::current_request_subject(&state, &headers)
+        .await
+        .ok_or(AppError::Forbidden)?;
     let ticket = state
         .archive_tickets
-        .take(&query.ticket)
+        .take(&query.ticket, &subject)
         .await
         .ok_or(AppError::NotFound)?;
+    ensure_storage_action(
+        &state,
+        &headers,
+        &ticket.storage_id,
+        StorageAction::Download,
+    )
+    .await?;
     let authorizer = FolderLockAuthorizer::new(&state, &headers, &ticket.storage_id).await;
     for file in &ticket.files {
         authorizer.ensure_access(&file.storage_path)?;
@@ -438,8 +462,11 @@ fn deduplicate_paths(mut paths: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{archive_name, common_parent, deduplicate_paths, write_archive, ArchiveFile};
-    use crate::{storage::StorageService, storage_backend::StorageBackend};
+    use super::{
+        archive_name, common_parent, deduplicate_paths, write_archive, ArchiveFile,
+        ArchiveTicketStore,
+    };
+    use crate::{auth::RequestSubject, storage::StorageService, storage_backend::StorageBackend};
     use futures_util::io::AsyncReadExt as FuturesAsyncReadExt;
     use tokio::io::AsyncReadExt;
 
@@ -519,5 +546,25 @@ mod tests {
         );
         drop(permit);
         assert!(store.acquire_stream().is_ok());
+    }
+
+    #[tokio::test]
+    async fn archive_ticket_is_single_use_and_bound_to_request_subject() {
+        let store = ArchiveTicketStore::new();
+        let owner = RequestSubject::Session("owner".into());
+        let attacker = RequestSubject::Session("attacker".into());
+        let token = store
+            .create(
+                owner.clone(),
+                "local".into(),
+                Vec::new(),
+                "files.zip".into(),
+            )
+            .await
+            .unwrap();
+
+        assert!(store.take(&token, &attacker).await.is_none());
+        assert!(store.take(&token, &owner).await.is_some());
+        assert!(store.take(&token, &owner).await.is_none());
     }
 }

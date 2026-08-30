@@ -1,11 +1,15 @@
 use std::{sync::Arc, time::Duration};
 
 use aws_sdk_s3::{
-    config::{retry::RetryConfig, timeout::TimeoutConfig, BehaviorVersion, Credentials, Region},
+    config::{
+        retry::RetryConfig, timeout::TimeoutConfig, BehaviorVersion, Credentials, Region,
+        RequestChecksumCalculation, ResponseChecksumValidation,
+    },
     Client,
 };
 use aws_smithy_http_client::Builder as HttpClientBuilder;
 use aws_smithy_types::byte_stream::ByteStream;
+use axum::http::HeaderValue;
 use tokio::sync::{Mutex, Semaphore};
 
 use super::{
@@ -15,7 +19,8 @@ use super::{
 };
 use crate::{
     config::{
-        validate_storage_backend, Config, S3AddressingStyle, S3StorageConfig, StorageBackendConfig,
+        validate_storage_backend, Config, S3AddressingStyle, S3Provider, S3StorageConfig,
+        StorageBackendConfig,
     },
     error::{AppError, AppResult},
 };
@@ -45,6 +50,13 @@ impl S3Backend {
             .force_path_style(settings.addressing_style == S3AddressingStyle::Path)
             .disable_multi_region_access_points(true)
             .disable_s3_express_session_auth(true)
+            // The AWS SDK enables optional S3 checksum trailers by default.
+            // Third-party S3 implementations do not consistently support the
+            // aws-chunked trailer framing, so request checksums are used only
+            // for operations whose protocol model requires them. Ycloud still
+            // verifies Content-Length, ETag and downloaded bytes itself.
+            .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+            .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
             .retry_config(RetryConfig::standard().with_max_attempts(S3_MAX_ATTEMPTS))
             .timeout_config(timeouts);
 
@@ -62,6 +74,7 @@ impl S3Backend {
 
         Ok(Self {
             client: Client::from_conf(sdk_config.build()),
+            provider: settings.provider,
             bucket: settings.bucket.clone(),
             prefix: settings.prefix.clone(),
             request_gate: Arc::new(Semaphore::new(S3_REQUEST_CONCURRENCY)),
@@ -119,23 +132,33 @@ impl S3Backend {
         let length = i64::try_from(payload.len())
             .map_err(|_| AppError::ServiceUnavailable("对象存储激活探测数据无效".into()))?;
         let _permit = self.acquire_request().await?;
-        let output = self
+        let request = self
             .client
             .put_object()
             .bucket(&self.bucket)
             .key(source_key)
             .content_length(length)
-            .if_none_match("*")
-            .body(ByteStream::from(payload.to_vec()))
-            .send()
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
-                    "S3 activation write probe failed"
-                );
-                AppError::ServiceUnavailable("对象存储缺少安全写入权限或条件写入能力".into())
-            })?;
+            .body(ByteStream::from(payload.to_vec()));
+        let result = if self.provider == S3Provider::AlibabaOss {
+            request
+                .customize()
+                .mutate_request(|request| {
+                    request
+                        .headers_mut()
+                        .insert("x-oss-forbid-overwrite", HeaderValue::from_static("true"));
+                })
+                .send()
+                .await
+        } else {
+            request.if_none_match("*").send().await
+        };
+        let output = result.map_err(|error| {
+            tracing::warn!(
+                error_kind = %error.as_service_error().map_or("transport", |_| "service"),
+                "S3 activation write probe failed"
+            );
+            AppError::ServiceUnavailable("对象存储缺少安全写入权限或条件写入能力".into())
+        })?;
         let source_etag = output
             .e_tag()
             .map(str::to_owned)

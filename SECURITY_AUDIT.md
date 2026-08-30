@@ -6,9 +6,9 @@
 | --- | --- |
 | 文档版本 | 1.0 |
 | 编制日期 | 2026-08-29 |
-| 当前参考分支与提交 | `main` / `0961e39578f8fc8c6a68549234934da2a4c40694` |
-| 当前工作区状态 | 存在未提交改动，仅用于准备审核，不可作为正式审核结论基线 |
-| 正式审核提交 | 待冻结：`________________` |
+| 当前参考分支与提交 | `main` / `7994d40d4fe5c14670f1f145e034aab1742704e3` |
+| 原始功能基线 | `4fa46f69c07042ae01212eba662594b2877144b9`；保留为首轮预审起点 |
+| 安全加固基线 | `7994d40d4fe5c14670f1f145e034aab1742704e3`；代码已提交并冻结 |
 | 构建产物 SHA-256 | 待填写：`________________` |
 | 审核负责人 | 待填写 |
 | 复核人 | 待填写 |
@@ -28,6 +28,8 @@
 审核以机密性、完整性、可用性和可追责性为共同目标。安全结论不能只依据前端是否隐藏按钮，也不能只依据设计文档；后端执行路径、自动化测试和隔离环境中的动态验证缺一不可。
 
 ## 2. 范围与责任边界
+
+正式生产审核只覆盖 Linux 原生进程、Docker 和 Docker Compose。Windows 仅作为开发、编译和本机回归环境；Windows 服务安装、ACL/DACL 与生产运维不属于发布支持范围，也不构成 Linux/容器 Release 的阻断项。
 
 ### 2.1 纳入范围
 
@@ -60,6 +62,7 @@ S3 凭据最小权限属于第三方账号的部署策略，不是 Ycloud 能单
 - 不把真实管理员密码、TOTP 种子、恢复码、Session、S3 Key、WebDAV 密码或用户文件写入审核报告。
 - 不以扫描器“未发现问题”代替人工授权、路径和状态机审核。
 - 不自动执行 `npm audit fix`、无审查升级依赖或改变生产配置。
+- 不对 Windows 生产部署、Windows 服务身份或 DACL 加固作发布承诺；Windows 构建只用于开发兼容性检查。
 
 ## 3. 系统、资产与信任边界
 
@@ -148,7 +151,7 @@ WebDAV 客户端 ───── Basic Auth ────────────
 - [ ] 明确允许的压力上限、故障注入范围、恢复点和停止条件。
 - [ ] 校准测试机和服务器时间，TOTP 测试同时记录时间源。
 
-正式结论必须引用冻结后的提交；本文件顶部的提交只是编制文档时的参考 HEAD，因为当前工作区存在大量未提交改动。
+正式结论必须引用冻结后的提交。`4fa46f69c07042ae01212eba662594b2877144b9` 是首个冻结功能基线，`7994d40d4fe5c14670f1f145e034aab1742704e3` 是在其上完成首批安全加固并通过当前自动化门禁的代码基线；后续修复仍必须形成新提交并重新记录产物哈希。
 
 ### 5.1 最小环境矩阵
 
@@ -156,10 +159,10 @@ WebDAV 客户端 ───── Basic Auth ────────────
 
 | 维度 | 必测环境 |
 | --- | --- |
-| 操作系统/文件系统 | Windows + NTFS；Linux + 常见本地文件系统；实际使用的容器卷或网络盘另列 |
+| 操作系统/文件系统 | Linux + 实际生产文件系统；Docker/Compose 使用的 bind mount、named volume 或网络盘另列。Windows 仅做非阻断开发回归 |
 | 网络模式 | 回环直连；显式可信 LAN；公网 HTTPS 反向代理；禁止的错误组合 |
 | 本地存储 | 默认存储根；预声明额外挂载；只读/权限错误/磁盘满/外部进程改动 |
-| 对象存储 | 阿里 OSS、腾讯 COS、MinIO/RustFS、目标通用 S3；每类使用隔离 Bucket/Prefix |
+| 对象存储 | 阿里 OSS、腾讯 COS、MinIO、RustFS、通用 S3 配置分支；每类使用隔离 Bucket/Prefix。腾讯 COS、阿里 OSS、MinIO、RustFS 基础真实 smoke 以及基于 MinIO 的 `s3_compatible` 配置分支 smoke 已于 2026-08-30 通过；MinIO 与 RustFS 另已通过 65 MiB Multipart、错误凭据拒绝、首片提交后的客户端断流与 Multipart 残留检查、UploadPart 传输中 TCP 断连和恢复清理，以及即时 Abort 同样断网后的持久化会话恢复；未据此声称 AWS S3 或任意未测试第三方实现已通过 |
 | 身份 | 匿名、网页访客、管理员、启用/禁用普通账号、只读/部分/完整权限账号、WebDAV 挂载 |
 | 2FA | 未启用、已启用、正常 TOTP、时钟偏差、恢复码、恢复码耗尽 |
 | 浏览器/客户端 | Chromium 系、Firefox；实际支持的 WebDAV 客户端；移动端只验证安全行为差异 |
@@ -172,22 +175,22 @@ WebDAV 客户端 ───── Basic Auth ────────────
 | 控制 | 代码证据 | 当前证据级别 | 动态审核重点 |
 | --- | --- | --- | --- |
 | 默认回环监听；非回环模式显式校验 | `src/config/runtime.rs` | 已实现 | 错误组合能否启动；代理与局域网边界 |
-| 可信代理、Host、Proto 和单值转发头校验 | `src/security.rs::proxy_boundary_middleware` | 已实现并有单元测试 | 多层代理、IPv4/IPv6、重复头和直连绕过 |
+| 可信代理、Host、Proto 和单值转发头校验 | `src/security.rs::proxy_boundary_middleware` | 已实现并有单元测试；本地自定义 Authority 使用 `ALLOWED_HOSTS` | 多层代理、IPv4/IPv6、重复头、DNS 变化和直连绕过 |
 | HttpOnly、SameSite=Strict、可配置 Secure Cookie | `src/security.rs::session_cookie` | 已实现并有单元测试 | 公网所有令牌是否都带 Secure；注销清除一致性 |
 | Cookie 认证的同源/Origin CSRF 校验 | `src/security.rs::csrf_middleware` | 已实现 | 无 Origin、旧客户端、代理重写和各写路由覆盖 |
 | CSP、DENY frame、nosniff、Referrer/Permissions Policy、公开模式 HSTS | `src/security.rs::security_headers_middleware` | 已实现 | 所有错误、流式和静态响应是否覆盖 |
 | 管理员、普通账号、网页访问和 WebDAV 边界 | `src/auth.rs`、`src/file_access.rs`、`src/webdav.rs` | 已实现 | 每个对象级操作和权限撤销 |
 | Argon2 密码哈希、未知账号仍执行哈希验证 | `src/config/password.rs`、`src/auth.rs::login_handler` | 已实现 | 参数基线、并发上限、计时和拒绝服务 |
-| 管理员 TOTP、二维码、哈希恢复码和启停后会话处理 | `src/totp.rs`、`src/admin_api.rs` | 已实现 | 重放、并发使用恢复码、时钟偏差、秘密生命周期 |
+| 管理员 TOTP、二维码、哈希恢复码和启停后会话处理 | `src/totp.rs`、`src/admin_api.rs` | 单实例 TOTP 计数器防重放、恢复码原子消费和认证转换锁已实现 | 多实例共享状态、并发使用恢复码、时钟偏差、秘密生命周期 |
 | 会话和访问令牌的总量/单主体上限 | `src/auth.rs` | 已实现并有单元测试 | 权限变化、集群、TTL、窃取和轮换 |
 | 路由 Body 上限、常规/上传超时和敏感头日志标记 | `src/app.rs` | 已实现 | chunked 请求、慢客户端、代理限制是否一致 |
-| 本地路径规范化、拒绝 `..`、反斜线、冒号、系统目录和链接/重解析点 | `src/storage/path.rs` | 已实现并有单元测试 | 竞态、硬链接、挂载点、Unicode 和 Windows 名称 |
+| 本地路径规范化、拒绝 `..`、反斜线、冒号、系统目录和链接 | `src/storage/path.rs` | 已实现并有单元测试 | Linux 竞态、硬链接、挂载点和 Unicode 名称 |
 | 原子写入、事务区、恢复和磁盘保留 | `src/storage/`、`src/storage_transaction.rs`、`src/capacity.rs` | 已实现 | 崩溃点、磁盘满、断电、并发覆盖 |
-| 上传批次大小/条目/票据限制 | `src/upload_batch.rs` | 已实现并有单元测试 | 票据主体绑定、并发、取消、过期和权限撤销 |
-| ZIP 大小/条目/并发/票据/空闲超时和源文件变更检查 | `src/archive.rs` | 已实现并有单元测试 | 票据主体绑定、授权复查、客户端断开和名称安全 |
+| 上传批次大小/条目/票据限制 | `src/upload_batch.rs` | 已绑定具体 Session 并有交换测试 | 并发、取消、过期和权限撤销 |
+| ZIP 大小/条目/并发/票据/空闲超时和源文件变更检查 | `src/archive.rs` | 已绑定具体 Session/Gate、消费时复查权限并有单次/交换测试 | 客户端断开、权限瞬时变化和名称安全 |
 | S3 官方 Endpoint 约束和自建 Endpoint 精确允许列表 | `src/config/validation.rs`、`src/config/runtime.rs` | 已实现 | DNS、重定向、私网地址、TLS 和凭据目标 |
 | S3/TOTP 敏感字段 AES-256-GCM 加密，密文绑定上下文 | `src/config/secret_store.rs`、`src/config/persistence.rs` | 已实现并有单元测试 | 主密钥备份、迁移、轮换、文件 ACL 和故障恢复 |
-| Windows DPAPI；Unix 主密钥/配置/日志权限收紧 | `src/config/secret_store.rs`、`src/config/persistence.rs`、`src/login_security.rs` | 部分平台实现 | 实际服务账号、ACL、容器卷、备份恢复 |
+| Unix 主密钥/配置/日志权限收紧；容器支持只读外部 Secret 文件 | `src/config/secret_store.rs`、`src/config/persistence.rs`、`src/login_security.rs` | 已实现并需部署验证 | Linux 服务账号、文件 mode/owner、容器卷和备份恢复 |
 | 登录失败限制、人工封禁、事件保留和有界记录 | `src/login_security.rs` | 已实现 | 多实例一致性、NAT 误伤、日志完整性和磁盘故障 |
 | 锁文件、Cargo Deny 规则、npm CI 和 npm Dependabot | `Cargo.lock`、`deny.toml`、`frontend/package-lock.json`、`.github/` | 部分已配置 | Rust CI/Cargo 更新是否完整、例外是否过期、构建来源 |
 
@@ -286,8 +289,8 @@ WebDAV 客户端 ───── Basic Auth ────────────
 | --- | --- | --- | --- |
 | PATH-01 | P0 | 绝对路径、父级组件、空组件、点组件、反斜线、NUL、冒号和保留系统目录 | 所有入口统一规范化并在访问前拒绝危险路径 |
 | PATH-02 | P0 | URL 百分号解码、重复编码、UTF-8 异常和 WebDAV 路径 | 只按预期解码一次；路由层和存储层理解一致；非法编码安全拒绝 |
-| PATH-03 | P1 | Unicode 正规化、大小写碰撞、尾随点/空格、Windows 设备名和 ADS | 各支持平台行为被测试；不会映射到意外文件或覆盖不同名称 |
-| PATH-04 | P0 | 符号链接、Windows Junction/重解析点和链接到根外 | 创建前、打开前及递归遍历时均拒绝；不能借已有链接逃逸 |
+| PATH-03 | P1 | Unicode 正规化、大小写行为、尾随空格和实际生产文件系统名称规则 | 各正式支持文件系统的行为被测试；不会映射到意外文件或覆盖不同名称 |
+| PATH-04 | P0 | 符号链接、挂载点替换和链接到根外 | 创建前、打开前及递归遍历时均拒绝；不能借已有链接逃逸 |
 | PATH-05 | P0 | 检查与使用之间替换目录/链接的 TOCTOU | 高风险操作使用安全句柄/原子策略或有可证明的竞态防护 |
 | PATH-06 | P1 | 硬链接、挂载点、网络共享和跨卷重命名 | 支持边界明确；不能借硬链接访问未授权数据；跨卷失败可恢复 |
 | PATH-07 | P0 | `.ycloud-system`、事务临时名、容量账本和配置目录 | 浏览、WebDAV、S3 Key 和任何变体都不可访问或覆盖内部对象 |
@@ -348,11 +351,11 @@ WebDAV 客户端 ───── Basic Auth ────────────
 | ID | 优先级 | 审核内容 | 通过标准 |
 | --- | --- | --- | --- |
 | KEY-01 | P0 | S3 Secret、Access Key 和 TOTP 种子静态存储 | 敏感字段使用带随机 Nonce 的认证加密；密文绑定字段/存储上下文；篡改后拒绝启动或加载 |
-| KEY-02 | P0 | 单机自动主密钥的生成和权限 | 使用 CSPRNG；原子创建；Windows 绑定预期服务账号的 DPAPI；Unix 目录 0700/文件 0600 |
+| KEY-02 | P0 | Linux 单机自动主密钥的生成和权限 | 使用 CSPRNG；原子创建；目录 0700、文件 0600；仅运行服务账号可读 |
 | KEY-03 | P0 | `YCLOUD_CONFIG_KEY_FILE` 和 `YCLOUD_CONFIG_KEY` 优先级、格式和泄露面 | 文件优先且必须为普通小文件；环境变量仅作覆盖；错误不回显值；来源变化可诊断 |
 | KEY-04 | P0 | 主密钥与配置的备份、恢复和灾难演练 | 两者作为同一恢复单元受控备份；在全新主机成功恢复；密钥丢失行为明确且不静默重置 |
 | KEY-05 | P1 | 明文旧配置迁移、崩溃窗口和备份轮换 | 迁移后主配置与备份均无明文；中途中断不留下更宽权限副本 |
-| KEY-06 | P1 | 主密钥轮换/重加密和服务账号迁移 | 有原子、可回滚流程；旧密钥保留到验证完成；DPAPI 身份变化有操作说明 |
+| KEY-06 | P1 | 主密钥轮换/重加密和 Linux 服务账号迁移 | 有原子、可回滚流程；旧密钥保留到验证完成；owner/group/mode 变化有操作说明 |
 | KEY-07 | P1 | 内存、Core Dump、Swap、诊断导出和前端表单 | 不在前端持久存储秘密；日志和 Debug 脱敏；部署可关闭或保护 Core Dump |
 | KEY-08 | P1 | 配置 API、备份文件、初始凭据和临时文件权限 | 所有副本同等保护；API 只返回布尔“已配置”而非原值 |
 | KEY-09 | P2 | 威胁说明的真实性 | 明确“静态加密不防已控制 Ycloud 运行账号/宿主机管理员”，不作超出边界的宣传 |
@@ -440,9 +443,9 @@ WebDAV 客户端 ───── Basic Auth ────────────
 | T-26 | P1 | 同时施加登录、上传、下载、目录和 S3 慢响应负载 | 各资源上限生效；服务可恢复；无死锁或无界增长 |
 | T-27 | P1 | 重启与多实例条件下验证 Session、封禁、票据和恢复码 | 与声明的部署模式一致；不支持的集群拓扑被明确阻止或警告 |
 | T-28 | P0 | 在旧密码/旧锁密码异步验证期间执行改密、启用 2FA、禁用账号或修改锁，再释放验证请求 | 旧凭据不得在撤销动作完成后签发新的 Session/Gate/Unlock 令牌 |
-| T-29 | P0 | 未解锁时对含锁后代的父目录执行删除、重命名、移动、复制，并测试 Windows 路径别名 | 全部安全拒绝，或在明确授权后事务性迁移锁；任何别名都不能绕过 |
+| T-29 | P0 | 未解锁时对含锁后代的父目录执行删除、重命名、移动、复制，并测试 Linux 符号链接与路径别名 | 全部安全拒绝，或在明确授权后事务性迁移锁；任何别名都不能绕过 |
 | T-30 | P0 | S3 凭据轮换与旧明文配置迁移的每个保存点故障注入 | 主配置、备份和临时文件均不长期保留不应存在的旧/明文凭据 |
-| T-31 | P0 | Windows 第二个低权限本机账号读取或改写初始凭据、配置、备份、主密钥和安全日志 | 显式 DACL 阻止读取/修改；服务身份仍可正常启动和轮换 |
+| T-31 | 不适用 | Windows 生产服务 ACL/DACL | Windows 不属于正式部署支持范围；只保留编译和本机功能回归，不纳入 Release 签字 |
 | T-32 | P1 | 启用 Debug Trace 后执行带归档/上传票据、游标、敏感文件名的请求 | 日志只含路由模板和脱敏元数据，不含完整查询、票据或秘密 |
 | T-33 | P1 | 执行账号、2FA、权限、S3、WebDAV、锁和安全策略变更 | 产生结构化管理员审计事件，含主体/IP/request ID/字段名/结果但无旧值、新值或秘密 |
 | T-34 | P0 | 同一 IP 并发触发登录阈值，并让账号 A/WebDAV A 成功后继续攻击 B | Argon2 前原子限制；A 的成功不清除 B 的主体失败计数；全局 IP 桶仍限制扫描 |
@@ -485,14 +488,14 @@ npm audit --audit-level=moderate
 
 - 对整个 Git 历史运行支持脱敏输出的秘密扫描器；命中项需要验证历史是否公开，不能只删除当前文件。
 - 为 Release 生成 CycloneDX 或 SPDX SBOM，并与二进制/镜像 Digest 一起发布。
-- 在 Linux 与 Windows 分别运行路径、权限和事务测试；S3 集成测试使用一次性 Bucket/Prefix。
+- 在 Linux 原生与实际 Docker/Compose 卷上分别运行路径、权限和事务测试；Windows 只保留非阻断编译/回归；S3 集成测试使用一次性 Bucket/Prefix。
 - 将 Rust fmt、Clippy、测试、Deny/Audit 增加到受保护分支 CI。当前仓库可见前端工作流，正式审核需确认后端检查不是只靠本地执行。
 
 报告必须保存命令、退出码、工具版本、运行时间和完整脱敏输出。在线公告数据库不可用时可以保留离线结果，但不能据此声称“当前没有已知漏洞”；应注明数据库快照时间并补跑在线检查。
 
 ## 10. 静态预审候选项与优先验证假设
 
-本节来自编制文档时对**未冻结、未提交工作树**的静态走查，作用是安排正式审核顺序。表中的级别是初始建议，不是最终漏洞定级；除非写明“本机已观察”，均需在冻结基线上通过动态用例证明可利用性和影响。
+本节最初来自原始功能基线 `4fa46f69c07042ae01212eba662594b2877144b9` 的静态走查；首批修复现已绑定安全加固基线 `7994d40d4fe5c14670f1f145e034aab1742704e3`。本节用于安排正式审核顺序，表中的级别是初始建议，不是最终漏洞定级；除非写明已取得动态证据，均需通过隔离用例证明可利用性和影响。
 
 ### 10.1 静态预审候选项
 
@@ -501,14 +504,14 @@ npm audit --audit-level=moderate
 | PRE-01 | 高候选 | `/api/login`、`/api/gate` 未挂载 `auth.rs` 的固定窗口 `RateLimiter`；持久限制执行“检查封禁 → 异步 Argon2 → 记录失败”，见 `src/app.rs`、`src/auth.rs`、`src/login_security.rs` | 以并发屏障验证同一 IP 能否在阈值落盘前同时进入昂贵验证；将检查、计数与发放资格做原子状态转换，并设置入口级有界速率/队列 |
 | PRE-02 | 中高候选 | Account/WebDAV 失败状态按“入口类型 + IP”聚合，同一 IP 上任一该类账号成功可能清零其他账号攻击产生的计数，见 `src/login_security.rs::record_success` | 用两个账号/挂载交替成功与失败复现；状态至少纳入目标主体标识，同时处理 NAT 误伤、隐私和记录容量 |
 | PRE-03 | 高候选 | 管理员用户名、管理员密码和全局网页密码更新依赖已有管理员 Session，未见当前密码/2FA 重新认证；敏感配置变更没有完整安全事件，见 `src/admin_api.rs::update_admin_account` | 验证被窃长期 Session 的影响；高风险变更要求近期重新认证，并记录不含秘密的结构化管理审计事件 |
-| PRE-04 | 高候选 | 恢复码先通过异步 Argon2 验证，随后在独立配置更新中删除，见 `src/auth.rs::login_handler` | 两个并发请求使用同一恢复码，必须至多一个成功；采用原子消费或恢复码版本/锁 |
-| PRE-05 | 高候选 | 登录/网页 Gate/文件夹解锁先复制旧哈希或 2FA 状态，再异步验证并签发；改密、启用 2FA 或改锁后清理旧令牌，可能与仍在执行的旧验证交错，见 `src/auth.rs`、`src/admin_api.rs` | 用并发屏障验证旧凭据请求能否在清理后签发新令牌；为凭据/授权增加 epoch 并在签发和每次使用时校验，或将验证与签发绑定同一版本事务 |
+| PRE-04 | 已加固待复测 | 恢复码验证后在认证转换锁内确认仍存在并原子删除，见 `src/auth.rs::login_handler` | 用两个并发请求提交同一恢复码，确认至多一个成功且失败请求不获得 Session |
+| PRE-05 | 已加固待复测 | 登录、网页 Gate 和文件夹解锁在签发令牌前进入认证转换锁并重新匹配当前凭据；所有相关改密/禁用操作在同一锁内更新并撤销令牌 | 用并发屏障验证旧凭据请求不能在改密、启用 2FA、禁用账号或改锁完成后签发新令牌 |
 | PRE-06 | 高候选 | 文件夹锁匹配请求位于锁路径之下，但对锁目录的祖先执行删除/重命名/移动/复制时，单项和批量处理未见与后代锁双向重叠检查，见 `src/config.rs`、`src/api.rs`、`src/batch_operations.rs` | 在未解锁状态操作含锁子目录的父目录；树形变更必须拒绝，或在全部相关锁已授权后事务性迁移锁配置 |
-| PRE-07 | 高候选 | 运行时锁路径比较区分大小写；配置校验的部分 Windows 重叠比较却忽略大小写。配置路径校验还接受 `.`，而运行时规范化会折叠它，见 `src/config.rs`、`src/config/validation.rs`、锁/WebDAV 管理 API | 在 NTFS、大小写敏感卷和实际网络盘测试大小写、尾随点/空格、`.` 与 Unicode 别名；所有配置先经唯一后端感知的规范化，再持久化和比较 |
+| PRE-07 | 高候选 | 运行时锁路径比较与配置阶段的路径规范化规则不完全一致；配置路径校验还接受 `.`，而运行时规范化会折叠它，见 `src/config.rs`、`src/config/validation.rs`、锁/WebDAV 管理 API | 在正式 Linux 文件系统和实际容器卷测试大小写、尾随空格、`.`、Unicode 与链接别名；所有配置先经唯一后端感知的规范化，再持久化和比较 |
 | PRE-08 | 条件高候选 | 本地解析会拒绝最后存在祖先是链接并检查 canonical 根边界，但未使用逐组件 no-follow 句柄；指向同一存储根内其他目录的中间链接和检查/打开竞态需验证，见 `src/storage/path.rs`、`src/storage/response.rs` | 若挂载可被外部进程修改，测试跨 Share/锁别名及 TOCTOU；优先使用 handle-relative/no-follow 解析，或把“挂载由 Ycloud 独占且不得含链接”设为可验证部署前提 |
-| PRE-09 | 中高候选 | 归档票据保存存储和文件集合，不保存发起主体；消费时重新查文件夹锁，但未见重新执行 StorageAction::Download，见 `src/archive.rs` | 交换票据、注销、撤权和禁用存储后消费；票据绑定主体/Session/授权 epoch，消费时复查权限并确保 URL/Trace 日志脱敏 |
-| PRE-10 | 中候选 | 上传批次票据绑定 storage/path/size，但不绑定主体；每次上传仍会查 Upload 权限，见 `src/upload_batch.rs` | 同存储两个有上传权主体交换、抢占和取消票据；绑定主体/Session，并为票据查询参数和访问日志脱敏 |
-| PRE-11 | 高候选（平台/部署） | Windows 的 `secure_file_permissions` 分支为空，初始明文凭据、配置、备份和安全日志依赖目录继承 DACL，见 `src/config/persistence.rs`、`src/login_security.rs`。本机预审观察到当前开发目录对普通已认证用户存在继承读或修改权限，该证据不能泛化到其他部署 | 在正式 Windows 服务目录用第二个低权限账号实测；显式设置仅服务身份、Administrators、SYSTEM 所需 ACL，并验证所有主/备份/临时文件 |
+| PRE-09 | 已加固待复测 | 归档票据已绑定具体 Session/Gate；错误主体不消费票据，下载开始前重新检查 Download 权限、存储状态和文件夹锁；Trace 不记录查询字符串 | 动态执行交换票据、注销、撤权、禁用存储和并发单次消费测试 |
+| PRE-10 | 已加固待复测 | 上传批次票据已绑定具体 Session，同时保留 storage/path/size 和每次 Upload 权限检查；取消操作也验证主体 | 动态执行同存储不同账号/会话交换、抢占、取消、过期和权限撤销测试 |
+| PRE-11 | 不适用（范围排除） | Windows 的 `secure_file_permissions` 不提供生产 DACL 加固 | Windows 仅用于开发编译与本机回归；不纳入生产支持或 Linux/容器发布门禁，并在 README 明示该边界 |
 | PRE-12 | 高候选 | 普通 S3 凭据更新只保存一次配置，`.bak` 可能保留更新前的可解密密文；待添加/删除路径另有双写清理，见 `src/state.rs` | 轮换前后检查主/备份；明确安全备份历史策略，或刷新旧备份，并要求 Provider 端立即吊销旧凭据 |
 | PRE-13 | 高候选 | 旧明文配置迁移通过连续保存两次擦除明文备份；两次保存之间崩溃可能留下“加密主配置 + 明文备份”，见 `src/config/persistence.rs` | 在两个发布点间故障注入并重启；启动时主动检测所有恢复副本的明文敏感字段，迁移/擦除必须可恢复且原子 |
 | PRE-14 | 中高候选 | 自建 S3 白名单可以显式批准 HTTP Origin；精确 Origin 比较不固定 DNS 解析结果，见 `src/config/runtime.rs`、`src/s3_backend/client.rs` | 使用假凭据验证明文、DNS 变化、重定向、代理、TLS/SNI；考虑独立 `ALLOW_INSECURE_S3_HTTP` 与持续 UI 警告，生产结合出站防火墙 |
@@ -517,20 +520,20 @@ npm audit --audit-level=moderate
 | PRE-17 | 中候选 | `IO_CONCURRENCY`、`MAX_LIST_ENTRIES`、常规/上传超时和磁盘保留等运行环境值主要做类型解析，合理非零上下界需复核，见 `src/config/runtime.rs` | 对极端值做启动矩阵；给可配置项宽松但有限的部署 envelope，避免关闭安全超时或生成巨型响应 |
 | PRE-18 | 中候选 | `S3StorageConfig` 有脱敏 Debug，但包含已解密 TOTP/密码哈希等内容的上层配置类型仍可被未来 Debug 输出；进程内 S3 Secret 是可克隆 `String` | 全局搜索 Debug/Trace，增加脱敏包装/Debug；限制 Core Dump、调试和崩溃报告，明确静态加密不保护进程内存 |
 | PRE-19 | 中候选 | 后端依赖检查、Rust 测试和 Clippy 未见进入当前 GitHub Actions；Cargo Dependabot、SBOM、产物签名和来源证明也未见完整配置 | 把 Rust 门禁纳入受保护分支；固定工具和 Action；生成 SBOM/校验和；持续复核 RustSec 例外 |
-| PRE-20 | 中候选 | TOTP 校验接受当前计数器前后各一个窗口，但未记录已消费计数器，同一验证码可在窗口内重复创建 Session，见 `src/totp.rs`、`src/auth.rs` | 并发和顺序重放必须至多一次成功；保存短期已消费 counter，集群中使用共享原子状态 |
+| PRE-20 | 已加固待复测 | 单实例保存近期已消费 TOTP counter，同一验证码仅第一次可签发 Session，2FA 启停时清空旧状态，见 `src/totp.rs`、`src/auth.rs` | 执行并发和顺序重放；多实例部署必须使用共享原子状态或明确拒绝横向扩容 |
 | PRE-21 | 中候选 | 初始凭据文件同时包含管理员与网页门禁初始密码，只要其中任一密码变化就会删除该文件；另一默认凭据可能仍有效但提醒消失，见 `src/admin_api.rs`、`src/config/persistence.rs` | 分别只轮换一种凭据验证告警；独立持久化两种“已轮换”状态，明文文件删除不能代替安全状态管理 |
 | PRE-22 | 中低候选 | WebDAV 未知、禁用和已知挂载返回路径不同；用户名不匹配可在 Argon2 前返回，见 `src/webdav.rs` | 测量状态码和时间分布；未知用户名执行同成本虚拟验证，并按产品策略统一外部错误，内部保留真实原因 |
-| PRE-23 | 条件高候选 | `public_proxy_config` 在回环 Bind 时直接返回本地模式，可能忽略同机反向代理使用的 `PUBLIC_BASE_URL`/可信代理设置，见 `src/config/runtime.rs` | 明确部署模式而非仅从 Bind 推断；测试“回环应用 + 同机公网代理”，确保真实 IP、Host/Proto、HSTS 和 Gate 策略不退化 |
+| PRE-23 | 已加固待复测 | 只要配置 `PUBLIC_BASE_URL` 或 `TRUSTED_PROXY_IPS` 就进入严格公网代理模式，不再因回环 Bind 提前退回本地模式，见 `src/config/runtime.rs` | 在“回环应用 + 同机公网代理”实测真实 IP、Host/Proto、HSTS、Secure Cookie 和直连拒绝 |
 | PRE-24 | 低到中候选 | TOTP Secret、恢复码、`/api/me` 和管理员信息未见统一 `Cache-Control: no-store, private` | 审核代理/浏览器缓存；对认证、身份、管理员和秘密响应统一 no-store，代理明确不缓存 `/api/*` |
 | PRE-25 | 高候选 | 本地挂载目录先做词法去重/嵌套判断，后端稍后才 canonicalize；多个 S3 实例也可能配置相同 Origin/Bucket 与重叠 Prefix，见 `src/storage_catalog.rs`、`src/storage.rs`、`src/config/validation.rs` | 枚举全部启用实例按物理身份/规范对象命名空间比较；不同授权域不得指向同一或嵌套数据，或必须合并授权并持续告警 |
-| PRE-26 | 高候选 | 非 public 模式按 peer IP 放行而未见 Host 白名单；本地 CSRF Origin 由请求 Host 推导，回环无网页密码时还有自动 Gate，见 `src/security.rs`、`src/auth.rs` | 在回环/LAN 动态验证恶意 Host 与 DNS Rebinding；引入明确允许的 Host/Origin，自动 Gate 不能由重绑定域名继承 |
+| PRE-26 | 已加固待复测 | 回环只接受 localhost/回环 IP，LAN 只接受本地 IP，自定义 Authority 必须由 `ALLOWED_HOSTS` 精确声明；公网 Host 固定为 `PUBLIC_BASE_URL` | 在回环/LAN 动态验证恶意 Host、Origin 和 DNS Rebinding，确认自动 Gate 与 Cookie 写请求均不可越界 |
 
 ### 10.2 仍需验证的总体边界
 
 1. **同源预览隔离。** 本地/S3 响应会把 SVG 等类型降级，但仍需动态验证 PDF、文本、媒体和伪造扩展名不会在 Ycloud 同源上下文获得脚本能力。
 2. **权限变更和长期状态。** Session 为内存态且有绝对 TTL；登录封禁为持久态。需验证账号/权限/存储变化后的即时撤销，以及多实例拓扑是否被支持或明确拒绝。
 3. **局域网明文边界。** `ALLOW_LAN_HTTP=true` 是显式选择，但 WebDAV Basic、Session 和上传内容都会以明文穿越局域网。审核应把它标为受信网络模式，不得作为公网或不可信 Wi-Fi 部署方案。
-4. **主密钥恢复和轮换。** AES-GCM、DPAPI/Unix 权限解决静态配置泄露的一部分风险，不防运行账号失陷。必须验证密钥与配置成对备份、服务账号迁移和轮换流程。
+4. **主密钥恢复和轮换。** AES-GCM 与 Unix 文件权限解决静态配置泄露的一部分风险，不防运行账号失陷。必须在 Linux/容器中验证密钥与配置成对备份、服务账号迁移和轮换流程。
 5. **S3 保留空间的独占性。** S3 事务日志有严格格式和 ETag 校验但没有独立 MAC；应确认配置 Prefix 与 `.ycloud-system` 只由 Ycloud 身份写入，或为恢复日志增加认证保护。
 6. **依赖公告例外。** `deny.toml` 对 `RUSTSEC-2026-0253` 有可达性说明；审核必须用当前 AWS SDK 依赖树重新确认 S3 Express 路径确实关闭，并跟踪上游修复，不能只沿用旧报告。
 
@@ -556,7 +559,7 @@ npm audit --audit-level=moderate
 
 ### 11.3 主机、容器和文件权限
 
-- [ ] 使用独立非管理员服务账号运行 Ycloud；存储和配置只授予必要 ACL。
+- [ ] 使用独立非 root 服务账号运行 Ycloud；存储和配置只授予必要 owner/group/mode 权限。
 - [ ] 配置、主密钥、安全日志、事务区和备份不被 Web Server 作为静态文件发布。
 - [ ] 容器采用非 root、最小 Capability、受控可写卷和只读 Secret 文件；镜像 Digest 固定。
 - [ ] `YCLOUD_CONFIG_KEY_FILE` 由 Secret 管理器只读挂载；非必要不使用环境变量明文密钥。
@@ -629,6 +632,7 @@ npm audit --audit-level=moderate
 
 Release 通过必须同时满足：
 
+- [ ] 审核环境属于正式支持的 Linux 原生、Docker 或 Docker Compose；Windows 结果不作为生产发布证据。
 - [ ] 冻结基线和实际发布产物一致。
 - [ ] 全部 `P0` 与 `P1` 审核项有证据；无法执行的项目有原因和补偿验证。
 - [ ] 未关闭的 Critical/High 为 0。

@@ -1,18 +1,21 @@
 # Ycloud 安全审查执行报告
 
-> 本报告对应 2026-08-30 在当前工作区执行的预审。它不是安全认证，也不是 Release 签字。由于工作区存在未提交改动、缺少隔离动态环境和部分在线公告数据，本报告不作“通过”结论。
+> 本报告始于 2026-08-30 对原始功能基线 `4fa46f69c070` 的预审，并记录安全加固代码基线 `7994d40d4fe5` 的复测证据。它不是安全认证，也不是 Release 签字。由于部分隔离动态用例和 RustSec 在线公告数据仍不完整，本报告不作“通过”结论。
+
+正式生产审核范围为 Linux 原生进程、Docker 和 Docker Compose。Windows 仅用于开发编译与本机回归，其服务安装、ACL/DACL 和生产运维不属于发布门禁。
 
 ## 1. 审查基线
 
 | 项目 | 结果 |
 | --- | --- |
 | 分支 | `main` |
-| HEAD | `0961e39578f8fc8c6a68549234934da2a4c40694` |
-| 工作区 | 不干净；存在既有未提交功能、前端和安全改动 |
+| 原始功能基线 | `4fa46f69c07042ae01212eba662594b2877144b9` |
+| 安全加固代码基线 | `7994d40d4fe5c14670f1f145e034aab1742704e3` |
+| 基线状态 | 首批安全加固已提交并冻结；本报告的代码复测结论绑定上述安全加固基线 |
 | `git diff --check` | 通过；仅报告 Git 的 LF/CRLF 提示 |
 | Rust | `rustc 1.96.1` / `cargo 1.96.1` |
 | Node/npm | `node v24.19.0` / `npm 11.17.0` |
-| Windows Release SHA-256 | `D3BD08770FE050B51C80D3BE9CEB5B77286259233F005F37B71F0B3A9235FFFD` |
+| Windows 开发测试产物 SHA-256 | `D3BD08770FE050B51C80D3BE9CEB5B77286259233F005F37B71F0B3A9235FFFD`；不作为发布产物 |
 | 前端 JS SHA-256 | `131E1559155F25AC823FA580575C605490B97350D67948A3274B08048868E6E5` |
 | 前端 CSS SHA-256 | `A7E01BE90158E0811983076F149412C1789F543CC12E643320101E1CA7921342` |
 
@@ -22,8 +25,21 @@
 | --- | --- | --- |
 | `cargo fmt --all -- --check` | 通过 | 无格式差异 |
 | `cargo clippy --locked --all-targets -- -D warnings` | 通过 | 无 Clippy 警告 |
-| `cargo test --locked` | 通过 | 102 通过、0 失败、1 ignored |
-| `cargo build --locked --release` | 通过 | 生成 Windows Release 可执行文件 |
+| `cargo test --locked` | 通过 | 安全加固代码基线 107 通过、0 失败、1 ignored；ignored 为需显式配置的真实 S3 smoke |
+| 腾讯 COS 真实 smoke | 通过 | `s3_backend::tests::s3_compatibility_smoke`：1 通过、0 失败；使用成都地域隔离 Bucket 和随机 Prefix |
+| 阿里 OSS 真实 smoke | 通过 | 修复条件写和 SDK checksum framing 兼容性后：1 通过、0 失败；使用成都地域隔离 Bucket 和随机 Prefix |
+| RustFS 真实 smoke | 通过 | 局域网 Linux RustFS `1.0.0-beta.12`：健康探测通过，完整 smoke 1 通过、0 失败；使用隔离 Bucket 和随机 Prefix |
+| MinIO 真实 smoke | 通过 | 局域网 Linux MinIO：健康探测通过，完整 smoke 1 通过、0 失败；使用隔离 Bucket 和随机 Prefix |
+| 通用 S3 配置分支 smoke | 通过 | 使用 `s3_compatible` Provider 对同一 MinIO 隔离 Bucket 执行：1 通过、0 失败；不代表 AWS S3 或任意未测试实现已通过 |
+| MinIO Multipart/错误凭据专项 | 通过 | 流式 65 MiB Multipart、逐段下载校验、大文件复制/移动/删除及错误 Secret 拒绝全部通过；1 通过、0 失败 |
+| RustFS Multipart/错误凭据专项 | 通过 | 流式 65 MiB Multipart、逐段下载校验、大文件复制/移动/删除及错误 Secret 拒绝全部通过；1 通过、0 失败 |
+| MinIO 客户端断流/Multipart 残留专项 | 通过 | 首个 64 MiB 分片提交后注入请求体错误；目标不可见、容量为零且未完成 Multipart 列表为空；1 通过、0 失败 |
+| RustFS 客户端断流/Multipart 残留专项 | 通过 | 首个 64 MiB 分片提交后注入请求体错误；目标不可见、容量为零且未完成 Multipart 列表为空；1 通过、0 失败 |
+| MinIO TCP 中断/恢复清理专项 | 通过 | 回环故障代理在首个 UploadPart 传输中断开连接；恢复后目标不可见、容量为零且未完成 Multipart 列表为空；1 通过、0 失败 |
+| RustFS TCP 中断/恢复清理专项 | 通过 | 回环故障代理在首个 UploadPart 传输中断开连接；恢复后目标不可见、容量为零且未完成 Multipart 列表为空；1 通过、0 失败 |
+| MinIO 持续断网/延迟恢复专项 | 通过 | UploadPart 中断后保持代理离线，使即时 Abort 失败；恢复网络后根据持久化会话终止远端 Multipart，目标不可见且容量归零；默认线程栈下 1 通过、0 失败 |
+| RustFS 持续断网/延迟恢复专项 | 通过 | 与 MinIO 相同的持续断网、即时 Abort 失败和持久化恢复流程；默认线程栈下远端 Multipart 清空、目标不可见且容量归零；1 通过、0 失败 |
+| `cargo build --locked --release` | 通过 | 生成 Windows 本机开发测试可执行文件，不作为正式发布产物 |
 | `npm ci` | 通过 | 依照 lockfile 安装 |
 | `npm run check` | 通过 | lint、27 个测试文件/110 项测试、typecheck、build 均通过 |
 | `cargo deny check bans licenses sources` | 通过 | 许可证、来源和禁用依赖通过；存在重复依赖警告 |
@@ -38,13 +54,39 @@
 
 ### 3.2 S3 真实环境
 
-全量 Rust 测试中的 `s3_backend::tests::s3_compatibility_smoke` 按设计为 ignored，需要隔离 Bucket/Prefix 和临时凭据。本次环境没有 `YCLOUD_S3_SMOKE_*` 测试变量，因此没有对阿里 OSS、腾讯 COS、MinIO/RustFS 或目标通用 S3 执行真实网络读写验收。
+2026-08-30 已在腾讯云成都地域的隔离 Bucket `ycloud-smoke-1321907833` 上执行 `s3_backend::tests::s3_compatibility_smoke`。测试使用官方 HTTPS 区域 Endpoint、虚拟主机寻址和每次运行生成的随机 Prefix，列举、激活探测、上传、下载、覆盖、文件复制/移动/删除、目录复制/移动/删除及最终容量清零均通过。测试完成后临时 DPAPI 凭据文件已删除。
+
+2026-08-30 已在阿里云成都地域的隔离 Bucket `ycloud-smoke-14124124` 上执行同一真实 smoke。首次运行发现 RAM 未授权；授权后又发现 OSS 不支持标准 S3 条件 `PutObject`，以及 AWS SDK 默认可选 checksum trailer 与 OSS 不兼容。修复后，完整 smoke 1 项通过、0 失败，测试前缀清零，临时 DPAPI 凭据文件已删除。
+
+2026-08-30 已对局域网 Linux 服务器上的 RustFS `1.0.0-beta.12` 执行健康检查和同一真实 smoke。测试使用 S3 API Endpoint `http://192.168.2.37:9000`、`us-east-1`、路径寻址、隔离 Bucket `ycloud-smoke` 和随机 Prefix；服务就绪、列举、激活探测、上传、下载、覆盖、文件复制/移动/删除、目录复制/移动/删除及最终容量清零均通过。完整 smoke 1 项通过、0 失败，临时 DPAPI 凭据文件已删除。
+
+2026-08-30 已对局域网 Linux 服务器上的 MinIO 执行健康检查和同一真实 smoke。测试使用 S3 API Endpoint `http://192.168.2.37:9002`、`us-east-1`、路径寻址、隔离 Bucket `yogrut-test` 和随机 Prefix；列举、激活探测、上传、下载、覆盖、文件复制/移动/删除、目录复制/移动/删除及最终容量清零均通过。完整 smoke 1 项通过、0 失败，耗时 5.54 秒，临时 DPAPI 凭据文件已删除。
+
+2026-08-30 已将 Provider 切换为 `s3_compatible`，对上述 MinIO Endpoint 和 Bucket 再次执行完整 smoke；1 项通过、0 失败，耗时 5.13 秒，临时 DPAPI 凭据文件已删除。该结果证明 Ycloud 通用 S3 配置分支可与这一 MinIO 实现正常协作，不代表 AWS S3 或任意未测试的第三方 S3 实现已经验收。
+
+2026-08-30 已对上述 MinIO 执行第一轮专项测试。测试从分块流生成 65 MiB 数据，跨过 Ycloud 的 64 MiB Multipart 阈值；上传后以流式下载逐段校验内容，并完成大文件复制、移动、删除和最终容量清零。同时以正确 Access Key ID 配合随机错误 Secret 验证服务拒绝访问。完整测试 1 项通过、0 失败，耗时 13.65 秒，临时 DPAPI 凭据文件已删除。
+
+2026-08-30 已在 RustFS Endpoint `http://192.168.2.37:9000` 的新隔离 Bucket `yogrut-test` 上执行相同专项测试。65 MiB Multipart、流式下载逐段校验、大文件复制/移动/删除、最终容量清零及错误 Secret 拒绝全部通过；完整测试 1 项通过、0 失败，耗时 9.43 秒，临时 DPAPI 凭据文件已删除。
+
+2026-08-30 已在 MinIO 上执行客户端断流专项测试。测试在首个 64 MiB 分片成功提交后让请求体返回错误，并验证目标文件不可见、用户数据容量为零、该随机 Prefix 下未完成 Multipart 列表为空。完整测试 1 项通过、0 失败，耗时 9.23 秒，临时 DPAPI 凭据文件已删除。
+
+2026-08-30 已在 RustFS 上执行相同客户端断流专项测试。目标文件不可见、用户数据容量为零、该随机 Prefix 下未完成 Multipart 列表为空；完整测试 1 项通过、0 失败，耗时 5.79 秒，临时 DPAPI 凭据文件已删除。
+
+2026-08-30 已在 MinIO 上执行传输层中断专项测试。测试经仅监听本机回环地址的临时 TCP 故障代理转发，在首个 UploadPart 请求传输部分数据后断开连接，随后恢复正常转发；Ycloud 返回上传失败并完成 Abort，目标文件不可见、用户数据容量为零、未完成 Multipart 列表为空。完整测试 1 项通过、0 失败，耗时 8.00 秒，临时 DPAPI 凭据文件已删除。
+
+2026-08-30 已在 RustFS 上执行相同传输层中断专项测试。Ycloud 返回上传失败并完成 Abort，目标文件不可见、用户数据容量为零、未完成 Multipart 列表为空；完整测试 1 项通过、0 失败，耗时 4.46 秒，临时 DPAPI 凭据文件已删除。
+
+2026-08-30 已在 MinIO 上执行持续断网专项测试。测试在首个 UploadPart 传输部分数据后断开连接并保持代理离线，使上传失败后的即时 Abort 同样无法连接；网络恢复后，Ycloud 从 `.ycloud-system/multipart-sessions/` 读取受前缀和结构校验约束的会话记录，终止远端 Multipart 并删除日志。目标文件不可见、用户容量为零且未完成 Multipart 列表为空；默认 Windows 测试线程栈下 1 项通过、0 失败，耗时 9.59 秒，临时 DPAPI 凭据文件已删除。测试期间同时发现会话日志 PUT 与 UploadPart 组合 future 会使原测试线程栈溢出，现已通过独立 Tokio 任务边界缩小调用栈，并由本次默认栈实测确认修复。
+
+2026-08-31 已在 RustFS 上以默认 Windows 测试线程栈复验相同持续断网场景。测试启动时先终止隔离 `ycloud-smoke/` 前缀下前次异常测试留下的未完成分片，再执行 UploadPart 中断、持续离线、即时 Abort 失败和网络恢复。持久化会话恢复成功，目标文件不可见、用户容量为零且未完成 Multipart 列表为空；1 项通过、0 失败，耗时 5.46 秒，临时 DPAPI 凭据文件已删除。
+
+阿里适配使用原生 `x-oss-forbid-overwrite` 保护首次写入；事务更新和删除在进程内共享写锁下先校验 ETag。由于 OSS 缺少等价的标准条件更新/删除，本保证不跨 Ycloud 进程，同一 Bucket/Prefix 必须保持单写实例。MinIO 与 RustFS 已有 Multipart、客户端请求体断流、单次 TCP 断连恢复，以及即时 Abort 同样断网后的持久化恢复证据。公有云同类传输故障、限流、凭据轮换及厂商故障恢复仍待测试。
 
 代码已有 S3 测试连接探测：列举、随机内部前缀写入、HEAD/ETag、读取、服务端复制和删除，并在失败时清理临时对象。该探测不等于完整的大文件、Multipart、故障恢复和厂商兼容性验收。
 
 ### 3.3 动态安全矩阵
 
-SECURITY_AUDIT.md 中 T-01 至 T-41 的隔离动态用例本次未全部执行，原因是没有专用管理员/普通账号、隔离本地目录、四类 S3、WebDAV 客户端、反向代理、公网 HTTPS 和故障注入环境。涉及认证竞态、CSRF/Host/DNS Rebinding、Windows ACL、票据交换、路径 TOCTOU、预览隔离和恢复演练的结论均应保持“待动态验证”。
+SECURITY_AUDIT.md 中 T-01 至 T-41 的适用隔离动态用例本次未全部执行，原因是没有专用管理员/普通账号、隔离本地目录、WebDAV 客户端、反向代理、公网 HTTPS 和故障注入环境。涉及认证竞态、CSRF/Host/DNS Rebinding、票据交换、Linux 路径 TOCTOU、预览隔离和恢复演练的结论均应保持“待动态验证”。Windows ACL 用例已按正式平台范围标记为不适用。
 
 ## 4. 需要优先验证的静态候选项
 
@@ -52,27 +94,34 @@ SECURITY_AUDIT.md 中 T-01 至 T-41 的隔离动态用例本次未全部执行�
 
 | 优先级 | 候选项 | 当前状态 |
 | --- | --- | --- |
-| 高 | 登录/Argon2 并发限制、恢复码并发消费、旧凭据验证与会话签发竞态（PRE-01/04/05/20） | 待动态验证 |
-| 高 | 文件夹锁后代目录的删除/移动/复制、Windows 路径别名和链接竞态（PRE-06/07/08） | 待动态验证 |
+| 高 | 登录/Argon2 并发限制、恢复码并发消费、旧凭据验证与会话签发竞态（PRE-01/04/05/20） | 恢复码、TOTP 重放和旧凭据签发已加固；入口失败阈值并发及完整竞态仍待动态验证 |
+| 高 | 文件夹锁后代目录的删除/移动/复制、Linux 路径别名和链接竞态（PRE-06/07/08） | 待动态验证 |
 | 高 | S3 凭据轮换、配置备份和旧明文迁移的崩溃窗口（PRE-12/13） | 待动态验证 |
 | 高 | 不同 `storage_id` 指向相同或重叠本地/S3 命名空间（PRE-25） | 待动态验证 |
-| 高/平台 | Windows 服务目录 ACL 是否阻止低权限账号读取或修改配置、主密钥、备份和日志（PRE-11） | 待 Windows 动态验证 |
-| 中高 | 归档票据、上传批次票据是否绑定发起主体/会话（PRE-09/10） | 待动态验证 |
+| 中高 | 归档票据、上传批次票据是否绑定发起主体/会话（PRE-09/10） | 已绑定具体 Session/Gate；归档消费重新检查下载权限；单元测试通过，待跨账号动态复测 |
 | 中高 | 自定义 S3 Endpoint 的 DNS 变化、重定向、TLS/SNI 和 HTTP 明文边界（PRE-14） | 待动态验证 |
-| 高/网络 | 回环或 LAN 模式下恶意 Host、Origin 和 DNS Rebinding 是否能借自动 Gate 或 Cookie 写请求越界（PRE-23/26） | 待动态验证 |
+| 高/网络 | 回环或 LAN 模式下恶意 Host、Origin 和 DNS Rebinding 是否能借自动 Gate 或 Cookie 写请求越界（PRE-23/26） | 已增加 Host 精确边界并修正回环后端代理模式；单元测试通过，待真实代理/DNS 复测 |
+
+### 4.1 冻结基线后的首批修复
+
+- 登录成功签发与管理员、普通账号、网页密码、2FA 和文件夹锁状态变更使用同一认证转换锁；旧凭据验证完成后必须再次匹配当前配置才可签发令牌。
+- 恢复码在认证转换内原子消费；同一 TOTP 计数器在单实例中只允许成功一次。多实例仍需共享状态或明确禁止横向扩容。
+- 上传和归档票据绑定创建它的具体 Session/Gate；错误主体不会消耗归档票据，归档开始时重新验证下载权限、存储状态和文件夹锁。
+- 请求日志只记录路径，不再记录包含上传/归档票据的查询字符串。
+- 回环和 LAN 模式新增 Host 校验；自定义内网域名必须进入 `ALLOWED_HOSTS`。配置 `PUBLIC_BASE_URL`/`TRUSTED_PROXY_IPS` 时，即使后端监听回环地址也进入严格 HTTPS 代理模式。
 
 ## 5. 当前结论
 
 - 代码质量和现有自动化回归是绿色的。
 - 依赖许可证、来源、npm 公告和静态敏感信息扫描没有发现当前证据下的阻断项。
-- RustSec 在线公告检查、真实 S3 兼容性和大部分 P0/P1 动态安全用例尚未取得证据。
-- 当前工作区不是冻结基线，不能发布 Critical/High 为零或 Release 通过的结论。
+- 腾讯 COS、阿里 OSS、MinIO 与 RustFS 基础真实兼容性已通过，通用 S3 配置分支已基于 MinIO 通过；AWS S3 和未测试第三方实现不在通过范围内。RustSec 在线公告检查和其他 P0/P1 动态安全用例尚未取得完整证据。
+- 安全加固代码基线已经冻结，但动态证据仍不完整，不能发布 Critical/High 为零或 Release 通过的结论。
 
 ## 6. 下一步建议
 
-1. 冻结审核提交，保存补丁哈希和最终产物哈希。
-2. 在隔离环境执行 T-01 至 T-41，优先认证、会话、权限、路径和票据用例。
-3. 为 OSS、COS、MinIO/RustFS、目标通用 S3 各准备一次性账号、Bucket 和 Prefix，运行 ignored S3 smoke。
+1. 保留 `4fa46f69c070` 作为原始功能预审起点，以 `7994d40d4fe5` 作为后续动态审核和修复复测基线；正式发布时记录 Linux 二进制或容器镜像 Digest。
+2. 在隔离环境执行适用的 T-01 至 T-41，优先复测认证转换、会话、权限、路径、票据和 Host/Origin 用例。
+3. 保留已通过的 OSS、COS、MinIO、RustFS 和通用配置分支脱敏证据；继续执行大文件 Multipart、限流、网络中断、凭据轮换和恢复测试。
 4. 在可联网审核机重新执行 `cargo audit`、`cargo deny check`，记录公告数据库日期。
-5. 完成 Windows ACL、反向代理/DNS、主密钥恢复和备份恢复演练。
+5. 完成 Linux/容器权限、反向代理/DNS、主密钥恢复和备份恢复演练。
 6. 对确认的 Critical/High 修复后由非原实现者复测，再更新 SECURITY_AUDIT.md 的执行记录和发现项总表。

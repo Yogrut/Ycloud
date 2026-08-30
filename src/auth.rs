@@ -407,6 +407,8 @@ pub struct LoginRequest {
     #[serde(default)]
     pub username: Option<String>,
     pub password: String,
+    #[serde(default)]
+    pub totp_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -414,6 +416,7 @@ pub struct LoginResponse {
     pub success: bool,
     pub message: String,
     pub is_admin: bool,
+    pub totp_required: bool,
 }
 
 #[derive(Serialize)]
@@ -433,7 +436,14 @@ pub async fn login_handler(
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
-    let (admin_policy, admin_username, admin_hash, ordinary_candidate) = {
+    let (
+        admin_policy,
+        admin_username,
+        admin_hash,
+        admin_totp_secret,
+        recovery_hashes,
+        ordinary_candidate,
+    ) = {
         let config = state.config_file.read().await;
         let supplied = body.username.as_deref().unwrap_or("");
         (
@@ -443,6 +453,8 @@ pub async fn login_handler(
             },
             config.admin_username.clone(),
             config.admin_password_hash.clone(),
+            config.admin_totp_secret.clone(),
+            config.admin_recovery_code_hashes.clone(),
             config
                 .user_accounts
                 .iter()
@@ -485,13 +497,66 @@ pub async fn login_handler(
     };
     let password_valid = valid_password_length(&body.password)
         && state.passwords.verify(password_hash, body.password).await;
+    let supplied_second_factor = body
+        .totp_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if requires_second_factor_challenge(
+        administrator,
+        password_valid,
+        admin_totp_secret.as_deref(),
+        supplied_second_factor,
+    ) {
+        return Json(LoginResponse {
+            success: false,
+            message: "请输入动态验证码或恢复码".into(),
+            is_admin: true,
+            totp_required: true,
+        })
+        .into_response();
+    }
+    let mut second_factor_valid = !administrator || admin_totp_secret.is_none();
+    let mut used_recovery_hash = None;
+    if administrator && password_valid {
+        if let Some(secret) = admin_totp_secret.as_deref() {
+            let supplied = body.totp_code.as_deref().unwrap_or("").trim();
+            second_factor_valid = crate::totp::verify_now(secret, supplied);
+            if !second_factor_valid {
+                let recovery = crate::totp::normalize_recovery_code(supplied);
+                if recovery.len() == 10 {
+                    for hash in recovery_hashes {
+                        if state.passwords.verify(hash.clone(), recovery.clone()).await {
+                            used_recovery_hash = Some(hash);
+                            second_factor_valid = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let authenticated = password_valid
+        && second_factor_valid
         && (administrator
             || ordinary_candidate
                 .as_ref()
                 .is_some_and(|(_, _, enabled)| *enabled));
 
     if authenticated {
+        if let Some(used_hash) = used_recovery_hash {
+            if let Err(error) = state
+                .update_config(move |config| {
+                    config
+                        .admin_recovery_code_hashes
+                        .retain(|hash| hash != &used_hash);
+                    Ok(())
+                })
+                .await
+            {
+                return error.into_response();
+            }
+        }
         if let Err(error) = state
             .login_security
             .record_success(entry, ip, user_agent)
@@ -517,6 +582,7 @@ pub async fn login_handler(
                 success: true,
                 message: "Authenticated".into(),
                 is_admin: administrator,
+                totp_required: false,
             },
             session_cookie(
                 "session",
@@ -535,6 +601,15 @@ pub async fn login_handler(
         }
         invalid_login_response(entry)
     }
+}
+
+fn requires_second_factor_challenge(
+    administrator: bool,
+    password_valid: bool,
+    totp_secret: Option<&str>,
+    supplied_second_factor: Option<&str>,
+) -> bool {
+    administrator && password_valid && totp_secret.is_some() && supplied_second_factor.is_none()
 }
 
 pub async fn logout_handler(
@@ -569,6 +644,7 @@ pub async fn logout_handler(
         success: true,
         message: "Logged out".into(),
         is_admin: false,
+        totp_required: false,
     })
     .into_response();
     for name in ["session", "gate_access"] {
@@ -704,6 +780,7 @@ pub async fn gate_handler(
             success: true,
             message: "Authenticated".into(),
             is_admin: false,
+            totp_required: false,
         },
         session_cookie(
             "gate_access",
@@ -725,6 +802,7 @@ fn invalid_login_response(entry: LoginEntry) -> Response {
         success: false,
         message: message.into(),
         is_admin: false,
+        totp_required: false,
     })
     .into_response()
 }
@@ -737,6 +815,7 @@ fn limited_login_response(block_seconds: i64) -> Response {
             success: false,
             message: "尝试次数过多，请在限制结束后重试".into(),
             is_admin: false,
+            totp_required: false,
         }),
     )
         .into_response();
@@ -754,6 +833,7 @@ fn login_security_error(error: anyhow::Error) -> Response {
             success: false,
             message: "登录安全状态暂时不可用".into(),
             is_admin: false,
+            totp_required: false,
         }),
     )
         .into_response()
@@ -884,8 +964,8 @@ pub async fn auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_basic_auth, invalid_login_response, limited_login_response, AccessTokenStore,
-        SessionStore,
+        extract_basic_auth, invalid_login_response, limited_login_response,
+        requires_second_factor_challenge, AccessTokenStore, SessionStore,
     };
     use crate::login_security::LoginEntry;
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -919,6 +999,35 @@ mod tests {
         let limited = limited_login_response(3600);
         assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(limited.headers().get(header::RETRY_AFTER).unwrap(), "3600");
+    }
+
+    #[test]
+    fn second_factor_is_requested_only_after_a_valid_admin_password() {
+        assert!(!requires_second_factor_challenge(true, true, None, None));
+        assert!(!requires_second_factor_challenge(
+            true,
+            false,
+            Some("secret"),
+            None
+        ));
+        assert!(!requires_second_factor_challenge(
+            false,
+            true,
+            Some("secret"),
+            None
+        ));
+        assert!(requires_second_factor_challenge(
+            true,
+            true,
+            Some("secret"),
+            None
+        ));
+        assert!(!requires_second_factor_challenge(
+            true,
+            true,
+            Some("secret"),
+            Some("123456")
+        ));
     }
 
     #[tokio::test]

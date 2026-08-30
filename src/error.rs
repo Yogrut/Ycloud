@@ -169,11 +169,24 @@ impl From<StatusCode> for AppError {
 #[cfg(test)]
 mod tests {
     use super::AppError;
-    use axum::http::StatusCode;
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
 
     #[test]
     fn status_conversion_preserves_service_unavailable() {
         let error = AppError::from(StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn response_exposes_a_stable_machine_code_without_internal_context() {
+        let response =
+            AppError::with_source("database credentials leaked", anyhow::anyhow!("secret"))
+                .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "internal_error");
+        assert_eq!(json["error"]["message"], "Internal server error");
+        assert!(!String::from_utf8_lossy(&body).contains("secret"));
     }
 }

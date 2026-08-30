@@ -190,26 +190,23 @@ impl StorageBackend {
         ledger_path: PathBuf,
     ) -> AppResult<Self> {
         let persisted = load_capacity_ledger(&ledger_path).await?;
-        let (used, accurate) = match persisted {
-            Some(used) => (used, true),
-            None if capacity_limit.is_some() => (storage.user_data_size().await?, true),
-            None => (0, false),
-        };
+        // A persisted S3 ledger is only a last-known value. Objects may have
+        // changed outside Ycloud while it was stopped, so never advertise it
+        // as current before an online reconciliation finishes.
+        let used = persisted.unwrap_or(0);
         let backend = Self {
             active: Arc::new(ActiveStorage {
                 kind: StorageBackendKind::S3(storage),
                 capacity: CapacityTracker::new_with_ledger(
                     capacity_limit,
                     used,
-                    accurate,
+                    false,
                     Some(ledger_path),
                 ),
             }),
         };
         let active = &backend.active;
-        if accurate {
-            persist_capacity(&active.capacity).await;
-        } else if let StorageBackendKind::S3(storage) = &active.kind {
+        if let StorageBackendKind::S3(storage) = &active.kind {
             schedule_s3_capacity_reconcile(active.capacity.clone(), storage.clone());
         }
         Ok(backend)

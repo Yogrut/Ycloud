@@ -6,9 +6,8 @@ import { useLocale } from '../../shared/i18n'
 
 const GIB = 1024 ** 3
 const MIB = 1024 ** 2
-const HARD_MAX_UPLOAD_BYTES = 100 * GIB
-const HARD_MAX_ARCHIVE_BYTES = 10 * GIB
-const HARD_MAX_ARCHIVE_ENTRIES = 5000
+const DEFAULT_BATCH_BYTES = 20 * GIB
+const DEFAULT_BATCH_ENTRIES = 1000
 const HARD_MAX_RATE_BYTES = 1024 * MIB
 const MIN_RATE_BYTES = 64 * 1024
 
@@ -17,16 +16,21 @@ const emit = defineEmits<{ saved: [message: string] }>()
 const locale = useLocale()
 
 const uploadGiB = ref<string | number>('')
+const uploadBatchGiB = ref<string | number>('')
+const uploadBatchEntries = ref<string | number>('')
 const archiveGiB = ref<string | number>('')
 const archiveEntries = ref<string | number>('')
 const uploadRate = ref<string | number>('')
 const downloadRate = ref<string | number>('')
 const initialUploadGiB = ref('')
+const initialUploadBatchGiB = ref('')
+const initialUploadBatchEntries = ref('')
 const initialArchiveGiB = ref('')
 const initialArchiveEntries = ref('')
 const initialUploadRate = ref('')
 const initialDownloadRate = ref('')
 const baselineUploadBytes = ref(0)
+const baselineUploadBatchBytes = ref(0)
 const baselineArchiveBytes = ref(0)
 const saving = ref(false)
 const errorMessage = ref('')
@@ -41,13 +45,18 @@ function formatRate(bytes: number): string {
 
 function reset(): void {
   baselineUploadBytes.value = props.info.max_upload_bytes
+  baselineUploadBatchBytes.value = props.info.max_upload_batch_bytes ?? DEFAULT_BATCH_BYTES
   baselineArchiveBytes.value = props.info.max_archive_bytes
   initialUploadGiB.value = formatGiB(props.info.max_upload_bytes)
+  initialUploadBatchGiB.value = formatGiB(baselineUploadBatchBytes.value)
+  initialUploadBatchEntries.value = String(props.info.max_upload_batch_entries ?? DEFAULT_BATCH_ENTRIES)
   initialArchiveGiB.value = formatGiB(props.info.max_archive_bytes)
   initialArchiveEntries.value = String(props.info.max_archive_entries)
   initialUploadRate.value = formatRate(props.info.upload_rate_bytes_per_sec)
   initialDownloadRate.value = formatRate(props.info.download_rate_bytes_per_sec)
   uploadGiB.value = initialUploadGiB.value
+  uploadBatchGiB.value = initialUploadBatchGiB.value
+  uploadBatchEntries.value = initialUploadBatchEntries.value
   archiveGiB.value = initialArchiveGiB.value
   archiveEntries.value = initialArchiveEntries.value
   uploadRate.value = initialUploadRate.value
@@ -59,6 +68,8 @@ watch(() => props.info, reset, { immediate: true })
 
 const hasChanges = computed(() => (
   String(uploadGiB.value).trim() !== initialUploadGiB.value
+  || String(uploadBatchGiB.value).trim() !== initialUploadBatchGiB.value
+  || String(uploadBatchEntries.value).trim() !== initialUploadBatchEntries.value
   || String(archiveGiB.value).trim() !== initialArchiveGiB.value
   || String(archiveEntries.value).trim() !== initialArchiveEntries.value
   || String(uploadRate.value).trim() !== initialUploadRate.value
@@ -80,19 +91,35 @@ function buildRequest(): UpdateTransferLimitsRequest {
     uploadGiB.value,
     initialUploadGiB.value,
     baselineUploadBytes.value,
-    HARD_MAX_UPLOAD_BYTES,
+    props.info.deployment_max_upload_bytes ?? 100 * GIB,
     locale.text('单文件上传上限', 'Single-file upload limit'),
   )
+  const maxUploadBatchBytes = parseBytes(
+    uploadBatchGiB.value,
+    initialUploadBatchGiB.value,
+    baselineUploadBatchBytes.value,
+    props.info.deployment_max_upload_batch_bytes ?? 100 * GIB,
+    locale.text('批量上传总大小上限', 'Batch upload size limit'),
+  )
+  if (maxUploadBatchBytes < maxUploadBytes) {
+    throw new Error(locale.text('批量上传总大小上限不能小于单文件上传上限', 'Batch upload size limit cannot be lower than the single-file limit'))
+  }
+  const batchEntries = Number(uploadBatchEntries.value)
+  const maxBatchEntries = props.info.deployment_max_upload_batch_entries ?? 10_000
+  if (!Number.isInteger(batchEntries) || batchEntries < 1 || batchEntries > maxBatchEntries) {
+    throw new Error(locale.text(`批量上传文件数量必须在 1 到 ${maxBatchEntries} 之间`, `Batch upload file count must be between 1 and ${maxBatchEntries}`))
+  }
   const maxArchiveBytes = parseBytes(
     archiveGiB.value,
     initialArchiveGiB.value,
     baselineArchiveBytes.value,
-    HARD_MAX_ARCHIVE_BYTES,
+    props.info.deployment_max_archive_bytes ?? 100 * GIB,
     locale.text('打包源文件总大小上限', 'Archive source-size limit'),
   )
   const entries = Number(archiveEntries.value)
-  if (!Number.isInteger(entries) || entries < 1 || entries > HARD_MAX_ARCHIVE_ENTRIES) {
-    throw new Error(locale.text('打包条目数量上限必须在 1 到 5000 之间', 'Archive entry limit must be between 1 and 5000'))
+  const maxArchiveEntries = props.info.deployment_max_archive_entries ?? 100_000
+  if (!Number.isInteger(entries) || entries < 1 || entries > maxArchiveEntries) {
+    throw new Error(locale.text(`打包条目数量上限必须在 1 到 ${maxArchiveEntries} 之间`, `Archive entry limit must be between 1 and ${maxArchiveEntries}`))
   }
   const parseRate = (value: string | number, label: string): number => {
     const mib = Number(value)
@@ -105,6 +132,8 @@ function buildRequest(): UpdateTransferLimitsRequest {
   }
   return {
     max_upload_bytes: maxUploadBytes,
+    max_upload_batch_bytes: maxUploadBatchBytes,
+    max_upload_batch_entries: batchEntries,
     max_archive_bytes: maxArchiveBytes,
     max_archive_entries: entries,
     upload_rate_bytes_per_sec: parseRate(uploadRate.value, locale.text('上传限速', 'Upload rate limit')),
@@ -127,13 +156,18 @@ async function submit(): Promise<void> {
   try {
     await updateTransferLimits(body)
     baselineUploadBytes.value = body.max_upload_bytes
+    baselineUploadBatchBytes.value = body.max_upload_batch_bytes
     baselineArchiveBytes.value = body.max_archive_bytes
     initialUploadGiB.value = formatGiB(body.max_upload_bytes)
+    initialUploadBatchGiB.value = formatGiB(body.max_upload_batch_bytes)
+    initialUploadBatchEntries.value = String(body.max_upload_batch_entries)
     initialArchiveGiB.value = formatGiB(body.max_archive_bytes)
     initialArchiveEntries.value = String(body.max_archive_entries)
     initialUploadRate.value = formatRate(body.upload_rate_bytes_per_sec)
     initialDownloadRate.value = formatRate(body.download_rate_bytes_per_sec)
     uploadGiB.value = initialUploadGiB.value
+    uploadBatchGiB.value = initialUploadBatchGiB.value
+    uploadBatchEntries.value = initialUploadBatchEntries.value
     archiveGiB.value = initialArchiveGiB.value
     archiveEntries.value = initialArchiveEntries.value
     uploadRate.value = initialUploadRate.value
@@ -160,8 +194,22 @@ async function submit(): Promise<void> {
         <label class="compact-field limits-field limit-upload-size">
           <span>{{ locale.text('单文件上传上限', 'Single-file upload limit') }}</span>
           <span class="limits-control">
-            <span class="input-with-unit"><input v-model="uploadGiB" type="number" min="0.001" max="100" step="0.001" inputmode="decimal"><span>GiB</span></span>
-            <small>{{ locale.text('网页与 WebDAV 共用；范围 1 MiB–100 GiB，且不能超过部署环境的绝对上限。', 'Shared by the browser and WebDAV. Range: 1 MiB–100 GiB, subject to the deployment hard limit.') }}</small>
+            <span class="input-with-unit"><input v-model="uploadGiB" type="number" min="0.001" :max="(info.deployment_max_upload_bytes ?? 100 * GIB) / GIB" step="0.001" inputmode="decimal"><span>GiB</span></span>
+            <small>{{ locale.text(`网页与 WebDAV 共用；部署上限 ${formatGiB(info.deployment_max_upload_bytes ?? 100 * GIB)} GiB。`, `Shared by browser and WebDAV. Deployment maximum: ${formatGiB(info.deployment_max_upload_bytes ?? 100 * GIB)} GiB.`) }}</small>
+          </span>
+        </label>
+        <label class="compact-field limits-field limit-upload-batch-size">
+          <span>{{ locale.text('批量上传总大小', 'Batch upload size') }}</span>
+          <span class="limits-control">
+            <span class="input-with-unit"><input v-model="uploadBatchGiB" type="number" min="0.001" :max="(info.deployment_max_upload_batch_bytes ?? 100 * GIB) / GIB" step="0.001" inputmode="decimal"><span>GiB</span></span>
+            <small>{{ locale.text('一次选择文件或文件夹的内容总量；必须不小于单文件上限。', 'Total content in one file or folder selection; must not be lower than the single-file limit.') }}</small>
+          </span>
+        </label>
+        <label class="compact-field limits-field limit-upload-batch-entries">
+          <span>{{ locale.text('批量上传文件数量', 'Batch upload file count') }}</span>
+          <span class="limits-control">
+            <input v-model="uploadBatchEntries" type="number" min="1" :max="info.deployment_max_upload_batch_entries ?? 10000" step="1" inputmode="numeric">
+            <small>{{ locale.text('文件夹上传按其中的文件计数，空目录不计入。', 'Folder uploads count contained files; empty directories are not counted.') }}</small>
           </span>
         </label>
         <label class="compact-field limits-field limit-upload-rate">
@@ -181,14 +229,14 @@ async function submit(): Promise<void> {
         <label class="compact-field limits-field limit-archive-size">
           <span>{{ locale.text('打包源文件总大小', 'Archive source-size limit') }}</span>
           <span class="limits-control">
-            <span class="input-with-unit"><input v-model="archiveGiB" type="number" min="0.001" max="10" step="0.001" inputmode="decimal"><span>GiB</span></span>
-            <small>{{ locale.text('只累计文件内容；范围 1 MiB–10 GiB，普通单文件下载不受影响。', 'Counts file contents only. Range: 1 MiB–10 GiB. Regular single-file downloads are unaffected.') }}</small>
+            <span class="input-with-unit"><input v-model="archiveGiB" type="number" min="0.001" :max="(info.deployment_max_archive_bytes ?? 100 * GIB) / GIB" step="0.001" inputmode="decimal"><span>GiB</span></span>
+            <small>{{ locale.text(`只累计文件内容；部署上限 ${formatGiB(info.deployment_max_archive_bytes ?? 100 * GIB)} GiB，普通单文件下载不受影响。`, `Counts file contents only. Deployment maximum: ${formatGiB(info.deployment_max_archive_bytes ?? 100 * GIB)} GiB. Regular downloads are unaffected.`) }}</small>
           </span>
         </label>
         <label class="compact-field limits-field limit-archive-entries">
           <span>{{ locale.text('打包条目数量', 'Archive entry limit') }}</span>
           <span class="limits-control">
-            <input v-model="archiveEntries" type="number" min="1" max="5000" step="1" inputmode="numeric">
+            <input v-model="archiveEntries" type="number" min="1" :max="info.deployment_max_archive_entries ?? 100000" step="1" inputmode="numeric">
             <small>{{ locale.text('文件与文件夹递归合计；重复选择父目录与子项时会自动去重。', 'Counts files and folders recursively. Overlapping parent and child selections are deduplicated.') }}</small>
           </span>
         </label>

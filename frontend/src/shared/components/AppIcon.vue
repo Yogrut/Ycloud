@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import {
   PhArchive,
+  PhArrowClockwise,
   PhArrowCircleDown,
   PhArrowCircleRight,
   PhArrowCircleUp,
@@ -25,11 +26,15 @@ import {
   PhLockKey,
   PhMagnifyingGlass,
   PhMoon,
+  PhPause,
   PhPencilSimple,
+  PhPlay,
   PhPlugsConnected,
   PhShieldCheck,
   PhSlidersHorizontal,
+  PhStar,
   PhSun,
+  PhStop,
   PhTrash,
   PhTranslate,
   PhUserCircle,
@@ -62,10 +67,15 @@ export type AppIconName =
   | 'logs'
   | 'moon'
   | 'move'
+  | 'pause'
   | 'rename'
+  | 'retry'
+  | 'resume'
   | 'search'
   | 'sign-out'
   | 'storage'
+  | 'star'
+  | 'stop'
   | 'sun'
   | 'upload'
   | 'users'
@@ -97,10 +107,15 @@ const icons = {
   logs: PhListBullets,
   moon: PhMoon,
   move: PhArrowsOutCardinal,
+  pause: PhPause,
   rename: PhPencilSimple,
+  retry: PhArrowClockwise,
+  resume: PhPlay,
   search: PhMagnifyingGlass,
   'sign-out': PhArrowCircleRight,
   storage: PhHardDrives,
+  star: PhStar,
+  stop: PhStop,
   sun: PhSun,
   upload: PhArrowCircleUp,
   users: PhUsersThree,

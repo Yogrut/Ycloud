@@ -1,4 +1,5 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 
@@ -15,6 +16,7 @@ use crate::{
     storage::StorageService,
     storage_backend::{StorageBackend, StorageRegistry},
     transfer_limit::BandwidthLimiter,
+    upload_batch::UploadBatchStore,
 };
 
 #[derive(Clone)]
@@ -27,6 +29,7 @@ pub struct AppState {
     pub passwords: PasswordService,
     pub backends: StorageRegistry,
     pub archive_tickets: ArchiveTicketStore,
+    pub upload_batches: UploadBatchStore,
     pub webdav_gate: Arc<Semaphore>,
     pub login_security: LoginSecurity,
     pub upload_limiter: BandwidthLimiter,
@@ -42,6 +45,20 @@ impl AppState {
         if max_upload_bytes > config.max_upload_bytes {
             return Err(AppError::BadRequest(
                 "Persisted upload limit exceeds the deployment MAX_UPLOAD_BYTES envelope".into(),
+            ));
+        }
+        if persisted.max_upload_batch_bytes > config.max_upload_batch_bytes
+            || persisted.max_upload_batch_entries > config.max_upload_batch_entries
+        {
+            return Err(AppError::BadRequest(
+                "Persisted batch upload policy exceeds the deployment envelope".into(),
+            ));
+        }
+        if persisted.max_archive_bytes > config.max_archive_bytes
+            || persisted.max_archive_entries > config.max_archive_entries
+        {
+            return Err(AppError::BadRequest(
+                "Persisted archive policy exceeds the deployment envelope".into(),
             ));
         }
         let local_io_gate = Arc::new(Semaphore::new(config.io_concurrency.max(1)));
@@ -80,6 +97,7 @@ impl AppState {
         .map_err(|error| {
             AppError::with_source("failed to load persistent login security state", error)
         })?;
+        let upload_batch_ttl = Duration::from_secs(config.upload_timeout_secs);
         Ok(Self {
             config,
             config_file,
@@ -89,6 +107,7 @@ impl AppState {
             passwords: PasswordService::new(1),
             backends,
             archive_tickets: ArchiveTicketStore::new(),
+            upload_batches: UploadBatchStore::new(upload_batch_ttl),
             webdav_gate: Arc::new(Semaphore::new(8)),
             login_security,
             upload_limiter: BandwidthLimiter::new(persisted.upload_rate_bytes_per_sec),
@@ -100,6 +119,63 @@ impl AppState {
 
     pub async fn storage_backend(&self, storage_id: &str) -> AppResult<StorageBackend> {
         self.backends.get(storage_id).await
+    }
+
+    pub async fn test_local_storage(&self, path: &str) -> AppResult<()> {
+        let mount = self
+            .config
+            .local_mounts
+            .resolve_path(std::path::Path::new(path.trim()))
+            .map_err(|_| AppError::BadRequest("本地存储路径无效".into()))?
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "该路径未通过 STORAGE_PATH 或 LOCAL_STORAGE_MOUNTS 声明".into(),
+                )
+            })?;
+        if !self.config.local_mounts.status(&mount.id).await.ready {
+            return Err(AppError::ServiceUnavailable(
+                "本地存储目录不存在、不是目录或属于链接/重解析点".into(),
+            ));
+        }
+        let probe_directory = mount
+            .path
+            .join(crate::storage_transaction::SYSTEM_DIR)
+            .join("connection-tests");
+        tokio::fs::create_dir_all(&probe_directory)
+            .await
+            .map_err(|error| AppError::with_source("本地存储不可写", error))?;
+        let metadata = tokio::fs::symlink_metadata(&probe_directory)
+            .await
+            .map_err(|error| AppError::with_source("无法检查本地存储测试目录", error))?;
+        if !metadata.is_dir() || crate::storage::is_link_or_reparse_point(&metadata) {
+            return Err(AppError::ServiceUnavailable(
+                "本地存储测试目录不安全".into(),
+            ));
+        }
+        let probe_path = probe_directory.join(format!("{}.probe", uuid::Uuid::new_v4().simple()));
+        let result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&probe_path)
+                .await?;
+            file.write_all(b"ycloud-local-storage-probe").await?;
+            file.sync_all().await?;
+            drop(file);
+            let bytes = tokio::fs::read(&probe_path).await?;
+            if bytes != b"ycloud-local-storage-probe" {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "local storage probe content mismatch",
+                ));
+            }
+            tokio::fs::remove_file(&probe_path).await
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&probe_path).await;
+        }
+        result.map_err(|error| AppError::with_source("本地存储读写测试失败", error))
     }
 
     pub async fn add_local_storage(
@@ -221,8 +297,10 @@ impl AppState {
     ) -> AppResult<()> {
         let backend_config = StorageBackendConfig::S3(settings.clone());
         self.config.allows_storage_backend(&backend_config)?;
-        let backend = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
-        backend.activation_probe().await?;
+        if enabled {
+            let backend = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
+            backend.activation_probe().await?;
+        }
         let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
         next.pending_storage_instance = Some(StorageInstanceConfig {
@@ -240,9 +318,14 @@ impl AppState {
         storage_id: &str,
         name: String,
         mut settings: crate::config::S3StorageConfig,
+        enabled: bool,
+        allow_guest_access: bool,
     ) -> AppResult<()> {
         let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
+        if !enabled && next.default_storage_id == storage_id {
+            return Err(AppError::Conflict("请先将其他存储设为默认存储".into()));
+        }
         let instance = next
             .storage_instances
             .iter_mut()
@@ -259,19 +342,26 @@ impl AppState {
         }
         let backend_config = StorageBackendConfig::S3(settings.clone());
         self.config.allows_storage_backend(&backend_config)?;
-        let probe = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
-        probe.activation_probe().await?;
-        let prepared = prepare_storage_backend(
-            &self.config,
-            &self.local_io_gate,
-            next.max_upload_bytes,
-            storage_id,
-            &backend_config,
-        )
-        .await?;
+        let prepared = if enabled {
+            let probe = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
+            probe.activation_probe().await?;
+            Some(
+                prepare_storage_backend(
+                    &self.config,
+                    &self.local_io_gate,
+                    next.max_upload_bytes,
+                    storage_id,
+                    &backend_config,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         instance.name = name.trim().to_string();
         instance.backend = backend_config;
-        let enabled = instance.enabled;
+        instance.enabled = enabled;
+        instance.allow_guest_access = allow_guest_access;
         next.validate()?;
         save_config(&self.config.config_path, &next)
             .await
@@ -279,7 +369,7 @@ impl AppState {
                 AppError::with_source("failed to persist S3 storage settings", error)
             })?;
         *self.config_file.write().await = next;
-        if enabled {
+        if let Some(prepared) = prepared {
             self.backends
                 .insert_ready(storage_id.to_string(), prepared)
                 .await;
@@ -296,6 +386,8 @@ impl AppState {
         name: String,
         path: String,
         capacity_limit_bytes: Option<u64>,
+        enabled: bool,
+        allow_guest_access: bool,
     ) -> AppResult<()> {
         let mount_id = self
             .config
@@ -310,6 +402,9 @@ impl AppState {
             })?;
         let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
+        if !enabled && next.default_storage_id == storage_id {
+            return Err(AppError::Conflict("请先将其他存储设为默认存储".into()));
+        }
         let position = next
             .storage_instances
             .iter()
@@ -336,7 +431,6 @@ impl AppState {
             mount_id,
             capacity_limit_bytes,
         });
-        let enabled = next.storage_instances[position].enabled;
         let prepared = if enabled {
             Some(
                 prepare_storage_backend(
@@ -353,6 +447,8 @@ impl AppState {
         };
         next.storage_instances[position].name = name.trim().to_string();
         next.storage_instances[position].backend = backend_config;
+        next.storage_instances[position].enabled = enabled;
+        next.storage_instances[position].allow_guest_access = allow_guest_access;
         next.validate()?;
         save_config(&self.config.config_path, &next)
             .await
@@ -475,9 +571,35 @@ impl AppState {
         Ok(())
     }
 
+    pub async fn set_default_storage(&self, storage_id: &str) -> AppResult<()> {
+        let _update_guard = self.config_updates.lock().await;
+        let mut next = self.config_file.read().await.clone();
+        let instance = next
+            .storage_instances
+            .iter()
+            .find(|instance| instance.id == storage_id)
+            .ok_or(AppError::NotFound)?;
+        if !instance.enabled {
+            return Err(AppError::Conflict("停用的存储不能设为默认存储".into()));
+        }
+        if !self.backends.is_ready(storage_id).await {
+            return Err(AppError::ServiceUnavailable(
+                "存储当前不可用，不能设为默认存储".into(),
+            ));
+        }
+        next.default_storage_id = storage_id.to_string();
+        self.persist_storage_selection(&next).await?;
+        self.gate_access.clear().await;
+        self.folder_access.clear().await;
+        Ok(())
+    }
+
     pub async fn delete_storage(&self, storage_id: &str) -> AppResult<()> {
         let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
+        if next.default_storage_id == storage_id {
+            return Err(AppError::Conflict("请先将其他存储设为默认存储".into()));
+        }
         if next
             .shares
             .iter()
@@ -501,13 +623,6 @@ impl AppState {
         next.storage_instances.retain(|item| item.id != storage_id);
         if before == next.storage_instances.len() {
             return Err(AppError::NotFound);
-        }
-        if next.default_storage_id == storage_id {
-            next.default_storage_id = next
-                .storage_instances
-                .first()
-                .map(|instance| instance.id.clone())
-                .unwrap_or_default();
         }
         self.persist_storage_selection(&next).await?;
         self.backends.remove(storage_id).await;
@@ -645,6 +760,10 @@ mod tests {
                 .unwrap(),
                 config_path: root.join("config.json"),
                 max_upload_bytes: 1024 * 1024,
+                max_upload_batch_bytes: 100 * 1024 * 1024 * 1024,
+                max_upload_batch_entries: 10_000,
+                max_archive_bytes: 100 * 1024 * 1024 * 1024,
+                max_archive_entries: 100_000,
                 io_concurrency: 2,
                 max_list_entries: 100,
                 request_timeout_secs: 30,
@@ -710,6 +829,10 @@ mod tests {
                 .unwrap(),
                 config_path: root.join("config.json"),
                 max_upload_bytes: 1024 * 1024,
+                max_upload_batch_bytes: 100 * 1024 * 1024 * 1024,
+                max_upload_batch_entries: 10_000,
+                max_archive_bytes: 100 * 1024 * 1024 * 1024,
+                max_archive_entries: 100_000,
                 io_concurrency: 2,
                 max_list_entries: 100,
                 request_timeout_secs: 30,
@@ -778,6 +901,8 @@ mod tests {
                 "Backup".into(),
                 backup.to_string_lossy().into_owned(),
                 Some(8 * 1024 * 1024),
+                true,
+                false,
             )
             .await
             .unwrap();
@@ -816,6 +941,10 @@ mod tests {
                 .unwrap(),
                 config_path: config_path.clone(),
                 max_upload_bytes: 5 * 1024 * 1024 * 1024,
+                max_upload_batch_bytes: 100 * 1024 * 1024 * 1024,
+                max_upload_batch_entries: 10_000,
+                max_archive_bytes: 100 * 1024 * 1024 * 1024,
+                max_archive_entries: 100_000,
                 io_concurrency: 2,
                 max_list_entries: 100,
                 request_timeout_secs: 30,
@@ -895,6 +1024,10 @@ mod tests {
                 .unwrap(),
                 config_path: root.join("config.json"),
                 max_upload_bytes: 5 * 1024 * 1024 * 1024,
+                max_upload_batch_bytes: 100 * 1024 * 1024 * 1024,
+                max_upload_batch_entries: 10_000,
+                max_archive_bytes: 100 * 1024 * 1024 * 1024,
+                max_archive_entries: 100_000,
                 io_concurrency: 2,
                 max_list_entries: 100,
                 request_timeout_secs: 30,

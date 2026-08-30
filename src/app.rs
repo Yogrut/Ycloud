@@ -24,7 +24,7 @@ use crate::{
     batch_operations,
     security::{csrf_middleware, proxy_boundary_middleware, security_headers_middleware},
     state::AppState,
-    webdav,
+    upload_batch, webdav,
 };
 
 const MAX_BATCH_BODY_BYTES: usize = 256 * 1024;
@@ -79,6 +79,14 @@ pub fn build_router(state: AppState) -> Router {
     let write_api = Router::new()
         .route("/files", axum::routing::delete(api::delete_file))
         .route("/mkdir", post(api::create_directory))
+        .route(
+            "/upload/prepare",
+            post(upload_batch::prepare_upload_batch).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route(
+            "/upload/cancel",
+            post(upload_batch::cancel_upload_batch).layer(DefaultBodyLimit::max(32 * 1024)),
+        )
         .route("/upload", put(api::upload_file))
         .route("/rename", put(api::rename_file))
         .merge(batch_api)
@@ -113,12 +121,19 @@ pub fn build_router(state: AppState) -> Router {
             put(admin_api::update_share).delete(admin_api::delete_share),
         )
         .route("/account", put(admin_api::update_admin_account))
+        .route("/account/totp/setup", post(admin_api::setup_admin_totp))
+        .route("/account/totp/enable", post(admin_api::enable_admin_totp))
+        .route(
+            "/account/totp",
+            axum::routing::delete(admin_api::disable_admin_totp),
+        )
         .route("/users", post(admin_api::create_user_account))
         .route(
             "/users/{id}",
             put(admin_api::update_user_account).delete(admin_api::delete_user_account),
         )
         .route("/storage/test", post(admin_api::test_s3_storage))
+        .route("/storage/local/test", post(admin_api::test_local_storage))
         .route("/storage/s3/{id}", put(admin_api::update_s3_storage))
         .route(
             "/storage/pending",
@@ -136,6 +151,7 @@ pub fn build_router(state: AppState) -> Router {
             "/storage/{id}",
             put(admin_api::update_storage_access).delete(admin_api::delete_storage),
         )
+        .route("/storage/{id}/default", put(admin_api::set_default_storage))
         .route("/limits", put(admin_api::update_transfer_limits))
         .route(
             "/security/settings",
@@ -175,7 +191,21 @@ pub fn build_router(state: AppState) -> Router {
             MakeRequestUuid,
         ))
         .layer(PropagateRequestIdLayer::new(request_id_header))
-        .layer(TraceLayer::new_for_http());
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request| {
+                let request_id = request
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("missing");
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    uri = %request.uri(),
+                    request_id = %request_id,
+                )
+            }),
+        );
     let timeouts = RequestTimeouts {
         regular: Duration::from_secs(state.config.request_timeout_secs),
         upload: Duration::from_secs(state.config.upload_timeout_secs),
@@ -347,6 +377,10 @@ mod tests {
                 .unwrap(),
                 config_path: root.join("config.json"),
                 max_upload_bytes: 2 * 1024 * 1024,
+                max_upload_batch_bytes: 100 * 1024 * 1024 * 1024,
+                max_upload_batch_entries: 10_000,
+                max_archive_bytes: 100 * 1024 * 1024 * 1024,
+                max_archive_entries: 100_000,
                 io_concurrency: 2,
                 max_list_entries: 100,
                 request_timeout_secs: 30,
@@ -433,6 +467,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
+        assert!(health.headers().get("x-request-id").is_some());
         assert_eq!(
             health
                 .headers()
@@ -870,7 +905,7 @@ mod tests {
                     .header(header::COOKIE, format!("session={admin_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"max_upload_bytes":2097152,"max_archive_bytes":3145728,"max_archive_entries":2}"#,
+                        r#"{"max_upload_bytes":2097152,"max_upload_batch_bytes":4194304,"max_upload_batch_entries":4,"max_archive_bytes":3145728,"max_archive_entries":2}"#,
                     ))
                     .unwrap(),
             )
@@ -893,6 +928,8 @@ mod tests {
         let limits_body = to_bytes(limits_list.into_body(), 16 * 1024).await.unwrap();
         let limits_json: serde_json::Value = serde_json::from_slice(&limits_body).unwrap();
         assert_eq!(limits_json["max_upload_bytes"], 2_097_152);
+        assert_eq!(limits_json["max_upload_batch_bytes"], 4_194_304);
+        assert_eq!(limits_json["max_upload_batch_entries"], 4);
         assert_eq!(limits_json["max_archive_bytes"], 3_145_728);
         assert_eq!(limits_json["max_archive_entries"], 2);
 

@@ -2,10 +2,13 @@ use std::time::Duration;
 
 use aws_sdk_s3::{
     config::{retry::RetryConfig, timeout::TimeoutConfig},
+    types::{CompletedMultipartUpload, CompletedPart},
     Client,
 };
 use aws_smithy_types::byte_stream::ByteStream;
 use axum::{body::Body, http::HeaderValue};
+use bytes::BytesMut;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -28,6 +31,13 @@ const S3_MAX_CAPACITY_SCAN_PAGES: usize = 10_000;
 const S3_TRANSACTION_SCHEMA_VERSION: u32 = 1;
 const S3_MAX_PENDING_TRANSACTIONS: usize = 1_000;
 const S3_MAX_TRANSACTION_BYTES: usize = 64 * 1024;
+const S3_MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
+const S3_MULTIPART_PART_BYTES: u64 = 64 * 1024 * 1024;
+const S3_MULTIPART_MAX_PARTS: u64 = 10_000;
+// Keep one buffered part bounded even when the deployment envelope is set far
+// above the defaults. With 10,000 parts this supports objects up to 5 TiB.
+const S3_MULTIPART_MAX_PART_BYTES: u64 = 512 * 1024 * 1024;
+const S3_SINGLE_COPY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 
 mod body;
 mod capacity;
@@ -137,7 +147,9 @@ impl S3Backend {
         max_upload_bytes: u64,
         content_type: Option<&str>,
     ) -> AppResult<S3UploadResult> {
-        if content_length > max_upload_bytes {
+        if content_length > max_upload_bytes
+            || content_length > S3_MULTIPART_MAX_PART_BYTES * S3_MULTIPART_MAX_PARTS
+        {
             return Err(AppError::PayloadTooLarge);
         }
         let relative = StorageService::normalize_relative(relative)?;
@@ -146,40 +158,26 @@ impl S3Backend {
         let upload_id = uuid::Uuid::new_v4().simple().to_string();
         let temporary_key = internal_key(&self.prefix, "uploads", &upload_id);
         let backup_key = internal_key(&self.prefix, "backups", &upload_id);
-        let exact_body = ExactLengthBody::new(body.into_data_stream(), content_length);
-        let stream = ByteStream::from_body_1_x(exact_body);
-        let length = i64::try_from(content_length).map_err(|_| AppError::PayloadTooLarge)?;
-        let upload_timeouts = TimeoutConfig::builder()
-            .connect_timeout(S3_CONNECT_TIMEOUT)
-            .operation_attempt_timeout(self.upload_timeout)
-            .operation_timeout(self.upload_timeout)
-            .build();
-        let operation_override = aws_sdk_s3::config::Builder::new()
-            .retry_config(RetryConfig::standard().with_max_attempts(1))
-            .timeout_config(upload_timeouts);
-
-        let permit = self.acquire_request().await?;
-        let mut request = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&temporary_key)
-            .content_length(length)
-            .body(stream);
-        if let Some(content_type) = sanitize_content_type(content_type)? {
-            request = request.content_type(content_type);
-        }
-        let upload = request
-            .customize()
-            .config_override(operation_override)
-            .send()
-            .await;
-        drop(permit);
+        let content_type = sanitize_content_type(content_type)?;
+        let upload = if content_length >= S3_MULTIPART_THRESHOLD {
+            self.multipart_upload(
+                &temporary_key,
+                body,
+                content_length,
+                content_type.as_deref(),
+            )
+            .await
+        } else {
+            self.single_upload(
+                &temporary_key,
+                body,
+                content_length,
+                content_type.as_deref(),
+            )
+            .await
+        };
         if let Err(error) = upload {
-            tracing::warn!(
-                error_kind = %error.as_service_error().map_or("transport", |_| "service"),
-                "S3 temporary upload failed"
-            );
+            tracing::warn!(%error, "S3 temporary upload failed");
             self.delete_internal_best_effort(&temporary_key).await;
             return Err(AppError::ServiceUnavailable(
                 "对象存储上传失败或请求体长度不一致".into(),
@@ -612,6 +610,18 @@ impl S3Backend {
         source_etag: Option<&str>,
         destination_must_not_exist: bool,
     ) -> AppResult<String> {
+        let source = self.head_key(source_key).await?.ok_or(AppError::NotFound)?;
+        if source.size > S3_SINGLE_COPY_LIMIT {
+            return self
+                .multipart_copy(
+                    source_key,
+                    destination_key,
+                    source.size,
+                    source_etag,
+                    destination_must_not_exist,
+                )
+                .await;
+        }
         let _permit = self.acquire_request().await?;
         let mut request = self
             .client
@@ -637,6 +647,289 @@ impl S3Backend {
             .and_then(|result| result.e_tag())
             .map(str::to_owned)
             .ok_or_else(|| AppError::ServiceUnavailable("对象复制未返回提交 ETag".into()))
+    }
+
+    async fn single_upload(
+        &self,
+        key: &str,
+        body: Body,
+        content_length: u64,
+        content_type: Option<&str>,
+    ) -> AppResult<()> {
+        let exact_body = ExactLengthBody::new(body.into_data_stream(), content_length);
+        let stream = ByteStream::from_body_1_x(exact_body);
+        let length = i64::try_from(content_length).map_err(|_| AppError::PayloadTooLarge)?;
+        let upload_timeouts = TimeoutConfig::builder()
+            .connect_timeout(S3_CONNECT_TIMEOUT)
+            .operation_attempt_timeout(self.upload_timeout)
+            .operation_timeout(self.upload_timeout)
+            .build();
+        let operation_override = aws_sdk_s3::config::Builder::new()
+            .retry_config(RetryConfig::standard().with_max_attempts(1))
+            .timeout_config(upload_timeouts);
+        let _permit = self.acquire_request().await?;
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_length(length)
+            .body(stream);
+        if let Some(content_type) = content_type {
+            request = request.content_type(content_type);
+        }
+        request
+            .customize()
+            .config_override(operation_override)
+            .send()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("对象存储上传失败".into()))?;
+        Ok(())
+    }
+
+    async fn multipart_upload(
+        &self,
+        key: &str,
+        body: Body,
+        content_length: u64,
+        content_type: Option<&str>,
+    ) -> AppResult<()> {
+        let mut create = self
+            .client
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key);
+        if let Some(content_type) = content_type {
+            create = create.content_type(content_type);
+        }
+        let upload_id = {
+            let _permit = self.acquire_request().await?;
+            create
+                .send()
+                .await
+                .map_err(|_| AppError::ServiceUnavailable("无法创建对象存储分片上传".into()))?
+                .upload_id()
+                .map(str::to_owned)
+                .ok_or_else(|| AppError::ServiceUnavailable("对象存储未返回分片上传 ID".into()))?
+        };
+        let result = self
+            .upload_multipart_parts(key, &upload_id, body, content_length)
+            .await;
+        if result.is_err() {
+            self.abort_multipart_best_effort(key, &upload_id).await;
+        }
+        result
+    }
+
+    async fn upload_multipart_parts(
+        &self,
+        key: &str,
+        upload_id: &str,
+        body: Body,
+        content_length: u64,
+    ) -> AppResult<()> {
+        let part_size = multipart_part_size(content_length)?;
+        let mut stream = body.into_data_stream();
+        let mut buffer = BytesMut::with_capacity(part_size);
+        let mut completed = Vec::new();
+        let mut received = 0_u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|_| AppError::ServiceUnavailable("读取上传请求失败".into()))?;
+            received = received
+                .checked_add(chunk.len() as u64)
+                .ok_or(AppError::PayloadTooLarge)?;
+            if received > content_length {
+                return Err(AppError::PayloadTooLarge);
+            }
+            let mut offset = 0;
+            while offset < chunk.len() {
+                let take = (part_size - buffer.len()).min(chunk.len() - offset);
+                buffer.extend_from_slice(&chunk[offset..offset + take]);
+                offset += take;
+                if buffer.len() == part_size {
+                    completed.push(
+                        self.upload_part(
+                            key,
+                            upload_id,
+                            completed.len() + 1,
+                            buffer.split().freeze(),
+                        )
+                        .await?,
+                    );
+                }
+            }
+        }
+        if received != content_length {
+            return Err(AppError::ServiceUnavailable("上传请求体长度不一致".into()));
+        }
+        if !buffer.is_empty() {
+            completed.push(
+                self.upload_part(key, upload_id, completed.len() + 1, buffer.freeze())
+                    .await?,
+            );
+        }
+        let multipart = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed))
+            .build();
+        let _permit = self.acquire_request().await?;
+        self.client
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(multipart)
+            .send()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("对象存储分片上传提交失败".into()))?;
+        Ok(())
+    }
+
+    async fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        number: usize,
+        bytes: bytes::Bytes,
+    ) -> AppResult<CompletedPart> {
+        let part_number = i32::try_from(number).map_err(|_| AppError::PayloadTooLarge)?;
+        let length = i64::try_from(bytes.len()).map_err(|_| AppError::PayloadTooLarge)?;
+        let upload_timeouts = TimeoutConfig::builder()
+            .connect_timeout(S3_CONNECT_TIMEOUT)
+            .operation_attempt_timeout(self.upload_timeout)
+            .operation_timeout(self.upload_timeout)
+            .build();
+        let operation_override = aws_sdk_s3::config::Builder::new()
+            .retry_config(RetryConfig::standard().with_max_attempts(1))
+            .timeout_config(upload_timeouts);
+        let _permit = self.acquire_request().await?;
+        let output = self
+            .client
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .content_length(length)
+            .body(ByteStream::from(bytes))
+            .customize()
+            .config_override(operation_override)
+            .send()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("对象存储分片上传失败".into()))?;
+        let etag = output
+            .e_tag()
+            .ok_or_else(|| AppError::ServiceUnavailable("对象存储分片未返回 ETag".into()))?;
+        Ok(CompletedPart::builder()
+            .part_number(part_number)
+            .e_tag(etag)
+            .build())
+    }
+
+    async fn multipart_copy(
+        &self,
+        source_key: &str,
+        destination_key: &str,
+        source_size: u64,
+        source_etag: Option<&str>,
+        destination_must_not_exist: bool,
+    ) -> AppResult<String> {
+        if destination_must_not_exist && self.head_key(destination_key).await?.is_some() {
+            return Err(AppError::Conflict("目标对象已存在".into()));
+        }
+        let upload_id = {
+            let _permit = self.acquire_request().await?;
+            self.client
+                .create_multipart_upload()
+                .bucket(&self.bucket)
+                .key(destination_key)
+                .send()
+                .await
+                .map_err(|_| AppError::ServiceUnavailable("无法创建对象存储分片复制".into()))?
+                .upload_id()
+                .map(str::to_owned)
+                .ok_or_else(|| AppError::ServiceUnavailable("对象存储未返回分片复制 ID".into()))?
+        };
+        let result = async {
+            let part_size = multipart_part_size(source_size)? as u64;
+            let mut completed = Vec::new();
+            let mut start = 0_u64;
+            while start < source_size {
+                let end = (start + part_size).min(source_size) - 1;
+                let part_number =
+                    i32::try_from(completed.len() + 1).map_err(|_| AppError::PayloadTooLarge)?;
+                let _permit = self.acquire_request().await?;
+                let mut request = self
+                    .client
+                    .upload_part_copy()
+                    .bucket(&self.bucket)
+                    .key(destination_key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .copy_source(copy_source(&self.bucket, source_key))
+                    .copy_source_range(format!("bytes={start}-{end}"));
+                if let Some(etag) = source_etag {
+                    request = request.copy_source_if_match(etag);
+                }
+                let output = request
+                    .send()
+                    .await
+                    .map_err(|_| AppError::ServiceUnavailable("对象存储分片复制失败".into()))?;
+                let etag = output
+                    .copy_part_result()
+                    .and_then(|result| result.e_tag())
+                    .ok_or_else(|| {
+                        AppError::ServiceUnavailable("对象存储复制分片未返回 ETag".into())
+                    })?;
+                completed.push(
+                    CompletedPart::builder()
+                        .part_number(part_number)
+                        .e_tag(etag)
+                        .build(),
+                );
+                start = end + 1;
+            }
+            let multipart = CompletedMultipartUpload::builder()
+                .set_parts(Some(completed))
+                .build();
+            let _permit = self.acquire_request().await?;
+            self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(destination_key)
+                .upload_id(&upload_id)
+                .multipart_upload(multipart)
+                .send()
+                .await
+                .map_err(|_| AppError::ServiceUnavailable("对象存储分片复制提交失败".into()))?
+                .e_tag()
+                .map(str::to_owned)
+                .ok_or_else(|| AppError::ServiceUnavailable("对象存储复制未返回提交 ETag".into()))
+        }
+        .await;
+        if result.is_err() {
+            self.abort_multipart_best_effort(destination_key, &upload_id)
+                .await;
+        }
+        result
+    }
+
+    async fn abort_multipart_best_effort(&self, key: &str, upload_id: &str) {
+        let Ok(_permit) = self.acquire_request().await else {
+            return;
+        };
+        if self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .is_err()
+        {
+            tracing::warn!("failed to abort an incomplete S3 multipart operation");
+        }
     }
 
     async fn delete_internal_best_effort(&self, key: &str) {
@@ -946,6 +1239,17 @@ fn sanitize_content_type(content_type: Option<&str>) -> AppResult<Option<String>
     Ok(Some(content_type.to_owned()))
 }
 
+fn multipart_part_size(total_bytes: u64) -> AppResult<usize> {
+    let minimum = total_bytes.div_ceil(S3_MULTIPART_MAX_PARTS);
+    let mebibyte = 1024 * 1024;
+    let rounded = minimum.div_ceil(mebibyte) * mebibyte;
+    let size = S3_MULTIPART_PART_BYTES.max(rounded);
+    if size > S3_MULTIPART_MAX_PART_BYTES {
+        return Err(AppError::PayloadTooLarge);
+    }
+    usize::try_from(size).map_err(|_| AppError::PayloadTooLarge)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -968,11 +1272,24 @@ mod tests {
     };
 
     use super::{
-        copy_source, internal_key, list_prefix, listing::collect_page_entries, object_key,
-        parent_relative, snapshot_matches, valid_transaction_id, validate_upload_transaction,
-        ExactLengthBody, RawS3Metadata, S3Backend, S3ObjectSnapshot, S3UploadStage,
-        S3UploadTransaction,
+        copy_source, internal_key, list_prefix, listing::collect_page_entries, multipart_part_size,
+        object_key, parent_relative, snapshot_matches, valid_transaction_id,
+        validate_upload_transaction, ExactLengthBody, RawS3Metadata, S3Backend, S3ObjectSnapshot,
+        S3UploadStage, S3UploadTransaction, S3_MULTIPART_MAX_PARTS, S3_MULTIPART_MAX_PART_BYTES,
     };
+
+    #[test]
+    fn multipart_part_sizing_stays_within_provider_limits() {
+        assert_eq!(
+            multipart_part_size(64 * 1024 * 1024).unwrap(),
+            64 * 1024 * 1024
+        );
+        let four_tebibytes = 4_u64 * 1024 * 1024 * 1024 * 1024;
+        let part_size = multipart_part_size(four_tebibytes).unwrap() as u64;
+        assert!(four_tebibytes.div_ceil(part_size) <= S3_MULTIPART_MAX_PARTS);
+        assert!(part_size <= S3_MULTIPART_MAX_PART_BYTES);
+        assert!(multipart_part_size(6_u64 * 1024 * 1024 * 1024 * 1024).is_err());
+    }
 
     fn required_smoke_env(name: &str) -> String {
         std::env::var(name)
@@ -1076,6 +1393,10 @@ mod tests {
             .unwrap(),
             config_path: PathBuf::from("unused-smoke-config.json"),
             max_upload_bytes: 1024 * 1024,
+            max_upload_batch_bytes: 100 * 1024 * 1024 * 1024,
+            max_upload_batch_entries: 10_000,
+            max_archive_bytes: 100 * 1024 * 1024 * 1024,
+            max_archive_entries: 100_000,
             io_concurrency: 2,
             max_list_entries: 100,
             request_timeout_secs: 30,

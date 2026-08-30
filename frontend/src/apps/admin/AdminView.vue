@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import type { AdminInfo } from '../../shared/api/admin'
 import { AdminApiError, getAdminInfo, loginAdministrator } from '../../shared/api/admin'
 import AppIcon from '../../shared/components/AppIcon.vue'
+import AdminLoginCard from '../../shared/components/AdminLoginCard.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
 import type { ThemeController } from '../../shared/composables/useTheme'
@@ -26,6 +27,8 @@ const loading = ref(true)
 const requiresLogin = ref(false)
 const username = ref('')
 const password = ref('')
+const totpCode = ref('')
+const totpRequired = ref(false)
 const loginError = ref('')
 const loggingIn = ref(false)
 const notice = ref('')
@@ -79,19 +82,33 @@ async function submitLogin(): Promise<void> {
   loggingIn.value = true
   loginError.value = ''
   try {
-    const result = await loginAdministrator(username.value.trim(), password.value)
+    const result = await loginAdministrator(username.value.trim(), password.value, totpCode.value.trim())
+    if (result.totp_required) {
+      totpRequired.value = true
+      loginError.value = ''
+      return
+    }
     if (!result.success) throw new Error(result.message ?? locale.text('登录失败', 'Sign-in failed'))
     if (!result.is_admin) {
       await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' })
       throw new Error(locale.text('用户账号不能进入管理后台', 'This user cannot open the admin console.'))
     }
     password.value = ''
+    totpCode.value = ''
+    totpRequired.value = false
     await load()
   } catch (error) {
     loginError.value = error instanceof Error ? error.message : locale.text('登录失败', 'Sign-in failed')
   } finally {
     loggingIn.value = false
   }
+}
+
+function resetTotpChallenge(): void {
+  if (!totpRequired.value) return
+  totpRequired.value = false
+  totpCode.value = ''
+  loginError.value = ''
 }
 
 function showNotice(message: string): void {
@@ -169,14 +186,16 @@ onMounted(load)
   </main>
 
   <main v-else class="admin-login-shell">
-    <form class="admin-login-panel glass" @submit.prevent="submitLogin">
-      <AppIcon name="cloud" :size="52" class="login-logo" />
-      <h1>{{ locale.text('管理员登录', 'Administrator sign-in') }}</h1>
-      <label>{{ locale.text('用户名', 'Username') }}<input v-model="username" class="input" autocomplete="username" autofocus></label>
-      <label>{{ locale.text('密码', 'Password') }}<input v-model="password" class="input" type="password" autocomplete="current-password"></label>
-      <p class="admin-form-error" role="alert">{{ loginError }}</p>
-      <button class="btn" type="submit" :disabled="loggingIn">{{ loggingIn ? locale.text('登录中…', 'Signing in…') : locale.text('登录', 'Sign in') }}</button>
-    </form>
+    <AdminLoginCard
+      v-model:username="username"
+      v-model:password="password"
+      v-model:totp-code="totpCode"
+      :totp-required="totpRequired"
+      :error="loginError"
+      :busy="loggingIn"
+      @credentials-change="resetTotpChallenge"
+      @submit="submitLogin"
+    />
   </main>
 
   <div class="toast" :class="{ show: notice }" role="status">{{ notice }}</div>

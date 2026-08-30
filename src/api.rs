@@ -54,6 +54,8 @@ pub struct ListResponse {
     pub is_admin: bool,
     pub capabilities: BrowserCapabilities,
     pub max_upload_bytes: u64,
+    pub max_upload_batch_bytes: u64,
+    pub max_upload_batch_entries: usize,
     pub max_archive_bytes: u64,
     pub max_archive_entries: usize,
 }
@@ -77,6 +79,7 @@ impl FileListQuery {
         FileQuery {
             path: self.path.clone(),
             storage_id: self.storage_id.clone(),
+            batch: None,
         }
     }
 }
@@ -170,7 +173,14 @@ pub struct BrowserStorageView {
 }
 
 async fn browser_storage_views(state: &AppState, headers: &HeaderMap) -> Vec<BrowserStorageView> {
-    let storage_configs = state.config_file.read().await.storage_instances.clone();
+    let (mut storage_configs, default_storage_id) = {
+        let config = state.config_file.read().await;
+        (
+            config.storage_instances.clone(),
+            config.default_storage_id.clone(),
+        )
+    };
+    storage_configs.sort_by_key(|storage| usize::from(storage.id != default_storage_id));
     let mut storages = Vec::with_capacity(storage_configs.len());
     for storage in storage_configs {
         if !storage.enabled || !state.backends.is_ready(&storage.id).await {
@@ -375,10 +385,18 @@ pub async fn list_files(
         .map(|s| s.to_string());
 
     let permission = storage_permission(&state, &headers, &share.storage_id).await;
-    let (max_upload_bytes, max_archive_bytes, max_archive_entries) = {
+    let (
+        max_upload_bytes,
+        max_upload_batch_bytes,
+        max_upload_batch_entries,
+        max_archive_bytes,
+        max_archive_entries,
+    ) = {
         let config = state.config_file.read().await;
         (
             config.max_upload_bytes,
+            config.max_upload_batch_bytes,
+            config.max_upload_batch_entries,
             config.max_archive_bytes,
             config.max_archive_entries,
         )
@@ -425,6 +443,8 @@ pub async fn list_files(
         is_admin,
         capabilities,
         max_upload_bytes,
+        max_upload_batch_bytes,
+        max_upload_batch_entries,
         max_archive_bytes,
         max_archive_entries,
     }))
@@ -511,7 +531,18 @@ pub async fn upload_file(
         .and_then(|value| value.to_str().ok());
     let body = state.upload_limiter.wrap_body(body);
     let max_upload_bytes = state.config_file.read().await.max_upload_bytes;
-    backend
+    if query.batch.is_some() && expected_bytes.is_none() {
+        return Err(AppError::BadRequest(
+            "批量上传必须提供 Content-Length".into(),
+        ));
+    }
+    if let (Some(ticket), Some(size)) = (query.batch.as_deref(), expected_bytes) {
+        state
+            .upload_batches
+            .begin(ticket, &share.storage_id, &storage_path, size)
+            .await?;
+    }
+    let upload_result = backend
         .upload_file(
             &storage_path,
             body,
@@ -519,7 +550,14 @@ pub async fn upload_file(
             max_upload_bytes,
             content_type,
         )
-        .await?;
+        .await;
+    if let Some(ticket) = query.batch.as_deref() {
+        state
+            .upload_batches
+            .finish(ticket, &storage_path, upload_result.is_ok())
+            .await;
+    }
+    upload_result?;
     Ok(Json(
         serde_json::json!({ "success": true, "uploaded": [file_name] }),
     ))

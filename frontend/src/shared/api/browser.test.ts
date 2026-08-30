@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { batchOperation, createFolder, downloadUrl, fileApi, prepareArchive } from './browser'
+import { batchOperation, cancelUploadBatch, createFolder, downloadUrl, fileApi, prepareArchive, prepareUploadBatch, uploadFile } from './browser'
 import { formatSize } from '../format'
 
 describe('browser API paths', () => {
@@ -53,6 +53,66 @@ describe('browser API paths', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/archive/prepare', expect.objectContaining({
       body: JSON.stringify({ paths: ['/one.txt', '/folder/two.txt'] }),
+    }))
+  })
+
+  it('prepares an upload batch without rewriting its relative target paths', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ticket: 'batch-ticket' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(prepareUploadBatch([
+      { path: 'folder/one.txt', size: 11 },
+      { path: 'folder/two.txt', size: 22 },
+    ], 'primary')).resolves.toEqual({ ticket: 'batch-ticket' })
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/upload/prepare?storage_id=primary', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ items: [
+        { path: 'folder/one.txt', size: 11 },
+        { path: 'folder/two.txt', size: 22 },
+      ] }),
+    }))
+  })
+
+  it('aborts an active upload through its cancellation signal', async () => {
+    class AbortableXMLHttpRequest {
+      static instances: AbortableXMLHttpRequest[] = []
+      status = 0
+      responseText = ''
+      withCredentials = false
+      private listeners = new Map<string, () => void>()
+      upload = { addEventListener: () => undefined }
+      constructor() { AbortableXMLHttpRequest.instances.push(this) }
+      open(): void {}
+      setRequestHeader(): void {}
+      addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
+      send(): void {}
+      abort(): void { this.listeners.get('abort')?.() }
+    }
+    vi.stubGlobal('XMLHttpRequest', AbortableXMLHttpRequest)
+    const controller = new AbortController()
+    const result = uploadFile('file.txt', new File(['data'], 'file.txt'), () => undefined, 'primary', 'ticket', controller.signal)
+    controller.abort()
+
+    await expect(result).rejects.toThrow('上传已取消')
+    expect(AbortableXMLHttpRequest.instances).toHaveLength(1)
+  })
+
+  it('releases a temporary upload batch without touching stored files', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await cancelUploadBatch('batch-ticket', 'primary')
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/upload/cancel?storage_id=primary', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ ticket: 'batch-ticket' }),
     }))
   })
 

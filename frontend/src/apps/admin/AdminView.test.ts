@@ -40,8 +40,50 @@ describe('AdminView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    expect(host.textContent).toContain('管理员登录')
+    expect(host.textContent).toContain('账号登录')
+    expect(host.querySelector('.admin-login-brand')).not.toBeNull()
+    expect(host.querySelector('.admin-login-form-pane')).not.toBeNull()
+    expect(host.querySelector('.admin-login-brand')?.textContent).toContain('统一入口，管理所有存储')
+    expect(host.querySelector('.admin-login-platform')?.textContent).toContain('Ycloud')
+    expect(host.querySelector('.admin-login-hub')?.textContent).toContain('权限控制')
+    expect(host.querySelectorAll('.admin-login-node')).toHaveLength(2)
+    expect(host.querySelector('.admin-login-storage-row')?.textContent).toContain('本地存储')
+    expect(host.querySelector('.admin-login-storage-row')?.textContent).toContain('S3 存储')
+    expect(host.querySelector('.admin-login-storage-row')?.textContent).not.toContain('WebDAV')
+    expect(host.querySelector('.admin-login-card .locale-toggle')).toBeNull()
+    expect(host.textContent).not.toContain('协议')
     expect(host.querySelector('.admin-shell')).toBeNull()
+    app.unmount()
+  })
+
+  it('reveals the authenticator field only after the server requests it', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'Unauthorized' } }), {
+        status: 401, headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        success: false, is_admin: true, totp_required: true, message: '请输入动态验证码或恢复码',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountAdmin(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('input[autocomplete="one-time-code"]')).toBeNull()
+    const username = host.querySelector('input[autocomplete="username"]') as HTMLInputElement
+    const password = host.querySelector('input[autocomplete="current-password"]') as HTMLInputElement
+    username.value = 'admin'
+    username.dispatchEvent(new Event('input'))
+    password.value = 'correct-password'
+    password.dispatchEvent(new Event('input'))
+    ;(host.querySelector('form') as HTMLFormElement).dispatchEvent(new Event('submit', { cancelable: true }))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('input[autocomplete="one-time-code"]')).not.toBeNull()
+    expect(host.textContent).toContain('验证并登录')
     app.unmount()
   })
 

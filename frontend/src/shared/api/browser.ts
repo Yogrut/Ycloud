@@ -11,6 +11,8 @@ export interface FileEntry {
 
 import { appPath } from '../routes'
 import { useLocale } from '../i18n'
+import { ApiError, errorMetadata, readJson } from './client'
+import type { ErrorEnvelope } from './client'
 
 const locale = useLocale()
 
@@ -27,6 +29,8 @@ export interface FileListResponse {
   is_admin?: boolean
   capabilities?: BrowserCapabilities
   max_upload_bytes: number
+  max_upload_batch_bytes?: number
+  max_upload_batch_entries?: number
   max_archive_bytes: number
   max_archive_entries: number
 }
@@ -64,6 +68,11 @@ export interface ArchivePrepareResponse {
   max_entries: number
 }
 
+export interface UploadBatchItem {
+  path: string
+  size: number
+}
+
 export interface BatchItemResult {
   path: string
   status: number
@@ -79,29 +88,17 @@ export interface BatchResponse {
 
 export type BatchOperation = 'delete' | 'move' | 'copy'
 
-interface ErrorEnvelope {
-  message?: string
-  error?: { message?: string }
-}
-
-async function readJson<T>(response: Response): Promise<T | undefined> {
-  try {
-    return await response.json() as T
-  } catch {
-    return undefined
-  }
-}
-
 export async function apiRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(url, { credentials: 'same-origin', ...options })
   if (response.status === 401) {
     window.location.replace(appPath('/'))
-    throw new Error(locale.t('common.sessionExpired'))
+    throw new ApiError(locale.t('common.sessionExpired'), response.status, 'unauthorized', response.headers.get('x-request-id') ?? undefined)
   }
 
-  const body = await readJson<T & ErrorEnvelope>(response)
+  const body = await readJson<T>(response)
   if (!response.ok) {
-    throw new Error(body?.error?.message ?? body?.message ?? locale.t('common.requestFailed', { status: response.status }))
+    const details = errorMetadata(response, body ?? {})
+    throw new ApiError(details.message ?? locale.t('common.requestFailed', { status: response.status }), response.status, details.code, details.requestId)
   }
   if (body === undefined) throw new Error(locale.t('common.invalidResponse'))
   return body
@@ -173,6 +170,22 @@ export function prepareArchive(paths: string[], storageId?: string): Promise<Arc
   })
 }
 
+export function prepareUploadBatch(items: UploadBatchItem[], storageId?: string): Promise<{ ticket: string }> {
+  return apiRequest(withStorage('/api/upload/prepare', storageId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  })
+}
+
+export async function cancelUploadBatch(ticket: string, storageId?: string): Promise<void> {
+  await apiRequest(withStorage('/api/upload/cancel', storageId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ticket }),
+  })
+}
+
 export async function batchOperation(operation: BatchOperation, paths: string[], target = '', storageId?: string): Promise<BatchResponse> {
   const response = await fetch(withStorage(`/api/batch/${operation}`, storageId), {
     method: operation === 'move' ? 'PUT' : 'POST',
@@ -191,10 +204,14 @@ export async function batchOperation(operation: BatchOperation, paths: string[],
   throw new Error(locale.text('服务返回了无效的批量操作结果', 'The server returned an invalid batch result'))
 }
 
-export function uploadFile(path: string, file: File, onProgress: (loaded: number) => void, storageId?: string): Promise<void> {
+export function uploadFile(path: string, file: File, onProgress: (loaded: number) => void, storageId?: string, batch?: string, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest()
-    request.open('PUT', actionApi('upload', path, storageId))
+    const abortRequest = () => request.abort()
+    const cleanup = () => signal?.removeEventListener('abort', abortRequest)
+    const target = new URL(actionApi('upload', path, storageId), window.location.origin)
+    if (batch) target.searchParams.set('batch', batch)
+    request.open('PUT', `${target.pathname}${target.search}`)
     request.withCredentials = true
     request.setRequestHeader('Content-Type', 'application/octet-stream')
     request.upload.addEventListener('progress', event => {
@@ -202,11 +219,13 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
     })
     request.addEventListener('load', () => {
       if (request.status === 401) {
+        cleanup()
         window.location.replace(appPath('/'))
         reject(new Error(locale.t('common.sessionExpired')))
         return
       }
       if (request.status >= 200 && request.status < 300) {
+        cleanup()
         onProgress(file.size)
         resolve()
         return
@@ -218,10 +237,22 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
       } catch {
         // Keep the status-based message for non-JSON proxy failures.
       }
+      cleanup()
       reject(new Error(message))
     })
-    request.addEventListener('error', () => reject(new Error(locale.t('common.networkInterrupted'))))
-    request.addEventListener('abort', () => reject(new Error(locale.text('上传已取消', 'Upload cancelled'))))
+    request.addEventListener('error', () => {
+      cleanup()
+      reject(new Error(locale.t('common.networkInterrupted')))
+    })
+    request.addEventListener('abort', () => {
+      cleanup()
+      reject(new Error(locale.text('上传已取消', 'Upload cancelled')))
+    })
+    if (signal?.aborted) {
+      reject(new Error(locale.text('上传已取消', 'Upload cancelled')))
+      return
+    }
+    signal?.addEventListener('abort', abortRequest, { once: true })
     request.send(file)
   })
 }
@@ -234,11 +265,11 @@ export function unlockFolder(path: string, password: string, storageId?: string)
   })
 }
 
-export function adminLogin(username: string, password: string): Promise<{ success: boolean; message?: string; is_admin: boolean }> {
+export function adminLogin(username: string, password: string, totpCode?: string): Promise<{ success: boolean; message?: string; is_admin: boolean; totp_required?: boolean }> {
   return apiRequest('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password, totp_code: totpCode || undefined }),
   })
 }
 

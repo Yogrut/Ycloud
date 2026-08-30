@@ -46,7 +46,7 @@ export const en: Record<MessageKey, string> = {
   'menu.fileActions': 'File actions',
   'menu.selected': '{count} selected',
   'menu.clear': 'Clear',
-  'menu.upload': 'Upload files',
+  'menu.upload': 'Upload',
   'menu.newFolder': 'New folder',
   'menu.archive': 'Download as ZIP',
   'menu.move': 'Move',

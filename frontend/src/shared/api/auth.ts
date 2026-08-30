@@ -1,4 +1,5 @@
 import { useLocale } from '../i18n'
+import { readJson } from './client'
 
 const locale = useLocale()
 
@@ -14,14 +15,6 @@ interface GateResponse {
   message?: string
   error?: {
     message?: string
-  }
-}
-
-async function readJson<T>(response: Response): Promise<T | undefined> {
-  try {
-    return await response.json() as T
-  } catch {
-    return undefined
   }
 }
 

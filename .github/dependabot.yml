@@ -1,5 +1,24 @@
 version: 2
 updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    groups:
+      aws-sdk:
+        patterns:
+          - "aws-*"
+      rust-runtime:
+        patterns:
+          - axum
+          - tokio
+          - tower
+          - "tower-*"
+
   - package-ecosystem: npm
     directory: /frontend
     schedule:

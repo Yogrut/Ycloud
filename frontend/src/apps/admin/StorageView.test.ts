@@ -59,6 +59,16 @@ function setLabeledInput(host: HTMLElement, label: string, value: string): void 
   setInput(field ?? null, value)
 }
 
+async function chooseSelect(host: HTMLElement, selector: string, label: string): Promise<void> {
+  host.querySelector<HTMLButtonElement>(`${selector} .app-select-trigger`)?.click()
+  await nextTick()
+  const option = [...host.querySelectorAll<HTMLButtonElement>(`${selector} .app-select-option`)]
+    .find(item => item.textContent?.includes(label))
+  if (!option) throw new Error(`select option missing for ${label}`)
+  option.click()
+  await nextTick()
+}
+
 describe('StorageView', () => {
   it('keeps setup collapsed until New storage is selected', async () => {
     const host = document.createElement('div')
@@ -97,6 +107,41 @@ describe('StorageView', () => {
     app.unmount()
   })
 
+  it('tests a declared local mount before adding it', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(response()))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const { app, changed } = mountStorage(host)
+    button(host, '新建存储')?.click()
+    await nextTick()
+
+    button(host, '测试连接')?.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/local/test', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ path: '/mnt/archive' }),
+    }))
+    expect(changed).toHaveBeenCalledWith('存储连接与读写能力验证通过')
+    app.unmount()
+  })
+
+  it('sets a ready storage as the default', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(response()))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const { app, changed } = mountStorage(host)
+
+    host.querySelector<HTMLButtonElement>('button[aria-label="设为默认存储"]')?.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/primary/default', expect.objectContaining({ method: 'PUT' }))
+    expect(changed).toHaveBeenCalledWith('默认存储已更新')
+    app.unmount()
+  })
+
   it('reconfigures the complete local storage settings', async () => {
     const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(response()))
     vi.stubGlobal('fetch', fetchMock)
@@ -106,18 +151,14 @@ describe('StorageView', () => {
     host.querySelector<HTMLButtonElement>('button[aria-label="编辑存储"]')?.click()
     await nextTick()
     setLabeledInput(host, '存储名称', '主资料盘')
-    setLabeledInput(host, '本地存储路径', '/mnt/primary')
+    await chooseSelect(host, '.local-storage-path', '/mnt/archive')
     setInput(host.querySelector('.local-capacity-input'), '800')
     button(host, '保存')?.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/local', expect.objectContaining({
       method: 'PUT',
-      body: JSON.stringify({ storage_id: 'primary', name: '主资料盘', path: '/mnt/primary', capacity_limit_bytes: 800 * (1024 ** 3) }),
-    }))
-    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/primary', expect.objectContaining({
-      method: 'PUT',
-      body: JSON.stringify({ enabled: true, allow_guest_access: true }),
+      body: JSON.stringify({ storage_id: 'primary', name: '主资料盘', path: '/mnt/archive', capacity_limit_bytes: 800 * (1024 ** 3), enabled: true, allow_guest_access: true }),
     }))
     expect(changed).toHaveBeenCalledWith('存储设置已保存')
     app.unmount()
@@ -132,7 +173,7 @@ describe('StorageView', () => {
     button(host, '新建存储')?.click()
     await nextTick()
     setInput(host.querySelector('.local-storage-name'), '冷数据归档')
-    setInput(host.querySelector('.local-storage-path'), '/mnt/archive')
+    expect(host.querySelector('.local-storage-path .app-select-value')?.textContent).toContain('/mnt/archive')
     setInput(host.querySelector('.local-capacity-input'), '80')
     button(host, '保存')?.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))

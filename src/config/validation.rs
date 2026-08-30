@@ -7,8 +7,9 @@ use super::{
     paths_overlap, AppError, AppResult, ConfigFile, S3AddressingStyle, S3Provider,
     StorageBackendConfig, StorageInstanceConfig, CONFIG_SCHEMA_VERSION, HARD_MAX_ARCHIVE_BYTES,
     HARD_MAX_ARCHIVE_ENTRIES, HARD_MAX_STORAGE_CAPACITY_BYTES, HARD_MAX_TRANSFER_RATE_BYTES,
-    HARD_MAX_UPLOAD_BYTES, MAX_STORAGE_INSTANCES, MAX_USER_ACCOUNTS, MIN_STORAGE_CAPACITY_BYTES,
-    MIN_TRANSFER_BYTES, MIN_TRANSFER_RATE_BYTES,
+    HARD_MAX_UPLOAD_BATCH_BYTES, HARD_MAX_UPLOAD_BATCH_ENTRIES, HARD_MAX_UPLOAD_BYTES,
+    MAX_STORAGE_INSTANCES, MAX_USER_ACCOUNTS, MIN_STORAGE_CAPACITY_BYTES, MIN_TRANSFER_BYTES,
+    MIN_TRANSFER_RATE_BYTES,
 };
 
 impl ConfigFile {
@@ -29,6 +30,19 @@ impl ConfigFile {
                 "Administrator password hash is invalid".into(),
             ));
         }
+        if let Some(secret) = self.admin_totp_secret.as_deref() {
+            crate::totp::validate_secret(secret)?;
+        } else if !self.admin_recovery_code_hashes.is_empty() {
+            return Err(AppError::BadRequest("未启用 TOTP 时不能保留恢复码".into()));
+        }
+        if self.admin_recovery_code_hashes.len() > 10
+            || self
+                .admin_recovery_code_hashes
+                .iter()
+                .any(|hash| PasswordHash::new(hash).is_err())
+        {
+            return Err(AppError::BadRequest("管理员恢复码配置无效".into()));
+        }
         if self.user_accounts.len() > MAX_USER_ACCOUNTS {
             return Err(AppError::BadRequest("普通账号数量不能超过 100 个".into()));
         }
@@ -39,6 +53,8 @@ impl ConfigFile {
         }
         validate_transfer_limits(
             self.max_upload_bytes,
+            self.max_upload_batch_bytes,
+            self.max_upload_batch_entries,
             self.max_archive_bytes,
             self.max_archive_entries,
         )?;
@@ -74,6 +90,17 @@ impl ConfigFile {
                     ));
                 }
             }
+        }
+        if self.storage_instances.is_empty() {
+            return Err(AppError::BadRequest("至少需要保留一个存储实例".into()));
+        }
+        let default_storage = self
+            .storage_instances
+            .iter()
+            .find(|storage| storage.id == self.default_storage_id)
+            .ok_or_else(|| AppError::BadRequest("默认存储必须引用已存在的存储实例".into()))?;
+        if !default_storage.enabled {
+            return Err(AppError::Conflict("默认存储必须保持启用".into()));
         }
         let mut account_ids = HashSet::new();
         let mut account_names = HashSet::new();
@@ -315,22 +342,36 @@ pub fn validate_transfer_rate(bytes_per_second: u64, label: &str) -> AppResult<(
 
 pub fn validate_transfer_limits(
     max_upload_bytes: u64,
+    max_upload_batch_bytes: u64,
+    max_upload_batch_entries: usize,
     max_archive_bytes: u64,
     max_archive_entries: usize,
 ) -> AppResult<()> {
     if !(MIN_TRANSFER_BYTES..=HARD_MAX_UPLOAD_BYTES).contains(&max_upload_bytes) {
         return Err(AppError::BadRequest(
-            "单文件上传上限必须在 1 MiB 到 100 GiB 之间".into(),
+            "单文件上传上限超出配置格式允许的范围".into(),
+        ));
+    }
+    if !(MIN_TRANSFER_BYTES..=HARD_MAX_UPLOAD_BATCH_BYTES).contains(&max_upload_batch_bytes)
+        || max_upload_batch_bytes < max_upload_bytes
+    {
+        return Err(AppError::BadRequest(
+            "单次批量上传总量必须不小于单文件上限".into(),
+        ));
+    }
+    if !(1..=HARD_MAX_UPLOAD_BATCH_ENTRIES).contains(&max_upload_batch_entries) {
+        return Err(AppError::BadRequest(
+            "单次批量上传条目数超出配置格式允许的范围".into(),
         ));
     }
     if !(MIN_TRANSFER_BYTES..=HARD_MAX_ARCHIVE_BYTES).contains(&max_archive_bytes) {
         return Err(AppError::BadRequest(
-            "打包源文件总大小上限必须在 1 MiB 到 10 GiB 之间".into(),
+            "打包源文件总大小上限超出配置格式允许的范围".into(),
         ));
     }
     if !(1..=HARD_MAX_ARCHIVE_ENTRIES).contains(&max_archive_entries) {
         return Err(AppError::BadRequest(
-            "打包条目数量上限必须在 1 到 5000 之间".into(),
+            "打包条目数量上限超出配置格式允许的范围".into(),
         ));
     }
     Ok(())
@@ -378,24 +419,33 @@ pub fn validate_storage_backend(backend: &StorageBackendConfig) -> AppResult<()>
         .expect("authority checked above")
         .host()
         .to_ascii_lowercase();
+    let uses_https_default_port = uri
+        .authority()
+        .and_then(axum::http::uri::Authority::port_u16)
+        .is_none_or(|port| port == 443);
     match settings.provider {
         S3Provider::AlibabaOss => {
+            let public = format!("oss-{}.aliyuncs.com", settings.region);
+            let internal = format!("oss-{}-internal.aliyuncs.com", settings.region);
             if scheme != "https"
-                || !host.ends_with(".aliyuncs.com")
+                || !uses_https_default_port
+                || !matches!(host.as_str(), value if value == public || value == internal)
                 || settings.addressing_style != S3AddressingStyle::VirtualHosted
             {
                 return Err(AppError::BadRequest(
-                    "阿里云 OSS 必须使用 HTTPS 官方 Endpoint 和虚拟主机寻址".into(),
+                    "阿里云 OSS 必须使用与 Region 对应的 HTTPS 官方 Endpoint 和虚拟主机寻址".into(),
                 ));
             }
         }
         S3Provider::TencentCos => {
+            let expected = format!("cos.{}.myqcloud.com", settings.region);
             if scheme != "https"
-                || !host.ends_with(".myqcloud.com")
+                || !uses_https_default_port
+                || host != expected
                 || settings.addressing_style != S3AddressingStyle::VirtualHosted
             {
                 return Err(AppError::BadRequest(
-                    "腾讯云 COS 必须使用 HTTPS 官方 Endpoint 和虚拟主机寻址".into(),
+                    "腾讯云 COS 必须使用与 Region 对应的 HTTPS 官方 Endpoint 和虚拟主机寻址".into(),
                 ));
             }
         }

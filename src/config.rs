@@ -17,6 +17,7 @@ mod model;
 mod password;
 mod persistence;
 mod runtime;
+mod secret_store;
 mod validation;
 
 pub use model::{
@@ -32,11 +33,26 @@ pub use validation::{
 };
 
 pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_UPLOAD_BATCH_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_UPLOAD_BATCH_ENTRIES: usize = 1_000;
 pub const DEFAULT_MAX_ARCHIVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 1_000;
-pub const HARD_MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024 * 1024;
-pub const HARD_MAX_ARCHIVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
-pub const HARD_MAX_ARCHIVE_ENTRIES: usize = 5_000;
+pub const DEFAULT_DEPLOYMENT_MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+pub const DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+pub const DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_ENTRIES: usize = 10_000;
+pub const DEFAULT_DEPLOYMENT_MAX_ARCHIVE_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+pub const DEFAULT_DEPLOYMENT_MAX_ARCHIVE_ENTRIES: usize = 100_000;
+// Serialization and arithmetic sanity limits. Operational limits are supplied
+// by the deployment envelope and must not be confused with these format bounds.
+pub const HARD_MAX_UPLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024 * 1024;
+pub const HARD_MAX_UPLOAD_BATCH_BYTES: u64 = HARD_MAX_UPLOAD_BYTES;
+// The batch manifest is accepted as one bounded JSON request and retained in
+// memory until every item completes. Keep this format bound aligned with the
+// deployment default and the active batch store instead of advertising a
+// value the service cannot safely hold.
+pub const HARD_MAX_UPLOAD_BATCH_ENTRIES: usize = 10_000;
+pub const HARD_MAX_ARCHIVE_BYTES: u64 = HARD_MAX_UPLOAD_BYTES;
+pub const HARD_MAX_ARCHIVE_ENTRIES: usize = 1_000_000;
 pub const DEFAULT_ADMIN_LOGIN_FAILURES: u32 = 3;
 pub const DEFAULT_WEB_LOGIN_FAILURES: u32 = 5;
 pub const DEFAULT_LOGIN_BLOCK_SECONDS: u64 = 60 * 60;
@@ -47,7 +63,7 @@ pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
 pub const MIN_STORAGE_CAPACITY_BYTES: u64 = 1024 * 1024;
 pub const HARD_MAX_STORAGE_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 9;
+pub const CONFIG_SCHEMA_VERSION: u32 = 11;
 pub const DEFAULT_STORAGE_ID: &str = "primary";
 pub const MAX_STORAGE_INSTANCES: usize = 16;
 pub const MAX_USER_ACCOUNTS: usize = 100;
@@ -131,6 +147,10 @@ pub struct Config {
     pub local_mounts: LocalMountCatalog,
     pub config_path: PathBuf,
     pub max_upload_bytes: u64,
+    pub max_upload_batch_bytes: u64,
+    pub max_upload_batch_entries: usize,
+    pub max_archive_bytes: u64,
+    pub max_archive_entries: usize,
     pub io_concurrency: usize,
     pub max_list_entries: usize,
     pub request_timeout_secs: u64,
@@ -168,6 +188,14 @@ fn default_admin_username() -> String {
 
 const fn default_max_upload_bytes() -> u64 {
     DEFAULT_MAX_UPLOAD_BYTES
+}
+
+const fn default_max_upload_batch_bytes() -> u64 {
+    DEFAULT_MAX_UPLOAD_BATCH_BYTES
+}
+
+const fn default_max_upload_batch_entries() -> usize {
+    DEFAULT_MAX_UPLOAD_BATCH_ENTRIES
 }
 
 const fn default_max_archive_bytes() -> u64 {
@@ -214,6 +242,8 @@ impl Default for ConfigFile {
             pending_storage_instance: None,
             admin_username: default_admin_username(),
             admin_password_hash: default_hash.clone(),
+            admin_totp_secret: None,
+            admin_recovery_code_hashes: Vec::new(),
             user_accounts: Vec::new(),
             global_web_password_hash: Some(default_hash),
             folder_locks: Vec::new(),
@@ -228,6 +258,8 @@ impl Default for ConfigFile {
                 readonly: false,
             }],
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            max_upload_batch_bytes: DEFAULT_MAX_UPLOAD_BATCH_BYTES,
+            max_upload_batch_entries: DEFAULT_MAX_UPLOAD_BATCH_ENTRIES,
             max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
             max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
             admin_login_failures: DEFAULT_ADMIN_LOGIN_FAILURES,
@@ -254,8 +286,9 @@ mod tests {
         InitialCredentials, LocalStorageConfig, S3AddressingStyle, S3Provider, S3StorageConfig,
         StorageBackendConfig, StorageInstanceConfig, StoragePermission, UserAccount,
         CONFIG_SCHEMA_VERSION, DEFAULT_MAX_ARCHIVE_BYTES, DEFAULT_MAX_ARCHIVE_ENTRIES,
-        DEFAULT_MAX_UPLOAD_BYTES, DEFAULT_STORAGE_ID, HARD_MAX_TRANSFER_RATE_BYTES,
-        MIN_TRANSFER_RATE_BYTES,
+        DEFAULT_MAX_UPLOAD_BATCH_BYTES, DEFAULT_MAX_UPLOAD_BATCH_ENTRIES, DEFAULT_MAX_UPLOAD_BYTES,
+        DEFAULT_STORAGE_ID, HARD_MAX_ARCHIVE_BYTES, HARD_MAX_ARCHIVE_ENTRIES,
+        HARD_MAX_TRANSFER_RATE_BYTES, HARD_MAX_UPLOAD_BATCH_ENTRIES, MIN_TRANSFER_RATE_BYTES,
     };
 
     #[test]
@@ -311,10 +344,16 @@ mod tests {
         };
         assert!(config.validate().is_err());
         config.max_upload_bytes = DEFAULT_MAX_UPLOAD_BYTES;
-        config.max_archive_bytes = 10 * 1024 * 1024 * 1024 + 1;
+        config.max_upload_batch_bytes = DEFAULT_MAX_UPLOAD_BYTES - 1;
+        assert!(config.validate().is_err());
+        config.max_upload_batch_bytes = DEFAULT_MAX_UPLOAD_BATCH_BYTES;
+        config.max_upload_batch_entries = HARD_MAX_UPLOAD_BATCH_ENTRIES + 1;
+        assert!(config.validate().is_err());
+        config.max_upload_batch_entries = DEFAULT_MAX_UPLOAD_BATCH_ENTRIES;
+        config.max_archive_bytes = HARD_MAX_ARCHIVE_BYTES + 1;
         assert!(config.validate().is_err());
         config.max_archive_bytes = DEFAULT_MAX_ARCHIVE_BYTES;
-        config.max_archive_entries = 5_001;
+        config.max_archive_entries = HARD_MAX_ARCHIVE_ENTRIES + 1;
         assert!(config.validate().is_err());
     }
 
@@ -649,6 +688,10 @@ mod tests {
             .unwrap(),
             config_path: "./config.json".into(),
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
+            max_upload_batch_bytes: super::DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_BYTES,
+            max_upload_batch_entries: super::DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_ENTRIES,
+            max_archive_bytes: super::DEFAULT_DEPLOYMENT_MAX_ARCHIVE_BYTES,
+            max_archive_entries: super::DEFAULT_DEPLOYMENT_MAX_ARCHIVE_ENTRIES,
             io_concurrency: 4,
             max_list_entries: 10_000,
             request_timeout_secs: 300,
@@ -681,6 +724,53 @@ mod tests {
                 ..settings
             }))
             .is_err());
+    }
+
+    #[test]
+    fn official_s3_endpoints_must_match_the_selected_region() {
+        let base = S3StorageConfig {
+            provider: S3Provider::TencentCos,
+            endpoint: "https://cos.ap-chengdu.myqcloud.com".into(),
+            bucket: "ycloud-files".into(),
+            region: "ap-chengdu".into(),
+            prefix: "files/".into(),
+            addressing_style: S3AddressingStyle::VirtualHosted,
+            access_key_id: "example-access-key".into(),
+            secret_access_key: "example-secret-key".into(),
+            capacity_limit_bytes: None,
+        };
+        let configured = |settings| ConfigFile {
+            storage_instances: vec![StorageInstanceConfig {
+                id: DEFAULT_STORAGE_ID.into(),
+                name: "Official S3".into(),
+                enabled: true,
+                allow_guest_access: true,
+                backend: StorageBackendConfig::S3(settings),
+            }],
+            ..ConfigFile::default()
+        };
+
+        assert!(configured(base.clone()).validate().is_ok());
+        assert!(configured(S3StorageConfig {
+            endpoint: "https://cos.ap-guangzhou.myqcloud.com".into(),
+            ..base.clone()
+        })
+        .validate()
+        .is_err());
+        assert!(configured(S3StorageConfig {
+            endpoint: "https://cos.ap-chengdu.myqcloud.com:8443".into(),
+            ..base.clone()
+        })
+        .validate()
+        .is_err());
+        assert!(configured(S3StorageConfig {
+            provider: S3Provider::AlibabaOss,
+            endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
+            region: "cn-hangzhou".into(),
+            ..base
+        })
+        .validate()
+        .is_ok());
     }
 
     #[tokio::test]
@@ -719,6 +809,34 @@ mod tests {
         ));
         assert!(remove_initial_credentials(&path).await.unwrap());
         assert!(!tokio::fs::try_exists(credentials_path).await.unwrap());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_master_key_encrypts_totp_secret_at_rest() {
+        let directory =
+            std::env::temp_dir().join(format!("ycloud-totp-secret-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let path = directory.join("config.json");
+        let secret = crate::totp::generate_secret();
+        let config = ConfigFile {
+            admin_totp_secret: Some(secret.clone()),
+            admin_recovery_code_hashes: vec![hash_password("ABCDE23456")],
+            ..ConfigFile::default()
+        };
+
+        save_config(&path, &config).await.unwrap();
+        let persisted = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!persisted.contains(&secret));
+        assert!(persisted.contains("enc:v2:"));
+        assert!(directory
+            .join(".ycloud-system")
+            .join("secrets")
+            .join("master.key")
+            .is_file());
+
+        let loaded = load_config(&path).await.unwrap();
+        assert_eq!(loaded.admin_totp_secret.as_deref(), Some(secret.as_str()));
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 }

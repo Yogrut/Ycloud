@@ -6,7 +6,8 @@ import LimitsView from './LimitsView.vue'
 const GIB = 1024 ** 3
 const info: AdminInfo = {
   username: 'admin', has_global_web_password: true, shares: [], folder_locks: [],
-  max_upload_bytes: 5 * GIB, max_archive_bytes: 3 * GIB, max_archive_entries: 1000,
+  max_upload_bytes: 5 * GIB, max_upload_batch_bytes: 20 * GIB, max_upload_batch_entries: 1000,
+  max_archive_bytes: 3 * GIB, max_archive_entries: 1000,
   upload_rate_bytes_per_sec: 0, download_rate_bytes_per_sec: 0,
   admin_login_failures: 3, web_login_failures: 5,
   admin_login_block_seconds: 3600, web_login_block_seconds: 3600,
@@ -37,13 +38,15 @@ describe('LimitsView', () => {
 
     const inputs = host.querySelectorAll<HTMLInputElement>('input')
     expect(inputs[0]?.value).toBe('5')
-    expect(inputs[1]?.value).toBe('0')
-    expect(inputs[2]?.value).toBe('0')
-    expect(inputs[3]?.value).toBe('3')
-    expect(inputs[4]?.value).toBe('1000')
+    expect(inputs[1]?.value).toBe('20')
+    expect(inputs[2]?.value).toBe('1000')
+    expect(inputs[3]?.value).toBe('0')
+    expect(inputs[4]?.value).toBe('0')
+    expect(inputs[5]?.value).toBe('3')
+    expect(inputs[6]?.value).toBe('1000')
     expect(host.textContent).toContain('磁盘始终保留安全余量')
     expect(host.querySelector('.limits-grid')).not.toBeNull()
-    expect(host.querySelectorAll('.limits-grid > .compact-field')).toHaveLength(5)
+    expect(host.querySelectorAll('.limits-grid > .compact-field')).toHaveLength(7)
     expect(host.querySelector('.limit-upload-rate + .limit-download-rate')).not.toBeNull()
     app.unmount()
   })
@@ -58,13 +61,13 @@ describe('LimitsView', () => {
     document.body.append(host)
     const app = mountLimits(host)
     const inputs = host.querySelectorAll<HTMLInputElement>('input')
-    if (!inputs[0] || !inputs[3] || !inputs[4]) throw new Error('limit input missing')
+    if (!inputs[0] || !inputs[5] || !inputs[6]) throw new Error('limit input missing')
     inputs[0].value = '6'
     inputs[0].dispatchEvent(new Event('input'))
-    inputs[3].value = '2.5'
-    inputs[3].dispatchEvent(new Event('input'))
-    inputs[4].value = '750'
-    inputs[4].dispatchEvent(new Event('input'))
+    inputs[5].value = '2.5'
+    inputs[5].dispatchEvent(new Event('input'))
+    inputs[6].value = '750'
+    inputs[6].dispatchEvent(new Event('input'))
     ;(host.querySelector('form') as HTMLFormElement).dispatchEvent(new Event('submit', { cancelable: true }))
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
@@ -72,6 +75,8 @@ describe('LimitsView', () => {
       method: 'PUT',
       body: JSON.stringify({
         max_upload_bytes: 6 * GIB,
+        max_upload_batch_bytes: 20 * GIB,
+        max_upload_batch_entries: 1000,
         max_archive_bytes: 2.5 * GIB,
         max_archive_entries: 750,
         upload_rate_bytes_per_sec: 0,
@@ -88,15 +93,15 @@ describe('LimitsView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const app = mountLimits(host)
-    const entries = host.querySelectorAll<HTMLInputElement>('input')[4]
+    const entries = host.querySelectorAll<HTMLInputElement>('input')[6]
     if (!entries) throw new Error('entry limit input missing')
-    entries.value = '5001'
+    entries.value = '100001'
     entries.dispatchEvent(new Event('input'))
     ;(host.querySelector('form') as HTMLFormElement).dispatchEvent(new Event('submit', { cancelable: true }))
     await nextTick()
 
     expect(fetchMock).not.toHaveBeenCalled()
-    expect(host.textContent).toContain('必须在 1 到 5000 之间')
+    expect(host.textContent).toContain('必须在 1 到 100000 之间')
     app.unmount()
   })
 
@@ -110,7 +115,7 @@ describe('LimitsView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const app = mountLimits(host, preciseInfo)
-    const entries = host.querySelectorAll<HTMLInputElement>('input')[4]
+    const entries = host.querySelectorAll<HTMLInputElement>('input')[6]
     if (!entries) throw new Error('entry limit input missing')
     entries.value = '999'
     entries.dispatchEvent(new Event('input'))
@@ -120,6 +125,8 @@ describe('LimitsView', () => {
     const options = fetchMock.mock.calls[0]?.[1] as RequestInit
     expect(JSON.parse(String(options.body))).toEqual({
       max_upload_bytes: preciseInfo.max_upload_bytes,
+      max_upload_batch_bytes: preciseInfo.max_upload_batch_bytes,
+      max_upload_batch_entries: preciseInfo.max_upload_batch_entries,
       max_archive_bytes: preciseInfo.max_archive_bytes,
       max_archive_entries: 999,
       upload_rate_bytes_per_sec: 0,

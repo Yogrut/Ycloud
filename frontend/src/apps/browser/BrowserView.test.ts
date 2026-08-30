@@ -45,6 +45,8 @@ function listResponse(names: string[]) {
     next_cursor: null,
     can_write: true,
     max_upload_bytes: 1024,
+    max_upload_batch_bytes: 4096,
+    max_upload_batch_entries: 100,
     max_archive_bytes: 1024,
     max_archive_entries: 100,
   }
@@ -126,6 +128,10 @@ describe('BrowserView', () => {
     expect(host.textContent).toContain('<img src=x onerror=alert(1)>.txt')
     expect(host.textContent).toContain('12 B')
     expect(host.querySelector('img')).toBeNull()
+    expect(host.querySelectorAll('.file-toolbar-actions .btn')).toHaveLength(2)
+    host.querySelector<HTMLButtonElement>('.file-toolbar-actions .btn')?.click()
+    await nextTick()
+    expect(host.querySelector('.overlay.active .admin-login-card')?.textContent).toContain('账号登录')
     app.unmount()
   })
 
@@ -142,8 +148,15 @@ describe('BrowserView', () => {
 
     expect(host.querySelector('.browser-chrome .top-search')).toBeNull()
     expect(host.querySelector('.file-toolbar .top-search')).not.toBeNull()
-    expect(host.querySelector('.file-toolbar')?.textContent).toContain('新建文件夹')
-    expect(host.querySelector('.file-toolbar')?.textContent).toContain('上传文件')
+    expect(host.querySelector('.file-toolbar')?.textContent).toContain('新建')
+    expect(host.querySelectorAll('.file-toolbar-actions .btn')).toHaveLength(2)
+    const uploadButton = [...host.querySelectorAll<HTMLButtonElement>('.file-toolbar-actions .btn')]
+      .find(button => button.textContent?.trim() === '上传')
+    expect(uploadButton).toBeDefined()
+    uploadButton?.click()
+    await nextTick()
+    expect(host.querySelector('.upload-queue-modal')?.textContent).toContain('选择文件')
+    expect(host.querySelector('.upload-queue-modal')?.textContent).toContain('选择文件夹')
     expect(host.querySelector('.file-row-menu')).toBeNull()
     const row = host.querySelector('.file-row') as HTMLElement
     row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, button: 2, clientX: 40, clientY: 40 }))
@@ -464,6 +477,266 @@ describe('BrowserView', () => {
     expect(window.dispatchEvent(drop)).toBe(false)
     expect(drop.defaultPrevented).toBe(true)
     expect(transfer.dropEffect).toBe('none')
+    app.unmount()
+  })
+
+  it('retries a failed upload with its existing batch ticket', async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      const body = url.includes('/api/upload/prepare') ? { ticket: 'batch-1' } : listResponse([])
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const statuses = [500, 204]
+    class MockXMLHttpRequest {
+      status = 0
+      responseText = ''
+      withCredentials = false
+      private listeners = new Map<string, () => void>()
+      private progress?: (event: ProgressEvent) => void
+      upload = { addEventListener: (_type: string, listener: (event: ProgressEvent) => void) => { this.progress = listener } }
+      open(): void {}
+      setRequestHeader(): void {}
+      addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
+      send(file: File): void {
+        this.progress?.({ lengthComputable: true, loaded: file.size } as ProgressEvent)
+        this.status = statuses.shift() ?? 204
+        this.responseText = this.status >= 400 ? JSON.stringify({ message: 'temporary failure' }) : ''
+        this.listeners.get('load')?.()
+      }
+    }
+    vi.stubGlobal('XMLHttpRequest', MockXMLHttpRequest)
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const input = host.querySelector<HTMLInputElement>('input[type="file"]:not([webkitdirectory])')!
+    Object.defineProperty(input, 'files', { configurable: true, value: [new File(['hello'], 'retry.txt')] })
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(host.querySelector('.upload-queue-modal')?.textContent).toContain('temporary failure')
+
+    const retry = host.querySelector<HTMLButtonElement>('button[aria-label="重试该文件"]')
+    retry?.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('.upload-task.is-succeeded')?.textContent).toContain('retry.txt')
+    expect(host.querySelector('.upload-task.is-succeeded')?.textContent).toContain('成功')
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/api/upload/prepare'))).toHaveLength(1)
+    app.unmount()
+  })
+
+  it('pauses queued files, resumes them, terminates the active upload, and clears only task records', async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const body = String(input).includes('/api/upload/prepare') ? { ticket: 'batch-controls' } : listResponse([])
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    class ControlledXMLHttpRequest {
+      static instances: ControlledXMLHttpRequest[] = []
+      status = 0
+      responseText = ''
+      withCredentials = false
+      private listeners = new Map<string, () => void>()
+      private progress?: (event: ProgressEvent) => void
+      upload = { addEventListener: (_type: string, listener: (event: ProgressEvent) => void) => { this.progress = listener } }
+      constructor() { ControlledXMLHttpRequest.instances.push(this) }
+      open(): void {}
+      setRequestHeader(): void {}
+      addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
+      send(): void { this.progress?.({ lengthComputable: true, loaded: 1 } as ProgressEvent) }
+      abort(): void { this.listeners.get('abort')?.() }
+      complete(status = 204): void { this.status = status; this.listeners.get('load')?.() }
+    }
+    vi.stubGlobal('XMLHttpRequest', ControlledXMLHttpRequest)
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const input = host.querySelector<HTMLInputElement>('input[type="file"]:not([webkitdirectory])')!
+    Object.defineProperty(input, 'files', { configurable: true, value: [new File(['one'], 'one.txt'), new File(['two'], 'two.txt')] })
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(ControlledXMLHttpRequest.instances).toHaveLength(1)
+    host.querySelector<HTMLButtonElement>('.upload-task.is-queued button[aria-label="暂停该文件"]')?.click()
+    await nextTick()
+    expect(host.querySelectorAll('.upload-task.is-paused')).toHaveLength(1)
+
+    ControlledXMLHttpRequest.instances[0]?.complete()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(host.querySelectorAll('.upload-task.is-succeeded')).toHaveLength(1)
+    expect(host.querySelectorAll('.upload-task.is-paused')).toHaveLength(1)
+
+    host.querySelector<HTMLButtonElement>('.upload-task.is-paused button[aria-label="继续该文件"]')?.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(ControlledXMLHttpRequest.instances).toHaveLength(2)
+    host.querySelector<HTMLButtonElement>('.upload-task.is-uploading button[aria-label="终止该文件"]')?.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(host.querySelectorAll('.upload-task.is-cancelled')).toHaveLength(1)
+
+    const filters = [...host.querySelectorAll<HTMLButtonElement>('.upload-filter-tab')]
+    filters.find(button => button.textContent?.includes('成功'))?.click()
+    await nextTick()
+    host.querySelector<HTMLButtonElement>('button[aria-label="删除当前筛选任务记录"]')?.click()
+    await nextTick()
+    expect(host.querySelectorAll('.upload-task')).toHaveLength(0)
+
+    filters.find(button => button.textContent?.includes('全部'))?.click()
+    await nextTick()
+    expect(host.querySelectorAll('.upload-task.is-cancelled')).toHaveLength(1)
+    host.querySelector<HTMLButtonElement>('button[aria-label="删除当前筛选任务记录"]')?.click()
+    await nextTick()
+    expect(host.querySelectorAll('.upload-task')).toHaveLength(0)
+    expect(host.querySelector('.upload-empty-state')?.textContent).toContain('选择文件或拖拽')
+    app.unmount()
+  })
+
+  it('accepts file drops on the file panel and keeps rejected files as removable errors', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse([])), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const panel = host.querySelector('.file-panel') as HTMLElement
+    const transfer = {
+      types: ['Files'],
+      items: [],
+      files: [new File([new Uint8Array(2048)], 'too-large.bin')],
+      dropEffect: 'none',
+    }
+    const enter = new Event('dragenter', { bubbles: true, cancelable: true })
+    Object.defineProperty(enter, 'dataTransfer', { value: transfer })
+    panel.dispatchEvent(enter)
+    await nextTick()
+    expect(host.querySelector('.upload-drop-overlay')).not.toBeNull()
+
+    const drop = new Event('drop', { bubbles: true, cancelable: true })
+    Object.defineProperty(drop, 'dataTransfer', { value: transfer })
+    panel.dispatchEvent(drop)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('.upload-drop-overlay')).toBeNull()
+    expect(host.querySelector('.upload-queue-modal')?.textContent).toContain('too-large.bin')
+    expect(host.querySelector('button[aria-label="重试该文件"]')).not.toBeNull()
+    expect(host.querySelector('button[aria-label="删除失败记录"]')).not.toBeNull()
+    app.unmount()
+  })
+
+  it('keeps an upload bound to the storage and directory where it was queued', async () => {
+    let resolvePrepare!: (response: Response) => void
+    const prepareResponse = new Promise<Response>(resolve => { resolvePrepare = resolve })
+    const storages = [
+      { id: 'primary', name: 'Local', requires_login: false },
+      { id: 'archive', name: 'Archive', requires_login: false },
+    ]
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/upload/prepare')) return prepareResponse
+      const storageId = new URL(url, 'http://localhost').searchParams.get('storage_id')
+      return Promise.resolve(new Response(JSON.stringify({
+        ...listResponse([]),
+        storage_id: storageId ?? 'primary',
+        current_path: storageId === 'archive' ? '' : 'incoming',
+        storages,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    class RecordingXMLHttpRequest {
+      static urls: string[] = []
+      status = 204
+      responseText = ''
+      withCredentials = false
+      private listeners = new Map<string, () => void>()
+      upload = { addEventListener: () => undefined }
+      open(_method: string, url: string): void { RecordingXMLHttpRequest.urls.push(url) }
+      setRequestHeader(): void {}
+      addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
+      send(): void { this.listeners.get('load')?.() }
+      abort(): void { this.listeners.get('abort')?.() }
+    }
+    vi.stubGlobal('XMLHttpRequest', RecordingXMLHttpRequest)
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const input = host.querySelector<HTMLInputElement>('input[type="file"]:not([webkitdirectory])')!
+    Object.defineProperty(input, 'files', { configurable: true, value: [new File(['data'], 'frozen.txt')] })
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+    expect(host.querySelector('.upload-task.is-preparing')).not.toBeNull()
+
+    await chooseOption(host, '.storage-switcher', 'Archive')
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    resolvePrepare(new Response(JSON.stringify({ ticket: 'frozen-ticket' }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(RecordingXMLHttpRequest.urls).toHaveLength(1)
+    const uploadUrl = new URL(RecordingXMLHttpRequest.urls[0]!, 'http://localhost')
+    expect(uploadUrl.searchParams.get('storage_id')).toBe('primary')
+    expect(uploadUrl.searchParams.get('path')).toBe('/incoming/frozen.txt')
+    app.unmount()
+  })
+
+  it('cancels a server batch when its only task is terminated during preparation', async () => {
+    let resolvePrepare!: (response: Response) => void
+    const prepareResponse = new Promise<Response>(resolve => { resolvePrepare = resolve })
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/upload/prepare')) return prepareResponse
+      const body = url.includes('/api/upload/cancel') ? { success: true } : listResponse([])
+      return Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const xhr = vi.fn()
+    vi.stubGlobal('XMLHttpRequest', xhr)
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const input = host.querySelector<HTMLInputElement>('input[type="file"]:not([webkitdirectory])')!
+    Object.defineProperty(input, 'files', { configurable: true, value: [new File(['data'], 'cancelled.txt')] })
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+
+    host.querySelector<HTMLButtonElement>('.upload-task.is-preparing button[aria-label="终止该文件"]')?.click()
+    resolvePrepare(new Response(JSON.stringify({ ticket: 'cancelled-ticket' }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('.upload-task.is-cancelled')?.textContent).toContain('cancelled.txt')
+    expect(xhr).not.toHaveBeenCalled()
+    const cancelCall = fetchMock.mock.calls.find(([request]) => String(request).includes('/api/upload/cancel'))
+    expect(cancelCall).toBeDefined()
+    expect(new URL(String(cancelCall?.[0]), 'http://localhost').searchParams.get('storage_id')).toBe('primary')
     app.unmount()
   })
 })

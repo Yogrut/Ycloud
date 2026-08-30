@@ -37,16 +37,17 @@ function mountAccount(host: HTMLElement) {
 }
 
 describe('AccountView', () => {
-  it('contains administrator credentials without mixing in sign-in protection', async () => {
+  it('contains administrator credentials and account-bound two-step verification', async () => {
     const host = document.createElement('div')
     document.body.append(host)
     const app = mountAccount(host)
     await nextTick()
 
     expect(host.querySelectorAll('.admin-pane')).toHaveLength(1)
-    expect(host.querySelectorAll('.account-section')).toHaveLength(1)
-    expect(host.querySelectorAll('.settings-grid')).toHaveLength(1)
+    expect(host.querySelectorAll('.account-section')).toHaveLength(2)
+    expect(host.querySelectorAll('.settings-grid')).toHaveLength(2)
     expect(host.textContent).toContain('管理员设置')
+    expect(host.textContent).toContain('两步验证')
     expect(host.textContent).not.toContain('登录保护')
     expect(host.textContent).not.toContain('保存登录限制')
     app.unmount()

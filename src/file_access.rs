@@ -14,6 +14,8 @@ pub struct FileQuery {
     pub path: Option<String>,
     #[serde(default)]
     pub storage_id: Option<String>,
+    #[serde(default)]
+    pub batch: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,15 +120,16 @@ pub async fn resolve_share(
     headers: &HeaderMap,
     query: &FileQuery,
 ) -> Result<Share, StatusCode> {
-    let candidates = state
-        .config_file
-        .read()
-        .await
+    let config = state.config_file.read().await;
+    let default_storage_id = config.default_storage_id.clone();
+    let mut candidates = config
         .storage_instances
         .iter()
         .filter(|storage| storage.enabled)
         .map(|storage| storage.id.clone())
         .collect::<Vec<_>>();
+    candidates.sort_by_key(|storage_id| usize::from(storage_id != &default_storage_id));
+    drop(config);
     let candidates = if let Some(requested) = query.storage_id.as_deref() {
         if !candidates.iter().any(|storage_id| storage_id == requested) {
             return Err(StatusCode::FORBIDDEN);

@@ -66,6 +66,8 @@ describe('admin API', () => {
     vi.stubGlobal('fetch', fetchMock)
     const body = {
       max_upload_bytes: 6_442_450_944,
+      max_upload_batch_bytes: 21_474_836_480,
+      max_upload_batch_entries: 1000,
       max_archive_bytes: 2_684_354_560,
       max_archive_entries: 750,
       upload_rate_bytes_per_sec: 8_388_608,

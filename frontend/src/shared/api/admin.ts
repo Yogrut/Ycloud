@@ -1,15 +1,25 @@
 import { useLocale } from '../i18n'
+import { ApiError, errorMetadata, readJson } from './client'
 
 const locale = useLocale()
 
 export interface AdminInfo {
   username: string
   has_global_web_password: boolean
+  admin_totp_enabled?: boolean
+  admin_recovery_codes_remaining?: number
   shares: WebDavMountView[]
   folder_locks: FolderLockView[]
   max_upload_bytes: number
+  max_upload_batch_bytes?: number
+  max_upload_batch_entries?: number
   max_archive_bytes: number
   max_archive_entries: number
+  deployment_max_upload_bytes?: number
+  deployment_max_upload_batch_bytes?: number
+  deployment_max_upload_batch_entries?: number
+  deployment_max_archive_bytes?: number
+  deployment_max_archive_entries?: number
   upload_rate_bytes_per_sec: number
   download_rate_bytes_per_sec: number
   admin_login_failures: number
@@ -195,6 +205,8 @@ export interface UpdateAccountResponse {
 
 export interface UpdateTransferLimitsRequest {
   max_upload_bytes: number
+  max_upload_batch_bytes: number
+  max_upload_batch_entries: number
   max_archive_bytes: number
   max_archive_entries: number
   upload_rate_bytes_per_sec: number
@@ -210,36 +222,26 @@ export interface UpdateLoginSecuritySettingsRequest {
   security_log_max_entries?: number
 }
 
-interface ErrorEnvelope {
-  message?: string
-  error?: { message?: string }
-}
-
-export class AdminApiError extends Error {
-  constructor(message: string, readonly status: number) {
-    super(message)
+export class AdminApiError extends ApiError {
+  constructor(message: string, status: number, code?: string, requestId?: string) {
+    super(message, status, code, requestId)
     this.name = 'AdminApiError'
-  }
-}
-
-async function readJson<T>(response: Response): Promise<T | undefined> {
-  try {
-    return await response.json() as T
-  } catch {
-    return undefined
   }
 }
 
 async function adminRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(url, { credentials: 'same-origin', ...options })
   if (response.status === 204) return undefined as T
-  const body = await readJson<T & ErrorEnvelope>(response)
+  const body = await readJson<T>(response)
   if (!response.ok) {
+    const details = errorMetadata(response, body ?? {})
     throw new AdminApiError(
-      body?.error?.message ?? body?.message ?? (response.status === 401
+      details.message ?? (response.status === 401
         ? locale.text('请先登录管理员账户', 'Sign in with an administrator account')
         : locale.t('common.requestFailed', { status: response.status })),
       response.status,
+      details.code,
+      details.requestId,
     )
   }
   if (body === undefined) throw new AdminApiError(locale.t('common.invalidResponse'), response.status)
@@ -250,11 +252,29 @@ export function getAdminInfo(): Promise<AdminInfo> {
   return adminRequest('/api/admin/info')
 }
 
-export function loginAdministrator(username: string, password: string): Promise<{ success: boolean; message?: string; is_admin: boolean }> {
+export function loginAdministrator(username: string, password: string, totpCode?: string): Promise<{ success: boolean; message?: string; is_admin: boolean; totp_required?: boolean }> {
   return adminRequest('/api/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password }),
+    body: JSON.stringify({ username, password, totp_code: totpCode || undefined }),
+  })
+}
+
+export function setupAdministratorTotp(currentPassword: string): Promise<{ secret: string; provisioning_uri: string; qr_svg: string }> {
+  return adminRequest('/api/admin/account/totp/setup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: currentPassword }),
+  })
+}
+
+export function enableAdministratorTotp(currentPassword: string, secret: string, code: string): Promise<{ success: boolean; recovery_codes: string[] }> {
+  return adminRequest('/api/admin/account/totp/enable', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: currentPassword, secret, code }),
+  })
+}
+
+export function disableAdministratorTotp(currentPassword: string, code: string): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/account/totp', {
+    method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: currentPassword, code }),
   })
 }
 
@@ -298,6 +318,14 @@ export function testS3Storage(body: TestS3StorageRequest): Promise<{ success: bo
   })
 }
 
+export function testLocalStorage(path: string): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/storage/local/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+}
+
 export function stageS3Storage(name: string, body: TestS3StorageRequest, enabled = true, allowGuestAccess = false): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/storage/pending', {
     method: 'PUT',
@@ -306,11 +334,11 @@ export function stageS3Storage(name: string, body: TestS3StorageRequest, enabled
   })
 }
 
-export function updateS3Storage(storageId: string, name: string, body: TestS3StorageRequest): Promise<{ success: boolean }> {
+export function updateS3Storage(storageId: string, name: string, body: TestS3StorageRequest, enabled: boolean, allowGuestAccess: boolean): Promise<{ success: boolean }> {
   return adminRequest(`/api/admin/storage/s3/${encodeURIComponent(storageId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, ...body }),
+    body: JSON.stringify({ name, enabled, allow_guest_access: allowGuestAccess, ...body }),
   })
 }
 
@@ -322,11 +350,11 @@ export function addLocalStorage(path: string, name: string, capacityLimitBytes: 
   })
 }
 
-export function updateLocalStorage(storageId: string, name: string, path: string, capacityLimitBytes: number | null): Promise<{ success: boolean }> {
+export function updateLocalStorage(storageId: string, name: string, path: string, capacityLimitBytes: number | null, enabled: boolean, allowGuestAccess: boolean): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/storage/local', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ storage_id: storageId, name, path, capacity_limit_bytes: capacityLimitBytes }),
+    body: JSON.stringify({ storage_id: storageId, name, path, capacity_limit_bytes: capacityLimitBytes, enabled, allow_guest_access: allowGuestAccess }),
   })
 }
 
@@ -336,6 +364,10 @@ export function updateStorageAccess(storageId: string, enabled: boolean, allowGu
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled, allow_guest_access: allowGuestAccess }),
   })
+}
+
+export function setDefaultStorage(storageId: string): Promise<{ success: boolean }> {
+  return adminRequest(`/api/admin/storage/${encodeURIComponent(storageId)}/default`, { method: 'PUT' })
 }
 
 export function deleteStorage(storageId: string): Promise<void> {

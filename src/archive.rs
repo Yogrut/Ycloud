@@ -29,7 +29,6 @@ use crate::{
     storage_backend::StorageBackend,
 };
 
-const MAX_ARCHIVE_VISITED_ENTRIES: usize = 10_000;
 const MAX_PENDING_TICKETS: usize = 32;
 const TICKET_TTL: Duration = Duration::from_secs(120);
 const ARCHIVE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -236,11 +235,6 @@ async fn collect_files(
             continue;
         }
         *entry_count = entry_count.saturating_add(1);
-        if *entry_count > MAX_ARCHIVE_VISITED_ENTRIES {
-            return Err(AppError::BadRequest(
-                "Archive traversal exceeds the 10000 entry safety limit".into(),
-            ));
-        }
         if *entry_count > max_archive_entries {
             return Err(AppError::BadRequest(
                 format!("Archive exceeds the configured {max_archive_entries} entry limit").into(),

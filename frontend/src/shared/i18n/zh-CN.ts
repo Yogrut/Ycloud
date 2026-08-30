@@ -44,7 +44,7 @@ export const zhCN = {
   'menu.fileActions': '文件操作',
   'menu.selected': '已选择 {count} 项',
   'menu.clear': '清除',
-  'menu.upload': '上传文件',
+  'menu.upload': '上传',
   'menu.newFolder': '新建文件夹',
   'menu.archive': '打包下载',
   'menu.move': '移动',

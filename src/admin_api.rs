@@ -18,15 +18,30 @@ use crate::{
     s3_backend::S3Backend,
 };
 
+mod totp;
+mod users;
+
+pub use totp::{disable_admin_totp, enable_admin_totp, setup_admin_totp};
+pub use users::{create_user_account, delete_user_account, update_user_account};
+
 #[derive(Serialize)]
 pub struct AdminInfo {
     pub username: String,
     pub has_global_web_password: bool,
+    pub admin_totp_enabled: bool,
+    pub admin_recovery_codes_remaining: usize,
     pub shares: Vec<ShareView>,
     pub folder_locks: Vec<FolderLockView>,
     pub max_upload_bytes: u64,
+    pub max_upload_batch_bytes: u64,
+    pub max_upload_batch_entries: usize,
     pub max_archive_bytes: u64,
     pub max_archive_entries: usize,
+    pub deployment_max_upload_bytes: u64,
+    pub deployment_max_upload_batch_bytes: u64,
+    pub deployment_max_upload_batch_entries: usize,
+    pub deployment_max_archive_bytes: u64,
+    pub deployment_max_archive_entries: usize,
     pub upload_rate_bytes_per_sec: u64,
     pub download_rate_bytes_per_sec: u64,
     pub admin_login_failures: u32,
@@ -218,9 +233,13 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
     let (
         username,
         has_global_web_password,
+        admin_totp_enabled,
+        admin_recovery_codes_remaining,
         shares,
         folder_locks,
         max_upload_bytes,
+        max_upload_batch_bytes,
+        max_upload_batch_entries,
         max_archive_bytes,
         max_archive_entries,
         upload_rate_bytes_per_sec,
@@ -240,6 +259,8 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
         (
             config.admin_username.clone(),
             config.global_web_password_hash.is_some(),
+            config.admin_totp_secret.is_some(),
+            config.admin_recovery_code_hashes.len(),
             config.shares.iter().map(ShareView::from).collect(),
             config
                 .folder_locks
@@ -247,6 +268,8 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
                 .map(FolderLockView::from)
                 .collect(),
             config.max_upload_bytes,
+            config.max_upload_batch_bytes,
+            config.max_upload_batch_entries,
             config.max_archive_bytes,
             config.max_archive_entries,
             config.upload_rate_bytes_per_sec,
@@ -314,11 +337,20 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
     Ok(Json(AdminInfo {
         username,
         has_global_web_password,
+        admin_totp_enabled,
+        admin_recovery_codes_remaining,
         shares,
         folder_locks,
         max_upload_bytes,
+        max_upload_batch_bytes,
+        max_upload_batch_entries,
         max_archive_bytes,
         max_archive_entries,
+        deployment_max_upload_bytes: state.config.max_upload_bytes,
+        deployment_max_upload_batch_bytes: state.config.max_upload_batch_bytes,
+        deployment_max_upload_batch_entries: state.config.max_upload_batch_entries,
+        deployment_max_archive_bytes: state.config.max_archive_bytes,
+        deployment_max_archive_entries: state.config.max_archive_entries,
         upload_rate_bytes_per_sec,
         download_rate_bytes_per_sec,
         admin_login_failures,
@@ -379,7 +411,20 @@ pub async fn test_s3_storage(
     Json(settings): Json<S3StorageConfig>,
 ) -> AppResult<Json<serde_json::Value>> {
     let backend = S3Backend::new(&settings, &state.config)?;
-    backend.probe().await?;
+    backend.activation_probe().await?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+#[derive(Deserialize)]
+pub struct TestLocalStorageRequest {
+    pub path: String,
+}
+
+pub async fn test_local_storage(
+    State(state): State<AppState>,
+    Json(body): Json<TestLocalStorageRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    state.test_local_storage(&body.path).await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
@@ -419,6 +464,10 @@ pub async fn stage_s3_storage(
 #[derive(Deserialize)]
 pub struct UpdateS3StorageRequest {
     pub name: String,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_guest_access: bool,
     #[serde(flatten)]
     pub settings: S3StorageConfig,
 }
@@ -429,7 +478,13 @@ pub async fn update_s3_storage(
     Json(body): Json<UpdateS3StorageRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     state
-        .update_s3_storage(&storage_id, body.name, body.settings)
+        .update_s3_storage(
+            &storage_id,
+            body.name,
+            body.settings,
+            body.enabled,
+            body.allow_guest_access,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
@@ -441,6 +496,10 @@ pub struct UpdateLocalStorageRequest {
     pub path: String,
     #[serde(default)]
     pub capacity_limit_bytes: Option<u64>,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_guest_access: bool,
 }
 
 pub async fn update_local_storage(
@@ -453,6 +512,8 @@ pub async fn update_local_storage(
             settings.name,
             settings.path,
             settings.capacity_limit_bytes,
+            settings.enabled,
+            settings.allow_guest_access,
         )
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
@@ -506,6 +567,14 @@ pub async fn update_storage_access(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+pub async fn set_default_storage(
+    State(state): State<AppState>,
+    Path(storage_id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    state.set_default_storage(&storage_id).await?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
 pub async fn delete_storage(
     State(state): State<AppState>,
     Path(storage_id): Path<String>,
@@ -529,6 +598,8 @@ pub async fn discard_pending_storage(State(state): State<AppState>) -> AppResult
 #[derive(Deserialize)]
 pub struct UpdateTransferLimitsRequest {
     pub max_upload_bytes: u64,
+    pub max_upload_batch_bytes: u64,
+    pub max_upload_batch_entries: usize,
     pub max_archive_bytes: u64,
     pub max_archive_entries: usize,
     #[serde(default)]
@@ -543,12 +614,28 @@ pub async fn update_transfer_limits(
 ) -> AppResult<Json<serde_json::Value>> {
     validate_transfer_limits(
         body.max_upload_bytes,
+        body.max_upload_batch_bytes,
+        body.max_upload_batch_entries,
         body.max_archive_bytes,
         body.max_archive_entries,
     )?;
     if body.max_upload_bytes > state.config.max_upload_bytes {
         return Err(AppError::BadRequest(
             "单文件上传上限超过部署环境允许的绝对上限；请调整 MAX_UPLOAD_BYTES 后重启服务".into(),
+        ));
+    }
+    if body.max_upload_batch_bytes > state.config.max_upload_batch_bytes
+        || body.max_upload_batch_entries > state.config.max_upload_batch_entries
+    {
+        return Err(AppError::BadRequest(
+            "批量上传策略超过部署环境允许的绝对上限；请调整 MAX_UPLOAD_BATCH_BYTES 或 MAX_UPLOAD_BATCH_ENTRIES 后重启服务".into(),
+        ));
+    }
+    if body.max_archive_bytes > state.config.max_archive_bytes
+        || body.max_archive_entries > state.config.max_archive_entries
+    {
+        return Err(AppError::BadRequest(
+            "打包下载策略超过部署环境允许的绝对上限；请调整 MAX_ARCHIVE_BYTES 或 MAX_ARCHIVE_ENTRIES 后重启服务".into(),
         ));
     }
     let current = state.config_file.read().await.clone();
@@ -563,6 +650,8 @@ pub async fn update_transfer_limits(
     state
         .update_config(move |config| {
             config.max_upload_bytes = body.max_upload_bytes;
+            config.max_upload_batch_bytes = body.max_upload_batch_bytes;
+            config.max_upload_batch_entries = body.max_upload_batch_entries;
             config.max_archive_bytes = body.max_archive_bytes;
             config.max_archive_entries = body.max_archive_entries;
             config.upload_rate_bytes_per_sec = upload_rate;
@@ -887,110 +976,6 @@ pub async fn update_admin_account(
         "success": true,
         "warning": initial_credentials_warning
     })))
-}
-
-#[derive(Deserialize)]
-pub struct CreateUserAccountRequest {
-    pub username: String,
-    pub password: String,
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-    #[serde(default)]
-    pub permissions: Vec<StoragePermission>,
-}
-
-#[derive(Deserialize)]
-pub struct UpdateUserAccountRequest {
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub enabled: Option<bool>,
-    pub permissions: Option<Vec<StoragePermission>>,
-}
-
-fn default_enabled() -> bool {
-    true
-}
-
-pub async fn create_user_account(
-    State(state): State<AppState>,
-    Json(body): Json<CreateUserAccountRequest>,
-) -> AppResult<(StatusCode, Json<UserAccountView>)> {
-    validate_password(&body.password, 12, "普通账号")?;
-    let password_hash = state.passwords.hash(body.password).await?;
-    let account = UserAccount {
-        id: Uuid::new_v4().to_string(),
-        username: body.username.trim().to_string(),
-        password_hash,
-        enabled: body.enabled,
-        permissions: body.permissions,
-    };
-    let view = UserAccountView::from(&account);
-    state
-        .update_config(move |config| {
-            config.user_accounts.push(account);
-            Ok(())
-        })
-        .await?;
-    Ok((StatusCode::CREATED, Json(view)))
-}
-
-pub async fn update_user_account(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(body): Json<UpdateUserAccountRequest>,
-) -> AppResult<Json<UserAccountView>> {
-    let password_hash = match body.password {
-        Some(password) if !password.is_empty() => {
-            validate_password(&password, 12, "普通账号")?;
-            Some(state.passwords.hash(password).await?)
-        }
-        _ => None,
-    };
-    let user_id = id.clone();
-    let view = state
-        .update_config(move |config| {
-            let account = config
-                .user_accounts
-                .iter_mut()
-                .find(|account| account.id == id)
-                .ok_or(AppError::NotFound)?;
-            if let Some(username) = body.username {
-                account.username = username.trim().to_string();
-            }
-            if let Some(hash) = password_hash {
-                account.password_hash = hash;
-            }
-            if let Some(enabled) = body.enabled {
-                account.enabled = enabled;
-            }
-            if let Some(permissions) = body.permissions {
-                account.permissions = permissions;
-            }
-            Ok(UserAccountView::from(&*account))
-        })
-        .await?;
-    // Credential, status and authorization changes take effect immediately.
-    state.sessions.revoke_user(&user_id).await;
-    Ok(Json(view))
-}
-
-pub async fn delete_user_account(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> AppResult<StatusCode> {
-    let user_id = id.clone();
-    state
-        .update_config(move |config| {
-            let before = config.user_accounts.len();
-            config.user_accounts.retain(|account| account.id != id);
-            if before == config.user_accounts.len() {
-                return Err(AppError::NotFound);
-            }
-            Ok(())
-        })
-        .await?;
-    state.sessions.revoke_user(&user_id).await;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

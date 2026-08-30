@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { BatchOperation, BatchResponse, BrowserCapabilities, BrowserStorage, FileEntry } from '../../shared/api/browser'
-import { adminLogin, batchOperation, createFolder, downloadUrl, listFiles, listStorages, logout, prepareArchive, renameItem, unlockFolder, uploadFile } from '../../shared/api/browser'
+import { adminLogin, batchOperation, createFolder, downloadUrl, listFiles, listStorages, logout, prepareArchive, renameItem, unlockFolder } from '../../shared/api/browser'
 import { appPath } from '../../shared/routes'
 import { formatSize } from '../../shared/format'
 import AppIcon from '../../shared/components/AppIcon.vue'
+import AdminLoginCard from '../../shared/components/AdminLoginCard.vue'
 import AppSelect from '../../shared/components/AppSelect.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
@@ -14,6 +15,8 @@ import BrowserContextMenu from './BrowserContextMenu.vue'
 import type { BrowserAction } from './BrowserActionIcon.vue'
 import FileIcon from './FileIcon.vue'
 import FolderPicker from './FolderPicker.vue'
+import UploadQueueDialog from './UploadQueueDialog.vue'
+import { useUploadQueue } from './useUploadQueue'
 
 type SortKey = 'name' | 'time' | 'size'
 type PageSize = 10 | 20 | 50 | 100
@@ -42,6 +45,8 @@ const canWrite = ref(false)
 const isAdministrator = ref(false)
 const capabilities = ref<BrowserCapabilities>({ download: false, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false })
 const maxUploadBytes = ref(0)
+const maxUploadBatchBytes = ref(0)
+const maxUploadBatchEntries = ref(0)
 const maxArchiveBytes = ref(0)
 const maxArchiveEntries = ref(0)
 const notice = ref('')
@@ -52,20 +57,15 @@ const unlockError = ref('')
 const showAdmin = ref(false)
 const adminUser = ref('')
 const adminPassword = ref('')
+const adminTotpCode = ref('')
+const adminTotpRequired = ref(false)
 const adminError = ref('')
+const adminLoggingIn = ref(false)
 const pendingStorageId = ref('')
-const fileInput = ref<HTMLInputElement>()
-const filePanel = ref<HTMLElement>()
 const showFolder = ref(false)
 const folderName = ref('')
 const folderError = ref('')
 const creatingFolder = ref(false)
-const showUpload = ref(false)
-const uploading = ref(false)
-const uploadCurrent = ref('')
-const uploadProcessed = ref(0)
-const uploadTotal = ref(0)
-const uploadSummary = ref('')
 const contextVisible = ref(false)
 const contextEntry = ref<FileEntry | null>(null)
 const contextX = ref(0)
@@ -81,6 +81,7 @@ const operationBusy = ref(false)
 const operationError = ref('')
 const pickerOperation = ref<'move' | 'copy' | null>(null)
 const pickerPaths = ref<string[]>([])
+const pickerStorageId = ref('')
 const batchResult = ref<BatchResponse | null>(null)
 const dragSelecting = ref(false)
 let dragSession: DragSession | null = null
@@ -88,8 +89,6 @@ let suppressRowClick = false
 let suppressRowClickTimer: number | undefined
 let searchTimer: number | undefined
 let refreshSequence = 0
-
-const uploadPercent = computed(() => uploadTotal.value ? Math.min(100, Math.round(uploadProcessed.value / uploadTotal.value * 100)) : 0)
 
 const visibleEntries = computed(() => entries.value)
 const pageNumber = computed(() => cursorHistory.value.length + 1)
@@ -117,6 +116,42 @@ function announce(message: string): void {
   notice.value = message
   window.setTimeout(() => { if (notice.value === message) notice.value = '' }, 2800)
 }
+
+const {
+  blockExternalFileDrop,
+  chooseFiles,
+  chooseFolder,
+  clearUploadTasks,
+  closeUploadDialog,
+  disposeUploads,
+  filePanel,
+  handleUploadDragEnter,
+  handleUploadDragLeave,
+  handleUploadDragOver,
+  handleUploadDrop,
+  openUploadManager,
+  pauseUploads,
+  removeFailedUpload,
+  resumeUploads,
+  retryUpload,
+  setFileInput,
+  setFolderInput,
+  showUpload,
+  terminateUploads,
+  uploadDropActive,
+  uploadFiles,
+  uploadTasks,
+} = useUploadQueue({
+  storageId: currentStorageId,
+  path,
+  maxUploadBytes,
+  maxUploadBatchBytes,
+  maxUploadBatchEntries,
+  canUpload: () => capabilities.value.upload,
+  requireUpload: () => requireCapability('upload'),
+  announce,
+  refresh,
+})
 
 async function refresh(): Promise<void> {
   const sequence = ++refreshSequence
@@ -147,6 +182,8 @@ async function refresh(): Promise<void> {
       delete: data.can_write,
     }
     maxUploadBytes.value = data.max_upload_bytes
+    maxUploadBatchBytes.value = data.max_upload_batch_bytes ?? data.max_upload_bytes
+    maxUploadBatchEntries.value = data.max_upload_batch_entries ?? 1
     maxArchiveBytes.value = data.max_archive_bytes
     maxArchiveEntries.value = data.max_archive_entries
     selected.value = new Set()
@@ -331,12 +368,6 @@ function cancelDragSelection(): void {
   dragSelecting.value = false
 }
 
-function blockExternalFileDrop(event: DragEvent): void {
-  if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return
-  event.preventDefault()
-  if (event.dataTransfer) event.dataTransfer.dropEffect = 'none'
-}
-
 function syncMobileMenu(paths: Set<string>): void {
   if (!isMobileLayout()) return
   if (!paths.size) {
@@ -412,20 +443,31 @@ async function openAdmin(forStorage = false): Promise<void> {
   }
   adminUser.value = ''
   adminPassword.value = ''
+  adminTotpCode.value = ''
+  adminTotpRequired.value = false
   adminError.value = ''
   showAdmin.value = true
 }
 
 async function submitAdmin(): Promise<void> {
+  if (adminLoggingIn.value) return
   if (!adminUser.value.trim() || !adminPassword.value) {
     adminError.value = locale.text('请输入用户名和密码', 'Enter your username and password')
     return
   }
+  adminLoggingIn.value = true
   try {
-    const result = await adminLogin(adminUser.value.trim(), adminPassword.value)
+    const result = await adminLogin(adminUser.value.trim(), adminPassword.value, adminTotpCode.value.trim())
+    if (result.totp_required) {
+      adminTotpRequired.value = true
+      adminError.value = ''
+      return
+    }
     if (!result.success) throw new Error(result.message ?? locale.text('登录失败', 'Sign-in failed'))
     showAdmin.value = false
     adminPassword.value = ''
+    adminTotpCode.value = ''
+    adminTotpRequired.value = false
     isAdministrator.value = result.is_admin
     if (pendingStorageId.value) {
       currentStorageId.value = pendingStorageId.value
@@ -437,7 +479,16 @@ async function submitAdmin(): Promise<void> {
     else await refresh()
   } catch (error) {
     adminError.value = error instanceof Error ? error.message : locale.text('登录失败', 'Sign-in failed')
+  } finally {
+    adminLoggingIn.value = false
   }
+}
+
+function resetAdminTotpChallenge(): void {
+  if (!adminTotpRequired.value) return
+  adminTotpRequired.value = false
+  adminTotpCode.value = ''
+  adminError.value = ''
 }
 
 function requireCapability(action: keyof BrowserCapabilities): boolean {
@@ -467,55 +518,6 @@ async function submitFolder(): Promise<void> {
     folderError.value = error instanceof Error ? error.message : locale.text('创建失败', 'Unable to create the folder')
   } finally {
     creatingFolder.value = false
-  }
-}
-
-function chooseFiles(): void {
-  if (requireCapability('upload')) fileInput.value?.click()
-}
-
-async function uploadFiles(event: Event): Promise<void> {
-  const input = event.target as HTMLInputElement
-  const files = Array.from(input.files ?? [])
-  input.value = ''
-  if (!files.length || !capabilities.value.upload || uploading.value) return
-
-  const accepted = files.filter(file => !maxUploadBytes.value || file.size <= maxUploadBytes.value)
-  const rejected = files.length - accepted.length
-  uploadTotal.value = accepted.reduce((sum, file) => sum + file.size, 0)
-  uploadProcessed.value = 0
-  uploadCurrent.value = locale.text('正在准备…', 'Preparing…')
-  uploadSummary.value = locale.text(`共 ${files.length} 个文件，逐个安全上传`, `Uploading ${files.length} file(s) sequentially`)
-  showUpload.value = true
-  uploading.value = true
-  let completedBytes = 0
-  let succeeded = 0
-  let failed = rejected
-
-  try {
-    for (const file of accepted) {
-      uploadCurrent.value = file.name
-      let currentLoaded = 0
-      try {
-        const target = [path.value, file.name].filter(Boolean).join('/')
-        await uploadFile(target, file, loaded => {
-          currentLoaded = loaded
-          uploadProcessed.value = completedBytes + loaded
-        }, currentStorageId.value)
-        succeeded += 1
-      } catch (error) {
-        failed += 1
-        announce(`${file.name}: ${error instanceof Error ? error.message : locale.text('上传失败', 'Upload failed')}`)
-      }
-      completedBytes += currentLoaded
-      uploadProcessed.value = completedBytes
-    }
-    uploadSummary.value = failed
-      ? locale.text(`上传结束：成功 ${succeeded} 个，失败 ${failed} 个`, `Upload finished: ${succeeded} succeeded, ${failed} failed`)
-      : locale.text(`上传完成：成功 ${succeeded} 个文件`, `Upload complete: ${succeeded} file(s)`)
-    await refresh()
-  } finally {
-    uploading.value = false
   }
 }
 
@@ -574,6 +576,7 @@ function requestTransfer(operation: 'move' | 'copy', paths: string[]): void {
   if (!paths.length || !requireCapability(operation === 'move' ? 'move_items' : 'copy')) return
   pickerOperation.value = operation
   pickerPaths.value = [...paths]
+  pickerStorageId.value = currentStorageId.value
   operationError.value = ''
 }
 
@@ -584,11 +587,11 @@ function requestDelete(paths: string[]): void {
   showDelete.value = true
 }
 
-async function runBatch(operation: BatchOperation, paths: string[], target = ''): Promise<void> {
+async function runBatch(operation: BatchOperation, paths: string[], target = '', storageId = currentStorageId.value): Promise<void> {
   operationBusy.value = true
   operationError.value = ''
   try {
-    const result = await batchOperation(operation, paths, target, currentStorageId.value)
+    const result = await batchOperation(operation, paths, target, storageId)
     const label = operation === 'move'
       ? locale.text('移动', 'Move')
       : operation === 'copy' ? locale.text('复制', 'Copy') : locale.text('删除', 'Delete')
@@ -609,8 +612,9 @@ async function runBatch(operation: BatchOperation, paths: string[], target = '')
 async function confirmTransfer(target: string): Promise<void> {
   const operation = pickerOperation.value
   const paths = [...pickerPaths.value]
+  const storageId = pickerStorageId.value
   pickerOperation.value = null
-  if (operation) await runBatch(operation, paths, target)
+  if (operation) await runBatch(operation, paths, target, storageId)
 }
 
 async function confirmDelete(): Promise<void> {
@@ -644,7 +648,7 @@ function handleMenuAction(action: BrowserAction): void {
       requestDelete(paths)
       break
     case 'upload':
-      chooseFiles()
+      openUploadManager()
       break
     case 'mkdir':
       openFolderDialog()
@@ -662,7 +666,9 @@ async function signOut(): Promise<void> {
 }
 
 function handleEscape(event: KeyboardEvent): void {
-  if (event.key === 'Escape') closeContextMenu()
+  if (event.key !== 'Escape') return
+  closeContextMenu()
+  if (showUpload.value) closeUploadDialog()
 }
 
 function handleDocumentClick(): void {
@@ -688,6 +694,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('blur', cancelDragSelection)
   window.removeEventListener('dragover', blockExternalFileDrop)
   window.removeEventListener('drop', blockExternalFileDrop)
+  disposeUploads()
   if (suppressRowClickTimer !== undefined) window.clearTimeout(suppressRowClickTimer)
   if (searchTimer !== undefined) window.clearTimeout(searchTimer)
 })
@@ -705,19 +712,31 @@ onBeforeUnmount(() => {
       <LocaleToggle class="flat" />
       <button class="icon-btn flat" type="button" :title="locale.text('退出登录', 'Sign out')" :aria-label="locale.text('退出登录', 'Sign out')" @click="signOut"><AppIcon name="sign-out" /></button>
     </div>
-    <input ref="fileInput" class="visually-hidden" type="file" multiple @change="uploadFiles">
+    <input :ref="setFileInput" class="visually-hidden" type="file" multiple @change="uploadFiles">
+    <input :ref="setFolderInput" class="visually-hidden" type="file" multiple webkitdirectory directory @change="uploadFiles">
   </header>
 
   <main class="browser-page" :class="{ 'selection-active': selected.size > 0 }">
-    <section ref="filePanel" class="file-panel glass" :class="{ 'drag-selecting': dragSelecting }" :aria-busy="loading" @mousedown="startDragSelection" @contextmenu="openBackgroundMenu">
+    <section
+      ref="filePanel"
+      class="file-panel glass"
+      :class="{ 'drag-selecting': dragSelecting, 'upload-drop-active': uploadDropActive }"
+      :aria-busy="loading"
+      @mousedown="startDragSelection"
+      @contextmenu="openBackgroundMenu"
+      @dragenter="handleUploadDragEnter"
+      @dragover="handleUploadDragOver"
+      @dragleave="handleUploadDragLeave"
+      @drop.stop.prevent="handleUploadDrop"
+    >
       <div class="file-toolbar">
         <label class="top-search file-search">
           <AppIcon name="search" />
           <input v-model="query" type="search" :placeholder="locale.text('搜索当前目录', 'Search this folder')" :aria-label="locale.text('搜索当前目录', 'Search this folder')" @input="scheduleSearch">
         </label>
         <div class="file-toolbar-actions">
-          <button v-if="capabilities.create_directory" class="btn secondary" type="button" @click="openFolderDialog"><AppIcon name="folder-plus" /><span>{{ locale.text('新建文件夹', 'New folder') }}</span></button>
-          <button v-if="capabilities.upload" class="btn" type="button" @click="chooseFiles"><AppIcon name="upload" /><span>{{ locale.text('上传文件', 'Upload files') }}</span></button>
+          <button class="btn secondary" type="button" @click="openFolderDialog"><AppIcon name="folder-plus" /><span>{{ locale.text('新建', 'New') }}</span></button>
+          <button class="btn" type="button" @click="openUploadManager"><AppIcon name="upload" /><span>{{ locale.text('上传', 'Upload') }}</span></button>
         </div>
       </div>
 
@@ -754,6 +773,11 @@ onBeforeUnmount(() => {
           <div class="cell right modified">{{ entry.modified || '-' }}</div>
         </div>
       </div>
+      <div v-if="uploadDropActive" class="upload-drop-overlay" aria-hidden="true">
+        <AppIcon name="upload" :size="32" />
+        <strong>{{ locale.text('拖放到这里上传', 'Drop here to upload') }}</strong>
+        <span>{{ locale.text('支持文件和文件夹', 'Files and folders are supported') }}</span>
+      </div>
       <footer class="file-pagination">
         <div class="pagination-summary">
           <AppSelect v-model="pageSize" class="page-size-select" placement="top" :options="pageSizeOptions" :label="locale.text('每页显示数量', 'Items per page')" @change="changePageSize" />
@@ -789,14 +813,19 @@ onBeforeUnmount(() => {
     </form>
   </div>
 
-  <div v-if="showAdmin" class="overlay active" @click.self="showAdmin = false">
-    <form class="modal" @submit.prevent="submitAdmin">
-      <h2>{{ locale.text('账号登录', 'Account sign-in') }}</h2>
-      <label>{{ locale.text('用户名', 'Username') }}<input v-model="adminUser" class="input" autocomplete="username"></label>
-      <label>{{ locale.text('密码', 'Password') }}<input v-model="adminPassword" class="input" type="password" autocomplete="current-password"></label>
-      <p class="modal-error">{{ adminError }}</p>
-      <div class="modal-actions"><button class="btn secondary" type="button" @click="showAdmin = false">{{ locale.t('common.cancel') }}</button><button class="btn" type="submit">{{ locale.text('登录', 'Sign in') }}</button></div>
-    </form>
+  <div v-if="showAdmin" class="overlay active admin-login-overlay" @click.self="showAdmin = false">
+    <AdminLoginCard
+      v-model:username="adminUser"
+      v-model:password="adminPassword"
+      v-model:totp-code="adminTotpCode"
+      :totp-required="adminTotpRequired"
+      :error="adminError"
+      :busy="adminLoggingIn"
+      cancelable
+      @credentials-change="resetAdminTotpChallenge"
+      @submit="submitAdmin"
+      @cancel="showAdmin = false"
+    />
   </div>
 
   <div v-if="showFolder" class="overlay active" @click.self="showFolder = false">
@@ -808,16 +837,20 @@ onBeforeUnmount(() => {
     </form>
   </div>
 
-  <div v-if="showUpload" class="overlay active" @click.self="!uploading && (showUpload = false)">
-    <section class="modal upload-modal" aria-labelledby="upload-title">
-      <h2 id="upload-title">{{ locale.text('上传文件', 'Upload files') }}</h2>
-      <p class="upload-current">{{ uploadCurrent }}</p>
-      <progress :value="uploadPercent" max="100">{{ uploadPercent }}%</progress>
-      <p>{{ uploadPercent }}% · {{ formatSize(uploadProcessed) }} / {{ formatSize(uploadTotal) }}</p>
-      <p class="upload-summary">{{ uploadSummary }}</p>
-      <div class="modal-actions"><button class="btn secondary" type="button" :disabled="uploading" @click="showUpload = false">{{ locale.t('common.close') }}</button></div>
-    </section>
-  </div>
+  <UploadQueueDialog
+    v-if="showUpload"
+    :tasks="uploadTasks"
+    @choose-files="chooseFiles"
+    @choose-folder="chooseFolder"
+    @drop="handleUploadDrop"
+    @close="closeUploadDialog"
+    @pause="pauseUploads"
+    @resume="resumeUploads"
+    @terminate="terminateUploads"
+    @clear="clearUploadTasks"
+    @retry="retryUpload"
+    @remove-failed="removeFailedUpload"
+  />
 
   <div v-if="showRename" class="overlay active" @click.self="showRename = false">
     <form class="modal" @submit.prevent="submitRename">
@@ -828,7 +861,7 @@ onBeforeUnmount(() => {
     </form>
   </div>
 
-  <FolderPicker v-if="pickerOperation" :title="pickerTitle" @close="pickerOperation = null" @confirm="confirmTransfer" />
+  <FolderPicker v-if="pickerOperation" :title="pickerTitle" :storage-id="pickerStorageId" @close="pickerOperation = null" @confirm="confirmTransfer" />
 
   <div v-if="showDelete" class="overlay active" @click.self="!operationBusy && (showDelete = false)">
     <section class="modal" aria-labelledby="delete-title">

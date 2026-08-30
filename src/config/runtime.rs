@@ -6,7 +6,10 @@ use anyhow::Context;
 
 use super::{
     AppError, AppResult, Config, LocalMountCatalog, S3Provider, StorageBackendConfig,
-    HARD_MAX_UPLOAD_BYTES,
+    DEFAULT_DEPLOYMENT_MAX_ARCHIVE_BYTES, DEFAULT_DEPLOYMENT_MAX_ARCHIVE_ENTRIES,
+    DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_BYTES, DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_ENTRIES,
+    DEFAULT_DEPLOYMENT_MAX_UPLOAD_BYTES, HARD_MAX_ARCHIVE_BYTES, HARD_MAX_ARCHIVE_ENTRIES,
+    HARD_MAX_UPLOAD_BATCH_BYTES, HARD_MAX_UPLOAD_BATCH_ENTRIES, HARD_MAX_UPLOAD_BYTES,
 };
 
 impl Config {
@@ -23,7 +26,28 @@ impl Config {
         // This is an absolute transport envelope. The administrator-facing,
         // persisted upload limit is enforced by StorageService and can be
         // changed without exposing concurrency/resource protection controls.
-        let max_upload_bytes = env_parse("MAX_UPLOAD_BYTES", HARD_MAX_UPLOAD_BYTES)?;
+        let max_upload_bytes = env_parse("MAX_UPLOAD_BYTES", DEFAULT_DEPLOYMENT_MAX_UPLOAD_BYTES)?;
+        let max_upload_batch_bytes = env_parse(
+            "MAX_UPLOAD_BATCH_BYTES",
+            DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_BYTES,
+        )?;
+        let max_upload_batch_entries = env_parse(
+            "MAX_UPLOAD_BATCH_ENTRIES",
+            DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_ENTRIES,
+        )?;
+        let max_archive_bytes =
+            env_parse("MAX_ARCHIVE_BYTES", DEFAULT_DEPLOYMENT_MAX_ARCHIVE_BYTES)?;
+        let max_archive_entries = env_parse(
+            "MAX_ARCHIVE_ENTRIES",
+            DEFAULT_DEPLOYMENT_MAX_ARCHIVE_ENTRIES,
+        )?;
+        validate_deployment_envelope(
+            max_upload_bytes,
+            max_upload_batch_bytes,
+            max_upload_batch_entries,
+            max_archive_bytes,
+            max_archive_entries,
+        )?;
         let io_concurrency = env_parse("IO_CONCURRENCY", 4_usize)?;
         let max_list_entries = env_parse("MAX_LIST_ENTRIES", 10_000_usize)?;
         let request_timeout_secs = env_parse("REQUEST_TIMEOUT_SECS", 300_u64)?;
@@ -41,6 +65,10 @@ impl Config {
             local_mounts,
             config_path,
             max_upload_bytes,
+            max_upload_batch_bytes,
+            max_upload_batch_entries,
+            max_archive_bytes,
+            max_archive_entries,
             io_concurrency,
             max_list_entries,
             request_timeout_secs,
@@ -76,6 +104,31 @@ impl Config {
             Err(AppError::Forbidden)
         }
     }
+}
+
+fn validate_deployment_envelope(
+    upload_bytes: u64,
+    batch_bytes: u64,
+    batch_entries: usize,
+    archive_bytes: u64,
+    archive_entries: usize,
+) -> anyhow::Result<()> {
+    if upload_bytes == 0 || upload_bytes > HARD_MAX_UPLOAD_BYTES {
+        anyhow::bail!("MAX_UPLOAD_BYTES is outside the supported format range");
+    }
+    if batch_bytes < upload_bytes || batch_bytes > HARD_MAX_UPLOAD_BATCH_BYTES {
+        anyhow::bail!("MAX_UPLOAD_BATCH_BYTES must be at least MAX_UPLOAD_BYTES");
+    }
+    if batch_entries == 0 || batch_entries > HARD_MAX_UPLOAD_BATCH_ENTRIES {
+        anyhow::bail!("MAX_UPLOAD_BATCH_ENTRIES is outside the supported format range");
+    }
+    if archive_bytes == 0 || archive_bytes > HARD_MAX_ARCHIVE_BYTES {
+        anyhow::bail!("MAX_ARCHIVE_BYTES is outside the supported format range");
+    }
+    if archive_entries == 0 || archive_entries > HARD_MAX_ARCHIVE_ENTRIES {
+        anyhow::bail!("MAX_ARCHIVE_ENTRIES is outside the supported format range");
+    }
+    Ok(())
 }
 
 fn s3_allowed_endpoints() -> anyhow::Result<HashSet<String>> {

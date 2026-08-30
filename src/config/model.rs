@@ -4,9 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     default_admin_login_failures, default_local_mount_id, default_login_block_seconds,
-    default_max_archive_bytes, default_max_archive_entries, default_max_upload_bytes,
-    default_security_log_max_entries, default_security_log_retention_days, default_storage_id,
-    default_true, default_web_login_failures, uuid_v4, DEFAULT_STORAGE_ID,
+    default_max_archive_bytes, default_max_archive_entries, default_max_upload_batch_bytes,
+    default_max_upload_batch_entries, default_max_upload_bytes, default_security_log_max_entries,
+    default_security_log_retention_days, default_storage_id, default_true,
+    default_web_login_failures, uuid_v4, DEFAULT_STORAGE_ID,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +239,10 @@ pub struct ConfigFile {
     pub admin_username: String,
     pub admin_password_hash: String,
     #[serde(default)]
+    pub admin_totp_secret: Option<String>,
+    #[serde(default)]
+    pub admin_recovery_code_hashes: Vec<String>,
+    #[serde(default)]
     pub user_accounts: Vec<UserAccount>,
     #[serde(default)]
     pub global_web_password_hash: Option<String>,
@@ -247,6 +252,10 @@ pub struct ConfigFile {
     pub shares: Vec<Share>,
     #[serde(default = "default_max_upload_bytes")]
     pub max_upload_bytes: u64,
+    #[serde(default = "default_max_upload_batch_bytes")]
+    pub max_upload_batch_bytes: u64,
+    #[serde(default = "default_max_upload_batch_entries")]
+    pub max_upload_batch_entries: usize,
     #[serde(default = "default_max_archive_bytes")]
     pub max_archive_bytes: u64,
     #[serde(default = "default_max_archive_entries")]

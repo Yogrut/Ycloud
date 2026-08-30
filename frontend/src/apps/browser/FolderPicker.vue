@@ -5,7 +5,7 @@ import { listFiles } from '../../shared/api/browser'
 import { useLocale } from '../../shared/i18n'
 import BrowserActionIcon from './BrowserActionIcon.vue'
 
-defineProps<{ title: string }>()
+const props = defineProps<{ title: string; storageId: string }>()
 const emit = defineEmits<{ close: []; confirm: [path: string] }>()
 const locale = useLocale()
 
@@ -22,7 +22,7 @@ async function load(destination: string): Promise<void> {
     let currentPath = destination
     const found: FileEntry[] = []
     do {
-      const data = await listFiles(destination, undefined, { limit: 100, cursor })
+      const data = await listFiles(destination, props.storageId, { limit: 100, cursor })
       currentPath = data.current_path
       found.push(...data.entries.filter(entry => entry.is_dir && !entry.locked))
       cursor = data.next_cursor ?? undefined

@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import type { AdminInfo, UpdateAccountRequest } from '../../shared/api/admin'
-import { updateAccount } from '../../shared/api/admin'
+import {
+  disableAdministratorTotp,
+  enableAdministratorTotp,
+  setupAdministratorTotp,
+  updateAccount,
+} from '../../shared/api/admin'
 import { useLocale } from '../../shared/i18n'
 
 const MASK = '••••••'
@@ -15,6 +20,13 @@ const webPassword = ref('')
 const saving = ref(false)
 const errorMessage = ref('')
 const confirmRemoval = ref(false)
+const totpEnabled = ref(Boolean(props.info.admin_totp_enabled))
+const totpPassword = ref('')
+const totpCode = ref('')
+const totpSetup = ref<{ secret: string; provisioning_uri: string; qr_svg: string }>()
+const recoveryCodes = ref<string[]>([])
+const totpBusy = ref(false)
+const totpError = ref('')
 
 const hasAccountChanges = computed(() => (
   username.value.trim() !== props.info.username
@@ -31,10 +43,17 @@ function reset(): void {
 }
 
 watch(() => props.info, reset, { immediate: true })
+watch(() => props.info.admin_totp_enabled, value => {
+  if (recoveryCodes.value.length === 0) totpEnabled.value = Boolean(value)
+})
 
 function selectMask(event: FocusEvent): void {
   const input = event.target as HTMLInputElement
   if (input.value === MASK) nextTick(() => input.select())
+}
+
+function qrDataUrl(svg: string): string {
+  return `data:image/svg+xml;base64,${window.btoa(svg)}`
 }
 
 function validate(): string | undefined {
@@ -80,6 +99,55 @@ async function submit(confirmed = false): Promise<void> {
   }
 }
 
+async function beginTotpSetup(): Promise<void> {
+  if (!totpPassword.value || totpBusy.value) return
+  totpBusy.value = true
+  totpError.value = ''
+  try {
+    totpSetup.value = await setupAdministratorTotp(totpPassword.value)
+  } catch (error) {
+    totpError.value = error instanceof Error ? error.message : locale.text('无法创建两步验证配置', 'Unable to prepare two-step verification')
+  } finally {
+    totpBusy.value = false
+  }
+}
+
+async function enableTotp(): Promise<void> {
+  if (!totpSetup.value || !totpPassword.value || !totpCode.value || totpBusy.value) return
+  totpBusy.value = true
+  totpError.value = ''
+  try {
+    const result = await enableAdministratorTotp(totpPassword.value, totpSetup.value.secret, totpCode.value.trim())
+    recoveryCodes.value = result.recovery_codes
+    totpEnabled.value = true
+    totpSetup.value = undefined
+    totpCode.value = ''
+    totpPassword.value = ''
+  } catch (error) {
+    totpError.value = error instanceof Error ? error.message : locale.text('启用两步验证失败', 'Unable to enable two-step verification')
+  } finally {
+    totpBusy.value = false
+  }
+}
+
+async function disableTotp(): Promise<void> {
+  if (!totpPassword.value || !totpCode.value || totpBusy.value) return
+  totpBusy.value = true
+  totpError.value = ''
+  try {
+    await disableAdministratorTotp(totpPassword.value, totpCode.value.trim())
+    totpEnabled.value = false
+    totpPassword.value = ''
+    totpCode.value = ''
+    emit('saved', locale.text('两步验证已停用，请重新登录', 'Two-step verification disabled. Sign in again'))
+    emit('expired')
+  } catch (error) {
+    totpError.value = error instanceof Error ? error.message : locale.text('停用两步验证失败', 'Unable to disable two-step verification')
+  } finally {
+    totpBusy.value = false
+  }
+}
+
 </script>
 
 <template>
@@ -91,7 +159,7 @@ async function submit(confirmed = false): Promise<void> {
       </div>
     </header>
     <div class="admin-pane-body">
-      <form class="account-section" :aria-label="locale.text('账户设置', 'Account settings')" @submit.prevent="submit()">
+      <form class="account-section account-credentials" :aria-label="locale.text('账户设置', 'Account settings')" @submit.prevent="submit()">
         <div class="settings-grid account-grid">
           <label class="compact-field">
             <span>{{ locale.text('管理员用户名', 'Administrator username') }}</span>
@@ -111,6 +179,52 @@ async function submit(confirmed = false): Promise<void> {
           <button class="btn" type="submit" :disabled="saving || !hasAccountChanges">{{ saving ? locale.t('common.saving') : locale.text('保存账户设置', 'Save account settings') }}</button>
         </div>
       </form>
+      <section class="account-section totp-section" :aria-label="locale.text('管理员两步验证', 'Administrator two-step verification')">
+        <div class="section-heading totp-heading">
+          <div>
+            <h2>{{ locale.text('两步验证', 'Two-step verification') }}</h2>
+            <p>{{ locale.text('使用 2FAuth 或其他标准验证器；服务器时间需保持准确。', 'Use 2FAuth or another standard authenticator; keep the server clock accurate.') }}</p>
+          </div>
+          <span class="status-pill" :class="{ inactive: !totpEnabled }">{{ totpEnabled ? locale.text('已启用', 'Enabled') : locale.text('未启用', 'Disabled') }}</span>
+        </div>
+
+        <div v-if="recoveryCodes.length" class="settings-grid">
+          <div class="compact-field">
+            <span>{{ locale.text('恢复码（仅显示一次）', 'Recovery codes (shown once)') }}</span>
+            <code v-for="code in recoveryCodes" :key="code">{{ code }}</code>
+            <small>{{ locale.text('立即离线保存。每个恢复码只能使用一次，然后请重新登录。', 'Save these offline now. Each code works once, then sign in again.') }}</small>
+          </div>
+        </div>
+
+        <template v-else>
+          <div class="settings-grid account-grid">
+            <label class="compact-field">
+              <span>{{ locale.text('当前管理员密码', 'Current administrator password') }}</span>
+              <input v-model="totpPassword" type="password" autocomplete="current-password">
+            </label>
+            <label v-if="totpEnabled || totpSetup" class="compact-field">
+              <span>{{ locale.text('动态验证码或恢复码', 'Authenticator or recovery code') }}</span>
+              <input v-model="totpCode" inputmode="numeric" autocomplete="one-time-code" maxlength="16">
+            </label>
+          </div>
+          <div v-if="totpSetup" class="settings-grid totp-setup-grid">
+            <div class="totp-qr-card">
+              <img :src="qrDataUrl(totpSetup.qr_svg)" :alt="locale.text('两步验证二维码', 'Two-step verification QR code')">
+              <small>{{ locale.text('使用 2FAuth 扫描二维码', 'Scan with 2FAuth') }}</small>
+            </div>
+            <label class="compact-field totp-secret-field">
+              <span>{{ locale.text('无法扫码时手动输入密钥', 'Enter the secret manually if scanning is unavailable') }}</span>
+              <input :value="totpSetup.secret" readonly>
+            </label>
+          </div>
+          <p class="admin-form-error" role="alert" aria-live="polite">{{ totpError }}</p>
+          <div class="admin-save-row">
+            <button v-if="!totpEnabled && !totpSetup" class="btn" type="button" :disabled="totpBusy || !totpPassword" @click="beginTotpSetup">{{ locale.text('开始设置', 'Set up') }}</button>
+            <button v-else-if="totpSetup" class="btn" type="button" :disabled="totpBusy || !totpCode" @click="enableTotp">{{ locale.text('验证并启用', 'Verify and enable') }}</button>
+            <button v-else class="btn danger" type="button" :disabled="totpBusy || !totpPassword || !totpCode" @click="disableTotp">{{ locale.text('验证并停用', 'Verify and disable') }}</button>
+          </div>
+        </template>
+      </section>
     </div>
   </section>
 

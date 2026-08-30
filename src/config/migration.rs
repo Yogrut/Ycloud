@@ -1,7 +1,10 @@
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{CONFIG_SCHEMA_VERSION, DEFAULT_STORAGE_ID};
+use super::{
+    CONFIG_SCHEMA_VERSION, DEFAULT_MAX_UPLOAD_BATCH_BYTES, DEFAULT_MAX_UPLOAD_BATCH_ENTRIES,
+    DEFAULT_STORAGE_ID,
+};
 
 pub(super) fn migrate_config(raw: &mut Value) -> anyhow::Result<bool> {
     let mut migrated = false;
@@ -33,6 +36,16 @@ pub(super) fn migrate_config(raw: &mut Value) -> anyhow::Result<bool> {
     }
     if schema_version < 9 {
         migrate_storage_visibility(raw);
+        migrated = true;
+    }
+    if schema_version < 10 {
+        raw["max_upload_batch_bytes"] = serde_json::json!(DEFAULT_MAX_UPLOAD_BATCH_BYTES);
+        raw["max_upload_batch_entries"] = serde_json::json!(DEFAULT_MAX_UPLOAD_BATCH_ENTRIES);
+        migrated = true;
+    }
+    if schema_version < 11 {
+        raw["admin_totp_secret"] = serde_json::Value::Null;
+        raw["admin_recovery_code_hashes"] = serde_json::json!([]);
         migrated = true;
     }
     if schema_version < CONFIG_SCHEMA_VERSION as u64 {

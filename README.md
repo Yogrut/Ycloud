@@ -24,6 +24,36 @@ cargo run --release --locked
 
 默认地址：`http://127.0.0.1:18473`。首次启动凭据写入 `initial-credentials.json`。
 
+## Docker Compose 部署
+
+默认 Compose 配置仅把服务发布到宿主机回环地址，适合本机访问或由同机反向代理转发：
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs ycloud
+```
+
+首次启动凭据位于容器的 `/var/lib/ycloud/initial-credentials.json`，可使用 `docker compose exec ycloud sh` 之外的只读复制方式查看，例如：
+
+```bash
+docker compose cp ycloud:/var/lib/ycloud/initial-credentials.json ./initial-credentials.json
+chmod 600 ./initial-credentials.json
+```
+
+登录并修改管理员密码与网页访问密码后，确认容器内的初始凭据文件已经被删除，再删除宿主机复制件。`ycloud-data` 卷同时保存配置、自动主密钥、本地文件和安全状态，备份与恢复时必须作为同一单元处理。
+
+公网 HTTPS 反向代理使用额外覆盖文件。先复制 `.env.example` 为 `.env`，只填写外部 HTTPS Origin 和代理到容器时呈现的精确源 IP。再从长期保存的 Secret 管理器加载配置主密钥；首次部署可生成后立即保存到 Secret 管理器：
+
+```bash
+export YCLOUD_CONFIG_KEY="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
+# 在继续前把 YCLOUD_CONFIG_KEY 保存到长期 Secret 管理器；丢失后无法解密已有 S3/TOTP 配置。
+docker compose -f compose.yaml -f compose.proxy.yaml up -d --build
+unset YCLOUD_CONFIG_KEY
+```
+
+Compose 从宿主机的 `YCLOUD_CONFIG_KEY` 创建 Secret，并只以 `/run/secrets/ycloud-config-key` 文件提供给 Ycloud；该变量不写入容器环境。反向代理必须保留原始 `Host`，设置单值 `X-Forwarded-For` 和 `X-Forwarded-Proto: https`，且其实际容器侧 IP 必须包含在 `TRUSTED_PROXY_IPS` 中。基础 Compose 配置含非 root 用户、只读根文件系统、全部 Capability 移除、`no-new-privileges`、PID 上限和健康检查。使用宿主机 bind mount 代替 named volume 时，目录必须预先归属 UID/GID `10001:10001` 且权限不得向其他用户开放。
+
 局域网测试：
 
 ```powershell

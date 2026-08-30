@@ -1,0 +1,42 @@
+name: ycloud
+
+services:
+  ycloud:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ycloud:local
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 30s
+    environment:
+      BIND_ADDRESS: 0.0.0.0
+      PORT: 18473
+      STORAGE_PATH: /var/lib/ycloud/storage
+      CONFIG_PATH: /var/lib/ycloud/config.json
+      ALLOW_LAN_HTTP: "true"
+      SECURE_COOKIES: "false"
+      RUST_LOG: info
+    ports:
+      - "${YCLOUD_PUBLISH_ADDRESS:-127.0.0.1}:${YCLOUD_PORT:-18473}:18473"
+    volumes:
+      - ycloud-data:/var/lib/ycloud
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:18473/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  ycloud-data:
+

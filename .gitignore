@@ -29,6 +29,8 @@
 *~
 .DS_Store
 Thumbs.db
+.env
+/secrets/
 
 # Local Codex/agent skill bundles are developer tooling, not Ycloud source
 .agents/

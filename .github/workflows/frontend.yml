@@ -67,3 +67,47 @@ jobs:
           cargo install cargo-deny --version 0.20.2 --locked
       - run: cargo audit
       - run: cargo deny check
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose models
+        env:
+          PUBLIC_BASE_URL: https://cloud.example.test
+          TRUSTED_PROXY_IPS: 172.18.0.1
+          YCLOUD_CONFIG_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        run: |
+          docker compose -f compose.yaml config --quiet
+          docker compose -f compose.yaml -f compose.proxy.yaml config --quiet
+      - name: Build production image
+        run: docker build --pull --tag ycloud:ci .
+      - name: Verify non-root image metadata
+        run: test "$(docker inspect --format '{{.Config.User}}' ycloud:ci)" = "10001:10001"
+      - name: Run hardened container
+        run: |
+          docker volume create ycloud-ci-data
+          docker run --detach --name ycloud-ci \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 256 \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777 \
+            --volume ycloud-ci-data:/var/lib/ycloud \
+            --env ALLOW_LAN_HTTP=true \
+            --env SECURE_COOKIES=false \
+            ycloud:ci
+          for attempt in $(seq 1 60); do
+            if docker exec ycloud-ci curl --fail --silent --show-error http://127.0.0.1:18473/api/ready; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs ycloud-ci
+          exit 1
+      - name: Clean container test resources
+        if: always()
+        run: |
+          docker rm --force ycloud-ci 2>/dev/null || true
+          docker volume rm ycloud-ci-data 2>/dev/null || true

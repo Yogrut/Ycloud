@@ -1,0 +1,18 @@
+services:
+  ycloud:
+    environment:
+      ALLOW_LAN_HTTP: "false"
+      SECURE_COOKIES: "true"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL to the external HTTPS origin}"
+      TRUSTED_PROXY_IPS: "${TRUSTED_PROXY_IPS:?set TRUSTED_PROXY_IPS to exact proxy IP addresses}"
+      YCLOUD_CONFIG_KEY_FILE: /run/secrets/ycloud-config-key
+    secrets:
+      - source: ycloud-config-key
+        target: ycloud-config-key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+
+secrets:
+  ycloud-config-key:
+    environment: YCLOUD_CONFIG_KEY

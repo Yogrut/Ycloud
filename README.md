@@ -29,19 +29,21 @@ cargo run --release --locked
 项目只使用一份 Compose。默认把容器端口发布为宿主机的 `18473`，启动后可直接通过 `http://服务器IP:18473` 访问：
 
 ```bash
+mkdir -p data
+sudo chown 10001:10001 data
+sudo chmod 700 data
 docker compose up -d --build
 docker compose ps
 docker compose logs ycloud
 ```
 
-首次启动凭据位于容器的 `/var/lib/ycloud/initial-credentials.json`，可使用 `docker compose exec ycloud sh` 之外的只读复制方式查看，例如：
+Ycloud 使用非 root UID/GID `10001:10001`，因此首次启动前必须创建 `./data` 并授予该账号写权限。首次启动凭据可直接在宿主机读取：
 
 ```bash
-docker compose cp ycloud:/var/lib/ycloud/initial-credentials.json ./initial-credentials.json
-chmod 600 ./initial-credentials.json
+sudo cat ./data/initial-credentials.json
 ```
 
-登录并修改管理员密码与网页访问密码后，确认容器内的初始凭据文件已经被删除，再删除宿主机复制件。`ycloud-data` 卷同时保存配置、自动主密钥、本地文件和安全状态，备份与恢复时必须作为同一单元处理。
+登录并修改管理员密码与网页访问密码后，确认 `./data/initial-credentials.json` 已被自动删除。`./data` 同时保存配置、自动主密钥、本地文件和安全状态，备份与恢复时必须作为同一单元处理。该目录已被 `.gitignore` 和 `.dockerignore` 排除，不会进入版本库或镜像构建上下文。
 
 直接 HTTP 模式不需要 `.env`。如需 HTTPS 反向代理，在 `compose.yaml` 中按注释启用可选代理参数，再在 `.env` 或部署环境中同时设置：
 
@@ -54,7 +56,7 @@ TRUSTED_PROXY_IPS=172.18.0.1
 
 不启用注释参数时不会进入 HTTPS 代理模式；只配置其中一项或安全参数组合不完整时，Ycloud 会拒绝启动。反向代理必须保留原始 `Host`，设置单值 `X-Forwarded-For` 和 `X-Forwarded-Proto: https`，且其实际容器侧 IP 必须包含在 `TRUSTED_PROXY_IPS` 中。这些变量只配置 Ycloud 的信任边界，不会自动部署或替代 Caddy、Nginx、Cloudflare Tunnel 或云负载均衡器。
 
-单机默认把自动生成的配置主密钥保存在 `ycloud-data` 卷中。`YCLOUD_CONFIG_KEY` 和 `YCLOUD_CONFIG_KEY_FILE` 均为可选覆盖项，需要时按 `compose.yaml` 中的注释启用；专业部署使用 `YCLOUD_CONFIG_KEY_FILE` 时还必须自行把对应只读 Secret 文件挂载进容器。容器默认使用非 root 用户运行。使用宿主机 bind mount 代替 named volume 时，目录必须预先归属 UID/GID `10001:10001` 且权限不得向其他用户开放。
+单机默认把自动生成的配置主密钥保存在 `./data` 中。`YCLOUD_CONFIG_KEY` 和 `YCLOUD_CONFIG_KEY_FILE` 均为可选覆盖项，需要时按 `compose.yaml` 中的注释启用；专业部署使用 `YCLOUD_CONFIG_KEY_FILE` 时还必须自行把对应只读 Secret 文件挂载进容器。容器默认使用非 root 用户运行，`./data` 必须归属 UID/GID `10001:10001` 且权限不得向其他用户开放。
 
 局域网测试：
 

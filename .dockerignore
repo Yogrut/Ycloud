@@ -6,6 +6,7 @@
 target
 frontend
 storage
+data
 config.json
 config.json.bak
 initial-credentials.json

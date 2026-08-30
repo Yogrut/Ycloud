@@ -2,12 +2,9 @@ name: ycloud
 
 services:
   ycloud:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     image: ycloud:local
     restart: unless-stopped
-    init: true
     user: "10001:10001"
     environment:
       ALLOW_LAN_HTTP: "${ALLOW_LAN_HTTP:-true}"
@@ -25,14 +22,11 @@ services:
       # PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL}"
       # TRUSTED_PROXY_IPS: "${TRUSTED_PROXY_IPS:?set TRUSTED_PROXY_IPS}"
 
-      # 外部配置主密钥是可选项；单机默认自动生成并保存在数据卷中。
+      # 外部配置主密钥是可选项；单机默认自动生成并保存在 ./data 中。
       # 二选一取消注释。使用 FILE 时还必须把只读密钥文件挂载进容器。
       # YCLOUD_CONFIG_KEY: "${YCLOUD_CONFIG_KEY:?set YCLOUD_CONFIG_KEY}"
       # YCLOUD_CONFIG_KEY_FILE: "${YCLOUD_CONFIG_KEY_FILE:?set YCLOUD_CONFIG_KEY_FILE}"
     ports:
       - "18473:18473"
     volumes:
-      - ycloud-data:/var/lib/ycloud
-
-volumes:
-  ycloud-data:
+      - ./data:/var/lib/ycloud

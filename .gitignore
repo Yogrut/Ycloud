@@ -5,6 +5,7 @@
 # User data (contains personal files — do NOT version)
 /storage/*
 !/storage/.gitkeep
+/data/
 
 # Runtime secrets and atomic-write backups
 /config.json

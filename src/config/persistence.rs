@@ -158,10 +158,11 @@ async fn load_or_create_initial_credentials(path: &Path) -> anyhow::Result<Initi
     };
     let json = serde_json::to_vec_pretty(&credentials)?;
     let temporary = path.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&temporary)
         .await
         .context("Failed to create temporary initial credentials file")?;
@@ -224,6 +225,39 @@ pub async fn remove_initial_credentials(config_path: &Path) -> anyhow::Result<bo
     }
 }
 
+/// Removes the bootstrap plaintext file only after neither password in it is
+/// still active. Keeping the file while one initial credential remains is
+/// intentional: otherwise rotating only the browser gate password could make
+/// the still-active administrator password unrecoverable.
+pub async fn remove_initial_credentials_if_rotated(
+    config_path: &Path,
+    config: &ConfigFile,
+) -> anyhow::Result<bool> {
+    let path = initial_credentials_path(config_path);
+    let content = match tokio::fs::read(&path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("Failed to read {}", path.display()))
+        }
+    };
+    let credentials: InitialCredentials =
+        serde_json::from_slice(&content).context("Initial credentials file is invalid")?;
+    validate_initial_credentials(&credentials)?;
+
+    let administrator_rotated =
+        !super::verify_password(&config.admin_password_hash, &credentials.admin_password);
+    let web_gate_rotated = config
+        .global_web_password_hash
+        .as_deref()
+        .is_none_or(|hash| !super::verify_password(hash, &credentials.web_access_password));
+    if administrator_rotated && web_gate_rotated {
+        remove_initial_credentials(config_path).await
+    } else {
+        Ok(false)
+    }
+}
+
 pub async fn save_config(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
     config
         .validate()
@@ -235,10 +269,11 @@ pub async fn save_config(path: &Path, config: &ConfigFile) -> anyhow::Result<()>
     let json = serde_json::to_string_pretty(&raw)?;
     let temporary = path.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
     let backup = config_backup_path(path);
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
         .open(&temporary)
         .await
         .context("Failed to create temporary configuration")?;
@@ -534,25 +569,6 @@ async fn secure_file_permissions(_path: &Path) -> anyhow::Result<()> {
 
 pub(super) fn config_backup_path(path: &Path) -> PathBuf {
     path.with_extension("json.bak")
-}
-
-trait SecureOpenOptions {
-    fn mode(&mut self, mode: u32) -> &mut Self;
-}
-
-#[cfg(unix)]
-impl SecureOpenOptions for OpenOptions {
-    fn mode(&mut self, mode: u32) -> &mut Self {
-        use std::os::unix::fs::OpenOptionsExt;
-        OpenOptionsExt::mode(self, mode)
-    }
-}
-
-#[cfg(not(unix))]
-impl SecureOpenOptions for OpenOptions {
-    fn mode(&mut self, _mode: u32) -> &mut Self {
-        self
-    }
 }
 
 #[cfg(test)]

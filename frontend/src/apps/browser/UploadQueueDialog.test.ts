@@ -90,6 +90,7 @@ describe('UploadQueueDialog', () => {
     await nextTick()
 
     host.querySelector<HTMLButtonElement>('.upload-task.is-queued button[aria-label="暂停该文件"]')?.click()
+    host.querySelector<HTMLButtonElement>('.upload-task.is-uploading button[aria-label="暂停该文件"]')?.click()
     host.querySelector<HTMLButtonElement>('.upload-task.is-uploading button[aria-label="终止该文件"]')?.click()
     host.querySelector<HTMLButtonElement>('.upload-task.is-paused button[aria-label="继续该文件"]')?.click()
     host.querySelector<HTMLButtonElement>('.upload-task.is-succeeded button[aria-label="删除该任务记录"]')?.click()
@@ -97,13 +98,31 @@ describe('UploadQueueDialog', () => {
     host.querySelector<HTMLButtonElement>('.upload-task.is-failed button[aria-label="删除失败记录"]')?.click()
     host.querySelector<HTMLButtonElement>('.upload-task.is-cancelled button[aria-label="删除该任务记录"]')?.click()
 
-    expect(pause).toHaveBeenCalledWith([1])
+    expect(pause).toHaveBeenNthCalledWith(1, [1])
+    expect(pause).toHaveBeenNthCalledWith(2, [2])
     expect(terminate).toHaveBeenCalledWith([2])
     expect(resume).toHaveBeenCalledWith([3])
     expect(clear).toHaveBeenNthCalledWith(1, [4])
     expect(retry).toHaveBeenCalledWith(5)
     expect(removeFailed).toHaveBeenCalledWith(5)
     expect(clear).toHaveBeenNthCalledWith(2, [6])
+    app.unmount()
+  })
+
+  it('enables filtered pause while a visible file is actively uploading', async () => {
+    const host = document.createElement('div')
+    document.body.append(host)
+    const pause = vi.fn()
+    const app = mountUploadDialog(host, {
+      tasks: [task(1, 'uploading')],
+      onPause: pause,
+    })
+    await nextTick()
+
+    const pauseButton = host.querySelector<HTMLButtonElement>('.upload-batch-actions button[aria-label="暂停当前筛选任务"]')
+    expect(pauseButton?.disabled).toBe(false)
+    pauseButton?.click()
+    expect(pause).toHaveBeenCalledWith([1])
     app.unmount()
   })
 })

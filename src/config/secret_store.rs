@@ -184,13 +184,11 @@ async fn create_managed_key(path: &Path) -> anyhow::Result<[u8; KEY_BYTES]> {
     let mut key = [0_u8; KEY_BYTES];
     OsRng.fill_bytes(&mut key);
     let encoded = encode_managed_key(&key)?;
-    let mut file = match OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .await
-    {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = match options.open(path).await {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             return read_managed_key(path).await;
@@ -349,25 +347,6 @@ async fn secure_file_permissions(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 async fn secure_file_permissions(_path: &Path) -> anyhow::Result<()> {
     Ok(())
-}
-
-trait SecureOpenOptions {
-    fn mode(&mut self, mode: u32) -> &mut Self;
-}
-
-#[cfg(unix)]
-impl SecureOpenOptions for OpenOptions {
-    fn mode(&mut self, mode: u32) -> &mut Self {
-        use std::os::unix::fs::OpenOptionsExt;
-        OpenOptionsExt::mode(self, mode)
-    }
-}
-
-#[cfg(not(unix))]
-impl SecureOpenOptions for OpenOptions {
-    fn mode(&mut self, _mode: u32) -> &mut Self {
-        self
-    }
 }
 
 #[cfg(test)]

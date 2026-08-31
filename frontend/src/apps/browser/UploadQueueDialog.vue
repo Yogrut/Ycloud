@@ -39,7 +39,7 @@ const visibleTasks = computed(() => props.tasks.filter(task => {
   return task.status === filter.value
 }))
 const visibleTaskIds = computed(() => visibleTasks.value.map(task => task.id))
-const visibleHasQueuedTasks = computed(() => visibleTasks.value.some(task => task.status === 'queued'))
+const visibleHasPausableTasks = computed(() => visibleTasks.value.some(task => task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading'))
 const visibleHasPausedTasks = computed(() => visibleTasks.value.some(task => task.status === 'paused'))
 const visibleHasActiveTasks = computed(() => visibleTasks.value.some(task => task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading' || task.status === 'paused'))
 const modalHeight = computed(() => Math.min(650, 390 + Math.min(visibleTasks.value.length, 5) * 52))
@@ -134,7 +134,7 @@ function handleDrop(event: DragEvent): void {
         </div>
         <div class="upload-batch-actions" :aria-label="locale.text('当前筛选任务控制', 'Filtered upload controls')">
           <span class="upload-total-progress">{{ locale.text('总进度', 'Total') }} {{ overallPercent }}%</span>
-          <button class="record-icon-btn" type="button" :disabled="!visibleHasQueuedTasks" :title="locale.text('暂停当前筛选中等待上传的任务', 'Pause queued tasks in this filter')" :aria-label="locale.text('暂停当前筛选任务', 'Pause filtered tasks')" @click="emit('pause', visibleTaskIds)"><AppIcon name="pause" :size="17" /></button>
+          <button class="record-icon-btn" type="button" :disabled="!visibleHasPausableTasks" :title="locale.text('暂停当前筛选中的未完成任务', 'Pause unfinished tasks in this filter')" :aria-label="locale.text('暂停当前筛选任务', 'Pause filtered tasks')" @click="emit('pause', visibleTaskIds)"><AppIcon name="pause" :size="17" /></button>
           <button class="record-icon-btn" type="button" :disabled="!visibleHasPausedTasks" :title="locale.text('继续当前筛选中的任务', 'Resume filtered tasks')" :aria-label="locale.text('继续当前筛选任务', 'Resume filtered tasks')" @click="emit('resume', visibleTaskIds)"><AppIcon name="resume" :size="17" /></button>
           <button class="record-icon-btn" type="button" :disabled="!visibleHasActiveTasks" :title="locale.text('终止当前筛选中的未完成任务', 'Terminate unfinished filtered tasks')" :aria-label="locale.text('终止当前筛选任务', 'Terminate filtered tasks')" @click="emit('terminate', visibleTaskIds)"><AppIcon name="stop" :size="17" /></button>
           <button class="record-icon-btn danger" type="button" :disabled="!visibleTasks.length || visibleHasActiveTasks" :title="locale.text('删除当前筛选中的任务记录，不会删除已上传文件', 'Delete filtered task records without deleting uploaded files')" :aria-label="locale.text('删除当前筛选任务记录', 'Delete filtered task records')" @click="emit('clear', visibleTaskIds)"><AppIcon name="delete" :size="17" /></button>
@@ -154,7 +154,7 @@ function handleDrop(event: DragEvent): void {
             <p v-if="task.error" class="upload-task-error">{{ task.error }}</p>
           </div>
           <div class="upload-task-actions">
-            <button v-if="task.status === 'queued'" class="record-icon-btn" type="button" :title="locale.text('暂停该文件', 'Pause this file')" :aria-label="locale.text('暂停该文件', 'Pause this file')" @click="emit('pause', [task.id])"><AppIcon name="pause" :size="16" /></button>
+            <button v-if="task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading'" class="record-icon-btn" type="button" :title="locale.text('暂停该文件', 'Pause this file')" :aria-label="locale.text('暂停该文件', 'Pause this file')" @click="emit('pause', [task.id])"><AppIcon name="pause" :size="16" /></button>
             <button v-if="task.status === 'paused'" class="record-icon-btn" type="button" :title="locale.text('继续该文件', 'Resume this file')" :aria-label="locale.text('继续该文件', 'Resume this file')" @click="emit('resume', [task.id])"><AppIcon name="resume" :size="16" /></button>
             <button v-if="task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading' || task.status === 'paused'" class="record-icon-btn" type="button" :title="locale.text('终止该文件', 'Terminate this file')" :aria-label="locale.text('终止该文件', 'Terminate this file')" @click="emit('terminate', [task.id])"><AppIcon name="stop" :size="16" /></button>
             <button v-if="task.status === 'failed'" class="record-icon-btn" type="button" :title="locale.text('重试该文件', 'Retry this file')" :aria-label="locale.text('重试该文件', 'Retry this file')" @click="emit('retry', task.id)"><AppIcon name="retry" :size="16" /></button>

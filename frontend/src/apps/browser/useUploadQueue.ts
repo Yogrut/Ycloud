@@ -33,6 +33,7 @@ export function useUploadQueue(context: UploadQueueContext) {
   let currentUploadTaskId: number | undefined
   let disposed = false
   const cancelledUploadTaskIds = new Set<number>()
+  const pausedUploadTaskIds = new Set<number>()
   const requeuedUploadTaskIds = new Set<number>()
 
   function chooseFiles(): void {
@@ -192,6 +193,10 @@ export function useUploadQueue(context: UploadQueueContext) {
               task.status = 'cancelled'
               task.loaded = 0
               task.error = locale.text('任务已终止', 'Task terminated')
+            } else if (pausedUploadTaskIds.has(task.id)) {
+              task.status = 'paused'
+              task.loaded = 0
+              task.error = ''
             } else if (requeuedUploadTaskIds.has(task.id)) {
               task.status = 'queued'
               task.loaded = 0
@@ -204,6 +209,7 @@ export function useUploadQueue(context: UploadQueueContext) {
             currentUploadController = undefined
             currentUploadTaskId = undefined
             cancelledUploadTaskIds.delete(task.id)
+            pausedUploadTaskIds.delete(task.id)
             requeuedUploadTaskIds.delete(task.id)
           }
         }
@@ -248,7 +254,15 @@ export function useUploadQueue(context: UploadQueueContext) {
   function pauseUploads(taskIds: number[]): void {
     const selectedIds = new Set(taskIds)
     for (const task of uploadTasks.value) {
-      if (selectedIds.has(task.id) && task.status === 'queued') task.status = 'paused'
+      if (!selectedIds.has(task.id)) continue
+      if (task.status === 'preparing' || task.status === 'queued') {
+        task.status = 'paused'
+        continue
+      }
+      if (task.status === 'uploading') {
+        pausedUploadTaskIds.add(task.id)
+        if (currentUploadTaskId === task.id) currentUploadController?.abort()
+      }
     }
   }
 

@@ -9,9 +9,9 @@ use uuid::Uuid;
 use crate::{
     auth::AppState,
     config::{
-        remove_initial_credentials, validate_transfer_limits, validate_transfer_rate, Config,
-        FolderLock, S3AddressingStyle, S3Provider, S3StorageConfig, Share, StorageBackendConfig,
-        StorageInstanceConfig, StoragePermission, UserAccount,
+        remove_initial_credentials_if_rotated, validate_transfer_limits, validate_transfer_rate,
+        Config, FolderLock, S3AddressingStyle, S3Provider, S3StorageConfig, Share,
+        StorageBackendConfig, StorageInstanceConfig, StoragePermission, UserAccount,
     },
     error::{AppError, AppResult},
     login_security::{LoginEntry, LoginEventPage, LoginPolicy},
@@ -966,7 +966,10 @@ pub async fn update_admin_account(
     }
     let mut initial_credentials_warning = None;
     if admin_password_changed || gate_changed {
-        if let Err(error) = remove_initial_credentials(&state.config.config_path).await {
+        let active_config = state.config_file.read().await.clone();
+        if let Err(error) =
+            remove_initial_credentials_if_rotated(&state.config.config_path, &active_config).await
+        {
             tracing::error!(%error, "failed to remove initial plaintext credentials after account update");
             initial_credentials_warning = Some(
                 "账户已更新，但初始凭据文件删除失败；请在服务器配置目录手动删除 initial-credentials.json",

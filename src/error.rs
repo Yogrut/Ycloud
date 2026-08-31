@@ -18,6 +18,7 @@ pub enum AppError {
     Conflict(Cow<'static, str>),
     PayloadTooLarge,
     InsufficientStorage,
+    ClientClosedRequest,
     RequestTimeout,
     TooManyRequests,
     ServiceUnavailable(Cow<'static, str>),
@@ -54,6 +55,9 @@ impl AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
+            Self::ClientClosedRequest => {
+                StatusCode::from_u16(499).expect("499 is a valid client error status")
+            }
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -73,6 +77,7 @@ impl AppError {
             Self::InsufficientStorage => {
                 "Storage does not have enough free space for this upload".into()
             }
+            Self::ClientClosedRequest => "Upload connection was closed by the client".into(),
             Self::RequestTimeout => "Request exceeded the configured timeout".into(),
             Self::TooManyRequests => "Too many requests".into(),
             Self::Internal { .. } => "Internal server error".into(),
@@ -91,6 +96,7 @@ impl fmt::Display for AppError {
             Self::NotFound => formatter.write_str("not found"),
             Self::PayloadTooLarge => formatter.write_str("payload too large"),
             Self::InsufficientStorage => formatter.write_str("insufficient storage"),
+            Self::ClientClosedRequest => formatter.write_str("client closed upload request"),
             Self::RequestTimeout => formatter.write_str("request timeout"),
             Self::TooManyRequests => formatter.write_str("too many requests"),
             Self::Internal { context, source } => {
@@ -131,6 +137,7 @@ impl IntoResponse for AppError {
             Self::Conflict(_) => "conflict",
             Self::PayloadTooLarge => "payload_too_large",
             Self::InsufficientStorage => "insufficient_storage",
+            Self::ClientClosedRequest => "client_closed_request",
             Self::RequestTimeout => "request_timeout",
             Self::TooManyRequests => "too_many_requests",
             Self::ServiceUnavailable(_) => "service_unavailable",
@@ -188,5 +195,10 @@ mod tests {
         assert_eq!(json["error"]["code"], "internal_error");
         assert_eq!(json["error"]["message"], "Internal server error");
         assert!(!String::from_utf8_lossy(&body).contains("secret"));
+    }
+
+    #[test]
+    fn interrupted_upload_is_classified_as_a_client_error() {
+        assert_eq!(AppError::ClientClosedRequest.status().as_u16(), 499);
     }
 }

@@ -257,7 +257,6 @@ fn private_file_options() -> fs::OpenOptions {
     options.create_new(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     options

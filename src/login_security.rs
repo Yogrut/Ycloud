@@ -480,7 +480,6 @@ async fn append_json_line(path: &Path, event: &LoginEvent) -> anyhow::Result<()>
     options.create(true).append(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let mut file = options.open(path).await?;
@@ -497,7 +496,6 @@ async fn compact_events(path: &Path, events: &VecDeque<LoginEvent>) -> anyhow::R
     options.create_new(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let mut file = options.open(&temporary).await?;
@@ -643,7 +641,6 @@ async fn persist_state(path: &Path, data: &SecurityData) -> anyhow::Result<()> {
     options.create_new(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let mut file = options.open(&temporary).await?;

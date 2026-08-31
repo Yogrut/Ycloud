@@ -351,8 +351,7 @@ impl StorageBackend {
                 let mut stream = body.into_data_stream();
                 let mut received = 0_u64;
                 while let Some(chunk) = stream.next().await {
-                    let chunk = chunk
-                        .map_err(|error| AppError::with_source("failed to read upload", error))?;
+                    let chunk = chunk.map_err(|_| AppError::ClientClosedRequest)?;
                     received = received
                         .checked_add(chunk.len() as u64)
                         .ok_or(AppError::PayloadTooLarge)?;

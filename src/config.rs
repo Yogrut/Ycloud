@@ -25,7 +25,9 @@ pub use model::{
     Share, StorageBackendConfig, StorageInstanceConfig, StoragePermission, UserAccount,
 };
 pub use password::{hash_password, verify_password};
-pub use persistence::{load_config, remove_initial_credentials, save_config};
+pub use persistence::{
+    load_config, remove_initial_credentials, remove_initial_credentials_if_rotated, save_config,
+};
 pub use runtime::normalize_s3_endpoint;
 pub use validation::{
     validate_login_security_settings, validate_storage_backend, validate_transfer_limits,
@@ -285,13 +287,14 @@ mod tests {
     use super::{
         config_backup_path, hash_password, initial_credentials_path, load_config,
         normalize_s3_endpoint, path_is_same_or_descendant, paths_overlap,
-        remove_initial_credentials, save_config, verify_password, Config, ConfigFile, FolderLock,
-        InitialCredentials, LocalStorageConfig, S3AddressingStyle, S3Provider, S3StorageConfig,
-        StorageBackendConfig, StorageInstanceConfig, StoragePermission, UserAccount,
-        CONFIG_SCHEMA_VERSION, DEFAULT_MAX_ARCHIVE_BYTES, DEFAULT_MAX_ARCHIVE_ENTRIES,
-        DEFAULT_MAX_UPLOAD_BATCH_BYTES, DEFAULT_MAX_UPLOAD_BATCH_ENTRIES, DEFAULT_MAX_UPLOAD_BYTES,
-        DEFAULT_STORAGE_ID, HARD_MAX_ARCHIVE_BYTES, HARD_MAX_ARCHIVE_ENTRIES,
-        HARD_MAX_TRANSFER_RATE_BYTES, HARD_MAX_UPLOAD_BATCH_ENTRIES, MIN_TRANSFER_RATE_BYTES,
+        remove_initial_credentials, remove_initial_credentials_if_rotated, save_config,
+        verify_password, Config, ConfigFile, FolderLock, InitialCredentials, LocalStorageConfig,
+        S3AddressingStyle, S3Provider, S3StorageConfig, StorageBackendConfig,
+        StorageInstanceConfig, StoragePermission, UserAccount, CONFIG_SCHEMA_VERSION,
+        DEFAULT_MAX_ARCHIVE_BYTES, DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_UPLOAD_BATCH_BYTES,
+        DEFAULT_MAX_UPLOAD_BATCH_ENTRIES, DEFAULT_MAX_UPLOAD_BYTES, DEFAULT_STORAGE_ID,
+        HARD_MAX_ARCHIVE_BYTES, HARD_MAX_ARCHIVE_ENTRIES, HARD_MAX_TRANSFER_RATE_BYTES,
+        HARD_MAX_UPLOAD_BATCH_ENTRIES, MIN_TRANSFER_RATE_BYTES,
     };
 
     #[test]
@@ -813,6 +816,31 @@ mod tests {
         ));
         assert!(remove_initial_credentials(&path).await.unwrap());
         assert!(!tokio::fs::try_exists(credentials_path).await.unwrap());
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_credentials_remain_until_both_passwords_are_rotated() {
+        let directory = std::env::temp_dir().join(format!(
+            "ycloud-partial-credential-rotation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let path = directory.join("config.json");
+        let mut config = load_config(&path).await.unwrap();
+        let credentials_path = initial_credentials_path(&path);
+
+        config.global_web_password_hash = Some(hash_password("replacement-web-password"));
+        assert!(!remove_initial_credentials_if_rotated(&path, &config)
+            .await
+            .unwrap());
+        assert!(tokio::fs::try_exists(&credentials_path).await.unwrap());
+
+        config.admin_password_hash = hash_password("replacement-admin-password");
+        assert!(remove_initial_credentials_if_rotated(&path, &config)
+            .await
+            .unwrap());
+        assert!(!tokio::fs::try_exists(&credentials_path).await.unwrap());
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 

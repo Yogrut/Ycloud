@@ -157,6 +157,7 @@ fn error_code(error: &AppError) -> &'static str {
         AppError::Conflict(_) => "conflict",
         AppError::PayloadTooLarge => "payload_too_large",
         AppError::InsufficientStorage => "insufficient_storage",
+        AppError::ClientClosedRequest => "client_closed_request",
         AppError::RequestTimeout => "request_timeout",
         AppError::TooManyRequests => "too_many_requests",
         AppError::ServiceUnavailable(_) => "service_unavailable",

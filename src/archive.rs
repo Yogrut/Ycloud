@@ -1,0 +1,570 @@
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use async_zip::{tokio::write::ZipFileWriter, Compression, ZipEntryBuilder};
+use axum::{
+    body::Body,
+    extract::{Query, State},
+    http::{header, HeaderMap, Response},
+    Json,
+};
+use futures_util::{io::AsyncWriteExt as FuturesAsyncWriteExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, Semaphore};
+use tokio_util::io::ReaderStream;
+use uuid::Uuid;
+
+use crate::{
+    auth::{self, RequestSubject},
+    error::{AppError, AppResult},
+    file_access::{
+        ensure_storage_action, resolve_share, share_storage_path, validate_batch_size, FileQuery,
+        FolderLockAuthorizer, StorageAction,
+    },
+    state::AppState,
+    storage::{attachment_header, FileResponseMode},
+    storage_backend::StorageBackend,
+};
+
+const MAX_PENDING_TICKETS: usize = 32;
+const TICKET_TTL: Duration = Duration::from_secs(120);
+const ARCHIVE_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone)]
+pub struct ArchiveTicketStore {
+    tickets: Arc<Mutex<HashMap<String, ArchiveTicket>>>,
+    prepare_gate: Arc<Semaphore>,
+    stream_gate: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct ArchiveTicket {
+    subject: RequestSubject,
+    storage_id: String,
+    files: Vec<ArchiveFile>,
+    archive_name: String,
+    created_at: Instant,
+}
+
+#[derive(Clone)]
+struct ArchiveFile {
+    storage_path: String,
+    zip_path: String,
+    size: u64,
+    modified_unix: Option<i64>,
+    version_tag: Option<String>,
+}
+
+impl Default for ArchiveTicketStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArchiveTicketStore {
+    pub fn new() -> Self {
+        Self {
+            tickets: Arc::new(Mutex::new(HashMap::new())),
+            prepare_gate: Arc::new(Semaphore::new(1)),
+            stream_gate: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    async fn create(
+        &self,
+        subject: RequestSubject,
+        storage_id: String,
+        files: Vec<ArchiveFile>,
+        archive_name: String,
+    ) -> AppResult<String> {
+        let mut tickets = self.tickets.lock().await;
+        tickets.retain(|_, ticket| ticket.created_at.elapsed() <= TICKET_TTL);
+        if tickets.len() >= MAX_PENDING_TICKETS {
+            return Err(AppError::ServiceUnavailable(
+                "Too many pending archive downloads".into(),
+            ));
+        }
+        let token = Uuid::new_v4().to_string();
+        tickets.insert(
+            token.clone(),
+            ArchiveTicket {
+                subject,
+                storage_id,
+                files,
+                archive_name,
+                created_at: Instant::now(),
+            },
+        );
+        Ok(token)
+    }
+
+    async fn take(&self, token: &str, subject: &RequestSubject) -> Option<ArchiveTicket> {
+        let mut tickets = self.tickets.lock().await;
+        let ticket = tickets.get(token)?;
+        if ticket.created_at.elapsed() > TICKET_TTL {
+            tickets.remove(token);
+            return None;
+        }
+        if &ticket.subject != subject {
+            return None;
+        }
+        tickets.remove(token)
+    }
+
+    pub async fn clear(&self) {
+        self.tickets.lock().await.clear();
+    }
+
+    async fn acquire_prepare(&self) -> AppResult<tokio::sync::OwnedSemaphorePermit> {
+        self.prepare_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("Archive service is shutting down".into()))
+    }
+
+    fn acquire_stream(&self) -> AppResult<tokio::sync::OwnedSemaphorePermit> {
+        self.stream_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AppError::TooManyRequests)
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PrepareArchiveBody {
+    paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct PrepareArchiveResponse {
+    ticket: String,
+    total_bytes: u64,
+    file_count: usize,
+    entry_count: usize,
+    max_bytes: u64,
+    max_entries: usize,
+}
+
+#[derive(Deserialize)]
+pub struct ArchiveQuery {
+    ticket: String,
+}
+
+pub async fn prepare_archive(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FileQuery>,
+    Json(body): Json<PrepareArchiveBody>,
+) -> AppResult<Json<PrepareArchiveResponse>> {
+    let _prepare_permit = state.archive_tickets.acquire_prepare().await?;
+    validate_batch_size(&body.paths)?;
+    let share = resolve_share(&state, &headers, &query).await?;
+    ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Download).await?;
+    let subject = auth::current_request_subject(&state, &headers)
+        .await
+        .ok_or(AppError::Forbidden)?;
+    let backend = state.storage_backend(&share.storage_id).await?;
+    let authorizer = FolderLockAuthorizer::new(&state, &headers, &share.storage_id).await;
+    let normalized = body
+        .paths
+        .iter()
+        .map(|path| crate::storage::StorageService::normalize_relative(path))
+        .collect::<AppResult<Vec<_>>>()?;
+    if normalized.iter().any(String::is_empty) {
+        return Err(AppError::BadRequest(
+            "The storage root cannot be archived".into(),
+        ));
+    }
+    let normalized = deduplicate_paths(normalized);
+    let common_parent = common_parent(&normalized);
+    let (max_archive_bytes, max_archive_entries) = {
+        let config = state.config_file.read().await;
+        (config.max_archive_bytes, config.max_archive_entries)
+    };
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    let mut total_bytes = 0_u64;
+    let mut entry_count = 0_usize;
+    for path in &normalized {
+        let storage_path = share_storage_path(&share, path);
+        authorizer.ensure_access(&storage_path)?;
+        collect_files(
+            &state,
+            &backend,
+            &authorizer,
+            storage_path,
+            path.clone(),
+            &common_parent,
+            &mut files,
+            &mut seen,
+            &mut total_bytes,
+            &mut entry_count,
+            max_archive_bytes,
+            max_archive_entries,
+        )
+        .await?;
+    }
+    if files.is_empty() {
+        return Err(AppError::BadRequest("No files selected for archive".into()));
+    }
+    let archive_name = archive_name(&normalized);
+    let file_count = files.len();
+    let ticket = state
+        .archive_tickets
+        .create(subject, share.storage_id, files, archive_name)
+        .await?;
+    Ok(Json(PrepareArchiveResponse {
+        ticket,
+        total_bytes,
+        file_count,
+        entry_count,
+        max_bytes: max_archive_bytes,
+        max_entries: max_archive_entries,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_files(
+    state: &AppState,
+    backend: &StorageBackend,
+    authorizer: &FolderLockAuthorizer,
+    storage_path: String,
+    request_path: String,
+    common_parent: &str,
+    files: &mut Vec<ArchiveFile>,
+    seen: &mut HashSet<String>,
+    total_bytes: &mut u64,
+    entry_count: &mut usize,
+    max_archive_bytes: u64,
+    max_archive_entries: usize,
+) -> AppResult<()> {
+    let mut pending = vec![(storage_path, request_path)];
+    while let Some((storage_relative, request_relative)) = pending.pop() {
+        if !seen.insert(storage_relative.clone()) {
+            continue;
+        }
+        *entry_count = entry_count.saturating_add(1);
+        if *entry_count > max_archive_entries {
+            return Err(AppError::BadRequest(
+                format!("Archive exceeds the configured {max_archive_entries} entry limit").into(),
+            ));
+        }
+        authorizer.ensure_access(&storage_relative)?;
+        let metadata = backend.metadata(&storage_relative).await?;
+        if metadata.is_dir {
+            let (entries, truncated) = backend
+                .list_directory(&storage_relative, state.config.max_list_entries)
+                .await?;
+            if truncated {
+                return Err(AppError::BadRequest(
+                    "Archive directory exceeds the fixed listing safety limit".into(),
+                ));
+            }
+            for entry in entries {
+                pending.push((entry.relative, join_path(&request_relative, &entry.name)));
+            }
+            continue;
+        }
+        *total_bytes = total_bytes
+            .checked_add(metadata.size)
+            .ok_or(AppError::PayloadTooLarge)?;
+        if *total_bytes > max_archive_bytes {
+            return Err(AppError::PayloadTooLarge);
+        }
+        let zip_path = request_relative
+            .strip_prefix(common_parent)
+            .unwrap_or(&request_relative)
+            .trim_start_matches('/')
+            .to_string();
+        files.push(ArchiveFile {
+            storage_path: storage_relative,
+            zip_path,
+            size: metadata.size,
+            modified_unix: metadata.modified_unix,
+            version_tag: metadata.version_tag,
+        });
+    }
+    Ok(())
+}
+
+pub async fn download_archive(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ArchiveQuery>,
+) -> AppResult<Response<Body>> {
+    let stream_permit = state.archive_tickets.acquire_stream()?;
+    let subject = auth::current_request_subject(&state, &headers)
+        .await
+        .ok_or(AppError::Forbidden)?;
+    let ticket = state
+        .archive_tickets
+        .take(&query.ticket, &subject)
+        .await
+        .ok_or(AppError::NotFound)?;
+    ensure_storage_action(
+        &state,
+        &headers,
+        &ticket.storage_id,
+        StorageAction::Download,
+    )
+    .await?;
+    let authorizer = FolderLockAuthorizer::new(&state, &headers, &ticket.storage_id).await;
+    for file in &ticket.files {
+        authorizer.ensure_access(&file.storage_path)?;
+    }
+    let (writer_side, reader_side) = tokio::io::duplex(128 * 1024);
+    let storage = state.storage_backend(&ticket.storage_id).await?;
+    tokio::spawn(async move {
+        let _stream_permit = stream_permit;
+        if let Err(error) = write_archive(storage, ticket.files, writer_side).await {
+            tracing::warn!(%error, "archive download stopped");
+        }
+    });
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            attachment_header(Path::new(&ticket.archive_name)),
+        )
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Body::from_stream(ReaderStream::new(reader_side)))
+        .map_err(|error| AppError::with_source("failed to build archive response", error))?;
+    Ok(state.download_limiter.wrap_response(response))
+}
+
+async fn write_archive(
+    storage: StorageBackend,
+    files: Vec<ArchiveFile>,
+    output: tokio::io::DuplexStream,
+) -> anyhow::Result<()> {
+    let mut zip = ZipFileWriter::with_tokio(output);
+    for file in files {
+        let metadata = storage.metadata(&file.storage_path).await?;
+        if metadata.is_dir
+            || metadata.size != file.size
+            || metadata.modified_unix != file.modified_unix
+            || metadata.version_tag != file.version_tag
+        {
+            anyhow::bail!("archive source changed during download");
+        }
+        let entry = ZipEntryBuilder::new(file.zip_path.into(), Compression::Stored);
+        let mut entry_writer = zip.write_entry_stream(entry).await?;
+        let response = storage
+            .stream_file(
+                &file.storage_path,
+                &HeaderMap::new(),
+                FileResponseMode::WebDav,
+            )
+            .await?;
+        if !response.status().is_success() {
+            anyhow::bail!("archive source could not be streamed");
+        }
+        let mut transferred = 0_u64;
+        let mut source = response.into_body().into_data_stream();
+        loop {
+            let next = tokio::time::timeout(ARCHIVE_STREAM_IDLE_TIMEOUT, source.next())
+                .await
+                .map_err(|_| anyhow::anyhow!("archive source was idle for too long"))?;
+            let Some(chunk) = next else {
+                break;
+            };
+            let chunk = chunk?;
+            transferred = transferred
+                .checked_add(u64::try_from(chunk.len())?)
+                .ok_or_else(|| anyhow::anyhow!("archive source length overflow"))?;
+            if transferred > file.size {
+                anyhow::bail!("archive source grew during download");
+            }
+            tokio::time::timeout(ARCHIVE_STREAM_IDLE_TIMEOUT, entry_writer.write_all(&chunk))
+                .await
+                .map_err(|_| anyhow::anyhow!("archive client was idle for too long"))??;
+        }
+        if transferred != file.size {
+            anyhow::bail!("archive source changed during download");
+        }
+        tokio::time::timeout(ARCHIVE_STREAM_IDLE_TIMEOUT, entry_writer.close())
+            .await
+            .map_err(|_| anyhow::anyhow!("archive client was idle for too long"))??;
+    }
+    tokio::time::timeout(ARCHIVE_STREAM_IDLE_TIMEOUT, zip.close())
+        .await
+        .map_err(|_| anyhow::anyhow!("archive client was idle for too long"))??;
+    Ok(())
+}
+
+fn common_parent(paths: &[String]) -> String {
+    let first_parent = paths[0]
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    let mut components: Vec<&str> = first_parent
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    for path in &paths[1..] {
+        let parent = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        let other: Vec<&str> = parent.split('/').filter(|part| !part.is_empty()).collect();
+        let shared = components
+            .iter()
+            .zip(other.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        components.truncate(shared);
+    }
+    components.join("/")
+}
+
+fn archive_name(paths: &[String]) -> String {
+    if paths.len() == 1 {
+        let name = paths[0].rsplit('/').next().unwrap_or("Ycloud");
+        format!("{name}.zip")
+    } else {
+        "Ycloud-打包下载.zip".to_string()
+    }
+}
+
+fn join_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn deduplicate_paths(mut paths: Vec<String>) -> Vec<String> {
+    paths.sort_by(|left, right| {
+        left.split('/')
+            .count()
+            .cmp(&right.split('/').count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut unique = Vec::<String>::new();
+    for path in paths {
+        if unique
+            .iter()
+            .any(|ancestor| path == *ancestor || path.starts_with(&format!("{ancestor}/")))
+        {
+            continue;
+        }
+        unique.push(path);
+    }
+    unique
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        archive_name, common_parent, deduplicate_paths, write_archive, ArchiveFile,
+        ArchiveTicketStore,
+    };
+    use crate::{auth::RequestSubject, storage::StorageService, storage_backend::StorageBackend};
+    use futures_util::io::AsyncReadExt as FuturesAsyncReadExt;
+    use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn archive_paths_are_relative_to_the_selection_parent() {
+        let paths = vec!["games/a.7z.001".into(), "games/a.7z.002".into()];
+        assert_eq!(common_parent(&paths), "games");
+        assert_eq!(archive_name(&paths), "Ycloud-打包下载.zip");
+    }
+
+    #[test]
+    fn archive_selection_removes_duplicates_and_descendants() {
+        assert_eq!(
+            deduplicate_paths(vec![
+                "games/part-1".into(),
+                "games".into(),
+                "games/part-2/file.bin".into(),
+                "docs/readme.md".into(),
+                "docs/readme.md".into(),
+            ]),
+            vec!["games".to_string(), "docs/readme.md".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_archive_preserves_utf8_name_and_content() {
+        let root = std::env::temp_dir().join(format!("ycloud-archive-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let absolute = root.join("游戏音乐.flac");
+        tokio::fs::write(&absolute, b"sample-content")
+            .await
+            .unwrap();
+        let storage = StorageService::new(root.clone(), 1024, 2, 100, 0)
+            .await
+            .unwrap();
+        let backend = StorageBackend::local(storage);
+        let metadata = backend.metadata("游戏音乐.flac").await.unwrap();
+        let (writer_side, mut reader_side) = tokio::io::duplex(16 * 1024);
+        let task = tokio::spawn(write_archive(
+            backend,
+            vec![ArchiveFile {
+                storage_path: "游戏音乐.flac".into(),
+                zip_path: "游戏音乐.flac".into(),
+                size: 14,
+                modified_unix: metadata.modified_unix,
+                version_tag: metadata.version_tag,
+            }],
+            writer_side,
+        ));
+        let mut bytes = Vec::new();
+        reader_side.read_to_end(&mut bytes).await.unwrap();
+        task.await.unwrap().unwrap();
+
+        let archive = async_zip::base::read::mem::ZipFileReader::new(bytes)
+            .await
+            .unwrap();
+        assert_eq!(
+            archive.file().entries()[0].filename().as_str().unwrap(),
+            "游戏音乐.flac"
+        );
+        let mut entry = archive.reader_without_entry(0).await.unwrap();
+        let mut content = Vec::new();
+        FuturesAsyncReadExt::read_to_end(&mut entry, &mut content)
+            .await
+            .unwrap();
+        assert_eq!(content, b"sample-content");
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_one_archive_stream_can_run_at_a_time() {
+        let store = super::ArchiveTicketStore::new();
+        let permit = store.acquire_stream().unwrap();
+        assert_eq!(
+            store.acquire_stream().unwrap_err().status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        );
+        drop(permit);
+        assert!(store.acquire_stream().is_ok());
+    }
+
+    #[tokio::test]
+    async fn archive_ticket_is_single_use_and_bound_to_request_subject() {
+        let store = ArchiveTicketStore::new();
+        let owner = RequestSubject::Session("owner".into());
+        let attacker = RequestSubject::Session("attacker".into());
+        let token = store
+            .create(
+                owner.clone(),
+                "local".into(),
+                Vec::new(),
+                "files.zip".into(),
+            )
+            .await
+            .unwrap();
+
+        assert!(store.take(&token, &attacker).await.is_none());
+        assert!(store.take(&token, &owner).await.is_some());
+        assert!(store.take(&token, &owner).await.is_none());
+    }
+}

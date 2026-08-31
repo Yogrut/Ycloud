@@ -1,0 +1,32 @@
+name: ycloud
+
+services:
+  ycloud:
+    build: .
+    image: ycloud:local
+    restart: unless-stopped
+    user: "10001:10001"
+    environment:
+      ALLOW_LAN_HTTP: "${ALLOW_LAN_HTTP:-true}"
+
+      # Dockerfile 已提供以下默认值，通常不需要重复配置。
+      # BIND_ADDRESS: 0.0.0.0
+      # PORT: 18473
+      # STORAGE_PATH: /var/lib/ycloud/storage
+      # CONFIG_PATH: /var/lib/ycloud/config.json
+      # RUST_LOG: info
+
+      # HTTPS 反向代理模式：将 ALLOW_LAN_HTTP 设为 false，并同时取消
+      # 以下三项的注释。PUBLIC_BASE_URL 可使用域名或 HTTPS IP:端口。
+      # SECURE_COOKIES: "true"
+      # PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL}"
+      # TRUSTED_PROXY_IPS: "${TRUSTED_PROXY_IPS:?set TRUSTED_PROXY_IPS}"
+
+      # 外部配置主密钥是可选项；单机默认自动生成并保存在 ./data 中。
+      # 二选一取消注释。使用 FILE 时还必须把只读密钥文件挂载进容器。
+      # YCLOUD_CONFIG_KEY: "${YCLOUD_CONFIG_KEY:?set YCLOUD_CONFIG_KEY}"
+      # YCLOUD_CONFIG_KEY_FILE: "${YCLOUD_CONFIG_KEY_FILE:?set YCLOUD_CONFIG_KEY_FILE}"
+    ports:
+      - "18473:18473"
+    volumes:
+      - ./data:/var/lib/ycloud

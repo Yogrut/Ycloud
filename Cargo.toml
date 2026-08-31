@@ -1,0 +1,39 @@
+[package]
+name = "ycloud"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+description = "Ycloud: a lightweight private file service with WebDAV support"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "fs", "io-util", "sync", "time"] }
+tower = { version = "0.5", features = ["timeout", "util"] }
+tower-http = { version = "0.6", features = ["request-id", "sensitive-headers", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+ring = "0.17"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+anyhow = "1"
+mime_guess = "2"
+bytes = "1"
+futures-util = { version = "0.3", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io"] }
+async_zip = { version = "0.0.18", default-features = false, features = ["tokio"] }
+fs4 = { version = "1", features = ["sync"] }
+aws-sdk-s3 = { version = "1.143.0", default-features = false, features = ["behavior-version-latest", "default-https-client", "http-1x", "rt-tokio"] }
+aws-smithy-http-client = { version = "1.4.0", default-features = false, features = ["default-client"] }
+aws-smithy-types = { version = "1.6.2", default-features = false, features = ["http-body-1-x", "rt-tokio"] }
+http-body = "1"
+http-body-util = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

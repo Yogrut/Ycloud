@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    # aws-sdk-s3 1.143.0 only uses lru 0.16.4 for S3 Express identity caching.
+    # Ycloud disables S3 Express session authentication for every S3 client.
+    # Keep this synchronized with deny.toml and remove it after the SDK upgrades.
+    "RUSTSEC-2026-0253",
+]

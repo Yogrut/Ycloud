@@ -1,0 +1,43 @@
+# Rust build output
+/target/
+/.cargo-audit-home/
+
+# User data (contains personal files — do NOT version)
+/storage/*
+!/storage/.gitkeep
+/data/
+
+# Runtime secrets and atomic-write backups
+/config.json
+/config.json.bak
+/initial-credentials.json
+/security-events.json
+/security-events.json.bak
+/security-events.jsonl
+/security-events.jsonl.bak
+/security-state.json
+/security-state.json.bak
+/.ycloud-system/
+*.upload
+*.tmp
+
+# IDE / Editor
+.obsidian/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.env
+/secrets/
+
+# Local Codex/agent skill bundles are developer tooling, not Ycloud source
+.agents/
+/skills-lock.json
+
+# Vue development output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/coverage/

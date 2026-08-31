@@ -24,6 +24,27 @@ cargo run --release --locked
 - 文件夹锁、TOTP、登录限制、访问日志和传输限制。
 - 流式传输、本地原子写入、事务恢复和 S3 Multipart。
 
+## 界面
+
+<table>
+  <tr>
+    <th>访客入口</th>
+    <th>文件管理</th>
+  </tr>
+  <tr>
+    <td><img src="docs/images/web-login.png" alt="Ycloud 访客入口"></td>
+    <td><img src="docs/images/file-browser.png" alt="Ycloud 文件管理"></td>
+  </tr>
+  <tr>
+    <th>管理员登录</th>
+    <th>存储管理</th>
+  </tr>
+  <tr>
+    <td><img src="docs/images/admin-login.png" alt="Ycloud 管理员登录"></td>
+    <td><img src="docs/images/storage-management.png" alt="Ycloud 存储管理"></td>
+  </tr>
+</table>
+
 ## Docker Compose
 
 ```bash

@@ -1,45 +1,46 @@
 # Ycloud 前端
 
-Vue 3.5 + TypeScript 前端，使用 Vite 构建。生产产物写入 `../static/app/` 并由 Rust 服务内嵌。
+Vue 3.5 + TypeScript + Vite。生产产物写入 `../static/app/` 并嵌入 Rust 可执行文件。
 
 ## 安装与检查
 
-```powershell
-cd frontend
+```bash
 npm ci
 npm run check
 ```
 
-`npm run check` 依次执行 lint、Vitest、TypeScript 检查和生产构建。依赖版本以 `package-lock.json` 为准，不使用未写入锁文件的全局包。
+`npm run check` 执行 ESLint、Vitest、TypeScript 检查和生产构建。
 
 ## 开发模式
 
-需要热更新时才使用两个终端：
+终端 1：
 
-```powershell
-# 终端 1
+```bash
 cargo run --locked
 ```
 
-```powershell
-# 终端 2
+终端 2：
+
+```bash
 cd frontend
 npm run dev
 ```
 
-日常生产运行不需要 Vite，只需在仓库根目录执行 `cargo run --release --locked`。
-
 ## 目录
 
 ```text
-src/api/          HTTP API 封装
-src/components/   通用组件
-src/composables/  可复用状态与交互逻辑
-src/router/       页面路由
-src/stores/       Pinia 状态
-src/views/        登录、浏览器和后台页面
-src/styles/       主题与布局样式
-src/test/         测试环境和共享工具
+src/apps/               页面和业务组件
+src/shared/api/         API 客户端
+src/shared/components/  共享组件
+src/shared/composables/ 共享状态逻辑
+src/shared/i18n/        中英文资源
+src/shared/styles/      主题和布局
 ```
 
-图标统一使用 `@phosphor-icons/vue`。不要引入远程字体、远程脚本或第二套图标系统。权限判断必须由后端执行，前端的按钮显示只用于改善交互。
+## 规则
+
+- 图标使用 `@phosphor-icons/vue`。
+- 不引入远程字体、远程脚本或第二套图标系统。
+- 权限由后端判断；前端只控制交互显示。
+- API 调用通过 `src/shared/api/`。
+- 修改前端后提交对应的 `static/app` 构建产物。

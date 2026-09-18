@@ -5,15 +5,16 @@ use axum::http::HeaderValue;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    internal_key, list_prefix, non_negative_size, valid_transaction_id, S3Backend,
-    S3_MAX_LIST_PAGES, S3_MAX_PENDING_TRANSACTIONS, S3_PAGE_SIZE,
+    authenticated_journal, capabilities, internal_key, list_prefix, non_negative_size,
+    valid_transaction_id, S3Backend, S3_MAX_LIST_PAGES, S3_MAX_PENDING_TRANSACTIONS, S3_PAGE_SIZE,
 };
 use crate::{
     error::{AppError, AppResult},
     storage::StorageService,
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+const JOURNAL_PURPOSE: &str = "directory-transaction:v2";
 const MAX_OBJECTS: usize = 1_000;
 const MAX_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
 // CopyObject is deliberately used instead of multipart copy in this stage.
@@ -65,6 +66,8 @@ struct Transaction {
     destination_relative: Option<String>,
     stage: Stage,
     objects: Vec<ObjectRecord>,
+    #[serde(default)]
+    auth_tag: String,
 }
 
 impl S3Backend {
@@ -186,9 +189,10 @@ impl S3Backend {
             destination_relative: destination,
             stage: Stage::CopyingTargets,
             objects,
+            auth_tag: String::new(),
         };
         let journal_etag = self
-            .write_directory_transaction(&journal_key, &transaction, None)
+            .write_directory_transaction(&journal_key, &mut transaction, None)
             .await?;
         self.execute_directory_transaction(&journal_key, journal_etag, &mut transaction)
             .await?;
@@ -301,7 +305,12 @@ impl S3Backend {
         mut journal_etag: String,
         transaction: &mut Transaction,
     ) -> AppResult<()> {
-        validate_transaction(&self.prefix, journal_key, transaction)?;
+        validate_transaction(
+            &self.transaction_auth_key,
+            &self.prefix,
+            journal_key,
+            transaction,
+        )?;
         if transaction.stage != Stage::SourcesDeleted {
             journal_etag = self
                 .copy_missing_targets(journal_key, journal_etag, transaction)
@@ -309,8 +318,12 @@ impl S3Backend {
         }
 
         if transaction.operation == Operation::Copy {
-            self.delete_transaction_best_effort(journal_key, Some(&journal_etag))
-                .await;
+            if let Err(error) = self
+                .delete_key_confirmed(journal_key, Some(&journal_etag))
+                .await
+            {
+                tracing::warn!(%error, "completed directory copy retained its recovery journal");
+            }
             return Ok(());
         }
 
@@ -333,8 +346,12 @@ impl S3Backend {
         if transaction.operation == Operation::Delete {
             self.cleanup_delete_trash(transaction).await?;
         }
-        self.delete_transaction_best_effort(journal_key, Some(&journal_etag))
-            .await;
+        if let Err(error) = self
+            .delete_key_confirmed(journal_key, Some(&journal_etag))
+            .await
+        {
+            tracing::warn!(%error, "completed directory mutation retained its recovery journal");
+        }
         Ok(())
     }
 
@@ -418,7 +435,7 @@ impl S3Backend {
                     "目录删除暂存对象发生外部变化；已停止清理".into(),
                 ));
             }
-            self.delete_key(&object.target_key, object.target_etag.as_deref())
+            self.delete_key_confirmed(&object.target_key, object.target_etag.as_deref())
                 .await?;
         }
         Ok(())
@@ -444,20 +461,11 @@ impl S3Backend {
                         && metadata.etag.as_deref()
                             == Some(transaction.objects[index].source_etag.as_str()) =>
                 {
-                    self.delete_key(
+                    self.delete_key_confirmed(
                         &transaction.objects[index].source_key,
                         Some(&transaction.objects[index].source_etag),
                     )
                     .await?;
-                    if self
-                        .head_key(&transaction.objects[index].source_key)
-                        .await?
-                        .is_some()
-                    {
-                        return Err(AppError::ServiceUnavailable(
-                            "对象存储未能确认目录源对象删除结果".into(),
-                        ));
-                    }
                 }
                 Some(_) => {
                     return Err(AppError::ServiceUnavailable(
@@ -489,10 +497,11 @@ impl S3Backend {
     async fn write_directory_transaction(
         &self,
         key: &str,
-        transaction: &Transaction,
+        transaction: &mut Transaction,
         previous_etag: Option<&str>,
     ) -> AppResult<String> {
-        validate_transaction(&self.prefix, key, transaction)?;
+        sign_transaction(&self.transaction_auth_key, transaction)?;
+        validate_transaction(&self.transaction_auth_key, &self.prefix, key, transaction)?;
         let data = serde_json::to_vec(transaction).map_err(|error| {
             AppError::with_source("failed to encode S3 directory transaction", error)
         })?;
@@ -505,18 +514,25 @@ impl S3Backend {
             .map_err(|_| AppError::ServiceUnavailable("对象存储目录事务记录过大".into()))?;
         if self.is_alibaba_oss() {
             if let Some(expected_etag) = previous_etag {
-                let current = self.head_key(key).await?;
+                let current = self.head_key(key).await.map_err(|_| {
+                    AppError::storage_capability(
+                        capabilities::CONDITIONAL_JOURNAL_UPDATE,
+                        "对象存储无法核对目录事务记录版本",
+                    )
+                })?;
                 if current
                     .as_ref()
                     .and_then(|metadata| metadata.etag.as_deref())
                     != Some(expected_etag)
                 {
-                    return Err(AppError::ServiceUnavailable(
-                        "对象存储目录事务记录在更新前发生变化".into(),
+                    return Err(AppError::storage_capability(
+                        capabilities::CONDITIONAL_JOURNAL_UPDATE,
+                        "对象存储目录事务记录在更新前发生变化",
                     ));
                 }
             }
         }
+        self.recovery_runtime.journal_write_started(key);
         let _permit = self.acquire_request().await?;
         let mut request = self
             .client
@@ -546,17 +562,24 @@ impl S3Backend {
         } else {
             request.send().await
         };
+        let capability = if previous_etag.is_some() {
+            capabilities::CONDITIONAL_JOURNAL_UPDATE
+        } else {
+            capabilities::CONDITIONAL_JOURNAL
+        };
         result
             .map_err(|error| {
                 tracing::error!(
                     error_kind = %error.as_service_error().map_or("transport", |_| "service"),
                     "S3 directory transaction journal write failed"
                 );
-                AppError::ServiceUnavailable("无法持久化对象存储目录事务状态".into())
+                AppError::storage_capability(capability, "无法持久化对象存储目录事务状态")
             })?
             .e_tag()
             .map(str::to_owned)
-            .ok_or_else(|| AppError::ServiceUnavailable("对象存储未返回目录事务记录 ETag".into()))
+            .ok_or_else(|| {
+                AppError::storage_capability(capability, "对象存储未返回目录事务记录 ETag")
+            })
     }
 
     async fn list_directory_transaction_keys(&self) -> AppResult<Vec<String>> {
@@ -668,12 +691,27 @@ impl S3Backend {
         }
         let transaction: Transaction = serde_json::from_slice(&data)
             .map_err(|error| AppError::with_source("invalid S3 directory transaction", error))?;
-        validate_transaction(&self.prefix, key, &transaction)?;
+        validate_transaction(&self.transaction_auth_key, &self.prefix, key, &transaction)?;
         Ok((transaction, etag))
     }
 }
 
 fn validate_transaction(
+    auth_key: &[u8; 32],
+    prefix: &str,
+    journal_key: &str,
+    transaction: &Transaction,
+) -> AppResult<()> {
+    if transaction.schema_version == 1 && transaction.auth_tag.is_empty() {
+        return Err(AppError::ServiceUnavailable(
+            "检测到旧版未认证目录事务；已保留记录并拒绝自动执行".into(),
+        ));
+    }
+    validate_transaction_structure(prefix, journal_key, transaction)?;
+    verify_transaction_auth(auth_key, transaction)
+}
+
+fn validate_transaction_structure(
     prefix: &str,
     journal_key: &str,
     transaction: &Transaction,
@@ -740,6 +778,32 @@ fn validate_transaction(
     Ok(())
 }
 
+fn transaction_auth_bytes(transaction: &Transaction) -> AppResult<Vec<u8>> {
+    let mut unsigned = transaction.clone();
+    unsigned.auth_tag.clear();
+    let encoded = serde_json::to_vec(&unsigned).map_err(|error| {
+        AppError::with_source("failed to authenticate S3 directory transaction", error)
+    })?;
+    Ok(encoded)
+}
+
+fn sign_transaction(auth_key: &[u8; 32], transaction: &mut Transaction) -> AppResult<()> {
+    let payload = transaction_auth_bytes(transaction)?;
+    transaction.auth_tag = authenticated_journal::sign_payload(auth_key, JOURNAL_PURPOSE, &payload);
+    Ok(())
+}
+
+fn verify_transaction_auth(auth_key: &[u8; 32], transaction: &Transaction) -> AppResult<()> {
+    let payload = transaction_auth_bytes(transaction)?;
+    authenticated_journal::verify_payload(
+        auth_key,
+        JOURNAL_PURPOSE,
+        &payload,
+        &transaction.auth_tag,
+    )
+    .map_err(|_| invalid_transaction())
+}
+
 fn expected_target_prefix(
     prefix: &str,
     transaction: &Transaction,
@@ -789,8 +853,9 @@ fn ambiguous_target() -> AppError {
 #[cfg(test)]
 mod tests {
     use super::{
-        should_checkpoint, validate_transaction, ObjectRecord, Operation, Stage, Transaction,
-        JOURNAL_CATEGORY, TRASH_CATEGORY,
+        should_checkpoint, sign_transaction, validate_transaction, validate_transaction_structure,
+        ObjectRecord, Operation, Stage, Transaction, JOURNAL_CATEGORY, SCHEMA_VERSION,
+        TRASH_CATEGORY,
     };
     use crate::s3_backend::internal_key;
 
@@ -799,22 +864,22 @@ mod tests {
         let id = "0123456789abcdef0123456789abcdef";
         let transaction = copy_transaction(id);
         let key = internal_key("tenant/", JOURNAL_CATEGORY, id);
-        assert!(validate_transaction("tenant/", &key, &transaction).is_ok());
+        assert!(validate_transaction_structure("tenant/", &key, &transaction).is_ok());
 
         let mut escaped = transaction.clone();
         escaped.objects[1].target_key = "tenant/outside/file.bin".into();
-        assert!(validate_transaction("tenant/", &key, &escaped).is_err());
+        assert!(validate_transaction_structure("tenant/", &key, &escaped).is_err());
 
         let mut duplicate = transaction.clone();
         duplicate.objects.push(duplicate.objects[0].clone());
-        assert!(validate_transaction("tenant/", &key, &duplicate).is_err());
+        assert!(validate_transaction_structure("tenant/", &key, &duplicate).is_err());
     }
 
     #[test]
     fn delete_manifest_only_targets_internal_trash() {
         let id = "fedcba9876543210fedcba9876543210";
         let mut transaction = Transaction {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             id: id.into(),
             operation: Operation::Delete,
             source_relative: "source".into(),
@@ -828,11 +893,12 @@ mod tests {
                 target_etag: Some("trash-etag".into()),
                 source_deleted: true,
             }],
+            auth_tag: String::new(),
         };
         let key = internal_key("tenant/", JOURNAL_CATEGORY, id);
-        assert!(validate_transaction("tenant/", &key, &transaction).is_ok());
+        assert!(validate_transaction_structure("tenant/", &key, &transaction).is_ok());
         transaction.objects[0].target_key = "tenant/source-backup/file.bin".into();
-        assert!(validate_transaction("tenant/", &key, &transaction).is_err());
+        assert!(validate_transaction_structure("tenant/", &key, &transaction).is_err());
     }
 
     #[test]
@@ -842,11 +908,30 @@ mod tests {
         let mut transaction = copy_transaction(id);
         transaction.operation = Operation::Move;
         transaction.stage = Stage::SourcesDeleted;
-        assert!(validate_transaction("tenant/", &key, &transaction).is_err());
+        assert!(validate_transaction_structure("tenant/", &key, &transaction).is_err());
 
         let mut oversized = copy_transaction(id);
         oversized.objects[1].size = super::MAX_SINGLE_COPY_BYTES + 1;
-        assert!(validate_transaction("tenant/", &key, &oversized).is_err());
+        assert!(validate_transaction_structure("tenant/", &key, &oversized).is_err());
+    }
+
+    #[test]
+    fn authenticated_manifest_rejects_tampering_wrong_installation_and_legacy_records() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let key = internal_key("tenant/", JOURNAL_CATEGORY, id);
+        let auth_key = [0x41; 32];
+        let mut transaction = copy_transaction(id);
+        sign_transaction(&auth_key, &mut transaction).unwrap();
+        assert!(validate_transaction(&auth_key, "tenant/", &key, &transaction).is_ok());
+
+        let mut tampered = transaction.clone();
+        tampered.objects[1].size += 1;
+        assert!(validate_transaction(&auth_key, "tenant/", &key, &tampered).is_err());
+        assert!(validate_transaction(&[0x42; 32], "tenant/", &key, &transaction).is_err());
+
+        let mut legacy = copy_transaction(id);
+        legacy.schema_version = 1;
+        assert!(validate_transaction(&auth_key, "tenant/", &key, &legacy).is_err());
     }
 
     #[test]
@@ -859,7 +944,7 @@ mod tests {
 
     fn copy_transaction(id: &str) -> Transaction {
         Transaction {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             id: id.into(),
             operation: Operation::Copy,
             source_relative: "source".into(),
@@ -883,6 +968,7 @@ mod tests {
                     source_deleted: false,
                 },
             ],
+            auth_tag: String::new(),
         }
     }
 }

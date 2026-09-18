@@ -14,7 +14,6 @@ use axum::{
 use bytes::Bytes;
 use futures_util::Stream;
 use tokio::{
-    fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
     sync::OwnedSemaphorePermit,
 };
@@ -58,9 +57,7 @@ impl StorageService {
                     });
             }
         };
-        let mut file = File::open(path.absolute())
-            .await
-            .map_err(|error| AppError::with_source("failed to open file", error))?;
+        let mut file = self.open_file_for_read(path).await?;
         if start > 0 {
             file.seek(std::io::SeekFrom::Start(start))
                 .await
@@ -81,18 +78,8 @@ impl StorageService {
         let mut response = Response::builder()
             .status(status)
             .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_LENGTH, length)
-            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
-
-        let guessed_mime = mime_guess::from_path(path.absolute()).first_or_octet_stream();
-        let (content_type, force_attachment) = content_type_for_mode(&guessed_mime, mode);
-        response = response.header(header::CONTENT_TYPE, content_type);
-        if matches!(mode, FileResponseMode::Attachment) || force_attachment {
-            response = response.header(
-                header::CONTENT_DISPOSITION,
-                attachment_header(path.absolute()),
-            );
-        }
+            .header(header::CONTENT_LENGTH, length);
+        response = FileResponsePolicy::new(path.absolute(), None, mode).apply(response);
         if status == StatusCode::PARTIAL_CONTENT {
             let end = start.saturating_add(length).saturating_sub(1);
             response = response.header(
@@ -161,35 +148,69 @@ pub(crate) fn parse_range(
     Ok(Some((start, end - start + 1, StatusCode::PARTIAL_CONTENT)))
 }
 
-pub(crate) fn content_type_for_mode(
-    guessed: &mime_guess::Mime,
-    mode: FileResponseMode,
-) -> (HeaderValue, bool) {
-    let guessed_string = guessed.to_string();
-    match mode {
-        FileResponseMode::Attachment | FileResponseMode::WebDav => (
-            HeaderValue::from_str(&guessed_string)
-                .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-            false,
-        ),
-        FileResponseMode::Preview => {
-            let safe_inline = guessed.type_() == mime_guess::mime::IMAGE
-                && guessed.subtype() != mime_guess::mime::SVG
-                || guessed.type_() == mime_guess::mime::AUDIO
-                || guessed.type_() == mime_guess::mime::VIDEO
-                || *guessed == mime_guess::mime::APPLICATION_PDF;
-            if safe_inline {
-                (
-                    HeaderValue::from_str(&guessed_string)
-                        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-                    false,
-                )
-            } else if guessed.type_() == mime_guess::mime::TEXT {
-                (HeaderValue::from_static("text/plain; charset=utf-8"), false)
-            } else {
-                (HeaderValue::from_static("application/octet-stream"), true)
+/// The complete policy for untrusted file bodies. Backends must not override
+/// individual headers after applying it (including with S3 object metadata).
+pub(crate) struct FileResponsePolicy {
+    content_type: HeaderValue,
+    disposition: Option<HeaderValue>,
+}
+
+impl FileResponsePolicy {
+    pub(crate) fn new(path: &Path, stored_type: Option<&str>, mode: FileResponseMode) -> Self {
+        let guessed = mime_guess::from_path(path).first_or_octet_stream();
+        let (content_type, attachment) = match mode {
+            // DAV clients still receive the original bytes and media type.
+            // Browser navigation must treat these resources as downloads.
+            FileResponseMode::Attachment | FileResponseMode::WebDav => (
+                stored_type
+                    .and_then(|value| value.parse::<mime_guess::Mime>().ok())
+                    .and_then(|value| HeaderValue::from_str(value.as_ref()).ok())
+                    .unwrap_or_else(|| {
+                        HeaderValue::from_str(guessed.as_ref()).unwrap_or_else(|_| {
+                            HeaderValue::from_static("application/octet-stream")
+                        })
+                    }),
+                true,
+            ),
+            FileResponseMode::Preview => {
+                let safe_inline = guessed.type_() == mime_guess::mime::IMAGE
+                    && guessed.subtype() != mime_guess::mime::SVG
+                    || guessed.type_() == mime_guess::mime::AUDIO
+                    || guessed.type_() == mime_guess::mime::VIDEO
+                    || guessed == mime_guess::mime::APPLICATION_PDF;
+                if safe_inline {
+                    (
+                        HeaderValue::from_str(guessed.as_ref()).unwrap_or_else(|_| {
+                            HeaderValue::from_static("application/octet-stream")
+                        }),
+                        false,
+                    )
+                } else if guessed.type_() == mime_guess::mime::TEXT {
+                    (HeaderValue::from_static("text/plain; charset=utf-8"), false)
+                } else {
+                    (HeaderValue::from_static("application/octet-stream"), true)
+                }
             }
+        };
+        Self {
+            content_type,
+            disposition: attachment.then(|| attachment_header(path)),
         }
+    }
+
+    pub(crate) fn apply(
+        self,
+        builder: axum::http::response::Builder,
+    ) -> axum::http::response::Builder {
+        let mut builder = builder
+            .header(header::CONTENT_TYPE, self.content_type)
+            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+            .header(header::CONTENT_SECURITY_POLICY,
+                "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; img-src 'self' data: blob:; media-src 'self' blob:");
+        if let Some(disposition) = self.disposition {
+            builder = builder.header(header::CONTENT_DISPOSITION, disposition);
+        }
+        builder
     }
 }
 
@@ -238,4 +259,152 @@ pub(crate) fn attachment_header(path: &Path) -> HeaderValue {
         "attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}"
     ))
     .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestDirectory;
+
+    #[test]
+    fn all_download_modes_share_the_complete_isolation_policy() {
+        for mode in [FileResponseMode::Attachment, FileResponseMode::WebDav] {
+            for name in [
+                "report.txt",
+                "report.html",
+                "drawing.svg",
+                "report.pdf",
+                "image.png",
+            ] {
+                for stored in [None, Some("application/pdf")] {
+                    let response = FileResponsePolicy::new(Path::new(name), stored, mode)
+                        .apply(Response::builder())
+                        .body(())
+                        .unwrap();
+                    assert!(response.headers()[header::CONTENT_DISPOSITION]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("attachment;"));
+                    assert_eq!(
+                        response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+                        "nosniff"
+                    );
+                    assert!(response.headers()[header::CONTENT_SECURITY_POLICY]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("sandbox;"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preview_policy_ignores_object_metadata_and_keeps_supported_media_inline() {
+        for (name, expected, attachment) in [
+            ("report.txt", "text/plain; charset=utf-8", false),
+            ("image.png", "image/png", false),
+            ("report.pdf", "application/pdf", false),
+            ("drawing.svg", "application/octet-stream", true),
+        ] {
+            let response = FileResponsePolicy::new(
+                Path::new(name),
+                Some("application/pdf"),
+                FileResponseMode::Preview,
+            )
+            .apply(Response::builder())
+            .body(())
+            .unwrap();
+            assert_eq!(response.headers()[header::CONTENT_TYPE], expected);
+            assert_eq!(
+                response.headers().contains_key(header::CONTENT_DISPOSITION),
+                attachment
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_file_response_preserves_bytes_and_range_under_the_shared_policy() {
+        let directory = TestDirectory::new("file-response");
+        let storage = StorageService::new(directory.path().join("storage"), 1024, 1, 100, 0)
+            .await
+            .unwrap();
+        let path = directory.path().join("storage").join("notes.txt");
+        tokio::fs::write(&path, b"ordinary file data")
+            .await
+            .unwrap();
+        let resolved = storage.resolve_existing("notes.txt").await.unwrap();
+        for mode in [
+            FileResponseMode::Attachment,
+            FileResponseMode::Preview,
+            FileResponseMode::WebDav,
+        ] {
+            let response = storage
+                .stream_file(&resolved, &HeaderMap::new(), mode)
+                .await
+                .unwrap();
+            assert_eq!(response.headers()[header::CONTENT_LENGTH], "18");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(&bytes[..], b"ordinary file data");
+        }
+        let mut request = HeaderMap::new();
+        request.insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
+        let response = storage
+            .stream_file(&resolved, &request, FileResponseMode::WebDav)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 0-3/18");
+        assert!(response.headers().contains_key(header::CONTENT_DISPOSITION));
+        assert_eq!(
+            &axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()[..],
+            b"ordi"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_security_headers_preserve_file_isolation() {
+        use axum::{middleware, routing::get, Router};
+        use tower::ServiceExt;
+        let directory = TestDirectory::new("file-security-middleware");
+        let runtime = crate::test_support::runtime_config(directory.path());
+        let router = Router::new()
+            .route(
+                "/file",
+                get(|| async {
+                    FileResponsePolicy::new(Path::new("notes.txt"), None, FileResponseMode::WebDav)
+                        .apply(Response::builder())
+                        .body(Body::from("ordinary data"))
+                        .unwrap()
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                runtime,
+                crate::security::security_headers_middleware,
+            ));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/file")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let policies: Vec<_> = response
+            .headers()
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(policies.len(), 2);
+        assert!(policies.iter().any(|policy| policy.starts_with("sandbox;")));
+        assert!(policies
+            .iter()
+            .any(|policy| policy.contains("script-src 'self'")));
+        assert!(response.headers().contains_key(header::CONTENT_DISPOSITION));
+    }
 }

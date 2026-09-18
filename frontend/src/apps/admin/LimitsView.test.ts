@@ -3,6 +3,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AdminInfo } from '../../shared/api/admin'
 import LimitsView from './LimitsView.vue'
 
+// This suite covers the pre-existing transfer controls; TrafficPanel has its own suite.
+vi.mock('./TrafficPanel.vue', () => ({ default: { template: '<div />' } }))
+
 const GIB = 1024 ** 3
 const info: AdminInfo = {
   username: 'admin', has_global_web_password: true, shares: [], folder_locks: [],
@@ -36,18 +39,13 @@ describe('LimitsView', () => {
     const app = mountLimits(host)
     await nextTick()
 
-    const inputs = host.querySelectorAll<HTMLInputElement>('input')
-    expect(inputs[0]?.value).toBe('5')
-    expect(inputs[1]?.value).toBe('20')
-    expect(inputs[2]?.value).toBe('1000')
-    expect(inputs[3]?.value).toBe('0')
-    expect(inputs[4]?.value).toBe('0')
-    expect(inputs[5]?.value).toBe('3')
-    expect(inputs[6]?.value).toBe('1000')
-    expect(host.textContent).toContain('磁盘始终保留安全余量')
-    expect(host.querySelector('.limits-grid')).not.toBeNull()
-    expect(host.querySelectorAll('.limits-grid > .compact-field')).toHaveLength(7)
-    expect(host.querySelector('.limit-upload-rate + .limit-download-rate')).not.toBeNull()
+    expect([...host.querySelectorAll('.setting-row-value')].map(el => el.textContent)).toEqual(['统一设置', '5 GiB', '20 GiB', '1000', '0 MiB/s', '0 MiB/s', '3 GiB', '1000'])
+    expect(host.querySelector('.setting-row-label')?.textContent).toBe('流量限制')
+    expect(host.querySelector('.settings-drawer')).toBeNull()
+    host.querySelectorAll<HTMLButtonElement>('.setting-row button')[1]!.click()
+    await nextTick()
+    expect(host.querySelector<HTMLInputElement>('.settings-drawer input')?.value).toBe('5')
+    expect(host.querySelectorAll('.settings-drawer input')).toHaveLength(1)
     app.unmount()
   })
 
@@ -60,14 +58,11 @@ describe('LimitsView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const app = mountLimits(host)
-    const inputs = host.querySelectorAll<HTMLInputElement>('input')
-    if (!inputs[0] || !inputs[5] || !inputs[6]) throw new Error('limit input missing')
-    inputs[0].value = '6'
-    inputs[0].dispatchEvent(new Event('input'))
-    inputs[5].value = '2.5'
-    inputs[5].dispatchEvent(new Event('input'))
-    inputs[6].value = '750'
-    inputs[6].dispatchEvent(new Event('input'))
+    host.querySelectorAll<HTMLButtonElement>('.setting-row button')[1]!.click()
+    await nextTick()
+    const input = host.querySelector<HTMLInputElement>('.settings-drawer input')!
+    input.value = '6'
+    input.dispatchEvent(new Event('input'))
     ;(host.querySelector('form') as HTMLFormElement).dispatchEvent(new Event('submit', { cancelable: true }))
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
@@ -77,13 +72,13 @@ describe('LimitsView', () => {
         max_upload_bytes: 6 * GIB,
         max_upload_batch_bytes: 20 * GIB,
         max_upload_batch_entries: 1000,
-        max_archive_bytes: 2.5 * GIB,
-        max_archive_entries: 750,
+        max_archive_bytes: 3 * GIB,
+        max_archive_entries: 1000,
         upload_rate_bytes_per_sec: 0,
         download_rate_bytes_per_sec: 0,
       }),
     }))
-    expect((host.querySelector('button[type="submit"]') as HTMLButtonElement).disabled).toBe(true)
+    expect(host.querySelector('.settings-drawer')).toBeNull()
     app.unmount()
   })
 
@@ -93,7 +88,9 @@ describe('LimitsView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const app = mountLimits(host)
-    const entries = host.querySelectorAll<HTMLInputElement>('input')[6]
+    host.querySelectorAll<HTMLButtonElement>('.setting-row button')[7]!.click()
+    await nextTick()
+    const entries = host.querySelector<HTMLInputElement>('.settings-drawer input')
     if (!entries) throw new Error('entry limit input missing')
     entries.value = '100001'
     entries.dispatchEvent(new Event('input'))
@@ -101,7 +98,7 @@ describe('LimitsView', () => {
     await nextTick()
 
     expect(fetchMock).not.toHaveBeenCalled()
-    expect(host.textContent).toContain('必须在 1 到 100000 之间')
+    expect(document.querySelector('.app-toast.error')?.textContent).toContain('必须在 1 到 100000 之间')
     app.unmount()
   })
 
@@ -115,7 +112,9 @@ describe('LimitsView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const app = mountLimits(host, preciseInfo)
-    const entries = host.querySelectorAll<HTMLInputElement>('input')[6]
+    host.querySelectorAll<HTMLButtonElement>('.setting-row button')[7]!.click()
+    await nextTick()
+    const entries = host.querySelector<HTMLInputElement>('.settings-drawer input')
     if (!entries) throw new Error('entry limit input missing')
     entries.value = '999'
     entries.dispatchEvent(new Event('input'))

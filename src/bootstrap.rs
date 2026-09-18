@@ -11,8 +11,9 @@ pub async fn run() -> anyhow::Result<()> {
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let runtime = config::Config::from_env()?;
+    let mut runtime = config::Config::from_env()?;
     let config_file = config::load_config(&runtime.config_path).await?;
+    runtime.initialize_transaction_auth_key().await?;
     let config_file = Arc::new(RwLock::new(config_file));
     let state = AppState::new(runtime.clone(), config_file).await?;
 

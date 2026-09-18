@@ -126,6 +126,9 @@ pub struct StorageInstanceConfig {
     pub enabled: bool,
     #[serde(default)]
     pub allow_guest_access: bool,
+    /// Missing on older configurations: inherit the existing guest access policy.
+    #[serde(default)]
+    pub allow_guest_download: Option<bool>,
     pub backend: StorageBackendConfig,
 }
 
@@ -140,6 +143,7 @@ impl StorageInstanceConfig {
             name: name.into(),
             enabled: true,
             allow_guest_access: true,
+            allow_guest_download: None,
             backend,
         }
     }
@@ -229,6 +233,10 @@ pub enum S3AddressingStyle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
+    #[serde(default)]
+    pub traffic: crate::traffic::TrafficSettings,
+    #[serde(default)]
+    pub domain_binding: Option<crate::domain_binding::DomainBinding>,
     #[serde(default)]
     pub schema_version: u32,
     #[serde(default)]

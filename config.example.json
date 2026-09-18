@@ -1,5 +1,6 @@
 {
-  "schema_version": 11,
+  "schema_version": 12,
+  "domain_binding": null,
   "storage_instances": [
     {
       "id": "primary",

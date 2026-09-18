@@ -6,6 +6,7 @@ import LoginView from './LoginView.vue'
 import PreviewView from '../preview/PreviewView.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
+import AppIcon from '../../shared/components/AppIcon.vue'
 import { useTheme } from '../../shared/composables/useTheme'
 import { currentAppPath } from '../../shared/routes'
 
@@ -21,10 +22,15 @@ const isPreview = computed(() => route.value === '/preview')
   <PreviewView v-else-if="isPreview" :theme="theme" />
   <BrowserView v-else-if="isBrowser" :theme="theme" />
   <template v-else>
-    <div class="login-floating-actions">
-      <LocaleToggle />
-      <ThemeToggle :theme="theme.current.value" @toggle="theme.toggle" />
+    <div class="login-page">
+      <header class="login-header">
+        <div class="login-header-brand"><AppIcon name="cloud" :size="28" /><span>Ycloud</span></div>
+        <div class="login-header-actions">
+          <LocaleToggle />
+          <ThemeToggle :theme="theme.current.value" @toggle="theme.toggle" />
+        </div>
+      </header>
+      <LoginView />
     </div>
-    <LoginView />
   </template>
 </template>

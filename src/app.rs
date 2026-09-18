@@ -37,6 +37,7 @@ pub fn build_router(state: AppState) -> Router {
 
     let auth_routes = Router::new()
         .route("/login", post(auth::login_handler))
+        .route("/user/login", post(auth::user_login_handler))
         .route("/gate", post(auth::gate_handler))
         .layer(DefaultBodyLimit::max(32 * 1024));
 
@@ -58,6 +59,7 @@ pub fn build_router(state: AppState) -> Router {
     let read_api = Router::new()
         .route("/storages", get(api::browser_storages))
         .route("/files", get(api::list_files))
+        .route("/directory/size", get(crate::directory_size::calculate))
         .route("/download", get(api::download_file))
         .route(
             "/archive/prepare",
@@ -87,6 +89,7 @@ pub fn build_router(state: AppState) -> Router {
             "/upload/cancel",
             post(upload_batch::cancel_upload_batch).layer(DefaultBodyLimit::max(32 * 1024)),
         )
+        .route("/upload/status", get(upload_batch::upload_batch_status))
         .route("/upload", put(api::upload_file))
         .route("/rename", put(api::rename_file))
         .merge(batch_api)
@@ -114,7 +117,17 @@ pub fn build_router(state: AppState) -> Router {
             ));
 
     let admin_routes = Router::new()
+        .route(
+            "/domain-binding",
+            get(crate::domain_binding::get_binding)
+                .put(crate::domain_binding::save_binding)
+                .delete(crate::domain_binding::remove_binding),
+        )
         .route("/info", get(admin_api::admin_info))
+        .route(
+            "/traffic",
+            get(crate::traffic::info).put(crate::traffic::update),
+        )
         .route("/shares", post(admin_api::create_share))
         .route(
             "/shares/{id}",
@@ -157,7 +170,10 @@ pub fn build_router(state: AppState) -> Router {
             "/security/settings",
             put(admin_api::update_login_security_settings),
         )
-        .route("/security/events", get(admin_api::login_events))
+        .route(
+            "/security/events",
+            get(admin_api::login_events).delete(admin_api::clear_login_events),
+        )
         .route("/security/block", post(admin_api::block_login))
         .route("/security/unblock", post(admin_api::unblock_login))
         .route("/locks", post(admin_api::create_lock))
@@ -166,6 +182,10 @@ pub fn build_router(state: AppState) -> Router {
             put(admin_api::update_lock).delete(admin_api::delete_lock),
         )
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            Arc::new(tokio::sync::Semaphore::new(4)),
+            crate::admin_execution::complete_mutation,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
@@ -235,7 +255,7 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .layer(middleware_stack)
         .layer(middleware::from_fn_with_state(
-            state.config.clone(),
+            state.clone(),
             proxy_boundary_middleware,
         ))
         .with_state(state)
@@ -397,9 +417,11 @@ mod tests {
                 trusted_proxy_ips: Default::default(),
                 allowed_hosts: ["ycloud.test".to_string()].into_iter().collect(),
                 s3_allowed_endpoints: Default::default(),
+                transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(ConfigFile {
                 schema_version: CONFIG_SCHEMA_VERSION,
+                domain_binding: None,
                 admin_username: "admin".into(),
                 admin_password_hash: hash_password("test-password"),
                 global_web_password_hash: None,
@@ -439,6 +461,7 @@ mod tests {
                     name: "Pending test".into(),
                     enabled: true,
                     allow_guest_access: false,
+                    allow_guest_download: None,
                     backend: StorageBackendConfig::S3(S3StorageConfig {
                         provider: S3Provider::AlibabaOss,
                         endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
@@ -461,6 +484,60 @@ mod tests {
         let gate_token = state.gate_access.create("__gate__".into()).await;
         let app = build_router(state);
 
+        // Each sign-in endpoint accepts only its own account class.
+        for (endpoint, username, password, succeeds, administrator) in [
+            ("/api/login", "reader", "reader-password", false, false),
+            ("/api/user/login", "admin", "test-password", false, false),
+            ("/api/login", "admin", "test-password", true, true),
+            ("/api/user/login", "reader", "reader-password", true, false),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    test_request()
+                        .method("POST")
+                        .uri(endpoint)
+                        .header(header::ORIGIN, "http://ycloud.test")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "username": username,
+                                "password": password,
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let cookie = response.headers().get(header::SET_COOKIE).cloned();
+            assert_eq!(cookie.is_some(), succeeds);
+            let body = to_bytes(response.into_body(), 8192).await.unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["success"], succeeds);
+            assert_eq!(result["is_admin"], administrator);
+            assert_eq!(result["totp_required"], false);
+            if let Some(cookie) = cookie {
+                let session_cookie = cookie.to_str().unwrap().split(';').next().unwrap();
+                let me = app
+                    .clone()
+                    .oneshot(
+                        test_request()
+                            .uri("/api/me")
+                            .header(header::COOKIE, session_cookie)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let me: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(me.into_body(), 8192).await.unwrap()).unwrap();
+                assert_eq!(me["username"], username);
+                assert_eq!(me["is_admin"], administrator);
+            }
+        }
+
         let health = app
             .clone()
             .oneshot(
@@ -473,6 +550,10 @@ mod tests {
             .unwrap();
         assert_eq!(health.status(), StatusCode::OK);
         assert!(health.headers().get("x-request-id").is_some());
+        assert_eq!(
+            health.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
         assert_eq!(
             health
                 .headers()

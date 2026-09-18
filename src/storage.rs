@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -8,28 +9,42 @@ use std::{
 
 use tokio::{
     fs::{self, OpenOptions},
-    sync::{mpsc, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
 };
-use uuid::Uuid;
 
 #[cfg(unix)]
 use tokio::fs::File;
 
 use crate::{
     error::{AppError, AppResult},
-    storage_transaction::{remove_any, TransactionPaths, SYSTEM_DIR},
+    storage_transaction::{DeletionObserver, TransactionPaths, SYSTEM_DIR},
 };
 
 mod atomic_write;
+mod cleanup;
+mod copy;
+mod directory_size;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux_root;
+#[cfg(test)]
+mod operation_tests;
 mod path;
 mod response;
+mod upload_cleanup;
 
 pub use atomic_write::{AtomicFileWriter, AtomicWriteResult};
+pub use cleanup::CleanupStatus;
 pub(crate) use path::is_link_or_reparse_point;
 pub use path::ResolvedPath;
 use path::{reject_root_or_descendant, require_plain_directory};
 pub use response::FileResponseMode;
-pub(crate) use response::{attachment_header, content_type_for_mode, parse_range};
+pub(crate) use response::{attachment_header, parse_range, FileResponsePolicy};
+pub use upload_cleanup::UploadCleanupStatus;
+
+pub(crate) struct LocalDirectoryEntry {
+    pub(crate) name: OsString,
+    pub(crate) metadata: std::fs::Metadata,
+}
 
 #[derive(Clone)]
 pub struct StorageService {
@@ -41,7 +56,65 @@ pub struct StorageService {
     reserved_upload_bytes: Arc<Mutex<u64>>,
     transactions: Arc<TransactionPaths>,
     mutation_gate: Arc<AsyncMutex<()>>,
-    trash_notify: mpsc::UnboundedSender<()>,
+    cleanup: cleanup::CleanupWorker,
+    upload_cleanup: upload_cleanup::UploadCleanupWorker,
+    #[cfg(target_os = "linux")]
+    linux_root: Arc<linux_root::LinuxRoot>,
+}
+
+struct DeleteAccounting {
+    capacity: Option<crate::capacity::CapacityTracker>,
+    cleanup: cleanup::CleanupWorker,
+    removed_size: u64,
+    publication_started: bool,
+    was_published: bool,
+    ledger_settled: bool,
+}
+
+impl DeletionObserver for DeleteAccounting {
+    fn publication_started(&mut self) {
+        self.publication_started = true;
+    }
+
+    fn published(&mut self, staged: &Path) {
+        self.cleanup
+            .record_deletion(staged.to_path_buf(), self.removed_size);
+        if let Some(capacity) = &self.capacity {
+            capacity.remove_used(self.removed_size);
+        }
+        self.publication_started = false;
+        self.was_published = true;
+    }
+}
+
+impl DeleteAccounting {
+    async fn persist(&mut self) -> AppResult<()> {
+        if self.publication_started {
+            if let Some(capacity) = &self.capacity {
+                capacity.mark_uncertain();
+            }
+            return Ok(());
+        }
+        if !self.was_published {
+            self.ledger_settled = true;
+            return Ok(());
+        }
+        if let Some(capacity) = &self.capacity {
+            capacity.persist().await?;
+        }
+        self.ledger_settled = true;
+        Ok(())
+    }
+}
+
+impl Drop for DeleteAccounting {
+    fn drop(&mut self) {
+        if self.publication_started || self.was_published && !self.ledger_settled {
+            if let Some(capacity) = &self.capacity {
+                capacity.mark_uncertain();
+            }
+        }
+    }
 }
 
 impl StorageService {
@@ -124,18 +197,17 @@ impl StorageService {
             .await
             .map_err(|error| AppError::with_source("failed to resolve storage directory", error))?;
 
-        let transactions = TransactionPaths::initialize(&root).await?;
-        let (trash_notify, mut trash_events) = mpsc::unbounded_channel();
-        let trash = transactions.trash.clone();
-        let cleaner_gate = io_gate.clone();
-        tokio::spawn(async move {
-            while trash_events.recv().await.is_some() {
-                let Ok(_permit) = cleaner_gate.acquire().await else {
-                    break;
-                };
-                purge_trash(&trash).await;
-            }
-        });
+        let transactions = Arc::new(TransactionPaths::initialize(&root).await?);
+        #[cfg(target_os = "linux")]
+        let linux_root = Arc::new(transactions.linux_root().clone());
+        let mutation_gate = Arc::new(AsyncMutex::new(()));
+        let cleanup = cleanup::CleanupWorker::start(
+            transactions.clone(),
+            io_gate.clone(),
+            mutation_gate.clone(),
+        );
+        let upload_cleanup =
+            upload_cleanup::UploadCleanupWorker::start(transactions.clone(), io_gate.clone());
         Ok(Self {
             root: Arc::new(root),
             io_gate,
@@ -143,14 +215,25 @@ impl StorageService {
             max_list_entries: max_list_entries.max(1),
             disk_reserve_bytes,
             reserved_upload_bytes: Arc::new(Mutex::new(0)),
-            transactions: Arc::new(transactions),
-            mutation_gate: Arc::new(AsyncMutex::new(())),
-            trash_notify,
+            transactions,
+            mutation_gate,
+            cleanup,
+            upload_cleanup,
+            #[cfg(target_os = "linux")]
+            linux_root,
         })
     }
 
     pub fn root(&self) -> &Path {
         self.root.as_path()
+    }
+
+    pub fn cleanup_status(&self) -> CleanupStatus {
+        self.cleanup.status()
+    }
+
+    pub fn upload_cleanup_status(&self) -> UploadCleanupStatus {
+        self.upload_cleanup.status()
     }
 
     pub fn max_upload_bytes(&self) -> u64 {
@@ -167,46 +250,156 @@ impl StorageService {
     }
 
     pub async fn metadata(&self, path: &ResolvedPath) -> AppResult<std::fs::Metadata> {
-        fs::metadata(path.absolute())
-            .await
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => AppError::NotFound,
-                _ => AppError::with_source("failed to read file metadata", error),
-            })
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_root.metadata(path.relative()).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            fs::metadata(path.absolute())
+                .await
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::NotFound => AppError::NotFound,
+                    _ => AppError::with_source("failed to read file metadata", error),
+                })
+        }
+    }
+
+    pub(crate) async fn open_file_for_read(&self, path: &ResolvedPath) -> AppResult<fs::File> {
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_root.open_file_for_read(path.relative()).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            fs::File::open(path.absolute())
+                .await
+                .map_err(|error| AppError::with_source("failed to open file", error))
+        }
+    }
+
+    pub(crate) async fn read_directory(
+        &self,
+        path: &ResolvedPath,
+    ) -> AppResult<Vec<LocalDirectoryEntry>> {
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_root
+                .read_directory(path.relative())
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|entry| LocalDirectoryEntry {
+                            name: entry.name,
+                            metadata: entry.metadata,
+                        })
+                        .collect()
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut directory = fs::read_dir(path.absolute())
+                .await
+                .map_err(|error| AppError::with_source("failed to list directory", error))?;
+            let mut entries = Vec::new();
+            while let Some(entry) = directory
+                .next_entry()
+                .await
+                .map_err(|error| AppError::with_source("failed to read directory entry", error))?
+            {
+                let metadata = fs::symlink_metadata(entry.path()).await.map_err(|error| {
+                    AppError::with_source("failed to inspect directory entry", error)
+                })?;
+                if is_link_or_reparse_point(&metadata) {
+                    continue;
+                }
+                entries.push(LocalDirectoryEntry {
+                    name: entry.file_name(),
+                    metadata,
+                });
+            }
+            Ok(entries)
+        }
     }
 
     pub async fn remove(&self, path: &ResolvedPath) -> AppResult<u64> {
+        self.remove_with_capacity(path, None).await
+    }
+
+    pub(crate) async fn remove_with_capacity(
+        &self,
+        path: &ResolvedPath,
+        capacity: Option<crate::capacity::CapacityTracker>,
+    ) -> AppResult<u64> {
         if path.is_root() {
             return Err(AppError::BadRequest(
                 "The storage root cannot be removed".into(),
             ));
         }
-        let _permit = self.acquire_io().await?;
-        let _mutation = self.mutation_gate.lock().await;
-        fs::symlink_metadata(path.absolute())
-            .await
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => AppError::NotFound,
-                _ => AppError::with_source("failed to inspect path", error),
-            })?;
-        let removed_size = self.path_size(path).await?;
-        self.transactions.stage_delete(path.absolute()).await?;
-        let _ = self.trash_notify.send(());
-        Ok(removed_size)
+        let permit = self.acquire_io().await?;
+        let storage = self.clone();
+        let path = path.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _mutation = storage.mutation_gate.lock().await;
+            storage.metadata(&path).await?;
+            let removed_size = storage.path_size(&path).await?;
+            let mut accounting = DeleteAccounting {
+                capacity,
+                cleanup: storage.cleanup.clone(),
+                removed_size,
+                publication_started: false,
+                was_published: false,
+                ledger_settled: false,
+            };
+            let result = storage
+                .transactions
+                .stage_delete(path.absolute(), removed_size, &mut accounting)
+                .await;
+            storage.cleanup.notify();
+            if let Err(error) = accounting.persist().await {
+                if let Some(capacity) = &accounting.capacity {
+                    capacity.mark_uncertain();
+                }
+                if result.is_ok() {
+                    return Err(error.with_operation(
+                        crate::error::CommitState::Committed,
+                        crate::error::CleanupState::Pending,
+                    ));
+                }
+            }
+            result.map(|_| removed_size)
+        })
+        .await
+        .map_err(|error| {
+            AppError::with_source("delete execution task failed", error).with_operation(
+                crate::error::CommitState::Unknown,
+                crate::error::CleanupState::Unknown,
+            )
+        })?
     }
 
     pub async fn create_directory(&self, path: &ResolvedPath) -> AppResult<()> {
         let _permit = self.acquire_io().await?;
         let _mutation = self.mutation_gate.lock().await;
-        fs::create_dir(path.absolute())
-            .await
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::AlreadyExists => {
-                    AppError::Conflict("Destination already exists".into())
-                }
-                _ => AppError::with_source("failed to create directory", error),
-            })?;
-        sync_parent_directory(path.absolute()).await
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_root.create_directory(path.relative()).await?;
+            self.linux_root.sync_parent(path.relative()).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            fs::create_dir(path.absolute())
+                .await
+                .map_err(|error| match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => {
+                        AppError::Conflict("Destination already exists".into())
+                    }
+                    _ => AppError::with_source("failed to create directory", error),
+                })?;
+            sync_parent_directory(path.absolute()).await
+        }
     }
 
     pub async fn move_path(
@@ -217,105 +410,96 @@ impl StorageService {
         reject_root_or_descendant(source, destination)?;
         let _permit = self.acquire_io().await?;
         let _mutation = self.mutation_gate.lock().await;
-        if fs::try_exists(destination.absolute())
-            .await
-            .map_err(|error| AppError::with_source("failed to inspect destination", error))?
+        #[cfg(target_os = "linux")]
         {
-            return Err(AppError::Conflict("Destination already exists".into()));
+            self.linux_root
+                .rename_noreplace(source.relative(), destination.relative())
+                .await?;
+            self.linux_root.sync_parent(source.relative()).await?;
+            self.linux_root.sync_parent(destination.relative()).await
         }
-        require_plain_directory(destination.absolute().parent()).await?;
-        fs::rename(source.absolute(), destination.absolute())
-            .await
-            .map_err(|error| AppError::with_source("failed to move path", error))?;
-        sync_parent_directory(source.absolute()).await?;
-        sync_parent_directory(destination.absolute()).await
-    }
-
-    pub async fn copy_path(
-        &self,
-        source: &ResolvedPath,
-        destination: &ResolvedPath,
-    ) -> AppResult<()> {
-        let expected_size = self.path_size(source).await?;
-        self.copy_path_with_expected_size(source, destination, expected_size)
-            .await
-    }
-
-    pub async fn copy_path_with_expected_size(
-        &self,
-        source: &ResolvedPath,
-        destination: &ResolvedPath,
-        expected_size: u64,
-    ) -> AppResult<()> {
-        reject_root_or_descendant(source, destination)?;
-        let _permit = self.acquire_io().await?;
-        let _mutation = self.mutation_gate.lock().await;
-        if fs::try_exists(destination.absolute())
-            .await
-            .map_err(|error| AppError::with_source("failed to inspect destination", error))?
+        #[cfg(not(target_os = "linux"))]
         {
-            return Err(AppError::Conflict("Destination already exists".into()));
+            if fs::try_exists(destination.absolute())
+                .await
+                .map_err(|error| AppError::with_source("failed to inspect destination", error))?
+            {
+                return Err(AppError::Conflict("Destination already exists".into()));
+            }
+            require_plain_directory(destination.absolute().parent()).await?;
+            fs::rename(source.absolute(), destination.absolute())
+                .await
+                .map_err(|error| AppError::with_source("failed to move path", error))?;
+            sync_parent_directory(source.absolute()).await?;
+            sync_parent_directory(destination.absolute()).await
         }
-
-        let metadata = self.metadata(source).await?;
-        let copy_size = self.path_size(source).await?;
-        if copy_size != expected_size {
-            return Err(AppError::Conflict(
-                "Source changed while preparing the copy".into(),
-            ));
-        }
-        let _physical_reservation = self.reserve_physical_bytes(copy_size).await?;
-        let transaction_id = Uuid::new_v4().to_string();
-        let temporary = self.transactions.copy_path(&transaction_id);
-        let result = if metadata.is_dir() {
-            copy_directory_iterative(source.absolute(), &temporary).await
-        } else if metadata.is_file() {
-            copy_file_synced(source.absolute(), &temporary).await
-        } else {
-            Err(AppError::Forbidden)
-        };
-        if let Err(error) = result {
-            let _ = remove_any(&temporary).await;
-            return Err(error);
-        }
-        require_plain_directory(destination.absolute().parent()).await?;
-        if fs::try_exists(destination.absolute())
-            .await
-            .unwrap_or(false)
-        {
-            let _ = remove_any(&temporary).await;
-            return Err(AppError::Conflict("Destination already exists".into()));
-        }
-        fs::rename(&temporary, destination.absolute())
-            .await
-            .map_err(|error| AppError::with_source("failed to publish copied path", error))?;
-        sync_parent_directory(destination.absolute()).await
     }
 
     pub async fn ready(&self) -> bool {
-        fs::metadata(self.root())
-            .await
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false)
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_root
+                .metadata("")
+                .await
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            fs::metadata(self.root())
+                .await
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        }
     }
 
     /// Count only user-visible files. The reserved transaction directory is
     /// excluded because it contains temporary copies, backups and trash that
     /// must not consume the logical user quota twice.
     pub async fn user_data_size(&self) -> AppResult<u64> {
-        let root = self.root.clone();
-        tokio::task::spawn_blocking(move || calculate_plain_path_size(&root, true))
-            .await
-            .map_err(|error| {
-                AppError::with_source("failed to inspect local storage usage", error)
-            })?
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_root.path_size("", true).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let root = self.root.clone();
+            tokio::task::spawn_blocking(move || calculate_plain_path_size(&root, true))
+                .await
+                .map_err(|error| {
+                    AppError::with_source("failed to inspect local storage usage", error)
+                })?
+        }
+    }
+
+    /// Take a capacity snapshot at the same mutation boundary used by local
+    /// upload, copy and delete publication. Reservations may still exist for
+    /// uploads that have not entered publication and remain separately
+    /// represented by `CapacityTracker::reserved`.
+    pub(crate) async fn reconcile_capacity_snapshot(
+        &self,
+        capacity: &crate::capacity::CapacityTracker,
+    ) -> AppResult<()> {
+        let _permit = self.acquire_io().await?;
+        let _mutation = self.mutation_gate.lock().await;
+        let used = self.user_data_size().await?;
+        capacity.persist_reconciled(used).await
     }
 
     pub async fn path_size(&self, path: &ResolvedPath) -> AppResult<u64> {
-        let absolute = path.absolute.clone();
-        tokio::task::spawn_blocking(move || calculate_plain_path_size(&absolute, false))
-            .await
-            .map_err(|error| AppError::with_source("failed to inspect local path size", error))?
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_root.path_size(path.relative(), false).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let absolute = path.absolute.clone();
+            tokio::task::spawn_blocking(move || calculate_plain_path_size(&absolute, false))
+                .await
+                .map_err(|error| {
+                    AppError::with_source("failed to inspect local path size", error)
+                })?
+        }
     }
 
     pub(crate) async fn acquire_io(&self) -> AppResult<OwnedSemaphorePermit> {
@@ -427,21 +611,6 @@ async fn copy_file_synced(source: &Path, destination: &Path) -> AppResult<()> {
     file.sync_all()
         .await
         .map_err(|error| AppError::with_source("failed to flush copied file", error))
-}
-
-async fn purge_trash(trash: &Path) {
-    let mut entries = match fs::read_dir(trash).await {
-        Ok(entries) => entries,
-        Err(error) => {
-            tracing::warn!(path = %trash.display(), %error, "failed to inspect staged deletions");
-            return;
-        }
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Err(error) = remove_any(&entry.path()).await {
-            tracing::warn!(path = %entry.path().display(), %error, "failed to purge staged deletion");
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -579,6 +748,13 @@ mod tests {
             .unwrap();
         drop(writer);
         assert!(!root.join("partial.bin").exists());
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            while storage.upload_cleanup_status().pending_uploads != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
         let mut entries = tokio::fs::read_dir(root.join(SYSTEM_DIR).join("uploads"))
             .await
             .unwrap();

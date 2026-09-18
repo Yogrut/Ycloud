@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import AppFeedback from '../../shared/components/AppFeedback.vue'
+import SettingsDrawer from '../../shared/components/SettingsDrawer.vue'
+import ConfirmDialog from '../../shared/components/ConfirmDialog.vue'
 import { computed, nextTick, ref } from 'vue'
 import type { FolderLockView, StorageInstanceView, UpdateFolderLockRequest } from '../../shared/api/admin'
 import { createFolderLock, deleteFolderLock, updateFolderLock } from '../../shared/api/admin'
-import AppIcon from '../../shared/components/AppIcon.vue'
 import AppSelect from '../../shared/components/AppSelect.vue'
 import { useLocale } from '../../shared/i18n'
 
@@ -14,6 +16,7 @@ const { locks, storages, defaultStorageId } = defineProps<{
 }>()
 const emit = defineEmits<{ changed: [message: string] }>()
 const locale = useLocale()
+const feedbackRevision = ref(0)
 
 const editing = ref<FolderLockView>()
 const showEditor = ref(false)
@@ -139,7 +142,7 @@ async function confirmDelete(): Promise<void> {
 </script>
 
 <template>
-  <section class="admin-pane glass" aria-labelledby="locks-title">
+  <section class="admin-pane list-pane glass" aria-labelledby="locks-title">
     <header class="admin-pane-head locks-head">
       <div>
         <h1 id="locks-title">{{ locale.text('网页文件夹锁', 'Browser folder locks') }}</h1>
@@ -150,6 +153,7 @@ async function confirmDelete(): Promise<void> {
     <div class="admin-pane-body locks-body">
       <div v-if="!locks.length" class="admin-empty">{{ locale.text('暂无网页文件夹锁', 'No browser folder locks') }}</div>
       <div v-else class="locks-list">
+        <div class="record-table-head"><span>{{ locale.text('目录', 'Folder') }}</span><span>{{ locale.text('所属存储', 'Storage') }}</span><span>{{ locale.text('状态 / 操作', 'Status / Actions') }}</span></div>
         <article v-for="lock in locks" :key="lock.id" class="lock-record">
           <strong class="admin-record-name">{{ displayPath(lock.path) }}</strong>
           <div class="admin-record-value">
@@ -159,8 +163,8 @@ async function confirmDelete(): Promise<void> {
           <div class="admin-record-end">
             <div class="admin-record-status"><span class="status-pill">{{ locale.text('网页保护', 'Browser protected') }}</span></div>
             <div class="lock-actions">
-              <button class="record-icon-btn" type="button" :title="locale.text('编辑文件夹锁', 'Edit folder lock')" :aria-label="locale.text('编辑文件夹锁', 'Edit folder lock')" @click="openEdit(lock)"><AppIcon name="rename" :size="18" /></button>
-              <button class="record-icon-btn danger" type="button" :title="locale.text('删除文件夹锁', 'Delete folder lock')" :aria-label="locale.text('删除文件夹锁', 'Delete folder lock')" @click="pendingDelete = lock; errorMessage = ''"><AppIcon name="delete" :size="18" /></button>
+              <button class="record-text-btn" type="button" :title="locale.text('编辑文件夹锁', 'Edit folder lock')" :aria-label="locale.text('编辑文件夹锁', 'Edit folder lock')" @click="openEdit(lock)">{{ locale.t('common.edit') }}</button>
+              <button class="record-text-btn danger" type="button" :title="locale.text('删除文件夹锁', 'Delete folder lock')" :aria-label="locale.text('删除文件夹锁', 'Delete folder lock')" @click="pendingDelete = lock; errorMessage = ''">{{ locale.t('common.delete') }}</button>
             </div>
           </div>
         </article>
@@ -168,10 +172,9 @@ async function confirmDelete(): Promise<void> {
     </div>
   </section>
 
-  <div v-if="showEditor" class="overlay" @click.self="closeEditor">
-    <form class="modal compact-editor-modal" role="dialog" aria-modal="true" aria-labelledby="lock-editor-title" @submit.prevent="submit">
-      <h2 id="lock-editor-title">{{ editing ? locale.text('编辑文件夹锁', 'Edit folder lock') : locale.text('新建文件夹锁', 'New folder lock') }}</h2>
-      <label>
+  <SettingsDrawer v-if="showEditor" :title="editing ? locale.text('编辑文件夹锁', 'Edit folder lock') : locale.text('新建文件夹锁', 'New folder lock')" :busy="saving" @close="closeEditor">
+    <form class="modal compact-editor-modal" @submit.prevent="feedbackRevision++; submit()">
+      <label class="required-field">
         {{ locale.text('所属存储', 'Storage') }}
         <AppSelect v-model="storageId" :options="storageOptions" :label="locale.text('所属存储', 'Storage')" />
       </label>
@@ -182,26 +185,16 @@ async function confirmDelete(): Promise<void> {
       <p class="field-hint">{{ locale.text('保存时自动统一为 /目录；不能是根目录，也不能与已启用 WebDAV 的父、当前或子目录重叠。', 'Paths are normalized when saved. The root is not allowed, and the path cannot overlap an enabled WebDAV mount at any level.') }}</p>
       <label>
         {{ locale.text('锁密码', 'Lock password') }}
-        <input v-model="password" class="input" type="password" required minlength="8" maxlength="1024" autocomplete="new-password" @focus="selectMask">
+        <input v-model="password" class="input" type="password" :required="!editing" minlength="8" maxlength="1024" autocomplete="new-password" @focus="selectMask">
       </label>
       <p class="field-hint">{{ locale.text('至少 8 位；编辑时保留掩码表示不修改密码，不需要保护时请删除该锁。', 'At least 8 characters. Leave the mask unchanged while editing to keep the current password; delete the lock to remove protection.') }}</p>
-      <p class="modal-error" role="alert" aria-live="polite">{{ errorMessage }}</p>
+      <AppFeedback v-if="!pendingDelete" :revision="feedbackRevision" :message="errorMessage" />
       <div class="modal-actions">
         <button class="btn secondary" type="button" :disabled="saving" @click="closeEditor">{{ locale.t('common.cancel') }}</button>
-        <button class="btn" type="submit" :disabled="saving || !hasChanges">{{ saving ? locale.t('common.saving') : (editing ? locale.t('common.save') : locale.t('common.create')) }}</button>
+        <button class="btn" type="submit" :disabled="saving || !hasChanges">{{ locale.text('确认', 'Confirm') }}</button>
       </div>
     </form>
-  </div>
+  </SettingsDrawer>
 
-  <div v-if="pendingDelete" class="overlay" @click.self="pendingDelete = undefined; errorMessage = ''">
-    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="delete-lock-title">
-      <h2 id="delete-lock-title">{{ locale.text('确认删除文件夹锁', 'Delete folder lock?') }}</h2>
-      <p>{{ locale.text(`删除 ${displayPath(pendingDelete.path)} 的锁后，该目录将不再单独要求网页访问密码，磁盘文件不会被删除。`, `Removing the lock from ${displayPath(pendingDelete.path)} stops its separate browser password prompt. Files on disk will not be deleted.`) }}</p>
-      <p class="modal-error" role="alert" aria-live="polite">{{ errorMessage }}</p>
-      <div class="modal-actions">
-        <button class="btn secondary" type="button" :disabled="deleting" @click="pendingDelete = undefined; errorMessage = ''">{{ locale.t('common.cancel') }}</button>
-        <button class="btn danger" type="button" :disabled="deleting" @click="confirmDelete">{{ deleting ? locale.text('删除中…', 'Deleting…') : locale.text('确认删除', 'Delete lock') }}</button>
-      </div>
-    </section>
-  </div>
+  <ConfirmDialog v-if="pendingDelete" :title="locale.text('删除文件夹锁', 'Delete folder lock')" :message="locale.text('将删除以下文件夹锁，是否继续？', 'Delete the following folder lock?')" :target="displayPath(pendingDelete.path)" :detail="locale.text('该目录将不再单独要求网页访问密码，磁盘文件不会被删除。', 'The separate browser password prompt will be removed. Files on disk will not be deleted.')" :error="errorMessage" :busy="deleting" @close="pendingDelete = undefined; errorMessage = ''" @confirm="confirmDelete" />
 </template>

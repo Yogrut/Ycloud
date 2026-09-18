@@ -1,9 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { batchOperation, cancelUploadBatch, createFolder, downloadUrl, fileApi, prepareArchive, prepareUploadBatch, uploadFile } from './browser'
+import { batchOperation, cancelUploadBatch, checkDownload, createFolder, downloadUrl, fileApi, getUploadBatchStatus, prepareArchive, prepareUploadBatch, uploadFile } from './browser'
 import { formatSize } from '../format'
 
 describe('browser API paths', () => {
   afterEach(() => vi.unstubAllGlobals())
+
+  it('checks download admission without consuming file content', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 429 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(checkDownload('/api/download?path=test')).rejects.toMatchObject({ status: 429 })
+    expect(fetchMock).toHaveBeenCalledWith('/api/download?path=test', expect.objectContaining({ method: 'HEAD' }))
+  })
 
   it('keeps the root endpoint minimal', () => {
     expect(fileApi('')).toBe('/api/files')
@@ -116,6 +123,32 @@ describe('browser API paths', () => {
     }))
   })
 
+  it('queries a bound upload result and can cancel only selected paths', async () => {
+    const status = {
+      ticket: 'batch-ticket',
+      items: [{ path: 'folder/one.txt', size: 11, status: 'complete' }],
+    }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(status), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(getUploadBatchStatus('batch-ticket', 'primary')).resolves.toEqual(status)
+    await cancelUploadBatch('batch-ticket', 'primary', ['folder/two.txt'])
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/upload/status?batch=batch-ticket&storage_id=primary', expect.objectContaining({ credentials: 'same-origin' }))
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/upload/cancel?storage_id=primary', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ ticket: 'batch-ticket', paths: ['folder/two.txt'] }),
+    }))
+  })
+
   it('preserves per-item details from a 207 batch response', async () => {
     const payload = {
       success: 1,
@@ -136,6 +169,38 @@ describe('browser API paths', () => {
       method: 'PUT',
       body: JSON.stringify({ paths: ['one.txt', 'two.txt'], target: '/target' }),
     }))
+  })
+})
+
+describe('mutation result transport', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('keeps upload commit metadata and treats lost responses as unknown', async () => {
+    for (const event of ['load', 'error']) {
+      class ResultRequest {
+        status = 409
+        withCredentials = false
+        responseText = JSON.stringify({ error: { code: 'operation_committed_pending', message: '已提交，请核对', operation: { commit: 'committed', cleanup: 'pending', retry: 'do_not_repeat' } } })
+        upload = { addEventListener: vi.fn() }
+        listeners = new Map<string, () => void>()
+        open(): void {}
+        setRequestHeader(): void {}
+        getResponseHeader(): null { return null }
+        addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
+        send(): void { queueMicrotask(() => this.listeners.get(event)?.()) }
+        abort(): void {}
+      }
+      vi.stubGlobal('XMLHttpRequest', ResultRequest)
+      await expect(uploadFile('note.txt', new File(['note'], 'note.txt'), () => undefined)).rejects.toMatchObject({
+        code: event === 'load' ? 'operation_committed_pending' : 'operation_result_unknown',
+        blocksRetry: true,
+      })
+    }
+  })
+
+  it('does not interpret a lost batch response as a confirmed failure', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('network')))
+    await expect(batchOperation('copy', ['one.txt'], 'target')).rejects.toMatchObject({ code: 'operation_result_unknown', blocksRetry: true })
   })
 })
 

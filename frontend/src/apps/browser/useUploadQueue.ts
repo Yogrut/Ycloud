@@ -1,10 +1,12 @@
 import { ref } from 'vue'
 import type { Ref } from 'vue'
-import { cancelUploadBatch, prepareUploadBatch, uploadFile } from '../../shared/api/browser'
+import { cancelUploadBatch, getUploadBatchStatus, prepareUploadBatch, uploadFile } from '../../shared/api/browser'
+import type { UploadBatchItemState } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import { useLocale } from '../../shared/i18n'
 import { candidatesFromDrop, candidatesFromFiles, joinUploadPath } from './uploadQueue'
 import type { UploadCandidate, UploadTask } from './uploadQueue'
+import { ApiError } from '../../shared/api/client'
 
 interface UploadQueueContext {
   storageId: Ref<string>
@@ -32,9 +34,8 @@ export function useUploadQueue(context: UploadQueueContext) {
   let currentUploadController: AbortController | undefined
   let currentUploadTaskId: number | undefined
   let disposed = false
-  const cancelledUploadTaskIds = new Set<number>()
-  const pausedUploadTaskIds = new Set<number>()
-  const requeuedUploadTaskIds = new Set<number>()
+  const reconcileTimers = new Set<number>()
+  const reconcileDelays = [0, 1000, 3000, 7000, 15000, 30000]
 
   function chooseFiles(): void {
     if (context.requireUpload()) fileInput.value?.click()
@@ -109,6 +110,8 @@ export function useUploadQueue(context: UploadQueueContext) {
       }
     })
     uploadTasks.value.push(...addedTasks)
+    const rejected = addedTasks.find(task => task.error)
+    if (rejected) context.announce(rejected.error)
     showUpload.value = true
     if (!uploading.value) {
       await runUploadTasks(addedTasks.filter(task => task.status === 'queued').map(task => task.id))
@@ -143,14 +146,21 @@ export function useUploadQueue(context: UploadQueueContext) {
             group.map(task => ({ path: task.targetPath, size: task.file.size })),
             storageId,
           )
-          if (disposed || group.some(task => task.status === 'cancelled')) {
+          if (disposed) {
             await cancelUploadBatch(prepared.ticket, storageId).catch(() => undefined)
             for (const task of group) {
               if (task.status === 'preparing') task.status = 'queued'
             }
             continue
           }
+          const cancelledPaths = group
+            .filter(task => task.status === 'cancelled')
+            .map(task => task.targetPath)
+          if (cancelledPaths.length) {
+            await cancelUploadBatch(prepared.ticket, storageId, cancelledPaths).catch(() => undefined)
+          }
           for (const task of group) {
+            if (task.status === 'cancelled') continue
             task.ticket = prepared.ticket
             if (task.status === 'preparing') task.status = 'queued'
           }
@@ -183,34 +193,45 @@ export function useUploadQueue(context: UploadQueueContext) {
             currentUploadTaskId = task.id
             currentUploadController = new AbortController()
             await uploadFile(task.targetPath, task.file, loaded => { task.loaded = loaded }, task.storageId, ticket, currentUploadController.signal)
-            if (!cancelledUploadTaskIds.has(task.id)) {
+            if (task.cancelRequested) {
+              task.status = 'verifying'
+              task.error = locale.text('正在确认终止后的实际结果', 'Checking the result after termination')
+              await requestCancellationAndReconcile(task)
+            } else if (task.pauseRequested) {
+              task.status = 'verifying'
+              task.error = locale.text('正在确认暂停后的实际结果', 'Checking the result after pausing')
+              await reconcileUploadTask(task)
+            } else {
               task.loaded = task.file.size
               task.status = 'succeeded'
               completedContexts.add(`${task.storageId}\u0000${task.basePath}`)
             }
           } catch (error) {
-            if (cancelledUploadTaskIds.has(task.id)) {
-              task.status = 'cancelled'
+            if (task.cancelRequested) {
+              task.status = 'verifying'
               task.loaded = 0
-              task.error = locale.text('任务已终止', 'Task terminated')
-            } else if (pausedUploadTaskIds.has(task.id)) {
-              task.status = 'paused'
+              task.error = locale.text('正在确认终止后的实际结果', 'Checking the result after termination')
+              await requestCancellationAndReconcile(task)
+            } else if (task.pauseRequested) {
+              task.status = 'verifying'
               task.loaded = 0
-              task.error = ''
-            } else if (requeuedUploadTaskIds.has(task.id)) {
-              task.status = 'queued'
-              task.loaded = 0
-              task.error = ''
+              task.error = locale.text('正在确认暂停后的实际结果', 'Checking the result after pausing')
+              await reconcileUploadTask(task)
             } else {
-              task.status = 'failed'
               task.error = error instanceof Error ? error.message : locale.text('上传异常', 'Upload error')
+              if (error instanceof ApiError && error.blocksRetry) {
+                task.status = 'verifying'
+                task.retryBlocked = true
+                void reconcileUploadTask(task)
+              } else {
+                task.status = 'failed'
+                task.retryBlocked = false
+                context.announce(task.error)
+              }
             }
           } finally {
             currentUploadController = undefined
             currentUploadTaskId = undefined
-            cancelledUploadTaskIds.delete(task.id)
-            pausedUploadTaskIds.delete(task.id)
-            requeuedUploadTaskIds.delete(task.id)
           }
         }
       }
@@ -234,10 +255,16 @@ export function useUploadQueue(context: UploadQueueContext) {
   function retryUpload(id: number): void {
     const task = uploadTasks.value.find(item => item.id === id && item.status === 'failed')
     if (!task) return
+    if (task.retryBlocked) {
+      context.announce(task.error)
+      return
+    }
     const error = uploadLimitError(task.file)
     task.status = error ? 'failed' : 'queued'
     task.loaded = 0
     task.error = error
+    task.cancelRequested = false
+    task.pauseRequested = false
     if (!error) void runUploadTasks([id])
   }
 
@@ -256,11 +283,14 @@ export function useUploadQueue(context: UploadQueueContext) {
     for (const task of uploadTasks.value) {
       if (!selectedIds.has(task.id)) continue
       if (task.status === 'preparing' || task.status === 'queued') {
+        task.pauseRequested = true
         task.status = 'paused'
         continue
       }
       if (task.status === 'uploading') {
-        pausedUploadTaskIds.add(task.id)
+        task.pauseRequested = true
+        task.status = 'verifying'
+        task.error = locale.text('正在确认暂停后的实际结果', 'Checking the result after pausing')
         if (currentUploadTaskId === task.id) currentUploadController?.abort()
       }
     }
@@ -273,6 +303,7 @@ export function useUploadQueue(context: UploadQueueContext) {
       if (!selectedIds.has(task.id) || task.status !== 'paused') continue
       task.status = 'queued'
       task.error = ''
+      task.pauseRequested = false
       ids.push(task.id)
     }
     if (!uploading.value) void runUploadTasks(ids)
@@ -284,21 +315,24 @@ export function useUploadQueue(context: UploadQueueContext) {
     if (!selectedTasks.some(task => ['preparing', 'queued', 'uploading', 'paused'].includes(task.status))) return
     for (const task of selectedTasks) {
       if (!['preparing', 'queued', 'uploading', 'paused'].includes(task.status)) continue
-      task.status = 'cancelled'
+      task.cancelRequested = true
+      task.pauseRequested = false
+      task.status = task.status === 'uploading' ? 'verifying' : 'cancelled'
       task.loaded = 0
-      task.error = locale.text('任务已终止', 'Task terminated')
+      task.error = task.status === 'verifying'
+        ? locale.text('正在确认终止后的实际结果', 'Checking the result after termination')
+        : locale.text('任务已终止', 'Task terminated')
     }
     if (currentUploadTaskId !== undefined && selectedIds.has(currentUploadTaskId)) {
-      cancelledUploadTaskIds.add(currentUploadTaskId)
       currentUploadController?.abort()
     }
-    invalidateSelectedUploadTickets(selectedTasks)
+    cancelPendingUploadItems(selectedTasks)
   }
 
   function clearUploadTasks(taskIds: number[]): void {
     const selectedIds = new Set(taskIds)
     const removedTasks = uploadTasks.value.filter(task => selectedIds.has(task.id))
-    if (removedTasks.some(task => ['preparing', 'queued', 'uploading', 'paused'].includes(task.status))) return
+    if (removedTasks.some(task => ['preparing', 'queued', 'uploading', 'paused', 'verifying'].includes(task.status))) return
     uploadTasks.value = uploadTasks.value.filter(task => !selectedIds.has(task.id))
     releaseUnusedUploadTickets(removedTasks)
   }
@@ -315,22 +349,119 @@ export function useUploadQueue(context: UploadQueueContext) {
     }
   }
 
-  function invalidateSelectedUploadTickets(tasks: UploadTask[]): void {
-    const tickets = new Map<string, { ticket: string; storageId: string }>()
+  function cancelPendingUploadItems(tasks: UploadTask[]): void {
+    const tickets = new Map<string, { ticket: string; storageId: string; paths: string[] }>()
     for (const task of tasks) {
-      if (!task.ticket) continue
-      tickets.set(`${task.storageId}\u0000${task.ticket}`, { ticket: task.ticket, storageId: task.storageId })
+      if (!task.ticket || task.status === 'verifying') continue
+      const key = `${task.storageId}\u0000${task.ticket}`
+      const group = tickets.get(key) ?? { ticket: task.ticket, storageId: task.storageId, paths: [] }
+      group.paths.push(task.targetPath)
+      tickets.set(key, group)
     }
-    for (const { ticket, storageId } of tickets.values()) {
-      for (const task of uploadTasks.value) {
-        if (task.storageId !== storageId || task.ticket !== ticket) continue
-        task.ticket = undefined
-        if (task.status === 'uploading') {
-          requeuedUploadTaskIds.add(task.id)
-          if (currentUploadTaskId === task.id) currentUploadController?.abort()
-        }
+    for (const { ticket, storageId, paths } of tickets.values()) {
+      void cancelUploadBatch(ticket, storageId, paths).catch(() => undefined)
+    }
+  }
+
+  async function requestCancellationAndReconcile(task: UploadTask): Promise<void> {
+    if (!task.ticket) {
+      markUnconfirmed(task)
+      return
+    }
+    await cancelUploadBatch(task.ticket, task.storageId, [task.targetPath]).catch(() => undefined)
+    await reconcileUploadTask(task)
+  }
+
+  async function reconcileUploadTask(task: UploadTask, attempt = 0): Promise<void> {
+    if (disposed || !task.ticket || !uploadTasks.value.includes(task)) return
+    try {
+      const batch = await getUploadBatchStatus(task.ticket, task.storageId)
+      const item = batch.items.find(candidate => candidate.path === task.targetPath)
+      if (!item) {
+        scheduleReconcile(task, attempt)
+        return
       }
-      void cancelUploadBatch(ticket, storageId).catch(() => undefined)
+      applyServerUploadState(task, item.status, item.operation)
+      if (item.status === 'in_progress') scheduleReconcile(task, attempt)
+    } catch {
+      scheduleReconcile(task, attempt)
+    }
+  }
+
+  function scheduleReconcile(task: UploadTask, attempt: number): void {
+    const delay = reconcileDelays[attempt]
+    if (delay === undefined) {
+      markUnconfirmed(task)
+      return
+    }
+    const timer = window.setTimeout(() => {
+      reconcileTimers.delete(timer)
+      void reconcileUploadTask(task, attempt + 1)
+    }, delay)
+    reconcileTimers.add(timer)
+  }
+
+  function applyServerUploadState(task: UploadTask, status: UploadBatchItemState, operation?: ApiError['operation']): void {
+    task.retryBlocked = false
+    if (status === 'complete') {
+      task.loaded = task.file.size
+      if (operation) {
+        task.status = 'failed'
+        task.retryBlocked = true
+        task.error = locale.text('文件变更已提交，请勿重复上传；可稍后核对清理状态', 'The file change was committed. Do not upload it again; check cleanup status later.')
+      } else {
+        task.status = 'succeeded'
+        task.error = ''
+      }
+      task.cancelRequested = false
+      task.pauseRequested = false
+      refreshTaskContext(task)
+      return
+    }
+    if (status === 'unknown') {
+      markUnconfirmed(task)
+      return
+    }
+    if (status === 'in_progress') {
+      task.status = 'verifying'
+      task.retryBlocked = true
+      task.error = locale.text('操作仍在服务端执行，正在确认结果', 'The operation is still running on the server')
+      return
+    }
+    if (status === 'cancelled' || (status === 'failed' && task.cancelRequested)) {
+      task.status = 'cancelled'
+      task.loaded = 0
+      task.error = locale.text('任务已终止，服务端确认未提交', 'Task terminated; the server confirmed it was not committed')
+      task.cancelRequested = false
+      task.pauseRequested = false
+      return
+    }
+    if ((status === 'pending' || status === 'failed') && task.pauseRequested) {
+      task.status = 'paused'
+      task.loaded = 0
+      task.error = ''
+      task.pauseRequested = false
+      return
+    }
+    task.status = 'failed'
+    task.loaded = 0
+    task.error = status === 'pending'
+      ? locale.text('服务端确认上传尚未开始，可以重试', 'The server confirmed the upload did not start; it can be retried')
+      : locale.text('服务端确认上传失败，可以重试', 'The server confirmed the upload failed; it can be retried')
+    task.cancelRequested = false
+    task.pauseRequested = false
+  }
+
+  function markUnconfirmed(task: UploadTask): void {
+    task.status = 'failed'
+    task.retryBlocked = true
+    task.error = locale.text('上传结果无法确认，请核对文件后再操作，不要直接重试', 'The upload result could not be confirmed. Check the file before retrying.')
+    context.announce(task.error)
+  }
+
+  function refreshTaskContext(task: UploadTask): void {
+    if (task.storageId === context.storageId.value && task.basePath === context.path.value) {
+      void context.refresh()
     }
   }
 
@@ -382,6 +513,8 @@ export function useUploadQueue(context: UploadQueueContext) {
   function disposeUploads(): void {
     disposed = true
     currentUploadController?.abort()
+    for (const timer of reconcileTimers) window.clearTimeout(timer)
+    reconcileTimers.clear()
     const tickets = new Map<string, { ticket: string; storageId: string }>()
     for (const task of uploadTasks.value) {
       if (!task.ticket) continue

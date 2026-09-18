@@ -17,16 +17,23 @@
   },
   "dependencies": {
     "@phosphor-icons/vue": "2.2.1",
+    "@vueuse/core": "15.0.0",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "reka-ui": "2.10.4",
+    "tailwind-merge": "3.7.0",
     "vue": "3.5.41"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@tailwindcss/vite": "4.3.3",
     "@types/node": "24.13.3",
     "@vitejs/plugin-vue": "6.0.8",
     "eslint": "10.8.1",
     "eslint-plugin-vue": "10.10.0",
     "globals": "17.11.0",
     "happy-dom": "20.11.6",
+    "tailwindcss": "4.3.3",
     "typescript": "6.0.3",
     "typescript-eslint": "8.67.0",
     "vite": "8.2.2",

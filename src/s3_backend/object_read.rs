@@ -2,19 +2,17 @@ use std::path::Path;
 
 use axum::{
     body::Body,
-    http::{header, HeaderMap, HeaderValue, Response, StatusCode},
+    http::{header, HeaderMap, Response, StatusCode},
 };
 use tokio_util::io::ReaderStream;
 
 use super::{
-    directory_metadata, list_prefix, non_negative_size, object_key, range_not_satisfiable,
-    PermitStream, S3Backend, S3Metadata,
+    capabilities, directory_metadata, list_prefix, non_negative_size, object_key,
+    range_not_satisfiable, PermitStream, S3Backend, S3Metadata,
 };
 use crate::{
     error::{AppError, AppResult},
-    storage::{
-        attachment_header, content_type_for_mode, parse_range, FileResponseMode, StorageService,
-    },
+    storage::{parse_range, FileResponseMode, FileResponsePolicy, StorageService},
 };
 
 impl S3Backend {
@@ -126,13 +124,25 @@ impl S3Backend {
                 error_kind = %error.as_service_error().map_or("transport", |_| "service"),
                 "S3 object download failed"
             );
-            AppError::ServiceUnavailable("对象已发生变化、无权读取或对象存储暂不可用".into())
+            if status == StatusCode::PARTIAL_CONTENT {
+                AppError::storage_capability(
+                    capabilities::RANGE_READ,
+                    "对象存储不支持当前范围读取或暂不可用",
+                )
+            } else {
+                AppError::ServiceUnavailable("对象已发生变化、无权读取或对象存储暂不可用".into())
+            }
         })?;
         let response_length = non_negative_size(output.content_length())?;
         if response_length != length {
-            return Err(AppError::ServiceUnavailable(
-                "对象存储返回了不一致的内容长度".into(),
-            ));
+            return Err(if status == StatusCode::PARTIAL_CONTENT {
+                AppError::storage_capability(
+                    capabilities::RANGE_READ,
+                    "对象存储范围读取返回了不一致的内容长度",
+                )
+            } else {
+                AppError::ServiceUnavailable("对象存储返回了不一致的内容长度".into())
+            });
         }
 
         let reader = output.body.into_async_read();
@@ -143,29 +153,13 @@ impl S3Backend {
         let mut response = Response::builder()
             .status(status)
             .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_LENGTH, length)
-            .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff");
-        let guessed = mime_guess::from_path(&metadata.relative).first_or_octet_stream();
-        let (mut content_type, force_attachment) = content_type_for_mode(&guessed, mode);
-        if matches!(
+            .header(header::CONTENT_LENGTH, length);
+        response = FileResponsePolicy::new(
+            Path::new(&metadata.relative),
+            metadata.content_type.as_deref(),
             mode,
-            FileResponseMode::Attachment | FileResponseMode::WebDav
-        ) {
-            if let Some(value) = metadata
-                .content_type
-                .as_deref()
-                .and_then(|value| HeaderValue::from_str(value).ok())
-            {
-                content_type = value;
-            }
-        }
-        response = response.header(header::CONTENT_TYPE, content_type);
-        if matches!(mode, FileResponseMode::Attachment) || force_attachment {
-            response = response.header(
-                header::CONTENT_DISPOSITION,
-                attachment_header(Path::new(&metadata.relative)),
-            );
-        }
+        )
+        .apply(response);
         if status == StatusCode::PARTIAL_CONTENT {
             let end = start.saturating_add(length).saturating_sub(1);
             response = response.header(

@@ -7,9 +7,12 @@ import {
   PhArrowCircleRight,
   PhArrowCircleUp,
   PhArrowsOutCardinal,
+  PhCalendarBlank,
   PhCloud,
+  PhCheckCircle,
   PhCopy,
   PhFile,
+  PhFileText,
   PhFileArchive,
   PhFileAudio,
   PhFileCode,
@@ -20,6 +23,7 @@ import {
   PhFolder,
   PhFolderOpen,
   PhFolderPlus,
+  PhGearSix,
   PhHardDrives,
   PhHouse,
   PhListBullets,
@@ -39,17 +43,24 @@ import {
   PhTranslate,
   PhUserCircle,
   PhUsersThree,
+  PhX,
+  PhXCircle,
 } from '@phosphor-icons/vue'
 
 export type AppIconName =
   | 'account'
   | 'administrator'
   | 'archive'
+  | 'calendar'
   | 'cloud'
+  | 'status-success'
+  | 'status-error'
+  | 'close'
   | 'copy'
   | 'delete'
   | 'download'
   | 'file'
+  | 'file-text'
   | 'file-archive'
   | 'file-audio'
   | 'file-code'
@@ -72,6 +83,7 @@ export type AppIconName =
   | 'retry'
   | 'resume'
   | 'search'
+  | 'settings'
   | 'sign-out'
   | 'storage'
   | 'star'
@@ -85,11 +97,16 @@ const icons = {
   account: PhUserCircle,
   administrator: PhShieldCheck,
   archive: PhArchive,
+  calendar: PhCalendarBlank,
   cloud: PhCloud,
+  'status-success': PhCheckCircle,
+  'status-error': PhXCircle,
+  close: PhX,
   copy: PhCopy,
   delete: PhTrash,
   download: PhArrowCircleDown,
   file: PhFile,
+  'file-text': PhFileText,
   'file-archive': PhFileArchive,
   'file-audio': PhFileAudio,
   'file-code': PhFileCode,
@@ -112,6 +129,7 @@ const icons = {
   retry: PhArrowClockwise,
   resume: PhPlay,
   search: PhMagnifyingGlass,
+  settings: PhGearSix,
   'sign-out': PhArrowCircleRight,
   storage: PhHardDrives,
   star: PhStar,
@@ -122,7 +140,10 @@ const icons = {
   webdav: PhPlugsConnected,
 } as const
 
-const props = withDefaults(defineProps<{ name: AppIconName; size?: number | string }>(), { size: 20 })
+const props = withDefaults(
+  defineProps<{ name: AppIconName; size?: number | string; weight?: 'duotone' | 'regular' | 'fill' }>(),
+  { size: 20, weight: 'duotone' },
+)
 const icon = computed(() => icons[props.name])
 </script>
 
@@ -132,9 +153,9 @@ const icon = computed(() => icons[props.name])
     class="ui-icon app-icon"
     :size="size"
     color="currentColor"
-    weight="duotone"
+    :weight="weight"
     :data-icon="name"
-    data-weight="duotone"
+    :data-weight="weight"
     aria-hidden="true"
     focusable="false"
   />

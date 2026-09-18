@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watchEffect } from 'vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
+import AppFeedback from '../../shared/components/AppFeedback.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import type { ThemeController } from '../../shared/composables/useTheme'
 import { useLocale } from '../../shared/i18n'
+import { checkDownload } from '../../shared/api/browser'
 
 defineProps<{ theme: ThemeController }>()
 const locale = useLocale()
@@ -43,6 +45,15 @@ async function loadText(): Promise<void> {
   }
 }
 
+async function startDownload(): Promise<void> {
+  try {
+    await checkDownload(downloadUrl)
+    window.location.href = downloadUrl
+  } catch (error) {
+    textError.value = error instanceof Error ? error.message : locale.t('preview.failed')
+  }
+}
+
 function closePreview(): void {
   window.close()
 }
@@ -59,12 +70,13 @@ watchEffect(() => {
 
 <template>
   <div class="preview-page">
+    <AppFeedback :message="textError" />
     <header class="preview-toolbar">
       <span class="preview-title">{{ name || locale.t('preview.title') }}</span>
       <div class="preview-actions">
         <LocaleToggle />
         <ThemeToggle :theme="theme.current.value" @toggle="theme.toggle" />
-        <a class="btn secondary" :href="downloadUrl">{{ locale.t('preview.download') }}</a>
+        <a class="btn secondary" :href="downloadUrl" @click.prevent="startDownload">{{ locale.t('preview.download') }}</a>
         <button class="btn secondary" type="button" @click="closePreview">{{ locale.t('preview.close') }}</button>
       </div>
     </header>
@@ -76,7 +88,7 @@ watchEffect(() => {
       <iframe v-else-if="kind === 'pdf'" :src="previewUrl" :title="name" />
       <div v-else-if="kind === 'text' && textError" class="preview-message"><strong>{{ name }}</strong><p>{{ textError }}</p></div>
       <pre v-else-if="kind === 'text'">{{ text }}{{ textTruncated ? `\n\n${locale.t('preview.truncated')}` : '' }}</pre>
-      <div v-else class="preview-message"><strong>{{ name }}</strong><p>{{ locale.t('preview.unsupported') }}</p><a class="btn" :href="downloadUrl">{{ locale.t('preview.downloadFile') }}</a></div>
+      <div v-else class="preview-message"><strong>{{ name }}</strong><p>{{ locale.t('preview.unsupported') }}</p><a class="btn" :href="downloadUrl" @click.prevent="startDownload">{{ locale.t('preview.downloadFile') }}</a></div>
     </main>
   </div>
 </template>

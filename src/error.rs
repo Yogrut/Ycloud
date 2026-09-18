@@ -9,8 +9,50 @@ use serde::Serialize;
 
 pub type AppResult<T> = Result<T, AppError>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitState {
+    NotCommitted,
+    Committed,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupState {
+    Complete,
+    Pending,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct OperationOutcome {
+    pub commit: CommitState,
+    pub cleanup: CleanupState,
+    pub retry: &'static str,
+}
+
+impl OperationOutcome {
+    fn new(commit: CommitState, cleanup: CleanupState) -> Self {
+        let retry = match commit {
+            CommitState::NotCommitted => "after_correction",
+            CommitState::Committed => "do_not_repeat",
+            CommitState::Unknown => "verify_first",
+        };
+        Self {
+            commit,
+            cleanup,
+            retry,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum AppError {
+    Operation {
+        outcome: OperationOutcome,
+        cause: Box<AppError>,
+    },
     BadRequest(Cow<'static, str>),
     Unauthorized,
     Forbidden,
@@ -21,6 +63,11 @@ pub enum AppError {
     ClientClosedRequest,
     RequestTimeout,
     TooManyRequests,
+    TrafficExhausted(Cow<'static, str>),
+    StorageCapability {
+        capability: &'static str,
+        message: Cow<'static, str>,
+    },
     ServiceUnavailable(Cow<'static, str>),
     Internal {
         context: Cow<'static, str>,
@@ -29,6 +76,69 @@ pub enum AppError {
 }
 
 impl AppError {
+    pub fn with_operation(self, commit: CommitState, cleanup: CleanupState) -> Self {
+        if matches!(self, Self::Operation { .. }) {
+            return self;
+        }
+        Self::Operation {
+            outcome: OperationOutcome::new(commit, cleanup),
+            cause: Box::new(self),
+        }
+    }
+
+    pub fn operation(&self) -> Option<OperationOutcome> {
+        match self {
+            Self::Operation { outcome, .. } => Some(*outcome),
+            _ => None,
+        }
+    }
+
+    pub fn blocks_retry(&self) -> bool {
+        self.operation()
+            .is_some_and(|outcome| outcome.commit != CommitState::NotCommitted)
+    }
+
+    pub fn storage_capability(
+        capability: &'static str,
+        message: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self::StorageCapability {
+            capability,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn capability(&self) -> Option<&'static str> {
+        match self {
+            Self::Operation { cause, .. } => cause.capability(),
+            Self::StorageCapability { capability, .. } => Some(capability),
+            _ => None,
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Operation { outcome, cause } => match outcome.commit {
+                CommitState::NotCommitted => cause.code(),
+                CommitState::Committed => "operation_committed_pending",
+                CommitState::Unknown => "operation_result_unknown",
+            },
+            Self::BadRequest(_) => "bad_request",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::Conflict(_) => "conflict",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::InsufficientStorage => "insufficient_storage",
+            Self::ClientClosedRequest => "client_closed_request",
+            Self::RequestTimeout => "request_timeout",
+            Self::TooManyRequests => "too_many_requests",
+            Self::TrafficExhausted(_) => "traffic_exhausted",
+            Self::StorageCapability { .. } => "storage_capability_unavailable",
+            Self::ServiceUnavailable(_) => "service_unavailable",
+            Self::Internal { .. } => "internal_error",
+        }
+    }
     pub fn internal(context: impl Into<Cow<'static, str>>) -> Self {
         Self::Internal {
             context: context.into(),
@@ -48,6 +158,13 @@ impl AppError {
 
     pub fn status(&self) -> StatusCode {
         match self {
+            Self::Operation { outcome, cause } => {
+                if outcome.commit == CommitState::NotCommitted {
+                    cause.status()
+                } else {
+                    StatusCode::CONFLICT
+                }
+            }
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
@@ -60,6 +177,8 @@ impl AppError {
             }
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            Self::TrafficExhausted(_) => StatusCode::TOO_MANY_REQUESTS,
+            Self::StorageCapability { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -67,8 +186,19 @@ impl AppError {
 
     pub(crate) fn public_message(&self) -> Cow<'static, str> {
         match self {
+            Self::Operation { outcome, cause } => match outcome.commit {
+                CommitState::NotCommitted => cause.public_message(),
+                CommitState::Committed => {
+                    "文件变更已提交，但后续收尾未完成。请核对结果，不要重复执行。".into()
+                }
+                CommitState::Unknown => {
+                    "操作结果尚未确认。请先核对文件和存储状态，不要直接重试。".into()
+                }
+            },
             Self::BadRequest(message)
+            | Self::TrafficExhausted(message)
             | Self::Conflict(message)
+            | Self::StorageCapability { message, .. }
             | Self::ServiceUnavailable(message) => message.clone(),
             Self::Unauthorized => "Authentication required".into(),
             Self::Forbidden => "Access denied".into(),
@@ -88,9 +218,19 @@ impl AppError {
 impl fmt::Display for AppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Operation { outcome, cause } => write!(
+                formatter,
+                "operation {:?}/{:?}: {cause}",
+                outcome.commit, outcome.cleanup
+            ),
             Self::BadRequest(message)
             | Self::Conflict(message)
-            | Self::ServiceUnavailable(message) => formatter.write_str(message),
+            | Self::ServiceUnavailable(message)
+            | Self::TrafficExhausted(message) => formatter.write_str(message),
+            Self::StorageCapability {
+                capability,
+                message,
+            } => write!(formatter, "storage capability {capability}: {message}"),
             Self::Unauthorized => formatter.write_str("unauthorized"),
             Self::Forbidden => formatter.write_str("forbidden"),
             Self::NotFound => formatter.write_str("not found"),
@@ -121,6 +261,10 @@ struct ErrorBody<'a> {
 struct ErrorDetails<'a> {
     code: &'a str,
     message: Cow<'a, str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capability: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<OperationOutcome>,
 }
 
 impl IntoResponse for AppError {
@@ -129,24 +273,13 @@ impl IntoResponse for AppError {
         if status.is_server_error() {
             tracing::error!(error = %self, "request failed");
         }
-        let code = match &self {
-            Self::BadRequest(_) => "bad_request",
-            Self::Unauthorized => "unauthorized",
-            Self::Forbidden => "forbidden",
-            Self::NotFound => "not_found",
-            Self::Conflict(_) => "conflict",
-            Self::PayloadTooLarge => "payload_too_large",
-            Self::InsufficientStorage => "insufficient_storage",
-            Self::ClientClosedRequest => "client_closed_request",
-            Self::RequestTimeout => "request_timeout",
-            Self::TooManyRequests => "too_many_requests",
-            Self::ServiceUnavailable(_) => "service_unavailable",
-            Self::Internal { .. } => "internal_error",
-        };
+        let code = self.code();
         let body = ErrorBody {
             error: ErrorDetails {
                 code,
                 message: self.public_message(),
+                capability: self.capability(),
+                operation: self.operation(),
             },
         };
         (status, Json(body)).into_response()
@@ -178,6 +311,47 @@ mod tests {
     use super::AppError;
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
 
+    #[tokio::test]
+    async fn operation_results_preserve_commit_cleanup_and_retry_without_internal_details() {
+        use super::{CleanupState, CommitState};
+        for (commit, code, retry) in [
+            (
+                CommitState::Committed,
+                "operation_committed_pending",
+                "do_not_repeat",
+            ),
+            (
+                CommitState::Unknown,
+                "operation_result_unknown",
+                "verify_first",
+            ),
+        ] {
+            let error = AppError::internal("private diagnostic")
+                .with_operation(commit, CleanupState::Pending);
+            assert_eq!(error.code(), code);
+            assert!(error.blocks_retry());
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["operation"]["retry"], retry);
+            assert_eq!(body["error"]["operation"]["cleanup"], "pending");
+            assert!(!String::from_utf8_lossy(&bytes).contains("private diagnostic"));
+        }
+    }
+
+    #[test]
+    fn uncommitted_operations_keep_original_error_and_require_correction() {
+        let error = AppError::InsufficientStorage.with_operation(
+            super::CommitState::NotCommitted,
+            super::CleanupState::Pending,
+        );
+        assert_eq!(error.code(), "insufficient_storage");
+        assert_eq!(error.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert!(!error.blocks_retry());
+        assert_eq!(error.operation().unwrap().retry, "after_correction");
+    }
+
     #[test]
     fn status_conversion_preserves_service_unavailable() {
         let error = AppError::from(StatusCode::SERVICE_UNAVAILABLE);
@@ -195,6 +369,19 @@ mod tests {
         assert_eq!(json["error"]["code"], "internal_error");
         assert_eq!(json["error"]["message"], "Internal server error");
         assert!(!String::from_utf8_lossy(&body).contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn storage_capability_failure_exposes_only_the_stable_contract() {
+        let response =
+            AppError::storage_capability("conditional_create", "对象存储缺少安全条件写入能力")
+                .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "storage_capability_unavailable");
+        assert_eq!(json["error"]["capability"], "conditional_create");
+        assert_eq!(json["error"]["message"], "对象存储缺少安全条件写入能力");
     }
 
     #[test]

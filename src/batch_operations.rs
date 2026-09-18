@@ -7,7 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::{AppError, AppResult},
+    error::AppResult,
     file_access::{
         batch_destination_path, ensure_copy_target_outside_source, ensure_non_root,
         ensure_storage_action, ensure_writable, resolve_share, share_storage_path,
@@ -29,6 +29,8 @@ struct BatchItemResult {
     status: u16,
     code: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<crate::error::OperationOutcome>,
 }
 
 #[derive(Serialize)]
@@ -94,7 +96,7 @@ async fn execute(
     for path in body.paths {
         let outcome = async {
             ensure_non_root(&path)?;
-            lock_authorizer.ensure_access(&share_storage_path(&share, &path))?;
+            lock_authorizer.ensure_tree_access(&share_storage_path(&share, &path))?;
             let source = share_storage_path(&share, &path);
             match operation {
                 Operation::Delete => backend.remove(&source).await,
@@ -102,7 +104,7 @@ async fn execute(
                     let destination_path = batch_destination_path(&body.target, &path)?;
                     ensure_copy_target_outside_source(&path, &destination_path)?;
                     lock_authorizer
-                        .ensure_access(&share_storage_path(&share, &destination_path))?;
+                        .ensure_tree_access(&share_storage_path(&share, &destination_path))?;
                     let destination = share_storage_path(&share, &destination_path);
                     if matches!(operation, Operation::Move) {
                         backend.move_path(&source, &destination).await
@@ -119,12 +121,14 @@ async fn execute(
                 status: StatusCode::OK.as_u16(),
                 code: "ok",
                 message: "Completed".into(),
+                operation: None,
             },
             Err(error) => BatchItemResult {
                 path,
                 status: error.status().as_u16(),
-                code: error_code(&error),
+                code: error.code(),
                 message: error.public_message().into_owned(),
+                operation: error.operation(),
             },
         });
     }
@@ -146,21 +150,4 @@ async fn execute(
         }),
     )
         .into_response())
-}
-
-fn error_code(error: &AppError) -> &'static str {
-    match error {
-        AppError::BadRequest(_) => "bad_request",
-        AppError::Unauthorized => "unauthorized",
-        AppError::Forbidden => "forbidden",
-        AppError::NotFound => "not_found",
-        AppError::Conflict(_) => "conflict",
-        AppError::PayloadTooLarge => "payload_too_large",
-        AppError::InsufficientStorage => "insufficient_storage",
-        AppError::ClientClosedRequest => "client_closed_request",
-        AppError::RequestTimeout => "request_timeout",
-        AppError::TooManyRequests => "too_many_requests",
-        AppError::ServiceUnavailable(_) => "service_unavailable",
-        AppError::Internal { .. } => "internal_error",
-    }
 }

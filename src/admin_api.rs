@@ -14,7 +14,7 @@ use crate::{
         StorageBackendConfig, StorageInstanceConfig, StoragePermission, UserAccount,
     },
     error::{AppError, AppResult},
-    login_security::{LoginEntry, LoginEventPage, LoginPolicy},
+    login_security::{EventQuery, LoginEntry, LoginEventPage, LoginPolicy},
     s3_backend::S3Backend,
 };
 
@@ -26,6 +26,7 @@ pub use users::{create_user_account, delete_user_account, update_user_account};
 
 #[derive(Serialize)]
 pub struct AdminInfo {
+    pub domain_binding: crate::domain_binding::BindingView,
     pub username: String,
     pub has_global_web_password: bool,
     pub admin_totp_enabled: bool,
@@ -95,12 +96,28 @@ pub struct StorageInstanceView {
     pub is_default: bool,
     pub enabled: bool,
     pub allow_guest_access: bool,
+    pub allow_guest_download: bool,
     pub status: &'static str,
     pub ready: bool,
     pub backend: StorageBackendView,
     pub usage_bytes: u64,
     pub reserved_bytes: u64,
     pub capacity_accurate: bool,
+    pub capacity_reconciling: bool,
+    pub cleanup_pending_bytes: Option<u64>,
+    pub cleanup_debt_complete: Option<bool>,
+    pub staging_cleanup_pending_uploads: Option<usize>,
+    pub staging_cleanup_pending_copies: Option<usize>,
+    pub staging_cleanup_failed_attempts: Option<u64>,
+    pub s3_orphan_uploads: Option<usize>,
+    pub s3_orphan_backups: Option<usize>,
+    pub s3_recovery_pending_records: Option<usize>,
+    pub s3_recovery_oldest_pending_seconds: Option<u64>,
+    pub s3_recovery_consecutive_failures: Option<u64>,
+    pub s3_recovery_last_failure: Option<String>,
+    pub s3_recovery_last_failure_unix: Option<i64>,
+    pub s3_recovery_next_retry_unix: Option<i64>,
+    pub s3_recovery_running: Option<bool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -309,12 +326,29 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
         is_default: false,
         enabled: instance.enabled,
         allow_guest_access: instance.allow_guest_access,
+        allow_guest_download: instance.allow_guest_access
+            && instance.allow_guest_download.unwrap_or(true),
         status: "pending",
         ready: false,
         backend: StorageBackendView::from_config(&instance.backend, &state.config),
         usage_bytes: 0,
         reserved_bytes: 0,
         capacity_accurate: false,
+        capacity_reconciling: false,
+        cleanup_pending_bytes: None,
+        cleanup_debt_complete: None,
+        staging_cleanup_pending_uploads: None,
+        staging_cleanup_pending_copies: None,
+        staging_cleanup_failed_attempts: None,
+        s3_orphan_uploads: None,
+        s3_orphan_backups: None,
+        s3_recovery_pending_records: None,
+        s3_recovery_oldest_pending_seconds: None,
+        s3_recovery_consecutive_failures: None,
+        s3_recovery_last_failure: None,
+        s3_recovery_last_failure_unix: None,
+        s3_recovery_next_retry_unix: None,
+        s3_recovery_running: None,
     });
     let mut local_mounts = Vec::with_capacity(state.config.local_mounts.all().len());
     for mount in state.config.local_mounts.all() {
@@ -335,6 +369,7 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
         });
     }
     Ok(Json(AdminInfo {
+        domain_binding: crate::domain_binding::view(&state).await,
         username,
         has_global_web_password,
         admin_totp_enabled,
@@ -374,14 +409,69 @@ async fn storage_instance_view(
     default_storage_id: &str,
 ) -> StorageInstanceView {
     let backend_view = StorageBackendView::from_config(&instance.backend, &state.config);
-    let (ready, usage_bytes, reserved_bytes, capacity_accurate) =
-        match state.storage_backend(&instance.id).await {
-            Ok(backend) => {
-                let capacity = backend.capacity_status();
-                (true, capacity.used, capacity.reserved, capacity.accurate)
-            }
-            Err(_) => (false, 0, 0, false),
-        };
+    let (
+        ready,
+        usage_bytes,
+        reserved_bytes,
+        capacity_accurate,
+        capacity_reconciling,
+        cleanup_pending_bytes,
+        cleanup_debt_complete,
+        staging_cleanup_pending_uploads,
+        staging_cleanup_pending_copies,
+        staging_cleanup_failed_attempts,
+        s3_orphan_uploads,
+        s3_orphan_backups,
+        s3_recovery_pending_records,
+        s3_recovery_oldest_pending_seconds,
+        s3_recovery_consecutive_failures,
+        s3_recovery_last_failure,
+        s3_recovery_last_failure_unix,
+        s3_recovery_next_retry_unix,
+        s3_recovery_running,
+    ) = match state.storage_backend(&instance.id).await {
+        Ok(backend) => {
+            let capacity = backend.capacity_status();
+            let cleanup = backend.local_cleanup_status();
+            let staging = backend.local_staging_cleanup_status();
+            let s3_recovery = backend.s3_recovery_status();
+            (
+                true,
+                capacity.used,
+                capacity.reserved,
+                capacity.accurate,
+                capacity.reconciling,
+                cleanup.map(|status| status.pending_bytes_upper_bound),
+                cleanup.map(|status| status.pending_bytes_complete),
+                staging.map(|status| status.pending_uploads),
+                staging.map(|status| status.pending_copies),
+                staging.map(|status| status.failed_attempts),
+                s3_recovery.as_ref().map(|status| status.orphan_uploads),
+                s3_recovery.as_ref().map(|status| status.orphan_backups),
+                s3_recovery.as_ref().map(|status| status.pending_records),
+                s3_recovery
+                    .as_ref()
+                    .and_then(|status| status.oldest_pending_age_seconds),
+                s3_recovery
+                    .as_ref()
+                    .map(|status| status.consecutive_failures),
+                s3_recovery
+                    .as_ref()
+                    .and_then(|status| status.last_failure.clone()),
+                s3_recovery
+                    .as_ref()
+                    .and_then(|status| status.last_failure_unix),
+                s3_recovery
+                    .as_ref()
+                    .and_then(|status| status.next_retry_unix),
+                s3_recovery.as_ref().map(|status| status.recovering),
+            )
+        }
+        Err(_) => (
+            false, 0, 0, false, false, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None,
+        ),
+    };
     StorageInstanceView {
         is_default: instance.id == default_storage_id,
         status: if !instance.enabled {
@@ -393,6 +483,8 @@ async fn storage_instance_view(
         },
         enabled: instance.enabled,
         allow_guest_access: instance.allow_guest_access,
+        allow_guest_download: instance.allow_guest_access
+            && instance.allow_guest_download.unwrap_or(true),
         id: instance.id,
         name: instance.name,
         ready,
@@ -400,6 +492,21 @@ async fn storage_instance_view(
         usage_bytes,
         reserved_bytes,
         capacity_accurate,
+        capacity_reconciling,
+        cleanup_pending_bytes,
+        cleanup_debt_complete,
+        staging_cleanup_pending_uploads,
+        staging_cleanup_pending_copies,
+        staging_cleanup_failed_attempts,
+        s3_orphan_uploads,
+        s3_orphan_backups,
+        s3_recovery_pending_records,
+        s3_recovery_oldest_pending_seconds,
+        s3_recovery_consecutive_failures,
+        s3_recovery_last_failure,
+        s3_recovery_last_failure_unix,
+        s3_recovery_next_retry_unix,
+        s3_recovery_running,
     }
 }
 
@@ -412,7 +519,10 @@ pub async fn test_s3_storage(
 ) -> AppResult<Json<serde_json::Value>> {
     let backend = S3Backend::new(&settings, &state.config)?;
     backend.activation_probe().await?;
-    Ok(Json(serde_json::json!({ "success": true })))
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "capabilities": backend.capability_report()
+    })))
 }
 
 #[derive(Deserialize)]
@@ -438,6 +548,8 @@ pub struct StageS3StorageRequest {
     pub enabled: bool,
     #[serde(default)]
     pub allow_guest_access: bool,
+    #[serde(default)]
+    pub allow_guest_download: Option<bool>,
     #[serde(flatten)]
     pub settings: S3StorageConfig,
 }
@@ -455,7 +567,10 @@ pub async fn stage_s3_storage(
             body.name,
             body.settings,
             body.enabled,
-            body.allow_guest_access,
+            crate::config::GuestAccess::checked(
+                body.allow_guest_access,
+                body.allow_guest_download,
+            )?,
         )
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
@@ -468,6 +583,8 @@ pub struct UpdateS3StorageRequest {
     pub enabled: bool,
     #[serde(default)]
     pub allow_guest_access: bool,
+    #[serde(default)]
+    pub allow_guest_download: Option<bool>,
     #[serde(flatten)]
     pub settings: S3StorageConfig,
 }
@@ -483,7 +600,10 @@ pub async fn update_s3_storage(
             body.name,
             body.settings,
             body.enabled,
-            body.allow_guest_access,
+            crate::config::GuestAccess::checked(
+                body.allow_guest_access,
+                body.allow_guest_download,
+            )?,
         )
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
@@ -500,6 +620,8 @@ pub struct UpdateLocalStorageRequest {
     pub enabled: bool,
     #[serde(default)]
     pub allow_guest_access: bool,
+    #[serde(default)]
+    pub allow_guest_download: Option<bool>,
 }
 
 pub async fn update_local_storage(
@@ -513,7 +635,10 @@ pub async fn update_local_storage(
             settings.path,
             settings.capacity_limit_bytes,
             settings.enabled,
-            settings.allow_guest_access,
+            crate::config::GuestAccess::checked(
+                settings.allow_guest_access,
+                settings.allow_guest_download,
+            )?,
         )
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
@@ -529,6 +654,8 @@ pub struct AddLocalStorageRequest {
     pub enabled: bool,
     #[serde(default)]
     pub allow_guest_access: bool,
+    #[serde(default)]
+    pub allow_guest_download: Option<bool>,
 }
 
 pub async fn add_local_storage(
@@ -541,7 +668,10 @@ pub async fn add_local_storage(
             settings.name,
             settings.capacity_limit_bytes,
             settings.enabled,
-            settings.allow_guest_access,
+            crate::config::GuestAccess::checked(
+                settings.allow_guest_access,
+                settings.allow_guest_download,
+            )?,
         )
         .await?;
     Ok((
@@ -554,6 +684,8 @@ pub async fn add_local_storage(
 pub struct UpdateStorageAccessRequest {
     pub enabled: bool,
     pub allow_guest_access: bool,
+    #[serde(default)]
+    pub allow_guest_download: Option<bool>,
 }
 
 pub async fn update_storage_access(
@@ -562,7 +694,14 @@ pub async fn update_storage_access(
     Json(body): Json<UpdateStorageAccessRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     state
-        .update_storage_access(&storage_id, body.enabled, body.allow_guest_access)
+        .update_storage_access(
+            &storage_id,
+            body.enabled,
+            crate::config::GuestAccess::checked(
+                body.allow_guest_access,
+                body.allow_guest_download,
+            )?,
+        )
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
@@ -725,6 +864,8 @@ pub struct LoginEventQuery {
     pub since: Option<i64>,
     pub cursor: Option<u64>,
     pub limit: Option<usize>,
+    pub page: Option<usize>,
+    pub search: Option<String>,
 }
 
 pub async fn login_events(
@@ -733,7 +874,7 @@ pub async fn login_events(
 ) -> AppResult<Json<LoginEventPage>> {
     let now = chrono::Utc::now().timestamp();
     let earliest = now - 30 * 24 * 60 * 60;
-    let since = query.since.unwrap_or(now - 7 * 24 * 60 * 60);
+    let since = query.since.unwrap_or(earliest);
     if since < earliest || since > now {
         return Err(AppError::BadRequest(
             "日志查询时间必须在最近 30 天内".into(),
@@ -748,19 +889,37 @@ pub async fn login_events(
     if query.ip.as_deref().is_some_and(|ip| ip.len() > 64) {
         return Err(AppError::BadRequest("IP 筛选条件过长".into()));
     }
+    if query
+        .search
+        .as_deref()
+        .is_some_and(|search| search.len() > 256)
+        || query.page == Some(0)
+    {
+        return Err(AppError::BadRequest("日志查询参数无效".into()));
+    }
     Ok(Json(
         state
             .login_security
-            .query_events(
-                query.success,
-                query.entry,
-                query.ip.as_deref(),
+            .query_events(EventQuery {
+                success: query.success,
+                entry: query.entry,
+                search: query.search.as_deref().or(query.ip.as_deref()),
                 since,
-                query.cursor,
+                cursor: query.cursor,
+                page: query.page.unwrap_or(1),
                 limit,
-            )
+            })
             .await,
     ))
+}
+
+pub async fn clear_login_events(State(state): State<AppState>) -> AppResult<StatusCode> {
+    state
+        .login_security
+        .clear_events()
+        .await
+        .map_err(|error| AppError::with_source("无法清空登录日志", error))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn block_login(
@@ -1040,21 +1199,28 @@ pub async fn update_lock(
     let _auth_guard = state.auth_transitions.lock().await;
     let result = state
         .update_config(move |config| {
-            if let Some(path) = body.path.as_ref() {
-                let normalized = path.trim_matches('/');
-                if config
-                    .folder_locks
-                    .iter()
-                    .any(|lock| lock.id != id && lock.path == normalized)
-                {
-                    return Err(AppError::Conflict("Folder already has a lock".into()));
-                }
-            }
-            let lock = config
+            let lock_index = config
                 .folder_locks
-                .iter_mut()
-                .find(|lock| lock.id == id)
+                .iter()
+                .position(|lock| lock.id == id)
                 .ok_or(AppError::NotFound)?;
+            let target_storage_id = body
+                .storage_id
+                .as_deref()
+                .unwrap_or(&config.folder_locks[lock_index].storage_id);
+            let target_path = body
+                .path
+                .as_deref()
+                .map(|path| path.trim_matches('/'))
+                .unwrap_or(&config.folder_locks[lock_index].path);
+            if config.folder_locks.iter().enumerate().any(|(index, lock)| {
+                index != lock_index
+                    && lock.storage_id == target_storage_id
+                    && lock.path == target_path
+            }) {
+                return Err(AppError::Conflict("Folder already has a lock".into()));
+            }
+            let lock = &mut config.folder_locks[lock_index];
             if let Some(storage_id) = body.storage_id {
                 lock.storage_id = storage_id;
             }

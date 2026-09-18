@@ -9,7 +9,8 @@ use crate::{
         AccessTokenStore, PasswordService, SessionStore, SharedAccessTokenStore, SharedSessionStore,
     },
     config::{
-        save_config, Config, ConfigFile, SharedConfig, StorageBackendConfig, StorageInstanceConfig,
+        save_config, save_config_refresh_backup, Config, ConfigFile, SharedConfig,
+        StorageBackendConfig, StorageInstanceConfig,
     },
     error::{AppError, AppResult},
     login_security::LoginSecurity,
@@ -31,11 +32,14 @@ pub struct AppState {
     pub archive_tickets: ArchiveTicketStore,
     pub upload_batches: UploadBatchStore,
     pub(crate) auth_transitions: Arc<Mutex<()>>,
+    pub(crate) login_attempts: Arc<Mutex<()>>,
     pub admin_totp_replay: crate::totp::TotpReplayStore,
     pub webdav_gate: Arc<Semaphore>,
+    pub(crate) directory_size_gate: Arc<Semaphore>,
     pub login_security: LoginSecurity,
     pub upload_limiter: BandwidthLimiter,
     pub download_limiter: BandwidthLimiter,
+    pub traffic: crate::traffic::TrafficStore,
     config_updates: Arc<Mutex<()>>,
     local_io_gate: Arc<Semaphore>,
 }
@@ -100,7 +104,10 @@ impl AppState {
             AppError::with_source("failed to load persistent login security state", error)
         })?;
         let upload_batch_ttl = Duration::from_secs(config.upload_timeout_secs);
+        let traffic =
+            crate::traffic::TrafficStore::load(&config.config_path, config_file.clone()).await?;
         Ok(Self {
+            traffic,
             config,
             config_file,
             sessions: Arc::new(SessionStore::new()),
@@ -111,8 +118,10 @@ impl AppState {
             archive_tickets: ArchiveTicketStore::new(),
             upload_batches: UploadBatchStore::new(upload_batch_ttl),
             auth_transitions: Arc::new(Mutex::new(())),
+            login_attempts: Arc::new(Mutex::new(())),
             admin_totp_replay: crate::totp::TotpReplayStore::default(),
             webdav_gate: Arc::new(Semaphore::new(8)),
+            directory_size_gate: Arc::new(Semaphore::new(2)),
             login_security,
             upload_limiter: BandwidthLimiter::new(persisted.upload_rate_bytes_per_sec),
             download_limiter: BandwidthLimiter::new(persisted.download_rate_bytes_per_sec),
@@ -122,6 +131,16 @@ impl AppState {
     }
 
     pub async fn storage_backend(&self, storage_id: &str) -> AppResult<StorageBackend> {
+        let enabled = self
+            .config_file
+            .read()
+            .await
+            .storage_instances
+            .iter()
+            .any(|instance| instance.id == storage_id && instance.enabled);
+        if !enabled {
+            return Err(AppError::NotFound);
+        }
         self.backends.get(storage_id).await
     }
 
@@ -188,8 +207,12 @@ impl AppState {
         name: String,
         capacity_limit_bytes: Option<u64>,
         enabled: bool,
-        allow_guest_access: bool,
+        allow_guest_access: impl Into<crate::config::GuestAccess>,
     ) -> AppResult<String> {
+        let crate::config::GuestAccess {
+            access: allow_guest_access,
+            download: allow_guest_download,
+        } = allow_guest_access.into();
         let mount_id = self
             .config
             .local_mounts
@@ -217,6 +240,7 @@ impl AppState {
             name: name.trim().to_string(),
             enabled,
             allow_guest_access,
+            allow_guest_download,
             backend: StorageBackendConfig::Local(crate::config::LocalStorageConfig {
                 mount_id,
                 capacity_limit_bytes,
@@ -257,8 +281,9 @@ impl AppState {
     pub async fn update_config<T, F>(&self, update: F) -> AppResult<T>
     where
         F: FnOnce(&mut ConfigFile) -> AppResult<T>,
+        T: Send + 'static,
     {
-        let _update_guard = self.config_updates.lock().await;
+        let update_guard = self.config_updates.clone().lock_owned().await;
         let mut next = self.config_file.read().await.clone();
         let result = update(&mut next)?;
         next.validate()?;
@@ -267,27 +292,44 @@ impl AppState {
                 "Persisted upload limit exceeds the deployment MAX_UPLOAD_BYTES envelope".into(),
             ));
         }
-        save_config(&self.config.config_path, &next)
-            .await
-            .map_err(|error| AppError::with_source("failed to persist configuration", error))?;
-        *self.config_file.write().await = next.clone();
-        self.backends
-            .set_local_max_upload_bytes(next.max_upload_bytes)
-            .await;
-        self.upload_limiter.set_rate(next.upload_rate_bytes_per_sec);
-        self.download_limiter
-            .set_rate(next.download_rate_bytes_per_sec);
-        if let Err(error) = self
-            .login_security
-            .configure_retention(
-                next.security_log_retention_days,
-                next.security_log_max_entries,
+        let state = self.clone();
+        // The writer retains serialization and publishes memory even when its
+        // caller stops waiting (also used outside administrative HTTP routes).
+        tokio::spawn(async move {
+            let _update_guard = update_guard;
+            save_config(&state.config.config_path, &next)
+                .await
+                .map_err(|error| AppError::with_source("failed to persist configuration", error))?;
+            *state.config_file.write().await = next.clone();
+            state
+                .backends
+                .set_local_max_upload_bytes(next.max_upload_bytes)
+                .await;
+            state
+                .upload_limiter
+                .set_rate(next.upload_rate_bytes_per_sec);
+            state
+                .download_limiter
+                .set_rate(next.download_rate_bytes_per_sec);
+            if let Err(error) = state
+                .login_security
+                .configure_retention(
+                    next.security_log_retention_days,
+                    next.security_log_max_entries,
+                )
+                .await
+            {
+                tracing::warn!(%error, "security event log compaction will be retried later");
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(|error| {
+            AppError::with_source(
+                "configuration update task failed; inspect current state before retrying",
+                error,
             )
-            .await
-        {
-            tracing::warn!(%error, "security event log compaction will be retried later");
-        }
-        Ok(result)
+        })?
     }
 
     /// Validate all required S3 capabilities before persisting credentials as
@@ -297,8 +339,12 @@ impl AppState {
         name: String,
         settings: crate::config::S3StorageConfig,
         enabled: bool,
-        allow_guest_access: bool,
+        allow_guest_access: impl Into<crate::config::GuestAccess>,
     ) -> AppResult<()> {
+        let crate::config::GuestAccess {
+            access: allow_guest_access,
+            download: allow_guest_download,
+        } = allow_guest_access.into();
         let backend_config = StorageBackendConfig::S3(settings.clone());
         self.config.allows_storage_backend(&backend_config)?;
         if enabled {
@@ -312,6 +358,7 @@ impl AppState {
             name,
             enabled,
             allow_guest_access,
+            allow_guest_download,
             backend: backend_config,
         });
         self.persist_storage_selection(&next).await
@@ -323,8 +370,12 @@ impl AppState {
         name: String,
         mut settings: crate::config::S3StorageConfig,
         enabled: bool,
-        allow_guest_access: bool,
+        allow_guest_access: impl Into<crate::config::GuestAccess>,
     ) -> AppResult<()> {
+        let crate::config::GuestAccess {
+            access: allow_guest_access,
+            download: allow_guest_download,
+        } = allow_guest_access.into();
         let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
         if !enabled && next.default_storage_id == storage_id {
@@ -366,12 +417,13 @@ impl AppState {
         instance.backend = backend_config;
         instance.enabled = enabled;
         instance.allow_guest_access = allow_guest_access;
+        instance.allow_guest_download = if allow_guest_access {
+            allow_guest_download.or(instance.allow_guest_download)
+        } else {
+            Some(false)
+        };
         next.validate()?;
-        save_config(&self.config.config_path, &next)
-            .await
-            .map_err(|error| {
-                AppError::with_source("failed to persist S3 storage settings", error)
-            })?;
+        self.save_storage_selection(&next).await?;
         *self.config_file.write().await = next;
         if let Some(prepared) = prepared {
             self.backends
@@ -391,8 +443,12 @@ impl AppState {
         path: String,
         capacity_limit_bytes: Option<u64>,
         enabled: bool,
-        allow_guest_access: bool,
+        allow_guest_access: impl Into<crate::config::GuestAccess>,
     ) -> AppResult<()> {
+        let crate::config::GuestAccess {
+            access: allow_guest_access,
+            download: allow_guest_download,
+        } = allow_guest_access.into();
         let mount_id = self
             .config
             .local_mounts
@@ -453,6 +509,11 @@ impl AppState {
         next.storage_instances[position].backend = backend_config;
         next.storage_instances[position].enabled = enabled;
         next.storage_instances[position].allow_guest_access = allow_guest_access;
+        next.storage_instances[position].allow_guest_download = if allow_guest_access {
+            allow_guest_download.or(next.storage_instances[position].allow_guest_download)
+        } else {
+            Some(false)
+        };
         next.validate()?;
         save_config(&self.config.config_path, &next)
             .await
@@ -525,8 +586,12 @@ impl AppState {
         &self,
         storage_id: &str,
         enabled: bool,
-        allow_guest_access: bool,
+        allow_guest_access: impl Into<crate::config::GuestAccess>,
     ) -> AppResult<()> {
+        let crate::config::GuestAccess {
+            access: allow_guest_access,
+            download: allow_guest_download,
+        } = allow_guest_access.into();
         let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
         let instance = next
@@ -536,6 +601,11 @@ impl AppState {
             .ok_or(AppError::NotFound)?;
         instance.enabled = enabled;
         instance.allow_guest_access = allow_guest_access;
+        instance.allow_guest_download = if allow_guest_access {
+            allow_guest_download.or(instance.allow_guest_download)
+        } else {
+            Some(false)
+        };
         let backend_config = instance.backend.clone();
         next.validate()?;
         save_config(&self.config.config_path, &next)
@@ -640,16 +710,16 @@ impl AppState {
     /// the current storage credential set. Replacing or discarding a pending
     /// backend must not leave its superseded secret in `config.json.bak`.
     async fn persist_storage_selection(&self, next: &ConfigFile) -> AppResult<()> {
+        self.save_storage_selection(next).await?;
+        *self.config_file.write().await = next.clone();
+        Ok(())
+    }
+
+    async fn save_storage_selection(&self, next: &ConfigFile) -> AppResult<()> {
         next.validate()?;
-        save_config(&self.config.config_path, next)
+        save_config_refresh_backup(&self.config.config_path, next)
             .await
             .map_err(|error| AppError::with_source("failed to persist storage settings", error))?;
-        save_config(&self.config.config_path, next)
-            .await
-            .map_err(|error| {
-                AppError::with_source("failed to refresh storage configuration backup", error)
-            })?;
-        *self.config_file.write().await = next.clone();
         Ok(())
     }
 }
@@ -719,13 +789,69 @@ fn capacity_ledger_path(config: &Config, storage_id: &str) -> PathBuf {
 mod tests {
     use super::AppState;
     use crate::config::{
-        Config, ConfigFile, LocalStorageConfig, S3AddressingStyle, S3Provider, S3StorageConfig,
-        Share, StorageBackendConfig, StorageInstanceConfig,
+        load_config, Config, ConfigFile, LocalStorageConfig, S3AddressingStyle, S3Provider,
+        S3StorageConfig, Share, StorageBackendConfig, StorageInstanceConfig,
     };
     use crate::storage_catalog::{DeploymentLocalMount, LocalMountCatalog};
     use axum::body::Body;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn accepted_config_update_finishes_after_the_waiter_is_cancelled() {
+        let directory = crate::test_support::TestDirectory::new("config-cancellation");
+        let state = crate::test_support::app_state(&directory, ConfigFile::default()).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        // Readers do not block candidate creation, but hold memory publication
+        // so cancellation happens while the owned update is still active.
+        let reader = state.config_file.read().await;
+        let waiter = tokio::spawn({
+            let state = state.clone();
+            let entered = entered.clone();
+            async move {
+                state
+                    .update_config(move |config| {
+                        config.admin_username = "updated-admin".into();
+                        entered.notify_one();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        entered.notified().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(state.config_updates.try_lock().is_err());
+        drop(reader);
+        let _completed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.config_updates.lock(),
+        )
+        .await
+        .unwrap();
+        let persisted = load_config(&state.config.config_path).await.unwrap();
+        assert_eq!(persisted.admin_username, "updated-admin");
+        assert_eq!(
+            state.config_file.read().await.admin_username,
+            persisted.admin_username
+        );
+    }
+
+    #[tokio::test]
+    async fn published_storage_disable_rejects_new_work_but_keeps_in_flight_backend_alive() {
+        let directory = crate::test_support::TestDirectory::new("storage-disable");
+        let state = crate::test_support::app_state(&directory, ConfigFile::default()).await;
+        let in_flight_backend = state.storage_backend("primary").await.unwrap();
+
+        state.config_file.write().await.storage_instances[0].enabled = false;
+        assert!(state.backends.is_ready("primary").await);
+        let error = match state.storage_backend("primary").await {
+            Ok(_) => panic!("a published disabled storage must reject new work"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status(), axum::http::StatusCode::NOT_FOUND);
+        assert!(in_flight_backend.metadata("").await.unwrap().is_dir);
+    }
 
     #[tokio::test]
     async fn declared_local_mounts_run_as_independent_storage_backends() {
@@ -743,6 +869,7 @@ mod tests {
             name: "Archive".into(),
             enabled: true,
             allow_guest_access: false,
+            allow_guest_download: None,
             backend: StorageBackendConfig::Local(LocalStorageConfig {
                 mount_id: "archive-disk".into(),
                 capacity_limit_bytes: None,
@@ -780,6 +907,7 @@ mod tests {
                 trusted_proxy_ips: Default::default(),
                 allowed_hosts: Default::default(),
                 s3_allowed_endpoints: Default::default(),
+                transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(persisted)),
         )
@@ -850,6 +978,7 @@ mod tests {
                 trusted_proxy_ips: Default::default(),
                 allowed_hosts: Default::default(),
                 s3_allowed_endpoints: Default::default(),
+                transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(persisted)),
         )
@@ -963,6 +1092,7 @@ mod tests {
                 trusted_proxy_ips: Default::default(),
                 allowed_hosts: Default::default(),
                 s3_allowed_endpoints: Default::default(),
+                transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(ConfigFile::default())),
         )
@@ -974,6 +1104,7 @@ mod tests {
             name: "Pending test".into(),
             enabled: true,
             allow_guest_access: false,
+            allow_guest_download: None,
             backend: StorageBackendConfig::S3(S3StorageConfig {
                 provider: S3Provider::AlibabaOss,
                 endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
@@ -996,6 +1127,62 @@ mod tests {
         for content in [&primary, &backup] {
             assert!(!content.contains("credential-to-remove"));
             assert!(!content.contains("secret-to-remove"));
+        }
+
+        let mut configured = state.config_file.read().await.clone();
+        configured.storage_instances.push(StorageInstanceConfig {
+            id: "credential-update".into(),
+            name: "Credential update".into(),
+            enabled: false,
+            allow_guest_access: false,
+            allow_guest_download: None,
+            backend: StorageBackendConfig::S3(S3StorageConfig {
+                provider: S3Provider::AlibabaOss,
+                endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
+                bucket: "ycloud-credential-update".into(),
+                region: "cn-hangzhou".into(),
+                prefix: "files/".into(),
+                addressing_style: S3AddressingStyle::VirtualHosted,
+                access_key_id: "old-access-key".into(),
+                secret_access_key: "old-secret-key".into(),
+                capacity_limit_bytes: None,
+            }),
+        });
+        state.persist_storage_selection(&configured).await.unwrap();
+        state
+            .update_s3_storage(
+                "credential-update",
+                "Credential update".into(),
+                S3StorageConfig {
+                    provider: S3Provider::AlibabaOss,
+                    endpoint: "https://oss-cn-hangzhou.aliyuncs.com".into(),
+                    bucket: "ycloud-credential-update".into(),
+                    region: "cn-hangzhou".into(),
+                    prefix: "files/".into(),
+                    addressing_style: S3AddressingStyle::VirtualHosted,
+                    access_key_id: "new-access-key".into(),
+                    secret_access_key: "new-secret-key".into(),
+                    capacity_limit_bytes: None,
+                },
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+
+        for persisted_path in [&config_path, &config_path.with_extension("json.bak")] {
+            let persisted = load_config(persisted_path).await.unwrap();
+            let StorageBackendConfig::S3(settings) = &persisted
+                .storage_instances
+                .iter()
+                .find(|storage| storage.id == "credential-update")
+                .unwrap()
+                .backend
+            else {
+                panic!("expected S3 storage");
+            };
+            assert_eq!(settings.access_key_id, "new-access-key");
+            assert_eq!(settings.secret_access_key, "new-secret-key");
         }
 
         let original_limit = state.config_file.read().await.max_upload_bytes;
@@ -1047,6 +1234,7 @@ mod tests {
                 trusted_proxy_ips: Default::default(),
                 allowed_hosts: Default::default(),
                 s3_allowed_endpoints: Default::default(),
+                transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(ConfigFile::default())),
         )
@@ -1062,6 +1250,7 @@ mod tests {
             name: "Archive".into(),
             enabled: true,
             allow_guest_access: false,
+            allow_guest_download: None,
             backend: StorageBackendConfig::S3(S3StorageConfig {
                 provider: S3Provider::TencentCos,
                 endpoint: "https://cos.ap-chengdu.myqcloud.com".into(),

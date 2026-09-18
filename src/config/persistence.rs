@@ -6,6 +6,7 @@ use rand_core::{OsRng, RngCore};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 use uuid::Uuid;
 
+use super::commit::{self, ConfigCommit};
 use super::migration::migrate_config;
 use super::secret_store::SecretStore;
 use super::{
@@ -26,47 +27,35 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
     }
     let backup_path = config_backup_path(path);
     if tokio::fs::try_exists(path).await? || tokio::fs::try_exists(&backup_path).await? {
-        let content = match tokio::fs::read_to_string(path).await {
-            Ok(content) if serde_json::from_str::<serde_json::Value>(&content).is_ok() => content,
+        let (content, recovering) = match tokio::fs::read_to_string(path).await {
+            Ok(content) if serde_json::from_str::<serde_json::Value>(&content).is_ok() => {
+                (content, false)
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error)
+                    .context("Failed to read primary configuration; refusing automatic rollback");
+            }
             Ok(_) | Err(_) => {
                 let backup = tokio::fs::read_to_string(&backup_path)
                     .await
                     .context("Primary config is unavailable and backup recovery failed")?;
-                serde_json::from_str::<serde_json::Value>(&backup)
-                    .context("Configuration backup is invalid")?;
-                tracing::warn!(
-                    backup = %backup_path.display(),
-                    "recovering configuration from last known good backup"
-                );
-                tokio::fs::copy(&backup_path, path)
-                    .await
-                    .context("Failed to restore configuration backup")?;
-                secure_file_permissions(path).await?;
-                backup
+                (backup, true)
             }
         };
-
-        let mut raw: serde_json::Value =
-            serde_json::from_str(&content).context("Failed to parse config.json")?;
-        let migrated = migrate_config(&mut raw)?;
-        let s3_credentials_migrated = decrypt_s3_credentials(path, &mut raw).await?;
-        let totp_secret_migrated = decrypt_admin_totp_secret(path, &mut raw).await?;
-        let credentials_migrated = s3_credentials_migrated || totp_secret_migrated;
-        let config: ConfigFile =
-            serde_json::from_value(raw).context("Failed to parse config.json")?;
-        config
-            .validate()
-            .map_err(anyhow::Error::new)
-            .context("Invalid config.json")?;
-        if migrated || credentials_migrated {
-            save_config(path, &config)
+        // Primary semantic/decryption failures never silently downgrade to an
+        // older security policy. A fallback is fully validated before writing.
+        let candidate = decode_candidate(path, &content).await?;
+        let config = candidate.config;
+        if candidate.migrated {
+            preserve_migration_backup(path, &content).await?;
+        }
+        if recovering || candidate.migrated || candidate.credentials_migrated {
+            persist_candidate(path, &config, !recovering, candidate.credentials_migrated)
                 .await
-                .context("Failed to persist migrated configuration")?;
-            if credentials_migrated {
-                save_config(path, &config)
-                    .await
-                    .context("Failed to replace plaintext configuration backup")?;
-            }
+                .context("Failed to publish validated configuration")?;
+        }
+        if recovering {
+            tracing::warn!("restored fully validated configuration backup");
         }
         warn_if_initial_credentials_remain(path).await?;
         Ok(config)
@@ -74,7 +63,9 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
         let credentials_path = initial_credentials_path(path);
         let credentials = load_or_create_initial_credentials(&credentials_path).await?;
         let config = ConfigFile {
+            traffic: crate::traffic::TrafficSettings::default(),
             schema_version: CONFIG_SCHEMA_VERSION,
+            domain_binding: None,
             storage_instances: vec![StorageInstanceConfig::primary(
                 StorageBackendConfig::default(),
             )],
@@ -118,6 +109,60 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
         );
         Ok(config)
     }
+}
+
+struct ConfigCandidate {
+    config: ConfigFile,
+    migrated: bool,
+    credentials_migrated: bool,
+}
+
+async fn decode_candidate(path: &Path, content: &str) -> anyhow::Result<ConfigCandidate> {
+    let mut raw: serde_json::Value =
+        serde_json::from_str(content).context("Failed to parse configuration candidate")?;
+    let migrated = migrate_config(&mut raw)?;
+    let s3_changed = decrypt_s3_credentials(path, &mut raw).await?;
+    let totp_changed = decrypt_admin_totp_secret(path, &mut raw).await?;
+    let config: ConfigFile =
+        serde_json::from_value(raw).context("Failed to decode configuration candidate")?;
+    config
+        .validate()
+        .map_err(anyhow::Error::new)
+        .context("Invalid configuration candidate; original files were not replaced")?;
+    Ok(ConfigCandidate {
+        config,
+        migrated,
+        credentials_migrated: s3_changed || totp_changed,
+    })
+}
+
+const MIGRATION_BACKUP_CONTEXT: &str = "ycloud-config:pre-migration:v1";
+
+async fn preserve_migration_backup(path: &Path, content: &str) -> anyhow::Result<()> {
+    // One bounded recovery slot, sealed as a whole so even legacy plaintext
+    // secrets are not copied into an extra plaintext recovery file.
+    let store = SecretStore::for_write(path).await?;
+    let sealed = store.seal(MIGRATION_BACKUP_CONTEXT, content)?;
+    let outcome = publish_bytes(
+        &path.with_extension("json.pre-migration"),
+        sealed.into_bytes(),
+        false,
+        false,
+    )
+    .await?;
+    if outcome.durability != super::ConfigDurability::Confirmed {
+        anyhow::bail!("Migration recovery snapshot durability was not confirmed; configuration was not migrated");
+    }
+    Ok(())
+}
+
+/// Read-only recovery export. Never restores old security settings implicitly.
+/// The original configuration key is required; callers must protect the output.
+pub async fn read_migration_backup(path: &Path) -> anyhow::Result<String> {
+    let sealed = tokio::fs::read_to_string(path.with_extension("json.pre-migration")).await?;
+    SecretStore::for_read(path)
+        .await?
+        .open(MIGRATION_BACKUP_CONTEXT, &sealed)
 }
 
 async fn warn_if_initial_credentials_remain(config_path: &Path) -> anyhow::Result<()> {
@@ -258,7 +303,24 @@ pub async fn remove_initial_credentials_if_rotated(
     }
 }
 
-pub async fn save_config(path: &Path, config: &ConfigFile) -> anyhow::Result<()> {
+pub async fn save_config(path: &Path, config: &ConfigFile) -> anyhow::Result<ConfigCommit> {
+    persist_candidate(path, config, true, false).await
+}
+
+/// Save once, then refresh the backup without creating a second logical commit.
+pub async fn save_config_refresh_backup(
+    path: &Path,
+    config: &ConfigFile,
+) -> anyhow::Result<ConfigCommit> {
+    persist_candidate(path, config, true, true).await
+}
+
+async fn persist_candidate(
+    path: &Path,
+    config: &ConfigFile,
+    rotate_previous: bool,
+    refresh_backup: bool,
+) -> anyhow::Result<ConfigCommit> {
     config
         .validate()
         .map_err(anyhow::Error::new)
@@ -266,60 +328,29 @@ pub async fn save_config(path: &Path, config: &ConfigFile) -> anyhow::Result<()>
     let mut raw = serde_json::to_value(config)?;
     encrypt_s3_credentials(path, &mut raw).await?;
     encrypt_admin_totp_secret(path, &mut raw).await?;
-    let json = serde_json::to_string_pretty(&raw)?;
-    let temporary = path.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
-    let backup = config_backup_path(path);
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(&temporary)
-        .await
-        .context("Failed to create temporary configuration")?;
-    let prepare_result = async {
-        file.write_all(json.as_bytes())
-            .await
-            .context("Failed to write temporary configuration")?;
-        file.sync_all()
-            .await
-            .context("Failed to flush temporary configuration")
-    }
-    .await;
-    drop(file);
-    if let Err(error) = prepare_result {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(error);
-    }
+    publish_bytes(
+        path,
+        serde_json::to_vec_pretty(&raw)?,
+        rotate_previous,
+        refresh_backup,
+    )
+    .await
+}
 
-    let commit_result: anyhow::Result<()> = async {
-        if tokio::fs::try_exists(path).await? {
-            if tokio::fs::try_exists(&backup).await? {
-                tokio::fs::remove_file(&backup).await?;
-            }
-            tokio::fs::rename(path, &backup)
-                .await
-                .context("Failed to rotate configuration backup")?;
-            secure_file_permissions(&backup).await?;
-        }
-        tokio::fs::rename(&temporary, path)
-            .await
-            .context("Failed to commit configuration")?;
-        secure_file_permissions(path).await?;
-        sync_parent_directory(path.parent().unwrap_or_else(|| Path::new("."))).await
-    }
-    .await;
-    if let Err(error) = commit_result {
-        if !tokio::fs::try_exists(path).await.unwrap_or(false)
-            && tokio::fs::try_exists(&backup).await.unwrap_or(false)
-        {
-            let _ = tokio::fs::rename(&backup, path).await;
-            let _ = sync_parent_directory(path.parent().unwrap_or_else(|| Path::new("."))).await;
-        }
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(error);
-    }
-    Ok(())
+async fn publish_bytes(
+    path: &Path,
+    bytes: Vec<u8>,
+    rotate_previous: bool,
+    refresh_backup: bool,
+) -> anyhow::Result<ConfigCommit> {
+    let path = path.to_owned();
+    // One blocking job owns every filesystem publication step. Dropping an
+    // HTTP future cannot interrupt rotation halfway through a rename sequence.
+    tokio::task::spawn_blocking(move || {
+        commit::publish(&path, &bytes, rotate_previous, refresh_backup, |_| Ok(()))
+    })
+    .await
+    .context("Configuration publication worker failed; commit outcome is unknown")?
 }
 
 const LEGACY_ENCRYPTED_CREDENTIAL_PREFIX: &str = "enc:v1:";
@@ -362,7 +393,6 @@ async fn decrypt_admin_totp_secret(
     }
     // A plaintext value can only come from an older/manual configuration.
     // Re-saving immediately moves it into the shared encrypted secret layer.
-    SecretStore::for_write(path).await?;
     Ok(true)
 }
 
@@ -413,14 +443,11 @@ async fn decrypt_s3_credentials(path: &Path, raw: &mut serde_json::Value) -> any
         }
         Ok(())
     })?;
-    if !has_encrypted && !has_plaintext_secret {
-        return Ok(false);
+    if !has_encrypted {
+        // Validation of a plaintext candidate must not create a master key.
+        return Ok(has_plaintext_secret);
     }
-    let store = if has_encrypted {
-        SecretStore::for_read(path).await?
-    } else {
-        SecretStore::for_write(path).await?
-    };
+    let store = SecretStore::for_read(path).await?;
     decrypt_s3_credentials_with_store(&store, raw, has_plaintext_secret)
 }
 
@@ -574,6 +601,88 @@ pub(super) fn config_backup_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod credential_tests {
     use super::*;
+    use crate::test_support::TestDirectory;
+
+    #[tokio::test]
+    async fn migration_keeps_an_encrypted_exact_recovery_copy() {
+        let directory = TestDirectory::new("migration-recovery");
+        let path = directory.path().join("config.json");
+        let mut raw = serde_json::to_value(ConfigFile::default()).unwrap();
+        raw["schema_version"] = serde_json::json!(11);
+        let original = serde_json::to_string_pretty(&raw).unwrap();
+        tokio::fs::write(&path, &original).await.unwrap();
+        let migrated = load_config(&path).await.unwrap();
+        assert_eq!(migrated.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(read_migration_backup(&path).await.unwrap(), original);
+        let protected = tokio::fs::read_to_string(path.with_extension("json.pre-migration"))
+            .await
+            .unwrap();
+        assert!(protected.starts_with("enc:v2:"));
+        assert!(!protected.contains("admin_password_hash"));
+        let protected_before = protected.clone();
+        load_config(&path).await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(path.with_extension("json.pre-migration"))
+                .await
+                .unwrap(),
+            protected_before
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_primary_restores_only_a_fully_validated_backup() {
+        let directory = TestDirectory::new("validated-recovery");
+        let path = directory.path().join("config.json");
+        let config = ConfigFile::default();
+        save_config_refresh_backup(&path, &config).await.unwrap();
+        let backup_before = tokio::fs::read(config_backup_path(&path)).await.unwrap();
+        tokio::fs::remove_file(&path).await.unwrap();
+        let loaded = load_config(&path).await.unwrap();
+        assert_eq!(loaded.admin_username, config.admin_username);
+        assert_eq!(
+            tokio::fs::read(config_backup_path(&path)).await.unwrap(),
+            backup_before
+        );
+        assert!(path.is_file());
+    }
+
+    #[tokio::test]
+    async fn semantically_invalid_backup_is_not_published() {
+        let directory = TestDirectory::new("recovery-validation");
+        let path = directory.path().join("config.json");
+        let mut candidate = serde_json::to_value(ConfigFile::default()).unwrap();
+        candidate["admin_username"] = serde_json::json!("");
+        let original = serde_json::to_vec(&candidate).unwrap();
+        tokio::fs::write(config_backup_path(&path), &original)
+            .await
+            .unwrap();
+        assert!(load_config(&path).await.is_err());
+        assert!(!path.exists());
+        assert_eq!(
+            tokio::fs::read(config_backup_path(&path)).await.unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_validation_failure_does_not_roll_back_security_settings() {
+        let directory = TestDirectory::new("primary-validation");
+        let path = directory.path().join("config.json");
+        save_config_refresh_backup(&path, &ConfigFile::default())
+            .await
+            .unwrap();
+        let backup = tokio::fs::read(config_backup_path(&path)).await.unwrap();
+        let mut candidate = serde_json::to_value(ConfigFile::default()).unwrap();
+        candidate["admin_username"] = serde_json::json!("");
+        let original = serde_json::to_vec(&candidate).unwrap();
+        tokio::fs::write(&path, &original).await.unwrap();
+        assert!(load_config(&path).await.is_err());
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+        assert_eq!(
+            tokio::fs::read(config_backup_path(&path)).await.unwrap(),
+            backup
+        );
+    }
 
     #[test]
     fn s3_credentials_are_encrypted_and_round_trip() {

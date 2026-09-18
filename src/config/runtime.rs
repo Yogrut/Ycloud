@@ -13,7 +13,7 @@ use super::{
 };
 
 impl Config {
-    pub fn from_env() -> anyhow::Result<Self> {
+    pub(crate) fn from_env() -> anyhow::Result<Self> {
         let bind_address = env_parse("BIND_ADDRESS", IpAddr::from([127, 0, 0, 1]))?;
         let port = env_parse("PORT", 18_473_u16)?;
         let storage_path =
@@ -82,7 +82,18 @@ impl Config {
             trusted_proxy_ips,
             allowed_hosts,
             s3_allowed_endpoints,
+            // Bootstrap replaces this only after the persisted configuration
+            // has been validated. This avoids creating a replacement master
+            // key before an existing encrypted configuration is opened.
+            transaction_auth_key: [0; 32],
         })
+    }
+
+    pub(crate) async fn initialize_transaction_auth_key(&mut self) -> anyhow::Result<()> {
+        self.transaction_auth_key = super::secret_store::SecretStore::for_write(&self.config_path)
+            .await?
+            .derive_key("ycloud:s3-transaction-auth:v1");
+        Ok(())
     }
 
     pub fn is_public_mode(&self) -> bool {

@@ -12,9 +12,20 @@ export interface FileEntry {
 import { appPath } from '../routes'
 import { useLocale } from '../i18n'
 import { ApiError, errorMetadata, readJson } from './client'
-import type { ErrorEnvelope } from './client'
+import type { ErrorEnvelope, OperationOutcome } from './client'
 
 const locale = useLocale()
+
+export async function checkDownload(url: string): Promise<void> {
+  const response = await fetch(url, { method: 'HEAD', credentials: 'same-origin', cache: 'no-store' })
+  if (response.ok) return
+  const message = response.status === 429
+    ? locale.text('下载流量不足或请求过于频繁，请稍后重试或联系管理员', 'Insufficient download allowance or too many requests. Try later or contact the administrator.')
+    : response.status === 403
+      ? locale.text('没有下载权限', 'Download permission denied')
+      : locale.text('暂时无法下载', 'Download is currently unavailable')
+  throw new ApiError(message, response.status)
+}
 
 export interface FileListResponse {
   storage_id: string
@@ -73,7 +84,20 @@ export interface UploadBatchItem {
   size: number
 }
 
+export type UploadBatchItemState = 'pending' | 'in_progress' | 'complete' | 'failed' | 'unknown' | 'cancelled'
+
+export interface UploadBatchStatus {
+  ticket: string
+  items: Array<{
+    path: string
+    size: number
+    status: UploadBatchItemState
+    operation?: OperationOutcome
+  }>
+}
+
 export interface BatchItemResult {
+  operation?: OperationOutcome
   path: string
   status: number
   code: string
@@ -98,7 +122,7 @@ export async function apiRequest<T>(url: string, options: RequestInit = {}): Pro
   const body = await readJson<T>(response)
   if (!response.ok) {
     const details = errorMetadata(response, body ?? {})
-    throw new ApiError(details.message ?? locale.t('common.requestFailed', { status: response.status }), response.status, details.code, details.requestId)
+    throw new ApiError(details.message ?? locale.t('common.requestFailed', { status: response.status }), response.status, details.code, details.requestId, details.operation)
   }
   if (body === undefined) throw new Error(locale.t('common.invalidResponse'))
   return body
@@ -133,6 +157,10 @@ export function listFiles(path: string, storageId?: string, options: FileListOpt
 
 export function listStorages(): Promise<BrowserStorage[]> {
   return apiRequest<BrowserStorage[]>('/api/storages')
+}
+
+export function calculateDirectorySize(path: string, storageId: string, signal: AbortSignal): Promise<{ size: number }> {
+  return apiRequest(actionApi('directory/size', path, storageId), { signal })
 }
 
 function actionApi(action: string, path: string, storageId?: string): string {
@@ -178,11 +206,17 @@ export function prepareUploadBatch(items: UploadBatchItem[], storageId?: string)
   })
 }
 
-export async function cancelUploadBatch(ticket: string, storageId?: string): Promise<void> {
+export function getUploadBatchStatus(ticket: string, storageId?: string): Promise<UploadBatchStatus> {
+  const query = new URLSearchParams({ batch: ticket })
+  if (storageId) query.set('storage_id', storageId)
+  return apiRequest(`/api/upload/status?${query.toString()}`)
+}
+
+export async function cancelUploadBatch(ticket: string, storageId?: string, paths: string[] = []): Promise<void> {
   await apiRequest(withStorage('/api/upload/cancel', storageId), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ticket }),
+    body: JSON.stringify(paths.length ? { ticket, paths } : { ticket }),
   })
 }
 
@@ -192,6 +226,8 @@ export async function batchOperation(operation: BatchOperation, paths: string[],
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ paths, target: target ? `/${cleanPath(target)}` : '' }),
+  }).catch(() => {
+    throw new ApiError(locale.text('连接中断，操作结果尚未确认，请先核对文件，不要直接重试。', 'Connection lost. Verify the operation result before retrying.'), 0, 'operation_result_unknown')
   })
   if (response.status === 401) {
     window.location.replace(appPath('/'))
@@ -231,18 +267,22 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
         return
       }
       let message = locale.text(`上传失败 (${request.status})`, `Upload failed (${request.status})`)
+      let details: ErrorEnvelope['error']
       try {
         const body = JSON.parse(request.responseText) as ErrorEnvelope
+        details = body.error
         message = body.error?.message ?? body.message ?? message
       } catch {
         // Keep the status-based message for non-JSON proxy failures.
       }
       cleanup()
-      reject(new Error(message))
+      const unknown = request.status >= 500 && !details?.operation
+      if (unknown) message = locale.text('上传结果尚未确认，请先核对文件，不要直接重试。', 'Upload result is unknown. Check the file before retrying.')
+      reject(new ApiError(message, request.status, unknown ? 'operation_result_unknown' : details?.code, request.getResponseHeader('x-request-id') ?? undefined, details?.operation))
     })
     request.addEventListener('error', () => {
       cleanup()
-      reject(new Error(locale.t('common.networkInterrupted')))
+      reject(new ApiError(locale.text('连接中断，上传结果尚未确认，请先核对文件，不要直接重试。', 'Connection lost. Check the upload result before retrying.'), 0, 'operation_result_unknown'))
     })
     request.addEventListener('abort', () => {
       cleanup()
@@ -270,6 +310,14 @@ export function adminLogin(username: string, password: string, totpCode?: string
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password, totp_code: totpCode || undefined }),
+  })
+}
+
+export function userLogin(username: string, password: string): Promise<{ success: boolean; message?: string; is_admin: boolean }> {
+  return apiRequest('/api/user/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
   })
 }
 

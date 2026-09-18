@@ -32,25 +32,32 @@ let dragDepth = 0
 const succeeded = computed(() => countStatus('succeeded'))
 const failed = computed(() => countStatus('failed'))
 const cancelled = computed(() => countStatus('cancelled'))
-const active = computed(() => props.tasks.filter(task => ['preparing', 'queued', 'uploading', 'paused'].includes(task.status)).length)
+const active = computed(() => props.tasks.filter(task => ['preparing', 'queued', 'uploading', 'paused', 'verifying'].includes(task.status)).length)
 const visibleTasks = computed(() => props.tasks.filter(task => {
   if (filter.value === 'all') return true
-  if (filter.value === 'active') return task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading' || task.status === 'paused'
+  if (filter.value === 'active') return task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading' || task.status === 'paused' || task.status === 'verifying'
   return task.status === filter.value
 }))
 const visibleTaskIds = computed(() => visibleTasks.value.map(task => task.id))
 const visibleHasPausableTasks = computed(() => visibleTasks.value.some(task => task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading'))
 const visibleHasPausedTasks = computed(() => visibleTasks.value.some(task => task.status === 'paused'))
-const visibleHasActiveTasks = computed(() => visibleTasks.value.some(task => task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading' || task.status === 'paused'))
+const visibleHasActiveTasks = computed(() => visibleTasks.value.some(task => task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading' || task.status === 'paused' || task.status === 'verifying'))
 const modalHeight = computed(() => Math.min(650, 390 + Math.min(visibleTasks.value.length, 5) * 52))
 const totalBytes = computed(() => props.tasks.reduce((total, task) => total + task.file.size, 0))
 const uploadedBytes = computed(() => props.tasks.reduce((total, task) => {
   if (task.status === 'succeeded') return total + task.file.size
+  if (task.status !== 'uploading' && task.status !== 'verifying') return total
   return total + Math.min(task.file.size, task.loaded)
 }, 0))
 const overallPercent = computed(() => totalBytes.value
-  ? Math.min(100, Math.round(uploadedBytes.value / totalBytes.value * 100))
-  : 0)
+  ? Math.min(succeeded.value === props.tasks.length ? 100 : 99, Math.round(uploadedBytes.value / totalBytes.value * 100))
+  : props.tasks.length && succeeded.value === props.tasks.length ? 100 : 0)
+const completionLabel = computed(() => {
+  if (!props.tasks.length) return locale.text('尚无上传任务', 'No uploads yet')
+  if (succeeded.value === props.tasks.length) return locale.text('全部上传成功', 'All uploads succeeded')
+  if (active.value) return locale.text(`已完成 ${succeeded.value} / ${props.tasks.length} 个文件`, `${succeeded.value} / ${props.tasks.length} files complete`)
+  return locale.text(`已完成 ${succeeded.value} / ${props.tasks.length} 个文件，${failed.value + cancelled.value} 个未成功`, `${succeeded.value} / ${props.tasks.length} files complete, ${failed.value + cancelled.value} unsuccessful`)
+})
 
 const filters = computed<Array<{ value: UploadFilter; label: string; count: number }>>(() => [
   { value: 'all', label: locale.text('全部', 'All'), count: props.tasks.length },
@@ -70,6 +77,7 @@ function taskStatus(task: UploadTask): string {
     case 'queued': return locale.text('等待上传', 'Queued')
     case 'uploading': return locale.text('正在上传', 'Uploading')
     case 'paused': return locale.text('已暂停', 'Paused')
+    case 'verifying': return locale.text('结果确认中', 'Verifying')
     case 'succeeded': return locale.text('成功', 'Succeeded')
     case 'failed': return locale.text('失败/异常', 'Failed')
     case 'cancelled': return locale.text('已终止', 'Terminated')
@@ -78,13 +86,15 @@ function taskStatus(task: UploadTask): string {
 
 function taskPercent(task: UploadTask): number {
   if (!task.file.size) return task.status === 'succeeded' ? 100 : 0
-  return Math.min(100, Math.round(task.loaded / task.file.size * 100))
+  if (task.status === 'succeeded') return 100
+  if (task.status !== 'uploading' && task.status !== 'verifying') return 0
+  return Math.min(99, Math.round(task.loaded / task.file.size * 100))
 }
 
 function statusClass(task: UploadTask): Record<string, boolean> {
   return {
     danger: task.status === 'failed',
-    warning: task.status === 'paused',
+    warning: task.status === 'paused' || task.status === 'verifying',
     muted: task.status === 'preparing' || task.status === 'queued' || task.status === 'cancelled',
   }
 }
@@ -133,7 +143,7 @@ function handleDrop(event: DragEvent): void {
           <button v-for="item in filters" :key="item.value" class="upload-filter-tab" :class="{ active: filter === item.value }" type="button" role="tab" :aria-selected="filter === item.value" @click="filter = item.value">{{ item.label }} <span>{{ item.count }}</span></button>
         </div>
         <div class="upload-batch-actions" :aria-label="locale.text('当前筛选任务控制', 'Filtered upload controls')">
-          <span class="upload-total-progress">{{ locale.text('总进度', 'Total') }} {{ overallPercent }}%</span>
+          <span class="upload-total-progress">{{ locale.text('总进度', 'Total') }}</span>
           <button class="record-icon-btn" type="button" :disabled="!visibleHasPausableTasks" :title="locale.text('暂停当前筛选中的未完成任务', 'Pause unfinished tasks in this filter')" :aria-label="locale.text('暂停当前筛选任务', 'Pause filtered tasks')" @click="emit('pause', visibleTaskIds)"><AppIcon name="pause" :size="17" /></button>
           <button class="record-icon-btn" type="button" :disabled="!visibleHasPausedTasks" :title="locale.text('继续当前筛选中的任务', 'Resume filtered tasks')" :aria-label="locale.text('继续当前筛选任务', 'Resume filtered tasks')" @click="emit('resume', visibleTaskIds)"><AppIcon name="resume" :size="17" /></button>
           <button class="record-icon-btn" type="button" :disabled="!visibleHasActiveTasks" :title="locale.text('终止当前筛选中的未完成任务', 'Terminate unfinished filtered tasks')" :aria-label="locale.text('终止当前筛选任务', 'Terminate filtered tasks')" @click="emit('terminate', visibleTaskIds)"><AppIcon name="stop" :size="17" /></button>
@@ -141,8 +151,8 @@ function handleDrop(event: DragEvent): void {
         </div>
       </div>
 
-      <progress class="upload-overall-progress" :value="overallPercent" max="100">{{ overallPercent }}%</progress>
-      <div class="upload-overall-meta"><span>{{ locale.text(`成功 ${succeeded} · 失败/异常 ${failed} · 已终止 ${cancelled}`, `${succeeded} succeeded · ${failed} failed · ${cancelled} terminated`) }}</span><span>{{ formatSize(uploadedBytes) }} / {{ formatSize(totalBytes) }}</span></div>
+      <progress class="upload-overall-progress" :value="overallPercent" max="100" :aria-label="locale.text('全部文件上传进度', 'Overall upload progress')">{{ overallPercent }}%</progress>
+      <div class="upload-overall-meta"><span><strong>{{ completionLabel }}</strong> · {{ locale.text(`成功 ${succeeded} · 失败/异常 ${failed} · 已终止 ${cancelled}`, `${succeeded} succeeded · ${failed} failed · ${cancelled} terminated`) }}</span><span class="upload-overall-percent">{{ overallPercent }}%</span></div>
 
       <div v-if="visibleTasks.length" class="upload-task-list">
         <article v-for="task in visibleTasks" :key="task.id" class="upload-task" :class="`is-${task.status}`">
@@ -150,14 +160,14 @@ function handleDrop(event: DragEvent): void {
           <div class="upload-task-content">
             <div class="upload-task-title"><strong :title="task.relativePath">{{ task.relativePath }}</strong><span class="status-pill" :class="statusClass(task)">{{ taskStatus(task) }}</span></div>
             <div class="upload-task-meta"><span>{{ formatSize(task.file.size) }}</span><span>{{ taskPercent(task) }}%</span></div>
-            <progress :value="taskPercent(task)" max="100">{{ taskPercent(task) }}%</progress>
+            <progress :value="taskPercent(task)" max="100" :aria-label="locale.text(`${task.relativePath} 上传进度`, `${task.relativePath} upload progress`)">{{ taskPercent(task) }}%</progress>
             <p v-if="task.error" class="upload-task-error">{{ task.error }}</p>
           </div>
           <div class="upload-task-actions">
             <button v-if="task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading'" class="record-icon-btn" type="button" :title="locale.text('暂停该文件', 'Pause this file')" :aria-label="locale.text('暂停该文件', 'Pause this file')" @click="emit('pause', [task.id])"><AppIcon name="pause" :size="16" /></button>
             <button v-if="task.status === 'paused'" class="record-icon-btn" type="button" :title="locale.text('继续该文件', 'Resume this file')" :aria-label="locale.text('继续该文件', 'Resume this file')" @click="emit('resume', [task.id])"><AppIcon name="resume" :size="16" /></button>
             <button v-if="task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading' || task.status === 'paused'" class="record-icon-btn" type="button" :title="locale.text('终止该文件', 'Terminate this file')" :aria-label="locale.text('终止该文件', 'Terminate this file')" @click="emit('terminate', [task.id])"><AppIcon name="stop" :size="16" /></button>
-            <button v-if="task.status === 'failed'" class="record-icon-btn" type="button" :title="locale.text('重试该文件', 'Retry this file')" :aria-label="locale.text('重试该文件', 'Retry this file')" @click="emit('retry', task.id)"><AppIcon name="retry" :size="16" /></button>
+            <button v-if="task.status === 'failed' && !task.retryBlocked" class="record-icon-btn" type="button" :title="locale.text('重试该文件', 'Retry this file')" :aria-label="locale.text('重试该文件', 'Retry this file')" @click="emit('retry', task.id)"><AppIcon name="retry" :size="16" /></button>
             <button v-if="task.status === 'failed'" class="record-icon-btn danger" type="button" :title="locale.text('删除失败记录', 'Delete failed record')" :aria-label="locale.text('删除失败记录', 'Delete failed record')" @click="emit('removeFailed', task.id)"><AppIcon name="delete" :size="16" /></button>
             <button v-if="task.status === 'succeeded' || task.status === 'cancelled'" class="record-icon-btn danger" type="button" :title="locale.text('删除该任务记录', 'Delete this task record')" :aria-label="locale.text('删除该任务记录', 'Delete this task record')" @click="emit('clear', [task.id])"><AppIcon name="delete" :size="16" /></button>
           </div>

@@ -1,9 +1,31 @@
 import { useLocale } from '../i18n'
+
+export interface TrafficQuota { enabled: boolean; upload: number; download: number }
+export interface TrafficUsage { upload: number; download: number }
+export interface TrafficCycle { unit: 'hours' | 'days' | 'months'; every: number; anchor: number; offset_minutes: number }
+export interface TrafficSettings {
+  total: TrafficQuota; guest: TrafficQuota; users_total: TrafficQuota; users: Record<string, TrafficQuota>; cycle: TrafficCycle
+}
+export interface TrafficInfo {
+  settings: TrafficSettings; total: TrafficUsage; guest: TrafficUsage; users_total: TrafficUsage
+  users: Record<string, TrafficUsage>; next_reset: number; days: Record<string, TrafficUsage>
+}
+export function getTraffic(start?: string, end?: string): Promise<TrafficInfo> {
+  const query = new URLSearchParams()
+  if (start) query.set('start', start)
+  if (end) query.set('end', end)
+  return adminRequest('/api/admin/traffic?' + query.toString())
+}
+export function saveTraffic(settings: Pick<TrafficSettings, 'total' | 'guest' | 'users_total' | 'cycle'>): Promise<{ success: boolean }> {
+  return adminRequest('/api/admin/traffic', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) })
+}
+
 import { ApiError, errorMetadata, readJson } from './client'
 
 const locale = useLocale()
 
 export interface AdminInfo {
+  domain_binding?: DomainBindingView
   username: string
   has_global_web_password: boolean
   admin_totp_enabled?: boolean
@@ -36,6 +58,28 @@ export interface AdminInfo {
   user_accounts?: UserAccountView[]
 }
 
+export interface DomainBinding {
+  public_url: string
+  trusted_proxy_ips: string[]
+}
+
+export interface DomainBindingView {
+  binding: DomainBinding | null
+  source: 'none' | 'environment' | 'settings'
+}
+
+export function getDomainBinding(): Promise<DomainBindingView> {
+  return adminRequest('/api/admin/domain-binding')
+}
+
+export function saveDomainBinding(binding: DomainBinding): Promise<DomainBindingView> {
+  return adminRequest('/api/admin/domain-binding', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(binding) })
+}
+
+export function removeDomainBinding(): Promise<DomainBindingView> {
+  return adminRequest('/api/admin/domain-binding', { method: 'DELETE' })
+}
+
 export interface LocalMountView {
   mount_id: string
   name: string
@@ -66,6 +110,7 @@ export interface UserAccountView {
 }
 
 export interface CreateUserAccountRequest {
+  traffic?: TrafficQuota
   username: string
   password: string
   enabled: boolean
@@ -73,6 +118,7 @@ export interface CreateUserAccountRequest {
 }
 
 export interface UpdateUserAccountRequest {
+  traffic?: TrafficQuota
   username?: string
   password?: string
   enabled?: boolean
@@ -85,12 +131,28 @@ export interface StorageInstanceView {
   is_default: boolean
   enabled?: boolean
   allow_guest_access?: boolean
+  allow_guest_download?: boolean
   status?: 'enabled' | 'disabled' | 'abnormal' | 'pending'
   ready: boolean
   backend: StorageBackendView
   usage_bytes: number
   reserved_bytes: number
   capacity_accurate?: boolean
+  capacity_reconciling?: boolean
+  cleanup_pending_bytes?: number | null
+  cleanup_debt_complete?: boolean | null
+  staging_cleanup_pending_uploads?: number | null
+  staging_cleanup_pending_copies?: number | null
+  staging_cleanup_failed_attempts?: number | null
+  s3_orphan_uploads?: number | null
+  s3_orphan_backups?: number | null
+  s3_recovery_pending_records?: number | null
+  s3_recovery_oldest_pending_seconds?: number | null
+  s3_recovery_consecutive_failures?: number | null
+  s3_recovery_last_failure?: string | null
+  s3_recovery_last_failure_unix?: number | null
+  s3_recovery_next_retry_unix?: number | null
+  s3_recovery_running?: boolean | null
 }
 
 export type S3Provider = 'alibaba_oss' | 'tencent_cos' | 'minio' | 's3_compatible'
@@ -121,6 +183,17 @@ export interface TestS3StorageRequest {
   access_key_id: string
   secret_access_key: string
   capacity_limit_bytes: number | null
+}
+
+export interface S3CapabilityReport {
+  profile_version: number
+  provider: S3Provider
+  conditional_create: 's3_if_none_match' | 'oss_forbid_overwrite'
+  conditional_update: 's3_if_match' | 'head_then_write_exclusive_prefix'
+  conditional_delete: 's3_if_match' | 'head_then_delete_exclusive_prefix'
+  activation_verified: string[]
+  deferred_until_first_use: string[]
+  requires_exclusive_internal_prefix: boolean
 }
 
 export interface WebDavMountView {
@@ -190,6 +263,8 @@ export interface LoginEvent {
 export interface LoginEventPage {
   events: LoginEvent[]
   next_cursor: number | null
+  total: number
+  page: number
 }
 
 export interface UpdateAccountRequest {
@@ -310,7 +385,7 @@ export function updateTransferLimits(body: UpdateTransferLimitsRequest): Promise
   })
 }
 
-export function testS3Storage(body: TestS3StorageRequest): Promise<{ success: boolean }> {
+export function testS3Storage(body: TestS3StorageRequest): Promise<{ success: boolean; capabilities: S3CapabilityReport }> {
   return adminRequest('/api/admin/storage/test', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -326,43 +401,43 @@ export function testLocalStorage(path: string): Promise<{ success: boolean }> {
   })
 }
 
-export function stageS3Storage(name: string, body: TestS3StorageRequest, enabled = true, allowGuestAccess = false): Promise<{ success: boolean }> {
+export function stageS3Storage(name: string, body: TestS3StorageRequest, enabled = true, allowGuestAccess = false, allowGuestDownload?: boolean): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/storage/pending', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, enabled, allow_guest_access: allowGuestAccess, ...body }),
+    body: JSON.stringify({ name, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload, ...body }),
   })
 }
 
-export function updateS3Storage(storageId: string, name: string, body: TestS3StorageRequest, enabled: boolean, allowGuestAccess: boolean): Promise<{ success: boolean }> {
+export function updateS3Storage(storageId: string, name: string, body: TestS3StorageRequest, enabled: boolean, allowGuestAccess: boolean, allowGuestDownload?: boolean): Promise<{ success: boolean }> {
   return adminRequest(`/api/admin/storage/s3/${encodeURIComponent(storageId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, enabled, allow_guest_access: allowGuestAccess, ...body }),
+    body: JSON.stringify({ name, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload, ...body }),
   })
 }
 
-export function addLocalStorage(path: string, name: string, capacityLimitBytes: number | null, enabled = true, allowGuestAccess = false): Promise<{ storage_id: string }> {
+export function addLocalStorage(path: string, name: string, capacityLimitBytes: number | null, enabled = true, allowGuestAccess = false, allowGuestDownload?: boolean): Promise<{ storage_id: string }> {
   return adminRequest('/api/admin/storage/local', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, name, capacity_limit_bytes: capacityLimitBytes, enabled, allow_guest_access: allowGuestAccess }),
+    body: JSON.stringify({ path, name, capacity_limit_bytes: capacityLimitBytes, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload }),
   })
 }
 
-export function updateLocalStorage(storageId: string, name: string, path: string, capacityLimitBytes: number | null, enabled: boolean, allowGuestAccess: boolean): Promise<{ success: boolean }> {
+export function updateLocalStorage(storageId: string, name: string, path: string, capacityLimitBytes: number | null, enabled: boolean, allowGuestAccess: boolean, allowGuestDownload?: boolean): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/storage/local', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ storage_id: storageId, name, path, capacity_limit_bytes: capacityLimitBytes, enabled, allow_guest_access: allowGuestAccess }),
+    body: JSON.stringify({ storage_id: storageId, name, path, capacity_limit_bytes: capacityLimitBytes, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload }),
   })
 }
 
-export function updateStorageAccess(storageId: string, enabled: boolean, allowGuestAccess: boolean): Promise<{ success: boolean }> {
+export function updateStorageAccess(storageId: string, enabled: boolean, allowGuestAccess: boolean, allowGuestDownload?: boolean): Promise<{ success: boolean }> {
   return adminRequest(`/api/admin/storage/${encodeURIComponent(storageId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled, allow_guest_access: allowGuestAccess }),
+    body: JSON.stringify({ enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload }),
   })
 }
 
@@ -391,24 +466,32 @@ export function updateLoginSecuritySettings(body: UpdateLoginSecuritySettingsReq
 }
 
 export interface LoginEventQuery {
-  success: boolean
-  since: number
+  success?: boolean
+  since?: number
   entry?: LoginEntry
   ip?: string
   cursor?: number
   limit?: number
+  page?: number
+  search?: string
 }
 
 export function getLoginEvents(query: LoginEventQuery): Promise<LoginEventPage> {
   const params = new URLSearchParams({
-    success: String(query.success),
-    since: String(query.since),
     limit: String(query.limit ?? 20),
   })
+  if (query.success !== undefined) params.set('success', String(query.success))
+  if (query.since !== undefined) params.set('since', String(query.since))
+  if (query.page !== undefined) params.set('page', String(query.page))
+  if (query.search?.trim()) params.set('search', query.search.trim())
   if (query.entry) params.set('entry', query.entry)
   if (query.ip?.trim()) params.set('ip', query.ip.trim())
   if (query.cursor !== undefined) params.set('cursor', String(query.cursor))
   return adminRequest(`/api/admin/security/events?${params}`)
+}
+
+export function clearLoginEvents(): Promise<void> {
+  return adminRequest('/api/admin/security/events', { method: 'DELETE' })
 }
 
 export function createFolderLock(body: CreateFolderLockRequest): Promise<FolderLockView> {

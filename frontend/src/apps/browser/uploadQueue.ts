@@ -1,4 +1,4 @@
-export type UploadTaskStatus = 'preparing' | 'queued' | 'uploading' | 'paused' | 'succeeded' | 'failed' | 'cancelled'
+export type UploadTaskStatus = 'preparing' | 'queued' | 'uploading' | 'paused' | 'verifying' | 'succeeded' | 'failed' | 'cancelled'
 
 export interface UploadCandidate {
   file: File
@@ -14,6 +14,9 @@ export interface UploadTask extends UploadCandidate {
   status: UploadTaskStatus
   loaded: number
   error: string
+  retryBlocked?: boolean
+  cancelRequested?: boolean
+  pauseRequested?: boolean
 }
 
 function cleanRelativePath(path: string): string {

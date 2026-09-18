@@ -7,6 +7,8 @@ use crate::config::{StoragePermission, UserAccount};
 
 #[derive(Deserialize)]
 pub struct CreateUserAccountRequest {
+    #[serde(default)]
+    pub traffic: crate::traffic::Quota,
     pub username: String,
     pub password: String,
     #[serde(default = "default_enabled")]
@@ -17,6 +19,7 @@ pub struct CreateUserAccountRequest {
 
 #[derive(Deserialize)]
 pub struct UpdateUserAccountRequest {
+    pub traffic: Option<crate::traffic::Quota>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub enabled: Option<bool>,
@@ -43,6 +46,11 @@ pub async fn create_user_account(
     let view = UserAccountView::from(&account);
     state
         .update_config(move |config| {
+            body.traffic.validate()?;
+            config
+                .traffic
+                .users
+                .insert(account.id.clone(), body.traffic);
             config.user_accounts.push(account);
             Ok(())
         })
@@ -83,7 +91,12 @@ pub async fn update_user_account(
             if let Some(permissions) = body.permissions {
                 account.permissions = permissions;
             }
-            Ok(UserAccountView::from(&*account))
+            let view = UserAccountView::from(&*account);
+            if let Some(traffic) = body.traffic {
+                traffic.validate()?;
+                config.traffic.users.insert(id.clone(), traffic);
+            }
+            Ok(view)
         })
         .await?;
     state.sessions.revoke_user(&user_id).await;
@@ -100,6 +113,7 @@ pub async fn delete_user_account(
         .update_config(move |config| {
             let before = config.user_accounts.len();
             config.user_accounts.retain(|account| account.id != id);
+            config.traffic.users.remove(&id);
             if before == config.user_accounts.len() {
                 return Err(AppError::NotFound);
             }

@@ -2,6 +2,8 @@ import { createApp, nextTick, ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AdminView from './AdminView.vue'
 
+vi.mock('./DashboardView.vue', () => ({ default: { template: '<section><h1 id="dashboard-title">仪表盘</h1></section>' } }))
+
 const adminInfo = {
   username: 'admin', has_global_web_password: true, shares: [], folder_locks: [],
   max_upload_bytes: 1024, max_archive_bytes: 1024, max_archive_entries: 100,
@@ -40,7 +42,7 @@ describe('AdminView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    expect(host.textContent).toContain('账号登录')
+    expect(host.textContent).toContain('管理员登录')
     expect(host.querySelector('.admin-login-brand')).not.toBeNull()
     expect(host.querySelector('.admin-login-form-pane')).not.toBeNull()
     expect(host.querySelector('.admin-login-brand')?.textContent).toContain('统一入口，管理所有存储')
@@ -99,8 +101,10 @@ describe('AdminView', () => {
 
     const links = [...host.querySelectorAll<HTMLAnchorElement>('.admin-nav-item')]
     expect(links.map(link => link.getAttribute('href'))).toEqual([
-      '/admin/storage', '/admin/webdav', '/admin/locks', '/admin/limits', '/admin/account', '/admin/users', '/admin/protection', '/admin/security',
+      '/admin/dashboard', '/admin/storage', '/admin/webdav', '/admin/locks', '/admin/limits', '/admin/account', '/admin/users', '/admin/protection', '/admin/security',
     ])
+    expect(host.querySelector('#dashboard-title')?.textContent).toBe('仪表盘')
+    expect(host.querySelector('.admin-nav-item.active')?.textContent).toContain('仪表盘')
     expect(host.querySelector('.admin-nav-heading')).toBeNull()
     expect(host.querySelector('.admin-header .admin-nav-brand')?.textContent).toContain('Ycloud 管理')
     expect(host.querySelector('.admin-header .top-actions')).not.toBeNull()

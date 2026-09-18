@@ -12,6 +12,15 @@ use crate::{
     storage_catalog::LocalMountCatalog,
 };
 
+mod commit;
+pub(crate) fn publish_traffic_snapshot(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let result = commit::publish(path, bytes, false, false, |_| Ok(()))?;
+    anyhow::ensure!(
+        result.durability == commit::ConfigDurability::Confirmed,
+        "Traffic ledger durability is unconfirmed"
+    );
+    Ok(())
+}
 mod migration;
 mod model;
 mod password;
@@ -20,13 +29,15 @@ mod runtime;
 mod secret_store;
 mod validation;
 
+pub use commit::{ConfigCommit, ConfigDurability};
 pub use model::{
     ConfigFile, FolderLock, LocalStorageConfig, S3AddressingStyle, S3Provider, S3StorageConfig,
     Share, StorageBackendConfig, StorageInstanceConfig, StoragePermission, UserAccount,
 };
 pub use password::{hash_password, verify_password};
 pub use persistence::{
-    load_config, remove_initial_credentials, remove_initial_credentials_if_rotated, save_config,
+    load_config, read_migration_backup, remove_initial_credentials,
+    remove_initial_credentials_if_rotated, save_config, save_config_refresh_backup,
 };
 pub use runtime::normalize_s3_endpoint;
 pub use validation::{
@@ -65,7 +76,7 @@ pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
 pub const MIN_STORAGE_CAPACITY_BYTES: u64 = 1024 * 1024;
 pub const HARD_MAX_STORAGE_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 11;
+pub const CONFIG_SCHEMA_VERSION: u32 = 13;
 pub const DEFAULT_STORAGE_ID: &str = "primary";
 pub const MAX_STORAGE_INSTANCES: usize = 16;
 pub const MAX_USER_ACCOUNTS: usize = 100;
@@ -172,9 +183,36 @@ pub struct Config {
     /// S3 endpoints. Official Alibaba and Tencent endpoints are constrained by
     /// their provider presets instead.
     pub s3_allowed_endpoints: HashSet<String>,
+    /// Installation-local authentication key for mutating recovery records.
+    /// It is derived from the protected configuration master key and must
+    /// never be serialized or returned by an API.
+    pub(crate) transaction_auth_key: [u8; 32],
 }
 
 pub type SharedConfig = Arc<RwLock<ConfigFile>>;
+
+pub struct GuestAccess {
+    pub access: bool,
+    pub download: Option<bool>,
+}
+impl From<bool> for GuestAccess {
+    fn from(access: bool) -> Self {
+        Self {
+            access,
+            download: None,
+        }
+    }
+}
+impl GuestAccess {
+    pub fn checked(access: bool, download: Option<bool>) -> crate::error::AppResult<Self> {
+        if !access && download == Some(true) {
+            return Err(crate::error::AppError::BadRequest(
+                "允许访客下载必须同时开启允许访客访问".into(),
+            ));
+        }
+        Ok(Self { access, download })
+    }
+}
 
 const INITIAL_CREDENTIALS_FILE: &str = "initial-credentials.json";
 
@@ -240,6 +278,8 @@ impl Default for ConfigFile {
         let default_hash = hash_password(&format!("{}{}", &first[..12], &second[..12]));
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
+            traffic: crate::traffic::TrafficSettings::default(),
+            domain_binding: None,
             storage_instances: vec![StorageInstanceConfig::primary(
                 StorageBackendConfig::default(),
             )],
@@ -331,6 +371,39 @@ mod tests {
         assert!(!lock.matches(DEFAULT_STORAGE_ID, "photos/public"));
         assert!(!lock.matches(DEFAULT_STORAGE_ID, "photos/private-old"));
         assert!(!lock.matches("another", "photos/private"));
+    }
+
+    #[test]
+    fn folder_lock_scope_is_unique_per_storage_and_normalized_path() {
+        let mut config = ConfigFile::default();
+        let password_hash = hash_password("test-password");
+        config.folder_locks.push(FolderLock {
+            id: "first-lock".into(),
+            storage_id: DEFAULT_STORAGE_ID.into(),
+            path: "private".into(),
+            password_hash: password_hash.clone(),
+        });
+        config.folder_locks.push(FolderLock {
+            id: "duplicate-lock".into(),
+            storage_id: DEFAULT_STORAGE_ID.into(),
+            path: "private".into(),
+            password_hash: password_hash.clone(),
+        });
+        assert!(config.validate().is_err());
+
+        config.storage_instances.push(StorageInstanceConfig {
+            id: "archive".into(),
+            name: "Archive disk".into(),
+            enabled: true,
+            allow_guest_access: false,
+            allow_guest_download: None,
+            backend: StorageBackendConfig::Local(LocalStorageConfig {
+                mount_id: "archive-disk".into(),
+                capacity_limit_bytes: None,
+            }),
+        });
+        config.folder_locks[1].storage_id = "archive".into();
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -432,6 +505,7 @@ mod tests {
             name: "Archive disk".into(),
             enabled: true,
             allow_guest_access: false,
+            allow_guest_download: None,
             backend: StorageBackendConfig::Local(LocalStorageConfig {
                 mount_id: "archive-disk".into(),
                 capacity_limit_bytes: None,
@@ -447,6 +521,57 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    #[test]
+    fn s3_storage_namespaces_cannot_overlap() {
+        fn instance(id: &str, prefix: &str) -> StorageInstanceConfig {
+            StorageInstanceConfig {
+                id: id.into(),
+                name: id.into(),
+                enabled: true,
+                allow_guest_access: false,
+                allow_guest_download: None,
+                backend: StorageBackendConfig::S3(S3StorageConfig {
+                    provider: S3Provider::Minio,
+                    endpoint: "http://minio.test:9000".into(),
+                    bucket: "ycloud-test".into(),
+                    region: "us-east-1".into(),
+                    prefix: prefix.into(),
+                    addressing_style: S3AddressingStyle::Path,
+                    access_key_id: "access-key".into(),
+                    secret_access_key: "secret-key".into(),
+                    capacity_limit_bytes: None,
+                }),
+            }
+        }
+
+        let mut config = ConfigFile::default();
+        config.storage_instances.push(instance("photos", "photos/"));
+        config
+            .storage_instances
+            .push(instance("photos-2026", "photos/2026/"));
+        assert!(config.validate().is_err());
+
+        config.storage_instances.pop();
+        config
+            .storage_instances
+            .push(instance("documents", "documents/"));
+        assert!(config.validate().is_ok());
+
+        config.pending_storage_instance = Some(instance("pending", "photos/private/"));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn configured_paths_must_be_canonical() {
+        let mut config = ConfigFile::default();
+        config.shares[0].path = "photos/./private".into();
+        assert!(config.validate().is_err());
+        config.shares[0].path = "/photos/private/".into();
+        assert!(config.validate().is_err());
+        config.shares[0].path = "photos/private".into();
+        assert!(config.validate().is_ok());
+    }
+
     #[tokio::test]
     async fn config_save_keeps_last_known_good_backup() {
         let directory =
@@ -455,6 +580,7 @@ mod tests {
         let path = directory.join("config.json");
         let mut config = ConfigFile {
             schema_version: CONFIG_SCHEMA_VERSION,
+            domain_binding: None,
             admin_username: "first-admin".into(),
             admin_password_hash: hash_password("test-password"),
             global_web_password_hash: None,
@@ -591,6 +717,7 @@ mod tests {
                 name: "Second local".into(),
                 enabled: true,
                 allow_guest_access: false,
+                allow_guest_download: None,
                 backend: StorageBackendConfig::Local(LocalStorageConfig::default()),
             }),
             ..ConfigFile::default()
@@ -613,6 +740,7 @@ mod tests {
             name: "Remote storage".into(),
             enabled: true,
             allow_guest_access: false,
+            allow_guest_download: None,
             backend: StorageBackendConfig::S3(pending),
         });
         assert!(config.validate().is_ok());
@@ -654,6 +782,7 @@ mod tests {
                 name: "S3 storage".into(),
                 enabled: true,
                 allow_guest_access: true,
+                allow_guest_download: None,
                 backend: StorageBackendConfig::S3(settings.clone()),
             }],
             ..ConfigFile::default()
@@ -710,6 +839,7 @@ mod tests {
             trusted_proxy_ips: Default::default(),
             allowed_hosts: Default::default(),
             s3_allowed_endpoints: [endpoint].into_iter().collect(),
+            transaction_auth_key: [0x31; 32],
         };
         let settings = S3StorageConfig {
             provider: S3Provider::Minio,
@@ -752,6 +882,7 @@ mod tests {
                 name: "Official S3".into(),
                 enabled: true,
                 allow_guest_access: true,
+                allow_guest_download: None,
                 backend: StorageBackendConfig::S3(settings),
             }],
             ..ConfigFile::default()

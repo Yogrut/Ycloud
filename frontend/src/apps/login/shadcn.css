@@ -1,0 +1,31 @@
+/* shadcn-vue utilities for the login page; omit Preflight to preserve Ycloud's other views. */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities) source(none);
+@source "../../components/ui";
+@source "./App.vue";
+@source "./LoginView.vue";
+
+@custom-variant dark (&:is(:root[data-theme="dark"] *));
+
+@theme inline {
+  --color-background: var(--login-bg);
+  --color-foreground: var(--login-text);
+  --color-card: var(--login-panel);
+  --color-card-foreground: var(--login-text);
+  --color-primary: var(--login-action);
+  --color-primary-foreground: var(--login-action-text);
+  --color-secondary: var(--login-subtle);
+  --color-secondary-foreground: var(--login-text);
+  --color-muted: var(--login-subtle);
+  --color-muted-foreground: var(--login-muted);
+  --color-accent: var(--login-subtle);
+  --color-accent-foreground: var(--login-text);
+  --color-border: var(--login-line);
+  --color-input: var(--login-line-strong);
+  --color-ring: var(--login-focus);
+  --color-destructive: #e05267;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+}

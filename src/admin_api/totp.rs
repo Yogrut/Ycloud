@@ -115,8 +115,18 @@ pub async fn disable_admin_totp(
             config.admin_recovery_code_hashes.clone(),
         )
     };
-    if !verify_admin_second_factor(&state, &secret, &recovery_hashes, &body.code).await {
-        return Err(AppError::BadRequest("动态验证码或恢复码无效".into()));
+    let proof = crate::auth::verify_admin_second_factor_proof(
+        &state.passwords,
+        &secret,
+        &recovery_hashes,
+        &body.code,
+    )
+    .await
+    .ok_or_else(|| AppError::BadRequest("动态验证码或恢复码无效".into()))?;
+    if let crate::auth::AdminSecondFactorProof::TotpCounter(counter) = proof {
+        if !state.admin_totp_replay.consume(counter).await {
+            return Err(AppError::BadRequest("动态验证码或恢复码无效".into()));
+        }
     }
     state
         .update_config(|config| {
@@ -139,25 +149,4 @@ async fn verify_current_admin_password(state: &AppState, password: String) -> Ap
         return Err(AppError::Forbidden);
     }
     Ok(())
-}
-
-async fn verify_admin_second_factor(
-    state: &AppState,
-    secret: &str,
-    recovery_hashes: &[String],
-    supplied: &str,
-) -> bool {
-    if crate::totp::verify_now(secret, supplied) {
-        return true;
-    }
-    let recovery = crate::totp::normalize_recovery_code(supplied);
-    if recovery.len() != 10 {
-        return false;
-    }
-    for hash in recovery_hashes {
-        if state.passwords.verify(hash.clone(), recovery.clone()).await {
-            return true;
-        }
-    }
-    false
 }

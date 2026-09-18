@@ -2,16 +2,23 @@ use axum::{body::Body, http::HeaderMap, response::Response};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use tokio::{fs, sync::RwLock};
+use tokio::{sync::Notify, sync::RwLock};
 
 use crate::{
     capacity::{load_capacity_ledger, CapacityStatus, CapacityTracker},
-    directory_listing::{DirectoryListRequest, DirectoryPage, DirectoryPageCollector},
+    directory_listing::{
+        page_from_snapshot, prepare_snapshot, DirectoryListRequest, DirectoryPage,
+    },
+    directory_snapshot::{
+        DirectorySnapshotCandidate, DirectorySnapshotCandidateResult, DirectorySnapshotKey,
+        DirectorySnapshotStore, SnapshotClaim,
+    },
     error::{AppError, AppResult},
     s3_backend::S3Backend,
-    storage::{is_link_or_reparse_point, FileResponseMode, StorageService},
+    storage::{FileResponseMode, LocalDirectoryEntry, StorageService},
 };
 
 pub use crate::directory_listing::BackendEntry;
@@ -144,6 +151,22 @@ enum StorageBackendKind {
 struct ActiveStorage {
     kind: StorageBackendKind,
     capacity: CapacityTracker,
+    local_reconcile_wake: Option<Arc<Notify>>,
+    directory_snapshots: DirectorySnapshotStore,
+}
+
+impl Drop for ActiveStorage {
+    fn drop(&mut self) {
+        if let Some(wake) = &self.local_reconcile_wake {
+            // `notify_one` stores a permit when the worker has not reached its
+            // wait yet, so a backend created and dropped in one scheduler turn
+            // cannot leave a detached task asleep forever.
+            wake.notify_one();
+        }
+        if let StorageBackendKind::S3(storage) = &self.kind {
+            storage.stop_recovery_worker();
+        }
+    }
 }
 
 impl StorageBackend {
@@ -159,6 +182,8 @@ impl StorageBackend {
             active: Arc::new(ActiveStorage {
                 kind: StorageBackendKind::Local(storage),
                 capacity: CapacityTracker::new(None, 0),
+                local_reconcile_wake: None,
+                directory_snapshots: DirectorySnapshotStore::new(),
             }),
         }
     }
@@ -169,17 +194,23 @@ impl StorageBackend {
         ledger_path: PathBuf,
     ) -> AppResult<Self> {
         let used = storage.user_data_size().await?;
+        let reconcile_wake = Arc::new(Notify::new());
+        let capacity =
+            CapacityTracker::new_with_ledger(capacity_limit, used, true, Some(ledger_path));
+        capacity.set_reconcile_wake(&reconcile_wake);
         let backend = Self {
             active: Arc::new(ActiveStorage {
                 kind: StorageBackendKind::Local(storage),
-                capacity: CapacityTracker::new_with_ledger(
-                    capacity_limit,
-                    used,
-                    true,
-                    Some(ledger_path),
-                ),
+                capacity,
+                local_reconcile_wake: Some(reconcile_wake.clone()),
+                directory_snapshots: DirectorySnapshotStore::new(),
             }),
         };
+        spawn_local_capacity_reconciler(
+            Arc::downgrade(&backend.active),
+            reconcile_wake,
+            Duration::from_secs(1),
+        );
         persist_capacity(&backend.active.capacity).await;
         Ok(backend)
     }
@@ -203,11 +234,14 @@ impl StorageBackend {
                     false,
                     Some(ledger_path),
                 ),
+                local_reconcile_wake: None,
+                directory_snapshots: DirectorySnapshotStore::new(),
             }),
         };
         let active = &backend.active;
         if let StorageBackendKind::S3(storage) = &active.kind {
             schedule_s3_capacity_reconcile(active.capacity.clone(), storage.clone());
+            spawn_s3_recovery_reconciler(storage.clone());
         }
         Ok(backend)
     }
@@ -272,32 +306,73 @@ impl StorageBackend {
         }
     }
 
+    pub(crate) async fn directory_size(
+        &self,
+        relative: &str,
+        max_entries: usize,
+    ) -> AppResult<u64> {
+        match &self.active.kind {
+            StorageBackendKind::Local(storage) => {
+                storage.directory_size(relative, max_entries).await
+            }
+            StorageBackendKind::S3(storage) => storage.directory_size(relative, max_entries).await,
+        }
+    }
+
     pub async fn list_directory_page(
         &self,
         relative: &str,
         request: DirectoryListRequest,
     ) -> AppResult<DirectoryPage> {
         let active = &self.active;
-        let mut collector = DirectoryPageCollector::new(request);
-        match &active.kind {
-            StorageBackendKind::Local(storage) => {
-                scan_local_directory(storage, relative, |entry| collector.consider(entry)).await?;
-            }
-            StorageBackendKind::S3(storage) => {
-                storage
-                    .scan_directory_entries(relative, |entry| {
-                        collector.consider(BackendEntry {
-                            name: entry.name,
-                            relative: entry.relative,
-                            is_dir: entry.is_dir,
-                            size: entry.size,
-                            modified_unix: entry.last_modified,
-                        });
-                    })
-                    .await?;
+        let key = DirectorySnapshotKey::new(relative, &request);
+        loop {
+            match active.directory_snapshots.claim(key.clone()) {
+                SnapshotClaim::Ready(entries) => {
+                    return Ok(page_from_snapshot(&entries, &request));
+                }
+                SnapshotClaim::Wait(mut completed) => {
+                    let pending = !*completed.borrow();
+                    if pending {
+                        let _ = completed.changed().await;
+                    }
+                }
+                SnapshotClaim::Build(build) => {
+                    let _permit = active.directory_snapshots.acquire_build_permit().await;
+                    let mut candidate = DirectorySnapshotCandidate::new(request.clone());
+                    match &active.kind {
+                        StorageBackendKind::Local(storage) => {
+                            scan_local_directory(storage, relative, |entry| {
+                                candidate.consider(entry)
+                            })
+                            .await?;
+                        }
+                        StorageBackendKind::S3(storage) => {
+                            storage
+                                .scan_directory_entries(relative, |entry| {
+                                    candidate.consider(BackendEntry {
+                                        name: entry.name,
+                                        relative: entry.relative,
+                                        is_dir: entry.is_dir,
+                                        size: entry.size,
+                                        modified_unix: entry.last_modified,
+                                    });
+                                })
+                                .await?;
+                        }
+                    }
+                    let entries = match candidate.finish() {
+                        DirectorySnapshotCandidateResult::Snapshot(entries) => entries,
+                        DirectorySnapshotCandidateResult::Page(page) => return Ok(page),
+                    };
+                    let entries =
+                        Arc::new(prepare_snapshot(entries, None, key.sort(), key.direction()));
+                    let page = page_from_snapshot(&entries, &request);
+                    build.publish(entries);
+                    return Ok(page);
+                }
             }
         }
-        Ok(collector.finish())
     }
 
     pub async fn stream_file(
@@ -325,6 +400,7 @@ impl StorageBackend {
         content_type: Option<&str>,
     ) -> AppResult<u64> {
         let active = &self.active;
+        let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
         let capacity = active.capacity.clone();
         if expected_bytes.is_some_and(|bytes| bytes > max_upload_bytes) {
             return Err(AppError::PayloadTooLarge);
@@ -358,16 +434,7 @@ impl StorageBackend {
                     capacity_reservation.ensure_new_size(received)?;
                     writer.write_chunk(&chunk).await?;
                 }
-                let committed = match writer.commit().await {
-                    Ok(committed) => committed,
-                    Err(error) => {
-                        drop(capacity_reservation);
-                        reconcile_local_capacity(&capacity, storage).await;
-                        return Err(error);
-                    }
-                };
-                capacity_reservation.commit(committed.previous_size, committed.size);
-                persist_capacity(&capacity).await;
+                let committed = writer.commit_with_capacity(capacity_reservation).await?;
                 Ok(committed.size)
             }
             StorageBackendKind::S3(storage) => {
@@ -410,6 +477,7 @@ impl StorageBackend {
 
     pub async fn create_directory(&self, relative: &str) -> AppResult<()> {
         let active = &self.active;
+        let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
         match &active.kind {
             StorageBackendKind::Local(storage) => {
                 let path = storage.resolve_for_write(relative).await?;
@@ -421,20 +489,15 @@ impl StorageBackend {
 
     pub async fn remove(&self, relative: &str) -> AppResult<()> {
         let active = &self.active;
+        let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
         let capacity = active.capacity.clone();
         match &active.kind {
             StorageBackendKind::Local(storage) => {
                 let path = storage.resolve_existing(relative).await?;
-                let removed_size = match storage.remove(&path).await {
-                    Ok(removed_size) => removed_size,
-                    Err(error) => {
-                        reconcile_local_capacity(&capacity, storage).await;
-                        return Err(error);
-                    }
-                };
-                capacity.remove_used(removed_size);
-                persist_capacity(&capacity).await;
-                Ok(())
+                storage
+                    .remove_with_capacity(&path, Some(capacity))
+                    .await
+                    .map(|_| ())
             }
             StorageBackendKind::S3(storage) => {
                 let metadata = storage.metadata(relative).await?;
@@ -459,6 +522,7 @@ impl StorageBackend {
 
     pub async fn move_path(&self, source: &str, destination: &str) -> AppResult<()> {
         let active = &self.active;
+        let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
         let capacity = active.capacity.clone();
         match &active.kind {
             StorageBackendKind::Local(storage) => {
@@ -466,7 +530,7 @@ impl StorageBackend {
                 let destination = storage.resolve_for_write(destination).await?;
                 let result = storage.move_path(&source, &destination).await;
                 if result.is_err() {
-                    reconcile_local_capacity(&capacity, storage).await;
+                    let _ = reconcile_local_capacity(&capacity, storage).await;
                 }
                 result
             }
@@ -486,24 +550,16 @@ impl StorageBackend {
 
     pub async fn copy_path(&self, source: &str, destination: &str) -> AppResult<()> {
         let active = &self.active;
+        let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
         let capacity = active.capacity.clone();
         match &active.kind {
             StorageBackendKind::Local(storage) => {
                 let source = storage.resolve_existing(source).await?;
                 let destination = storage.resolve_for_write(destination).await?;
                 let copied_size = storage.path_size(&source).await?;
-                let reservation = capacity.reserve_replacement(0, copied_size)?;
-                let result = storage
-                    .copy_path_with_expected_size(&source, &destination, copied_size)
-                    .await;
-                if let Err(error) = result {
-                    drop(reservation);
-                    reconcile_local_capacity(&capacity, storage).await;
-                    return Err(error);
-                }
-                reservation.commit(0, copied_size);
-                persist_capacity(&capacity).await;
-                Ok(())
+                storage
+                    .copy_path_with_capacity(&source, &destination, copied_size, capacity)
+                    .await
             }
             StorageBackendKind::S3(storage) => {
                 let copied_size = storage.path_size(source).await?;
@@ -533,6 +589,27 @@ impl StorageBackend {
         self.active.capacity.status()
     }
 
+    pub fn local_cleanup_status(&self) -> Option<crate::storage::CleanupStatus> {
+        match &self.active.kind {
+            StorageBackendKind::Local(storage) => Some(storage.cleanup_status()),
+            StorageBackendKind::S3(_) => None,
+        }
+    }
+
+    pub fn local_staging_cleanup_status(&self) -> Option<crate::storage::UploadCleanupStatus> {
+        match &self.active.kind {
+            StorageBackendKind::Local(storage) => Some(storage.upload_cleanup_status()),
+            StorageBackendKind::S3(_) => None,
+        }
+    }
+
+    pub fn s3_recovery_status(&self) -> Option<crate::s3_backend::S3RecoveryStatus> {
+        match &self.active.kind {
+            StorageBackendKind::Local(_) => None,
+            StorageBackendKind::S3(storage) => Some(storage.recovery_status()),
+        }
+    }
+
     pub async fn ready(&self) -> bool {
         let active = &self.active;
         match &active.kind {
@@ -545,8 +622,8 @@ impl StorageBackend {
         let active = &self.active;
         match &active.kind {
             StorageBackendKind::Local(storage) => {
-                reconcile_local_capacity(&active.capacity, storage).await;
-                persist_capacity(&active.capacity).await;
+                active.capacity.mark_uncertain();
+                let _ = reconcile_local_capacity(&active.capacity, storage).await;
             }
             StorageBackendKind::S3(storage) => {
                 schedule_s3_capacity_reconcile(active.capacity.clone(), storage.clone());
@@ -555,13 +632,51 @@ impl StorageBackend {
     }
 }
 
-async fn reconcile_local_capacity(capacity: &CapacityTracker, storage: &StorageService) {
-    match storage.user_data_size().await {
-        Ok(used) => capacity.reconcile(used),
+async fn reconcile_local_capacity(
+    capacity: &CapacityTracker,
+    storage: &StorageService,
+) -> AppResult<()> {
+    if !capacity.begin_reconciliation() {
+        return Ok(());
+    }
+    match storage.reconcile_capacity_snapshot(capacity).await {
+        Ok(()) => Ok(()),
         Err(error) => {
-            tracing::error!(%error, "failed to reconcile local capacity after a storage mutation error")
+            capacity.reconciliation_failed();
+            tracing::error!(%error, "failed to reconcile local capacity after a storage mutation error");
+            Err(error)
         }
     }
+}
+
+fn spawn_local_capacity_reconciler(
+    active: Weak<ActiveStorage>,
+    wake: Arc<Notify>,
+    retry_min: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            wake.notified().await;
+            let mut retry = retry_min;
+            loop {
+                let Some(current) = active.upgrade() else {
+                    return;
+                };
+                let result = match &current.kind {
+                    StorageBackendKind::Local(storage) => {
+                        reconcile_local_capacity(&current.capacity, storage).await
+                    }
+                    StorageBackendKind::S3(_) => return,
+                };
+                drop(current);
+                if result.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(Duration::from_secs(60));
+            }
+        }
+    });
 }
 
 fn schedule_s3_capacity_reconcile(capacity: CapacityTracker, storage: S3Backend) {
@@ -583,6 +698,78 @@ fn schedule_s3_capacity_reconcile(capacity: CapacityTracker, storage: S3Backend)
     });
 }
 
+pub(crate) fn spawn_s3_recovery_reconciler(storage: S3Backend) {
+    const QUIET_PERIOD: Duration = Duration::from_secs(1);
+    const RETRY_MIN: Duration = Duration::from_secs(1);
+    const RETRY_MAX: Duration = Duration::from_secs(60);
+
+    if !storage.begin_recovery_worker() {
+        tracing::warn!("refused to start a duplicate S3 recovery worker");
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            if storage.recovery_worker_stopped() {
+                return;
+            }
+            tokio::select! {
+                _ = storage.wait_for_recovery_work() => {}
+                _ = storage.wait_for_recovery_shutdown() => return,
+            }
+            if storage.recovery_worker_stopped() {
+                return;
+            }
+
+            // A normal mutation usually creates and settles its journal while
+            // holding the shared mutation gate. Give it a short quiet period
+            // so successful requests do not trigger an eight-category scan.
+            tokio::select! {
+                _ = tokio::time::sleep(QUIET_PERIOD) => {}
+                _ = storage.wait_for_recovery_shutdown() => return,
+            }
+            if !storage.recovery_has_pending() {
+                continue;
+            }
+
+            let mut retry = RETRY_MIN;
+            loop {
+                if storage.recovery_worker_stopped() {
+                    return;
+                }
+                if !storage.recovery_has_pending() {
+                    break;
+                }
+                storage.runtime_recovery_started();
+                match storage.recover_runtime_transactions().await {
+                    Ok(recovered) => {
+                        storage.runtime_recovery_succeeded();
+                        if let Some(recovered) = recovered {
+                            tracing::info!(recovered, "runtime S3 recovery completed");
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        storage.runtime_recovery_failed(error.public_message().as_ref(), retry);
+                        tracing::warn!(
+                            %error,
+                            retry_seconds = retry.as_secs(),
+                            "runtime S3 recovery remains pending"
+                        );
+                    }
+                }
+                if storage.recovery_worker_stopped() {
+                    return;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(retry) => {}
+                    _ = storage.wait_for_recovery_shutdown() => return,
+                }
+                retry = (retry * 2).min(RETRY_MAX);
+            }
+        }
+    });
+}
+
 async fn persist_capacity(capacity: &CapacityTracker) {
     if let Err(error) = capacity.persist().await {
         capacity.mark_uncertain();
@@ -599,52 +786,14 @@ async fn list_local_directory(
     if !storage.metadata(&directory).await?.is_dir() {
         return Err(AppError::NotFound);
     }
-    let mut read_dir = fs::read_dir(directory.absolute())
-        .await
-        .map_err(|error| AppError::with_source("failed to list directory", error))?;
-    let mut entries = Vec::new();
-    while entries.len() < max_entries {
-        let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|error| AppError::with_source("failed to read directory entry", error))?
-        else {
-            break;
-        };
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR) {
-            continue;
-        }
-        let Ok(metadata) = fs::symlink_metadata(entry.path()).await else {
-            tracing::warn!(path = %entry.path().display(), "skipping unreadable directory entry");
-            continue;
-        };
-        if is_link_or_reparse_point(&metadata) {
-            tracing::warn!(path = %entry.path().display(), "skipping symbolic link in storage directory");
-            continue;
-        }
-        let entry_relative = if relative.is_empty() {
-            name.clone()
-        } else {
-            format!("{}/{}", relative.trim_end_matches('/'), name)
-        };
-        entries.push(BackendEntry {
-            name,
-            relative: entry_relative,
-            is_dir: metadata.is_dir(),
-            size: metadata.len(),
-            modified_unix: metadata.modified().ok().map(|value| {
-                let value: chrono::DateTime<chrono::Utc> = value.into();
-                value.timestamp()
-            }),
-        });
-    }
-    let truncated = entries.len() == max_entries
-        && read_dir
-            .next_entry()
-            .await
-            .map_err(|error| AppError::with_source("failed to read directory entry", error))?
-            .is_some();
+    let mut entries = storage
+        .read_directory(&directory)
+        .await?
+        .into_iter()
+        .filter_map(|entry| local_backend_entry(relative, entry))
+        .collect::<Vec<_>>();
+    let truncated = entries.len() > max_entries;
+    entries.truncate(max_entries);
     Ok((entries, truncated))
 }
 
@@ -660,43 +809,34 @@ where
     if !storage.metadata(&directory).await?.is_dir() {
         return Err(AppError::NotFound);
     }
-    let mut read_dir = fs::read_dir(directory.absolute())
-        .await
-        .map_err(|error| AppError::with_source("failed to list directory", error))?;
-    while let Some(entry) = read_dir
-        .next_entry()
-        .await
-        .map_err(|error| AppError::with_source("failed to read directory entry", error))?
-    {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR) {
-            continue;
+    for entry in storage.read_directory(&directory).await? {
+        if let Some(entry) = local_backend_entry(relative, entry) {
+            consume(entry);
         }
-        let Ok(metadata) = fs::symlink_metadata(entry.path()).await else {
-            tracing::warn!(path = %entry.path().display(), "skipping unreadable directory entry");
-            continue;
-        };
-        if is_link_or_reparse_point(&metadata) {
-            tracing::warn!(path = %entry.path().display(), "skipping symbolic link in storage directory");
-            continue;
-        }
-        let entry_relative = if relative.is_empty() {
-            name.clone()
-        } else {
-            format!("{}/{}", relative.trim_end_matches('/'), name)
-        };
-        consume(BackendEntry {
-            name,
-            relative: entry_relative,
-            is_dir: metadata.is_dir(),
-            size: metadata.len(),
-            modified_unix: metadata.modified().ok().map(|value| {
-                let value: chrono::DateTime<chrono::Utc> = value.into();
-                value.timestamp()
-            }),
-        });
     }
     Ok(())
+}
+
+fn local_backend_entry(relative: &str, entry: LocalDirectoryEntry) -> Option<BackendEntry> {
+    let name = entry.name.to_string_lossy().to_string();
+    if name.eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR) {
+        return None;
+    }
+    let entry_relative = if relative.is_empty() {
+        name.clone()
+    } else {
+        format!("{}/{}", relative.trim_end_matches('/'), name)
+    };
+    Some(BackendEntry {
+        name,
+        relative: entry_relative,
+        is_dir: entry.metadata.is_dir(),
+        size: entry.metadata.len(),
+        modified_unix: entry.metadata.modified().ok().map(|value| {
+            let value: chrono::DateTime<chrono::Utc> = value.into();
+            value.timestamp()
+        }),
+    })
 }
 
 #[cfg(test)]
@@ -704,7 +844,74 @@ mod tests {
     use axum::body::Body;
 
     use super::{StorageBackend, StorageRegistry};
+    use crate::capacity::load_capacity_ledger;
+    use crate::directory_listing::{DirectoryListRequest, DirectorySort, SortDirection};
     use crate::storage::StorageService;
+    use crate::test_support::TestDirectory;
+
+    fn directory_request(limit: usize) -> DirectoryListRequest {
+        DirectoryListRequest {
+            limit,
+            search: None,
+            sort: DirectorySort::Name,
+            direction: SortDirection::Asc,
+            after: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_pages_reuse_a_snapshot_until_a_storage_mutation_invalidates_it() {
+        let fixture = TestDirectory::new("directory-snapshot");
+        let root = fixture.path().join("files");
+        let storage = StorageService::new(root.clone(), 1024, 1, 100, 0)
+            .await
+            .unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            tokio::fs::write(root.join(name), name).await.unwrap();
+        }
+        let backend = StorageBackend::local(storage);
+        let first = backend
+            .list_directory_page("", directory_request(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a.txt", "b.txt"]
+        );
+
+        tokio::fs::write(root.join("aa.txt"), b"external")
+            .await
+            .unwrap();
+        let cached = backend
+            .list_directory_page("", directory_request(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            cached
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a.txt", "b.txt"]
+        );
+
+        backend.create_directory("new-dir").await.unwrap();
+        let refreshed = backend
+            .list_directory_page("", directory_request(20))
+            .await
+            .unwrap();
+        let names = refreshed
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"aa.txt"));
+        assert!(names.contains(&"new-dir"));
+    }
 
     #[tokio::test]
     async fn local_capacity_counts_growth_copy_and_delete() {
@@ -720,6 +927,10 @@ mod tests {
             StorageBackend::local_configured(storage, Some(5), root.join("capacity-ledger.json"))
                 .await
                 .unwrap();
+        let staging = backend.local_staging_cleanup_status().unwrap();
+        assert_eq!(staging.pending_uploads, 0);
+        assert_eq!(staging.pending_copies, 0);
+        assert_eq!(staging.failed_attempts, 0);
 
         let rejected = backend
             .upload_file("new.bin", Body::from("12"), Some(2), 1024, None)
@@ -746,6 +957,49 @@ mod tests {
         assert!(backend.copy_path("new.bin", "third.bin").await.is_err());
 
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_capacity_uncertainty_is_reconciled_and_persisted_automatically() {
+        let fixture = TestDirectory::new("local-capacity-reconcile");
+        let root = fixture.path().join("files");
+        let ledger_dir = fixture.path().join("ledger");
+        let ledger = ledger_dir.join("state.json");
+        let storage = StorageService::new(root.clone(), 1024, 1, 100, 0)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("old.txt"), b"old")
+            .await
+            .unwrap();
+        let backend = StorageBackend::local_configured(storage, Some(100), ledger.clone())
+            .await
+            .unwrap();
+
+        tokio::fs::remove_file(&ledger).await.unwrap();
+        tokio::fs::remove_dir(&ledger_dir).await.unwrap();
+        tokio::fs::write(&ledger_dir, b"temporarily unavailable")
+            .await
+            .unwrap();
+        let error = backend
+            .upload_file("new.txt", Body::from("note"), Some(4), 1024, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "operation_committed_pending");
+        assert!(!backend.capacity_status().accurate);
+
+        tokio::fs::remove_file(&ledger_dir).await.unwrap();
+        // The reconciliation worker owns recovery and may recreate this
+        // directory immediately after the blocking file is removed.
+        tokio::fs::create_dir_all(&ledger_dir).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            while !backend.capacity_status().accurate {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("automatic local capacity reconciliation completed");
+        assert_eq!(backend.capacity_status().used, 7);
+        assert_eq!(load_capacity_ledger(&ledger).await.unwrap(), Some(7));
     }
 
     #[tokio::test]

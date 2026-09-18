@@ -213,6 +213,15 @@ pub async fn prepare_archive(
         return Err(AppError::BadRequest("No files selected for archive".into()));
     }
     let archive_name = archive_name(&normalized);
+    let traffic_subject = crate::traffic::browser_subject(&state, &headers).await;
+    state
+        .traffic
+        .preflight(
+            &traffic_subject,
+            crate::traffic::Direction::Download,
+            total_bytes,
+        )
+        .await?;
     let file_count = files.len();
     let ticket = state
         .archive_tickets
@@ -297,6 +306,11 @@ pub async fn download_archive(
     headers: HeaderMap,
     Query(query): Query<ArchiveQuery>,
 ) -> AppResult<Response<Body>> {
+    let traffic_subject = crate::traffic::browser_subject(&state, &headers).await;
+    state
+        .traffic
+        .preflight(&traffic_subject, crate::traffic::Direction::Download, 1)
+        .await?;
     let stream_permit = state.archive_tickets.acquire_stream()?;
     let subject = auth::current_request_subject(&state, &headers)
         .await
@@ -335,7 +349,10 @@ pub async fn download_archive(
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(Body::from_stream(ReaderStream::new(reader_side)))
         .map_err(|error| AppError::with_source("failed to build archive response", error))?;
-    Ok(state.download_limiter.wrap_response(response))
+    let subject = crate::traffic::browser_subject(&state, &headers).await;
+    Ok(state
+        .download_limiter
+        .wrap_response(state.traffic.download(response, subject).await?))
 }
 
 async fn write_archive(

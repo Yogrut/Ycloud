@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use crate::directory_listing::{DirectoryListRequest, DirectorySort, EntryPosition, SortDirection};
 use crate::error::{AppError, AppResult};
 use crate::file_access::{
-    check_folder_locks, ensure_non_root, ensure_storage_action, ensure_writable, join_request_path,
-    resolve_share, share_storage_path, storage_permission, FileQuery, FolderLockAuthorizer,
-    StorageAction,
+    check_folder_lock_tree, check_folder_locks, ensure_non_root, ensure_storage_action,
+    ensure_writable, join_request_path, resolve_share, share_storage_path, storage_permission,
+    FileQuery, FolderLockAuthorizer, StorageAction,
 };
 use crate::security::session_cookie;
 use crate::state::AppState;
@@ -529,7 +529,7 @@ pub async fn upload_file(
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
-    let body = state.upload_limiter.wrap_body(body);
+    let traffic_subject = crate::traffic::browser_subject(&state, &headers).await;
     let max_upload_bytes = state.config_file.read().await.max_upload_bytes;
     if query.batch.is_some() && expected_bytes.is_none() {
         return Err(AppError::BadRequest(
@@ -540,24 +540,54 @@ pub async fn upload_file(
         let subject = crate::auth::current_request_subject(&state, &headers)
             .await
             .ok_or(AppError::Forbidden)?;
-        state
+        let begin = state
             .upload_batches
             .begin(ticket, &subject, &share.storage_id, &storage_path, size)
             .await?;
+        match begin {
+            crate::upload_batch::UploadBegin::Start => {}
+            crate::upload_batch::UploadBegin::AlreadyComplete(None) => {
+                return Ok(Json(
+                    serde_json::json!({ "success": true, "uploaded": [file_name], "replayed": true }),
+                ));
+            }
+            crate::upload_batch::UploadBegin::AlreadyComplete(Some(outcome)) => {
+                return Err(AppError::Conflict(
+                    "文件变更已提交，但后续收尾未完成；请勿重复上传".into(),
+                )
+                .with_operation(outcome.commit, outcome.cleanup));
+            }
+        }
     }
-    let upload_result = backend
-        .upload_file(
-            &storage_path,
-            body,
-            expected_bytes,
-            max_upload_bytes,
-            content_type,
-        )
-        .await;
+    let upload_result = async {
+        state
+            .traffic
+            .preflight(
+                &traffic_subject,
+                crate::traffic::Direction::Upload,
+                expected_bytes.unwrap_or(1),
+            )
+            .await?;
+        let (body, meter) =
+            state
+                .traffic
+                .meter(body, traffic_subject, crate::traffic::Direction::Upload);
+        let result = backend
+            .upload_file(
+                &storage_path,
+                state.upload_limiter.wrap_body(body),
+                expected_bytes,
+                max_upload_bytes,
+                content_type,
+            )
+            .await;
+        meter.finish(result)
+    }
+    .await;
     if let Some(ticket) = query.batch.as_deref() {
         state
             .upload_batches
-            .finish(ticket, &storage_path, upload_result.is_ok())
+            .finish_result(ticket, &storage_path, &upload_result)
             .await;
     }
     upload_result?;
@@ -586,7 +616,10 @@ pub async fn download_file(
     let response = backend
         .stream_file(&file, &headers, FileResponseMode::Attachment)
         .await?;
-    Ok(state.download_limiter.wrap_response(response))
+    let subject = crate::traffic::browser_subject(&state, &headers).await;
+    Ok(state
+        .download_limiter
+        .wrap_response(state.traffic.download(response, subject).await?))
 }
 
 pub async fn delete_file(
@@ -600,7 +633,7 @@ pub async fn delete_file(
     ensure_writable(&share)?;
     let request_path = query.path.as_deref().unwrap_or("");
     ensure_non_root(request_path)?;
-    check_folder_locks(
+    check_folder_lock_tree(
         &state,
         &headers,
         &share.storage_id,
@@ -624,7 +657,7 @@ pub async fn rename_file(
     let backend = state.storage_backend(&share.storage_id).await?;
     ensure_writable(&share)?;
     ensure_non_root(&body.path)?;
-    check_folder_locks(
+    check_folder_lock_tree(
         &state,
         &headers,
         &share.storage_id,
@@ -641,7 +674,7 @@ pub async fn rename_file(
         .rsplit_once('/')
         .map(|(parent, _)| join_request_path(parent, &new_name))
         .unwrap_or_else(|| new_name.clone());
-    check_folder_locks(
+    check_folder_lock_tree(
         &state,
         &headers,
         &share.storage_id,
@@ -677,7 +710,10 @@ pub async fn preview_file(
     let response = backend
         .stream_file(&file, &headers, FileResponseMode::Preview)
         .await?;
-    Ok(state.download_limiter.wrap_response(response))
+    let subject = crate::traffic::browser_subject(&state, &headers).await;
+    Ok(state
+        .download_limiter
+        .wrap_response(state.traffic.download(response, subject).await?))
 }
 
 /// POST /api/folder/unlock — verify a folder lock password and return a token cookie.

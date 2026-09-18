@@ -118,6 +118,12 @@ fn current_counter() -> u64 {
     u64::try_from(chrono::Utc::now().timestamp().div_euclid(STEP_SECONDS)).unwrap_or_default()
 }
 
+#[cfg(test)]
+pub(crate) fn current_code_for_test(secret: &str) -> String {
+    let secret = decode_base32(secret).expect("test secret must be valid base32");
+    totp_code(&secret, current_counter())
+}
+
 fn totp_code(secret: &[u8], counter: u64) -> String {
     let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, secret);
     let digest = hmac::sign(&key, &counter.to_be_bytes());

@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ pub struct CapacityTracker {
     state: Arc<Mutex<CapacityState>>,
     ledger_path: Option<Arc<PathBuf>>,
     persist_gate: Arc<tokio::sync::Mutex<()>>,
+    reconcile_wake: Arc<Mutex<Option<Weak<tokio::sync::Notify>>>>,
 }
 
 #[derive(Debug)]
@@ -38,6 +39,7 @@ pub struct CapacityStatus {
     pub used: u64,
     pub reserved: u64,
     pub accurate: bool,
+    pub reconciling: bool,
 }
 
 const CAPACITY_LEDGER_VERSION: u8 = 1;
@@ -76,6 +78,7 @@ impl CapacityTracker {
             })),
             ledger_path: ledger_path.map(Arc::new),
             persist_gate: Arc::new(tokio::sync::Mutex::new(())),
+            reconcile_wake: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -108,6 +111,22 @@ impl CapacityTracker {
 
     pub fn mark_uncertain(&self) {
         self.lock_state().accurate = false;
+        let wake = self
+            .reconcile_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(wake) = wake {
+            wake.notify_one();
+        }
+    }
+
+    pub(crate) fn set_reconcile_wake(&self, wake: &Arc<tokio::sync::Notify>) {
+        *self
+            .reconcile_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(wake));
     }
 
     pub fn begin_reconciliation(&self) -> bool {
@@ -132,6 +151,7 @@ impl CapacityTracker {
             used: state.used,
             reserved: state.reserved,
             accurate: state.accurate,
+            reconciling: state.reconciling,
         }
     }
 
@@ -149,9 +169,36 @@ impl CapacityTracker {
         }
         save_capacity_ledger(path, status.used).await
     }
+
+    /// Persist a freshly scanned value before advertising it as accurate.
+    /// The caller must hold the storage mutation boundary until this returns,
+    /// so a local publication cannot change `used` between the scan and ledger
+    /// commit.
+    pub(crate) async fn persist_reconciled(&self, used: u64) -> AppResult<()> {
+        let _persist = self.persist_gate.lock().await;
+        if let Some(path) = self.ledger_path.as_deref() {
+            save_capacity_ledger(path, used).await?;
+        }
+        self.reconcile(used);
+        Ok(())
+    }
 }
 
 impl CapacityReservation {
+    pub(crate) fn tracker(&self) -> CapacityTracker {
+        self.tracker.clone()
+    }
+
+    /// Recheck growth against the file actually replaced under the mutation lock.
+    pub(crate) fn rebase_replacement(
+        &mut self,
+        previous_size: u64,
+        new_size: u64,
+    ) -> AppResult<()> {
+        self.old_size = previous_size;
+        self.ensure_new_size(new_size)
+    }
+
     pub fn ensure_new_size(&mut self, new_size: u64) -> AppResult<()> {
         let desired = new_size.saturating_sub(self.old_size);
         if desired <= self.reserved {
@@ -334,6 +381,18 @@ mod tests {
         let reservation = tracker.reserve_replacement(30, 45).unwrap();
         reservation.commit(40, 45);
         assert_eq!(tracker.status().used, 85);
+    }
+
+    #[test]
+    fn status_distinguishes_waiting_from_active_reconciliation() {
+        let tracker = CapacityTracker::new(Some(100), 80);
+        tracker.mark_uncertain();
+        assert!(!tracker.status().accurate);
+        assert!(!tracker.status().reconciling);
+        assert!(tracker.begin_reconciliation());
+        assert!(tracker.status().reconciling);
+        tracker.reconciliation_failed();
+        assert!(!tracker.status().reconciling);
     }
 
     #[tokio::test]

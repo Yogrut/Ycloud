@@ -88,7 +88,7 @@ pub async fn storage_permission(
             storage.allow_guest_access.then_some(StoragePermission {
                 storage_id: storage_id.into(),
                 browse: true,
-                download: true,
+                download: storage.allow_guest_download.unwrap_or(true),
                 upload: false,
                 create_directory: false,
                 rename: false,
@@ -247,6 +247,17 @@ pub async fn check_folder_locks(
         .ensure_access(full_path)
 }
 
+pub async fn check_folder_lock_tree(
+    state: &AppState,
+    headers: &HeaderMap,
+    storage_id: &str,
+    full_path: &str,
+) -> AppResult<()> {
+    FolderLockAuthorizer::new(state, headers, storage_id)
+        .await
+        .ensure_tree_access(full_path)
+}
+
 pub struct FolderLockAuthorizer {
     storage_id: String,
     locks: Vec<FolderLock>,
@@ -289,16 +300,118 @@ impl FolderLockAuthorizer {
         }
     }
 
+    /// Operations that traverse or replace a complete tree must also be
+    /// rejected when the requested path is an ancestor of a locked folder.
+    pub fn ensure_tree_access(&self, full_path: &str) -> AppResult<()> {
+        if self.is_tree_locked(full_path) {
+            Err(AppError::Forbidden)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn is_locked(&self, full_path: &str) -> bool {
         self.locks
             .iter()
             .filter(|lock| lock.matches(&self.storage_id, full_path))
             .any(|lock| !self.authorized.contains(&lock.id))
     }
+
+    pub fn is_tree_locked(&self, full_path: &str) -> bool {
+        self.locks
+            .iter()
+            .filter(|lock| {
+                lock.storage_id == self.storage_id && config::paths_overlap(full_path, &lock.path)
+            })
+            .any(|lock| !self.authorized.contains(&lock.id))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn guest_browse_and_download_are_separate_and_persisted() {
+        use super::*;
+        async fn renew_gate(state: &AppState, headers: &mut HeaderMap) {
+            let token = state.gate_access.create("__gate__".into()).await;
+            headers.insert(
+                axum::http::header::COOKIE,
+                format!("gate_access={token}").parse().unwrap(),
+            );
+        }
+        let directory = crate::test_support::TestDirectory::new("guest-download");
+        let state = crate::test_support::app_state(&directory, config::ConfigFile::default()).await;
+        let token = state.gate_access.create("__gate__".into()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("gate_access={token}").parse().unwrap(),
+        );
+        let id = config::DEFAULT_STORAGE_ID;
+        assert!(
+            storage_permission(&state, &headers, id)
+                .await
+                .unwrap()
+                .download
+        );
+        state
+            .update_storage_access(
+                id,
+                true,
+                config::GuestAccess::checked(true, Some(false)).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(storage_permission(&state, &headers, id).await.is_none());
+        renew_gate(&state, &mut headers).await;
+        assert!(
+            ensure_storage_action(&state, &headers, id, StorageAction::Browse)
+                .await
+                .is_ok()
+        );
+        assert!(
+            ensure_storage_action(&state, &headers, id, StorageAction::Download)
+                .await
+                .is_err()
+        );
+        assert!(
+            ensure_storage_action(&state, &headers, id, StorageAction::Upload)
+                .await
+                .is_err()
+        );
+        let saved: config::ConfigFile =
+            serde_json::from_slice(&std::fs::read(directory.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.storage_instances[0].allow_guest_download, Some(false));
+        // A legacy caller editing access must not erase a new download restriction.
+        state.update_storage_access(id, true, true).await.unwrap();
+        renew_gate(&state, &mut headers).await;
+        assert!(
+            !storage_permission(&state, &headers, id)
+                .await
+                .unwrap()
+                .download
+        );
+        state
+            .update_storage_access(
+                id,
+                true,
+                config::GuestAccess::checked(true, Some(true)).unwrap(),
+            )
+            .await
+            .unwrap();
+        renew_gate(&state, &mut headers).await;
+        assert!(
+            storage_permission(&state, &headers, id)
+                .await
+                .unwrap()
+                .download
+        );
+        state.update_storage_access(id, true, false).await.unwrap();
+        renew_gate(&state, &mut headers).await;
+        assert!(storage_permission(&state, &headers, id).await.is_none());
+        assert!(config::GuestAccess::checked(false, Some(true)).is_err());
+    }
     use super::{
         ensure_copy_target_outside_source, ensure_non_root, ensure_writable, join_request_path,
         share_storage_path, FolderLockAuthorizer,
@@ -352,5 +465,15 @@ mod tests {
         };
         assert!(authorizer.is_locked("test"));
         assert!(authorizer.ensure_access("test/child").is_err());
+        assert!(authorizer.ensure_tree_access("").is_err());
+        assert!(authorizer.ensure_tree_access("test").is_err());
+        assert!(authorizer.ensure_tree_access("test/child").is_err());
+        assert!(authorizer.ensure_tree_access("sibling").is_ok());
+
+        let unlocked = FolderLockAuthorizer {
+            authorized: ["lock-id".to_string()].into_iter().collect(),
+            ..authorizer
+        };
+        assert!(unlocked.ensure_tree_access("").is_ok());
     }
 }

@@ -57,6 +57,9 @@ describe('LocksView', () => {
     const host = document.createElement('div')
     document.body.append(host)
     const { app } = mountLocks(host, [{ id: 'lock-1', storage_id: 'primary', path: 'test' }])
+    expect(host.querySelector('button[aria-label="编辑文件夹锁"]')?.textContent).toBe('编辑')
+    expect(host.querySelector('button[aria-label="删除文件夹锁"]')?.textContent).toBe('删除')
+    expect(host.querySelector('.record-text-btn svg')).toBeNull()
     ;(host.querySelector('button[aria-label="编辑文件夹锁"]') as HTMLButtonElement).click()
     await nextTick()
     const pathInput = host.querySelector<HTMLInputElement>('.modal input')
@@ -90,7 +93,7 @@ describe('LocksView', () => {
     await nextTick()
 
     expect(fetchMock).not.toHaveBeenCalled()
-    expect(host.textContent).toContain('不能给存储根目录加锁')
+    expect(document.querySelector('.app-toast.error')?.textContent).toContain('不能给存储根目录加锁')
     app.unmount()
   })
 
@@ -102,7 +105,9 @@ describe('LocksView', () => {
     const { app, changed } = mountLocks(host, [{ id: 'lock-1', storage_id: 'primary', path: 'test' }])
     ;(host.querySelector('button[aria-label="删除文件夹锁"]') as HTMLButtonElement).click()
     await nextTick()
-    ;(host.querySelector('.modal .btn.danger') as HTMLButtonElement).click()
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(host.querySelector('.confirmation-target')?.textContent).toContain('/test')
+    ;(host.querySelector('.confirmation-actions .btn:not(.secondary)') as HTMLButtonElement).click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/locks/lock-1', expect.objectContaining({ method: 'DELETE' }))

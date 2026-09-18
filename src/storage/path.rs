@@ -38,6 +38,14 @@ impl StorageService {
 
     pub async fn resolve_existing(&self, path: &str) -> AppResult<ResolvedPath> {
         let resolved = self.resolve_for_write(path).await?;
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_root
+                .validate_existing(&resolved.relative)
+                .await?;
+            return Ok(resolved);
+        }
+        #[cfg(not(target_os = "linux"))]
         let canonical = fs::canonicalize(&resolved.absolute)
             .await
             .map_err(|error| match error.kind() {
@@ -59,6 +67,13 @@ impl StorageService {
                 current.join(component)
             });
 
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_root.validate_for_write(&relative).await?;
+            return Ok(ResolvedPath { relative, absolute });
+        }
+
+        #[cfg(not(target_os = "linux"))]
         let mut existing_ancestor = absolute.clone();
         loop {
             match fs::symlink_metadata(&existing_ancestor).await {

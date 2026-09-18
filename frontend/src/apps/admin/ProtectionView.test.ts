@@ -34,6 +34,8 @@ describe('ProtectionView', () => {
     await nextTick()
 
     expect(host.querySelector('#protection-title')?.textContent).toBe('登录保护')
+    host.querySelector<HTMLButtonElement>('.setting-row button')!.click()
+    await nextTick()
     const input = host.querySelector<HTMLInputElement>('input[type="number"]')
     if (!input) throw new Error('failure limit input not found')
     input.value = '4'

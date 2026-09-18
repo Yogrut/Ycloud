@@ -2,13 +2,6 @@
 yanked = "warn"
 unmaintained = "workspace"
 unsound = "all"
-ignore = [
-    # aws-sdk-s3 1.143.0 compiles lru 0.16.4 only for its S3 Express identity
-    # cache. Ycloud disables S3 Express session authentication when constructing
-    # every client, so the affected LruCache::pop path is unreachable. Remove
-    # this exception as soon as the AWS SDK accepts lru >= 0.18.2.
-    { id = "RUSTSEC-2026-0253", reason = "S3 Express is disabled for every Ycloud S3 client; awaiting an upstream AWS SDK dependency update" },
-]
 
 [licenses]
 allow = [

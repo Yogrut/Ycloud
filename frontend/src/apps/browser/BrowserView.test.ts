@@ -8,6 +8,10 @@ afterEach(() => {
 })
 
 function mountBrowser(host: HTMLElement) {
+  const originalFetch = globalThis.fetch
+  vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => input === '/api/me'
+    ? Promise.resolve(new Response(JSON.stringify({ logged_in: false, is_admin: false, username: null }), { status: 200 }))
+    : originalFetch(input, init))
   const app = createApp(BrowserView, {
     theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() },
   })
@@ -82,6 +86,8 @@ describe('BrowserView', () => {
     await nextTick()
 
     const name = host.querySelector('.file-name')!
+    expect(host.querySelector('.browser-shell')).not.toBeNull()
+    expect(host.querySelector('.file-list-body')).not.toBeNull()
     const label = name.querySelector('.file-label')!
     const lock = name.querySelector('.file-lock-indicator')!
     expect(label.nextElementSibling).toBe(lock)
@@ -131,7 +137,8 @@ describe('BrowserView', () => {
     expect(host.querySelectorAll('.file-toolbar-actions .btn')).toHaveLength(2)
     host.querySelector<HTMLButtonElement>('.file-toolbar-actions .btn')?.click()
     await nextTick()
-    expect(host.querySelector('.overlay.active .admin-login-card')?.textContent).toContain('账号登录')
+    expect(document.querySelector('.app-toast.error')?.textContent).toBe('无权限')
+    expect(document.querySelector('.user-account-modal')).toBeNull()
     app.unmount()
   })
 
@@ -236,7 +243,7 @@ describe('BrowserView', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(host.querySelector('.storage-switcher .app-select-trigger')?.textContent).toContain('Public')
-    expect(host.querySelector<HTMLFormElement>('.overlay.active form')?.textContent).toContain('账号登录')
+    expect(document.querySelector('.user-account-modal')?.textContent).toContain('用户登录')
     app.unmount()
   })
 
@@ -490,7 +497,7 @@ describe('BrowserView', () => {
       }))
     })
     vi.stubGlobal('fetch', fetchMock)
-    const statuses = [500, 204]
+    const statuses = [400, 204]
     class MockXMLHttpRequest {
       status = 0
       responseText = ''
@@ -500,6 +507,7 @@ describe('BrowserView', () => {
       upload = { addEventListener: (_type: string, listener: (event: ProgressEvent) => void) => { this.progress = listener } }
       open(): void {}
       setRequestHeader(): void {}
+      getResponseHeader(): null { return null }
       addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
       send(file: File): void {
         this.progress?.({ lengthComputable: true, loaded: file.size } as ProgressEvent)
@@ -535,7 +543,14 @@ describe('BrowserView', () => {
 
   it('pauses queued files, resumes them, terminates the active upload, and clears only task records', async () => {
     const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
-      const body = String(input).includes('/api/upload/prepare') ? { ticket: 'batch-controls' } : listResponse([])
+      const url = String(input)
+      const body = url.includes('/api/upload/prepare')
+        ? { ticket: 'batch-controls' }
+        : url.includes('/api/upload/status')
+          ? { ticket: 'batch-controls', items: [{ path: 'two.txt', size: 3, status: 'failed' }] }
+          : url.includes('/api/upload/cancel')
+            ? { success: true }
+            : listResponse([])
       return Promise.resolve(new Response(JSON.stringify(body), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -590,6 +605,10 @@ describe('BrowserView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
     expect(host.querySelectorAll('.upload-task.is-cancelled')).toHaveLength(1)
+    const cancelCall = fetchMock.mock.calls.find(([input]) => String(input).includes('/api/upload/cancel'))
+    expect(cancelCall?.[1]).toEqual(expect.objectContaining({
+      body: JSON.stringify({ ticket: 'batch-controls', paths: ['two.txt'] }),
+    }))
 
     const filters = [...host.querySelectorAll<HTMLButtonElement>('.upload-filter-tab')]
     filters.find(button => button.textContent?.includes('成功'))?.click()
@@ -605,6 +624,119 @@ describe('BrowserView', () => {
     await nextTick()
     expect(host.querySelectorAll('.upload-task')).toHaveLength(0)
     expect(host.querySelector('.upload-empty-state')?.textContent).toContain('选择文件或拖拽')
+    app.unmount()
+  })
+
+  it('reconciles a lost upload response from the server batch result', async () => {
+    let statusQueries = 0
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      const body = url.includes('/api/upload/prepare')
+        ? { ticket: 'batch-reconcile' }
+        : url.includes('/api/upload/status')
+          ? {
+              ticket: 'batch-reconcile',
+              items: [{
+                path: 'reconciled.txt',
+                size: 4,
+                status: statusQueries++ === 0 ? 'in_progress' : 'complete',
+              }],
+            }
+          : listResponse([])
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    class LostResponseXMLHttpRequest {
+      status = 0
+      responseText = ''
+      withCredentials = false
+      private listeners = new Map<string, () => void>()
+      upload = { addEventListener: () => undefined }
+      open(): void {}
+      setRequestHeader(): void {}
+      getResponseHeader(): null { return null }
+      addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
+      send(): void { this.listeners.get('error')?.() }
+      abort(): void { this.listeners.get('abort')?.() }
+    }
+    vi.stubGlobal('XMLHttpRequest', LostResponseXMLHttpRequest)
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const input = host.querySelector<HTMLInputElement>('input[type="file"]:not([webkitdirectory])')!
+    Object.defineProperty(input, 'files', { configurable: true, value: [new File(['data'], 'reconciled.txt')] })
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelector('.upload-task.is-succeeded')?.textContent).toContain('reconciled.txt')
+    expect(fetchMock.mock.calls.filter(([request]) => String(request).includes('/api/upload/status?batch=batch-reconcile'))).toHaveLength(2)
+    expect(host.querySelector('[aria-label="重试该文件"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('pauses an active upload only after the server confirms it was not committed', async () => {
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      const body = url.includes('/api/upload/prepare')
+        ? { ticket: 'pause-ticket' }
+        : url.includes('/api/upload/status')
+          ? { ticket: 'pause-ticket', items: [{ path: 'pause.txt', size: 4, status: 'failed' }] }
+          : listResponse([])
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    class PausableXMLHttpRequest {
+      static instances: PausableXMLHttpRequest[] = []
+      status = 204
+      responseText = ''
+      withCredentials = false
+      private listeners = new Map<string, () => void>()
+      upload = { addEventListener: () => undefined }
+      constructor() { PausableXMLHttpRequest.instances.push(this) }
+      open(): void {}
+      setRequestHeader(): void {}
+      getResponseHeader(): null { return null }
+      addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
+      send(): void {
+        if (PausableXMLHttpRequest.instances.length > 1) this.listeners.get('load')?.()
+      }
+      abort(): void { this.listeners.get('abort')?.() }
+    }
+    vi.stubGlobal('XMLHttpRequest', PausableXMLHttpRequest)
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const input = host.querySelector<HTMLInputElement>('input[type="file"]:not([webkitdirectory])')!
+    Object.defineProperty(input, 'files', { configurable: true, value: [new File(['data'], 'pause.txt')] })
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    host.querySelector<HTMLButtonElement>('.upload-task.is-uploading button[aria-label="暂停该文件"]')?.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(host.querySelector('.upload-task.is-paused')?.textContent).toContain('已暂停')
+    expect(fetchMock.mock.calls.some(([request]) => String(request).includes('/api/upload/status?batch=pause-ticket'))).toBe(true)
+
+    host.querySelector<HTMLButtonElement>('.upload-task.is-paused button[aria-label="继续该文件"]')?.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(PausableXMLHttpRequest.instances).toHaveLength(2)
+    expect(host.querySelector('.upload-task.is-succeeded')?.textContent).toContain('pause.txt')
     app.unmount()
   })
 
@@ -737,6 +869,64 @@ describe('BrowserView', () => {
     const cancelCall = fetchMock.mock.calls.find(([request]) => String(request).includes('/api/upload/cancel'))
     expect(cancelCall).toBeDefined()
     expect(new URL(String(cancelCall?.[0]), 'http://localhost').searchParams.get('storage_id')).toBe('primary')
+    expect(cancelCall?.[1]).toEqual(expect.objectContaining({
+      body: JSON.stringify({ ticket: 'cancelled-ticket', paths: ['cancelled.txt'] }),
+    }))
+    app.unmount()
+  })
+
+  it('cancels one preparing item without discarding the sibling batch ticket', async () => {
+    let resolvePrepare!: (response: Response) => void
+    const prepareResponse = new Promise<Response>(resolve => { resolvePrepare = resolve })
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/upload/prepare')) return prepareResponse
+      const body = url.includes('/api/upload/cancel') ? { success: true } : listResponse([])
+      return Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    class SuccessfulXMLHttpRequest {
+      static urls: string[] = []
+      status = 204
+      responseText = ''
+      withCredentials = false
+      private listeners = new Map<string, () => void>()
+      upload = { addEventListener: () => undefined }
+      open(_method: string, url: string): void { SuccessfulXMLHttpRequest.urls.push(url) }
+      setRequestHeader(): void {}
+      getResponseHeader(): null { return null }
+      addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
+      send(): void { this.listeners.get('load')?.() }
+      abort(): void { this.listeners.get('abort')?.() }
+    }
+    vi.stubGlobal('XMLHttpRequest', SuccessfulXMLHttpRequest)
+
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const input = host.querySelector<HTMLInputElement>('input[type="file"]:not([webkitdirectory])')!
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      value: [new File(['one'], 'one.txt'), new File(['two'], 'two.txt')],
+    })
+    input.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+
+    host.querySelector<HTMLButtonElement>('.upload-task.is-preparing button[aria-label="终止该文件"]')?.click()
+    resolvePrepare(new Response(JSON.stringify({ ticket: 'shared-ticket' }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(host.querySelectorAll('.upload-task.is-cancelled')).toHaveLength(1)
+    expect(host.querySelectorAll('.upload-task.is-succeeded')).toHaveLength(1)
+    expect(SuccessfulXMLHttpRequest.urls).toHaveLength(1)
+    expect(SuccessfulXMLHttpRequest.urls[0]).toContain('batch=shared-ticket')
+    const cancelCall = fetchMock.mock.calls.find(([request]) => String(request).includes('/api/upload/cancel'))
+    expect(cancelCall?.[1]).toEqual(expect.objectContaining({
+      body: JSON.stringify({ ticket: 'shared-ticket', paths: ['one.txt'] }),
+    }))
     app.unmount()
   })
 })

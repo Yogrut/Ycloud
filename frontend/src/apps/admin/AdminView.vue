@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import AppFeedback from '../../shared/components/AppFeedback.vue'
 import { computed, onMounted, ref } from 'vue'
 import type { AdminInfo } from '../../shared/api/admin'
 import { AdminApiError, getAdminInfo, loginAdministrator } from '../../shared/api/admin'
@@ -10,6 +11,7 @@ import type { ThemeController } from '../../shared/composables/useTheme'
 import { useLocale } from '../../shared/i18n'
 import AccountView from './AccountView.vue'
 import AdminNavIcon from './AdminNavIcon.vue'
+import DashboardView from './DashboardView.vue'
 import LimitsView from './LimitsView.vue'
 import LocksView from './LocksView.vue'
 import ProtectionView from './ProtectionView.vue'
@@ -32,6 +34,7 @@ const totpRequired = ref(false)
 const loginError = ref('')
 const loggingIn = ref(false)
 const notice = ref('')
+const noticeRevision = ref(0)
 const activeSection = window.location.pathname.endsWith('/security')
   ? 'security'
   : window.location.pathname.endsWith('/protection')
@@ -44,9 +47,12 @@ const activeSection = window.location.pathname.endsWith('/security')
         ? 'webdav'
         : window.location.pathname.endsWith('/storage')
           ? 'storage'
-          : window.location.pathname.endsWith('/users') ? 'users' : 'account'
+          : window.location.pathname.endsWith('/users')
+            ? 'users'
+            : window.location.pathname.endsWith('/account') ? 'account' : 'dashboard'
 
 const navigation = computed(() => [
+  { id: 'dashboard', label: locale.text('仪表盘', 'Dashboard'), href: appPath('/admin/dashboard') },
   { id: 'storage', label: locale.text('存储设置', 'Storage'), href: appPath('/admin/storage') },
   { id: 'webdav', label: 'WebDAV', href: appPath('/admin/webdav') },
   { id: 'locks', label: locale.text('文件夹锁', 'Folder locks'), href: appPath('/admin/locks') },
@@ -113,7 +119,7 @@ function resetTotpChallenge(): void {
 
 function showNotice(message: string): void {
   notice.value = message
-  window.setTimeout(() => { if (notice.value === message) notice.value = '' }, 3000)
+  noticeRevision.value += 1
   void load()
 }
 
@@ -154,6 +160,7 @@ onMounted(load)
       </aside>
       <div class="admin-content">
         <div v-if="loading" class="admin-loading glass">{{ locale.t('common.loading') }}</div>
+        <DashboardView v-else-if="info && activeSection === 'dashboard'" :info="info" />
         <SecurityView v-else-if="info && activeSection === 'security'" :info="info" @changed="showNotice" />
         <ProtectionView v-else-if="info && activeSection === 'protection'" :info="info" @saved="showNotice" />
         <UsersView v-else-if="info && activeSection === 'users'" :info="info" @changed="showNotice" />
@@ -198,5 +205,5 @@ onMounted(load)
     />
   </main>
 
-  <div class="toast" :class="{ show: notice }" role="status">{{ notice }}</div>
+  <AppFeedback :message="notice" :revision="noticeRevision" kind="success" />
 </template>

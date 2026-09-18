@@ -3,7 +3,8 @@ import { onMounted, ref } from 'vue'
 import type { FileEntry } from '../../shared/api/browser'
 import { listFiles } from '../../shared/api/browser'
 import { useLocale } from '../../shared/i18n'
-import BrowserActionIcon from './BrowserActionIcon.vue'
+import FileIcon from './FileIcon.vue'
+import AppFeedback from '../../shared/components/AppFeedback.vue'
 
 const props = defineProps<{ title: string; storageId: string }>()
 const emit = defineEmits<{ close: []; confirm: [path: string] }>()
@@ -51,12 +52,12 @@ onMounted(() => load(''))
       <div class="picker-list">
         <button v-if="path" class="picker-row" type="button" @click="load(parentPath())">{{ locale.t('picker.parent') }}</button>
         <button v-for="directory in directories" :key="directory.path" class="picker-row" type="button" @click="load(directory.path)">
-          <BrowserActionIcon name="folder" />
+          <FileIcon :entry="directory" />
           <span>{{ directory.name }}</span>
         </button>
         <p v-if="loading" class="picker-state">{{ locale.t('common.loading') }}</p>
-        <p v-else-if="error" class="modal-error">{{ error }}</p>
-        <p v-else-if="!directories.length && !path" class="picker-state">{{ locale.t('picker.emptyRoot') }}</p>
+        <p v-else-if="!error && !directories.length && !path" class="picker-state">{{ locale.t('picker.emptyRoot') }}</p>
+        <AppFeedback :message="error" />
       </div>
       <div class="modal-actions"><button class="btn secondary" type="button" @click="emit('close')">{{ locale.t('common.cancel') }}</button><button class="btn" type="button" :disabled="loading || !!error" @click="emit('confirm', path)">{{ locale.t('picker.choose') }}</button></div>
     </section>

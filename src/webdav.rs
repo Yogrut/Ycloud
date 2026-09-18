@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     extract::{Extension, Path, State},
     http::{header, HeaderMap, Method, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use std::time::Duration;
 
@@ -108,6 +108,11 @@ async fn verify_share_access(
         return Err(StatusCode::FORBIDDEN);
     }
     let failure_key = client_ip.unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+    let _attempt_guard = if headers.contains_key(header::AUTHORIZATION) {
+        Some(state.login_attempts.lock().await)
+    } else {
+        None
+    };
     if state
         .login_security
         .is_blocked(LoginEntry::WebDav, failure_key)
@@ -253,17 +258,29 @@ async fn handle_get(
         )
         .await
         .map_err(|error| error.status())?;
+    let response = state
+        .traffic
+        .download(response, "webdav".into())
+        .await
+        .map_err(|error| error.status())?;
     Ok(state.download_limiter.wrap_response(response))
 }
 
 async fn handle_head(
-    state: &AppState,
+    _state: &AppState,
     backend: &StorageBackend,
     share: &Share,
     sub_path: &str,
     headers: &HeaderMap,
 ) -> Result<Response, StatusCode> {
-    let mut response = handle_get(state, backend, share, sub_path, headers).await?;
+    let mut response = backend
+        .stream_file(
+            &share_storage_path(share, sub_path),
+            headers,
+            FileResponseMode::WebDav,
+        )
+        .await
+        .map_err(|error| error.status())?;
     *response.body_mut() = Body::empty();
     Ok(response)
 }
@@ -288,7 +305,20 @@ async fn handle_put(
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
     let max_upload_bytes = state.config_file.read().await.max_upload_bytes;
-    backend
+    state
+        .traffic
+        .preflight(
+            "webdav",
+            crate::traffic::Direction::Upload,
+            expected_bytes.unwrap_or(1),
+        )
+        .await
+        .map_err(|error| error.status())?;
+    let (body, meter) =
+        state
+            .traffic
+            .meter(body, "webdav".into(), crate::traffic::Direction::Upload);
+    let result = backend
         .upload_file(
             &storage_path,
             state.upload_limiter.wrap_body(body),
@@ -296,9 +326,8 @@ async fn handle_put(
             max_upload_bytes,
             content_type,
         )
-        .await
-        .map_err(|error| error.status())?;
-    empty_response(StatusCode::CREATED)
+        .await;
+    mutation_response(meter.finish(result), StatusCode::CREATED)
 }
 
 async fn handle_delete(
@@ -306,11 +335,8 @@ async fn handle_delete(
     share: &Share,
     sub_path: &str,
 ) -> Result<Response, StatusCode> {
-    backend
-        .remove(&share_storage_path(share, sub_path))
-        .await
-        .map_err(|error| error.status())?;
-    empty_response(StatusCode::NO_CONTENT)
+    let result = backend.remove(&share_storage_path(share, sub_path)).await;
+    mutation_response(result, StatusCode::NO_CONTENT)
 }
 
 async fn handle_mkcol(
@@ -349,10 +375,10 @@ async fn handle_move_or_copy(
     let target = share_storage_path(share, &destination_path);
 
     if copy {
-        backend
-            .copy_path(&source, &target)
-            .await
-            .map_err(|error| error.status())?;
+        return mutation_response(
+            backend.copy_path(&source, &target).await,
+            StatusCode::CREATED,
+        );
     } else {
         backend
             .move_path(&source, &target)
@@ -360,6 +386,34 @@ async fn handle_move_or_copy(
             .map_err(|error| error.status())?;
     }
     empty_response(StatusCode::CREATED)
+}
+
+fn mutation_response<T>(
+    result: crate::error::AppResult<T>,
+    success: StatusCode,
+) -> Result<Response, StatusCode> {
+    match result {
+        Ok(_) => empty_response(success),
+        Err(error) if error.operation().is_some() => Ok(error.into_response()),
+        Err(error) => Err(error.status()),
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn mutation_response_keeps_unknown_operation_details() {
+    let error = crate::error::AppError::internal("private").with_operation(
+        crate::error::CommitState::Unknown,
+        crate::error::CleanupState::Unknown,
+    );
+    let response = mutation_response::<()>(Err(error), StatusCode::CREATED).unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["operation"]["commit"], "unknown");
+    assert_eq!(body["error"]["operation"]["retry"], "verify_first");
 }
 
 fn propfind_entry(
@@ -426,4 +480,71 @@ fn empty_response(status: StatusCode) -> Result<Response, StatusCode> {
         .status(status)
         .body(Body::empty())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[cfg(test)]
+mod response_contract_tests {
+    use super::*;
+    use base64::Engine;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn authenticated_dav_read_keeps_file_bytes_and_download_isolation() {
+        let directory = crate::test_support::TestDirectory::new("dav-response");
+        let persisted = crate::config::ConfigFile {
+            shares: vec![Share {
+                id: "contract-share".into(),
+                storage_id: "primary".into(),
+                name: "documents".into(),
+                path: String::new(),
+                username: Some("reader".into()),
+                webdav_enabled: true,
+                password_hash: Some(crate::config::hash_password("contract-password")),
+                readonly: true,
+            }],
+            ..Default::default()
+        };
+        let state = crate::test_support::app_state(&directory, persisted).await;
+        tokio::fs::write(
+            state.config.storage_path.join("notes.txt"),
+            b"ordinary notes",
+        )
+        .await
+        .unwrap();
+        let request = axum::http::Request::builder()
+            .uri("/dav/documents/notes.txt")
+            .header(header::HOST, "127.0.0.1:18473")
+            .header(
+                header::AUTHORIZATION,
+                format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode("reader:contract-password")
+                ),
+            )
+            .extension(axum::extract::ConnectInfo(
+                "127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let response = crate::app::build_router(state)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers()[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .starts_with("attachment;"));
+        assert!(response
+            .headers()
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .any(|value| value.to_str().unwrap().starts_with("sandbox;")));
+        assert_eq!(
+            &axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()[..],
+            b"ordinary notes"
+        );
+    }
 }

@@ -89,6 +89,19 @@ pub struct LoginEventView {
 pub struct LoginEventPage {
     pub events: Vec<LoginEventView>,
     pub next_cursor: Option<u64>,
+    pub total: usize,
+    pub page: usize,
+}
+
+#[derive(Default)]
+pub struct EventQuery<'a> {
+    pub success: Option<bool>,
+    pub entry: Option<LoginEntry>,
+    pub search: Option<&'a str>,
+    pub since: i64,
+    pub cursor: Option<u64>,
+    pub page: usize,
+    pub limit: usize,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -269,28 +282,65 @@ impl LoginSecurity {
         self.append_event(event).await
     }
 
-    pub async fn query_events(
-        &self,
-        success: Option<bool>,
-        entry: Option<LoginEntry>,
-        ip_contains: Option<&str>,
-        since: i64,
-        cursor: Option<u64>,
-        limit: usize,
-    ) -> LoginEventPage {
+    pub async fn query_events(&self, query: EventQuery<'_>) -> LoginEventPage {
         let now = chrono::Utc::now().timestamp();
         let data = self.data.lock().await;
         let log = self.event_log.lock().await;
-        let ip_filter = ip_contains.map(str::trim).filter(|value| !value.is_empty());
-        let mut matching = log.events.iter().rev().filter(|event| {
-            event.occurred_at >= since
-                && cursor.is_none_or(|cursor| event.id < cursor)
-                && success.is_none_or(|value| event.success == value)
-                && entry.is_none_or(|value| event.entry == value)
-                && ip_filter.is_none_or(|value| event.ip.contains(value))
-        });
+        let search = query
+            .search
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase);
+        let since = query.since.max(now - i64::from(log.retention_days) * 86400);
+        let limit = query.limit.clamp(1, 100);
+        let requested_page = query.page.max(1);
+        let requested_start = requested_page.saturating_sub(1).saturating_mul(limit);
+        let mut total = 0_usize;
+        let mut selected = Vec::with_capacity(limit.saturating_add(1));
+        let mut last_page = VecDeque::with_capacity(limit);
+        for event in log.events.iter().rev() {
+            let matches = event.occurred_at >= since
+                && query.success.is_none_or(|value| event.success == value)
+                && query.entry.is_none_or(|value| event.entry == value)
+                && search.as_ref().is_none_or(|value| {
+                    event.ip.contains(value)
+                        || event.result.to_lowercase().contains(value)
+                        || event
+                            .user_agent
+                            .as_deref()
+                            .is_some_and(|agent| agent.to_lowercase().contains(value))
+                });
+            if !matches {
+                continue;
+            }
+            let match_index = total;
+            total = total.saturating_add(1);
+            if let Some(cursor) = query.cursor {
+                if event.id < cursor && selected.len() <= limit {
+                    selected.push(event);
+                }
+            } else {
+                if match_index >= requested_start && selected.len() <= limit {
+                    selected.push(event);
+                }
+                if last_page.len() == limit {
+                    last_page.pop_front();
+                }
+                last_page.push_back(event);
+            }
+        }
+        let page = query.page.max(1).min(total.div_ceil(limit).max(1));
+        let has_more = if query.cursor.is_some() || page == requested_page {
+            selected.len() > limit
+        } else {
+            let last_page_size = total.saturating_sub(page.saturating_sub(1).saturating_mul(limit));
+            let skip = last_page.len().saturating_sub(last_page_size);
+            selected = last_page.into_iter().skip(skip).collect();
+            false
+        };
+        selected.truncate(limit);
         let mut events = Vec::with_capacity(limit);
-        for event in matching.by_ref().take(limit) {
+        for event in selected {
             let current_blocked_until = data
                 .records
                 .iter()
@@ -302,7 +352,7 @@ impl LoginSecurity {
                 current_blocked_until,
             });
         }
-        let next_cursor = if matching.next().is_some() {
+        let next_cursor = if has_more {
             events.last().map(|event| event.event.id)
         } else {
             None
@@ -310,7 +360,20 @@ impl LoginSecurity {
         LoginEventPage {
             events,
             next_cursor,
+            total,
+            page,
         }
+    }
+
+    pub async fn clear_events(&self) -> anyhow::Result<()> {
+        let mut log = self.event_log.lock().await;
+        let empty = VecDeque::new();
+        // Replace both copies, so recovery cannot restore deliberately cleared events.
+        compact_events(&self.events_path, &empty).await?;
+        log.events.clear();
+        log.disk_entries = 0;
+        compact_events(&self.events_path, &empty).await?;
+        Ok(())
     }
 
     pub async fn unblock(&self, entry: LoginEntry, ip: IpAddr) -> anyhow::Result<bool> {
@@ -686,6 +749,230 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn full_capacity_query_counts_and_pages_in_memory() {
+        let root = std::env::temp_dir().join(format!("ycloud-log-capacity-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let tracker = LoginSecurity::load(&root.join("config.json"), 7, 20_000)
+            .await
+            .unwrap();
+        {
+            let mut log = tracker.event_log.lock().await;
+            for id in 1..=20_000 {
+                log.events.push_back(LoginEvent {
+                    id,
+                    entry: LoginEntry::Admin,
+                    success: id % 2 == 0,
+                    occurred_at: chrono::Utc::now().timestamp(),
+                    ip: "192.0.2.1".into(),
+                    result: "登录成功".into(),
+                    failed_attempts: 0,
+                    blocked_until: None,
+                    user_agent: Some("Mozilla/5.0 Test Browser".into()),
+                });
+            }
+        }
+        let started = std::time::Instant::now();
+        let page = tracker
+            .query_events(EventQuery {
+                success: Some(true),
+                search: Some("browser"),
+                page: 100,
+                limit: 100,
+                ..Default::default()
+            })
+            .await;
+        eprintln!("20,000-entry filtered log query: {:?}", started.elapsed());
+        assert_eq!(page.total, 10_000);
+        assert_eq!(page.page, 100);
+        assert_eq!(page.events.len(), 100);
+        assert!(page.next_cursor.is_none());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual D1 performance baseline"]
+    async fn retained_log_query_performance_baseline() {
+        let root = std::env::temp_dir().join(format!("ycloud-log-bench-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let tracker = LoginSecurity::load(&root.join("config.json"), 7, 20_000)
+            .await
+            .unwrap();
+        {
+            let mut log = tracker.event_log.lock().await;
+            for id in 1..=20_000 {
+                log.events.push_back(LoginEvent {
+                    id,
+                    entry: if id % 3 == 0 {
+                        LoginEntry::WebDav
+                    } else {
+                        LoginEntry::Admin
+                    },
+                    success: id % 2 == 0,
+                    occurred_at: chrono::Utc::now().timestamp(),
+                    ip: format!("192.0.2.{}", id % 251),
+                    result: if id % 2 == 0 {
+                        "登录成功".into()
+                    } else {
+                        "凭据无效".into()
+                    },
+                    failed_attempts: (id % 5) as u32,
+                    blocked_until: None,
+                    user_agent: Some(format!("Baseline Browser {}", id % 100)),
+                });
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let first = tracker
+            .query_events(EventQuery {
+                success: Some(false),
+                search: Some("browser 4"),
+                page: 10,
+                limit: 100,
+                ..Default::default()
+            })
+            .await;
+        let first_elapsed = started.elapsed();
+        std::hint::black_box(first);
+
+        let repeated_started = std::time::Instant::now();
+        for _ in 0..20 {
+            std::hint::black_box(
+                tracker
+                    .query_events(EventQuery {
+                        success: Some(false),
+                        search: Some("browser 4"),
+                        page: 10,
+                        limit: 100,
+                        ..Default::default()
+                    })
+                    .await,
+            );
+        }
+        let repeated_elapsed = repeated_started.elapsed();
+
+        let concurrent_started = std::time::Instant::now();
+        let mut queries = Vec::new();
+        for _ in 0..4 {
+            let tracker = tracker.clone();
+            queries.push(tokio::spawn(async move {
+                tracker
+                    .query_events(EventQuery {
+                        success: Some(false),
+                        search: Some("browser 4"),
+                        page: 10,
+                        limit: 100,
+                        ..Default::default()
+                    })
+                    .await
+            }));
+        }
+        for query in queries {
+            std::hint::black_box(query.await.unwrap());
+        }
+        eprintln!(
+            "login_log_baseline entries=20000 first={first_elapsed:?} repeated_20={repeated_elapsed:?} concurrent_4={:?}",
+            concurrent_started.elapsed()
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn filtered_totals_pages_and_clear_preserve_restrictions() {
+        let root = std::env::temp_dir().join(format!("ycloud-log-pages-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let config = root.join("config.json");
+        let tracker = LoginSecurity::load(&config, 7, 500).await.unwrap();
+        let ip: IpAddr = "192.0.2.23".parse().unwrap();
+        for _ in 0..3 {
+            tracker
+                .record_failure(
+                    LoginEntry::Admin,
+                    ip,
+                    Some("Test Browser"),
+                    LoginEntry::Admin.fixed_policy(),
+                )
+                .await
+                .unwrap();
+        }
+        tracker
+            .record_success(LoginEntry::Web, ip, Some("Other Browser"))
+            .await
+            .unwrap();
+        let page = tracker
+            .query_events(EventQuery {
+                success: Some(false),
+                search: Some("TEST"),
+                page: 2,
+                limit: 2,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(page.total, 3);
+        assert_eq!(page.page, 2);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event.id, 1);
+        assert!(page.next_cursor.is_none());
+        let clamped = tracker
+            .query_events(EventQuery {
+                success: Some(false),
+                search: Some("TEST"),
+                page: usize::MAX,
+                limit: 2,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(clamped.total, 3);
+        assert_eq!(clamped.page, 2);
+        assert_eq!(clamped.events.len(), 1);
+        assert_eq!(clamped.events[0].event.id, 1);
+        assert!(clamped.next_cursor.is_none());
+        let empty = tracker
+            .query_events(EventQuery {
+                search: Some("no match"),
+                page: usize::MAX,
+                limit: 20,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.page, 1);
+        tracker.clear_events().await.unwrap();
+        assert!(tracker.is_blocked(LoginEntry::Admin, ip).await.unwrap());
+        let reloaded = LoginSecurity::load(&config, 7, 500).await.unwrap();
+        assert_eq!(
+            reloaded
+                .query_events(EventQuery {
+                    limit: 20,
+                    ..Default::default()
+                })
+                .await
+                .total,
+            0
+        );
+        assert!(reloaded.is_blocked(LoginEntry::Admin, ip).await.unwrap());
+        assert!(tokio::fs::read(event_backup_path(&root.join(EVENTS_FILE)))
+            .await
+            .unwrap()
+            .is_empty());
+        tracker
+            .record_success(LoginEntry::Web, ip, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            tracker
+                .query_events(EventQuery {
+                    limit: 20,
+                    ..Default::default()
+                })
+                .await
+                .total,
+            1
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn restrictions_and_event_pages_are_persistent() {
         let root = std::env::temp_dir().join(format!("ycloud-login-security-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&root).await.unwrap();
@@ -705,7 +992,12 @@ mod tests {
         }
         assert!(tracker.is_blocked(LoginEntry::Admin, ip).await.unwrap());
         let page = tracker
-            .query_events(Some(false), Some(LoginEntry::Admin), None, 0, None, 2)
+            .query_events(EventQuery {
+                success: Some(false),
+                entry: Some(LoginEntry::Admin),
+                limit: 2,
+                ..Default::default()
+            })
             .await;
         assert_eq!(page.events.len(), 2);
         assert!(page.next_cursor.is_some());
@@ -735,7 +1027,12 @@ mod tests {
 
         let reloaded = LoginSecurity::load(&config, 7, 501).await.unwrap();
         let page = reloaded
-            .query_events(Some(true), Some(LoginEntry::Web), None, 0, None, 20)
+            .query_events(EventQuery {
+                success: Some(true),
+                entry: Some(LoginEntry::Web),
+                limit: 20,
+                ..Default::default()
+            })
             .await;
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].event.ip, ip.to_string());

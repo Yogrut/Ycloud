@@ -6,7 +6,7 @@ impl S3Backend {
     /// portable bucket-capacity API, so logical quota accounting is scoped to
     /// Ycloud's configured prefix and excludes its reserved transaction area.
     pub async fn user_data_size(&self) -> AppResult<u64> {
-        self.sum_object_bytes(&self.prefix, true).await
+        self.sum_object_bytes(&self.prefix, true, None).await
     }
 
     pub async fn path_size(&self, relative: &str) -> AppResult<u64> {
@@ -15,13 +15,32 @@ impl S3Backend {
             return Ok(metadata.size);
         }
         let prefix = list_prefix(&self.prefix, relative)?;
-        self.sum_object_bytes(&prefix, false).await
+        self.sum_object_bytes(&prefix, false, None).await
     }
 
-    async fn sum_object_bytes(&self, prefix: &str, exclude_internal: bool) -> AppResult<u64> {
+    pub(crate) async fn directory_size(
+        &self,
+        relative: &str,
+        max_entries: usize,
+    ) -> AppResult<u64> {
+        if !self.metadata(relative).await?.is_dir {
+            return Err(AppError::NotFound);
+        }
+        let prefix = list_prefix(&self.prefix, relative)?;
+        self.sum_object_bytes(&prefix, true, Some(max_entries))
+            .await
+    }
+
+    async fn sum_object_bytes(
+        &self,
+        prefix: &str,
+        exclude_internal: bool,
+        max_entries: Option<usize>,
+    ) -> AppResult<u64> {
         let internal_prefix = format!("{}.ycloud-system/", self.prefix);
         let mut continuation_token: Option<String> = None;
         let mut total = 0_u64;
+        let mut count = 0_usize;
         for _ in 0..S3_MAX_CAPACITY_SCAN_PAGES {
             let permit = self.acquire_request().await?;
             let mut request = self
@@ -43,6 +62,12 @@ impl S3Backend {
             drop(permit);
 
             for object in output.contents() {
+                count += 1;
+                if max_entries.is_some_and(|max| count > max) {
+                    return Err(AppError::BadRequest(
+                        "目录条目过多，请选择较小的子目录计算".into(),
+                    ));
+                }
                 let key = object.key().ok_or_else(|| {
                     AppError::ServiceUnavailable("对象存储容量统计遇到无键名对象".into())
                 })?;

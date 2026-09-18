@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import AppIcon from './AppIcon.vue'
+import AppFeedback from './AppFeedback.vue'
+import { ref } from 'vue'
 import { useLocale } from '../i18n'
 
 const props = withDefaults(defineProps<{
@@ -26,6 +28,7 @@ const emit = defineEmits<{
 }>()
 
 const locale = useLocale()
+const feedbackRevision = ref(0)
 
 function updateUsername(event: Event): void {
   emit('update:username', (event.target as HTMLInputElement).value)
@@ -43,7 +46,7 @@ function updateTotpCode(event: Event): void {
 </script>
 
 <template>
-  <form class="admin-login-card" @submit.prevent="emit('submit')">
+  <form class="admin-login-card" @submit.prevent="feedbackRevision++; emit('submit')">
     <button
       v-if="cancelable"
       class="admin-login-close"
@@ -82,8 +85,8 @@ function updateTotpCode(event: Event): void {
     <section class="admin-login-form-pane">
       <header class="admin-login-form-head">
         <span>{{ locale.text('Ycloud 管理后台', 'Ycloud administration') }}</span>
-        <h2>{{ locale.text('账号登录', 'Account sign-in') }}</h2>
-        <p>{{ locale.text('使用已授权的账号继续访问。', 'Continue with an authorized account.') }}</p>
+        <h2>{{ locale.text('管理员登录', 'Administrator sign-in') }}</h2>
+        <p>{{ locale.text('使用管理员账号进入管理后台。', 'Sign in with an administrator account.') }}</p>
       </header>
 
       <label>
@@ -99,7 +102,7 @@ function updateTotpCode(event: Event): void {
         <input :value="props.totpCode" class="input" inputmode="numeric" autocomplete="one-time-code" maxlength="16" autofocus @input="updateTotpCode">
       </label>
 
-      <p class="admin-login-error" role="alert" aria-live="polite">{{ error }}</p>
+      <AppFeedback :message="error" :revision="feedbackRevision" />
       <button class="btn admin-login-submit" type="submit" :disabled="busy || (totpRequired && !totpCode.trim())">
         {{ busy ? locale.text('登录中…', 'Signing in…') : (totpRequired ? locale.text('验证并登录', 'Verify and sign in') : locale.text('登录', 'Sign in')) }}
       </button>

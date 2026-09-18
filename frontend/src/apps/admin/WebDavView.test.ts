@@ -36,6 +36,25 @@ function respondJson(body: unknown): Response {
 }
 
 describe('WebDavView', () => {
+  it('marks credentials required only when enabling a new mount', async () => {
+    const host = document.createElement('div')
+    document.body.append(host)
+    const { app } = mountWebDav(host)
+    host.querySelector<HTMLButtonElement>('.webdav-head .btn')!.click()
+    await nextTick()
+    const username = host.querySelector<HTMLInputElement>('.webdav-user-field input')!
+    const password = host.querySelector<HTMLInputElement>('.webdav-password-field input')!
+    expect(username.getAttribute('aria-required')).toBe('true')
+    expect(password.getAttribute('aria-required')).toBe('true')
+    const enabled = host.querySelector<HTMLInputElement>('.webdav-options input')!
+    enabled.checked = false
+    enabled.dispatchEvent(new Event('change'))
+    await nextTick()
+    expect(username.getAttribute('aria-required')).toBe('false')
+    expect(password.getAttribute('aria-required')).toBe('false')
+    expect(host.querySelector<HTMLInputElement>('.webdav-name-field input')!.required).toBe(true)
+    app.unmount()
+  })
   it('renders a compact connection and permission row without credential details', async () => {
     const host = document.createElement('div')
     document.body.append(host)
@@ -48,8 +67,9 @@ describe('WebDavView', () => {
     expect(host.textContent).not.toContain('存储路径 /files')
     expect(host.textContent).not.toContain('密码已设置')
     expect(host.textContent).not.toContain('secure-dav-password')
-    expect(host.querySelector('button[aria-label="编辑 WebDAV 挂载"] svg')).not.toBeNull()
-    expect(host.querySelector('button[aria-label="删除 WebDAV 挂载"] svg')).not.toBeNull()
+    expect(host.querySelector('button[aria-label="编辑 WebDAV 挂载"]')?.textContent).toBe('编辑')
+    expect(host.querySelector('button[aria-label="删除 WebDAV 挂载"]')?.textContent).toBe('删除')
+    expect(host.querySelector('.record-text-btn svg')).toBeNull()
     app.unmount()
   })
 
@@ -93,10 +113,18 @@ describe('WebDavView', () => {
     await nextTick()
 
     const fullFields = host.querySelectorAll('.webdav-form-grid .full-field')
-    const connection = host.querySelector<HTMLInputElement>('.connection-path-field input')
+    const connection = host.querySelector<HTMLInputElement>('.connection-path-field input')!
     expect(fullFields).toHaveLength(3)
-    expect(connection?.readOnly).toBe(true)
-    expect(connection?.value).toBe('/dav/挂载名称')
+    expect(connection.disabled).toBe(true)
+    expect(connection.value).toBe('/dav/挂载名称')
+    connection.click()
+    connection.focus()
+    expect(document.activeElement).not.toBe(connection)
+    const name = host.querySelector<HTMLInputElement>('.webdav-name-field input')!
+    name.value = 'photos'
+    name.dispatchEvent(new Event('input'))
+    await nextTick()
+    expect(connection.value).toBe('/dav/photos')
     app.unmount()
   })
 
@@ -137,7 +165,13 @@ describe('WebDavView', () => {
     await nextTick()
 
     expect(fetchMock).not.toHaveBeenCalled()
-    expect(host.textContent).toContain('启用 WebDAV 必须设置用户名和密码')
+    expect(document.querySelector('.app-toast.error')?.textContent).toContain('启用 WebDAV 必须设置用户名和密码')
+    document.querySelector<HTMLButtonElement>('.app-toast button')!.click()
+    await nextTick()
+    expect(document.querySelector('.app-toast')).toBeNull()
+    host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+    await nextTick()
+    expect(document.querySelector('.app-toast.error')?.textContent).toContain('启用 WebDAV 必须设置用户名和密码')
     app.unmount()
   })
 
@@ -175,7 +209,9 @@ describe('WebDavView', () => {
     const { app, changed } = mountWebDav(host, [mountView])
     ;(host.querySelector('button[aria-label="删除 WebDAV 挂载"]') as HTMLButtonElement).click()
     await nextTick()
-    ;(host.querySelector('.modal .btn.danger') as HTMLButtonElement).click()
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(host.querySelector('.confirmation-target')?.textContent).toContain('media')
+    ;(host.querySelector('.confirmation-actions .btn:not(.secondary)') as HTMLButtonElement).click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
 
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/shares/share-1', expect.objectContaining({ method: 'DELETE' }))

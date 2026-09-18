@@ -411,6 +411,35 @@ impl PasswordService {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdminSecondFactorProof {
+    TotpCounter(u64),
+    RecoveryHash(String),
+}
+
+/// Verifies either administrator second-factor credential and preserves the
+/// evidence needed by the caller to consume it atomically with authentication.
+pub(crate) async fn verify_admin_second_factor_proof(
+    passwords: &PasswordService,
+    secret: &str,
+    recovery_hashes: &[String],
+    supplied: &str,
+) -> Option<AdminSecondFactorProof> {
+    if let Some(counter) = crate::totp::verify_now_counter(secret, supplied) {
+        return Some(AdminSecondFactorProof::TotpCounter(counter));
+    }
+    let recovery = crate::totp::normalize_recovery_code(supplied);
+    if recovery.len() != 10 {
+        return None;
+    }
+    for hash in recovery_hashes {
+        if passwords.verify(hash.clone(), recovery.clone()).await {
+            return Some(AdminSecondFactorProof::RecoveryHash(hash.clone()));
+        }
+    }
+    None
+}
+
 // ── Request / response types ──────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -443,6 +472,25 @@ pub async fn login_handler(
     Extension(ClientIp(ip)): Extension<ClientIp>,
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
+) -> Response {
+    authenticate_account(state, ip, headers, body, true).await
+}
+
+pub async fn user_login_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Extension(ClientIp(ip)): Extension<ClientIp>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<LoginRequest>,
+) -> Response {
+    authenticate_account(state, ip, headers, body, false).await
+}
+
+async fn authenticate_account(
+    state: AppState,
+    ip: std::net::IpAddr,
+    headers: axum::http::HeaderMap,
+    body: LoginRequest,
+    administrator: bool,
 ) -> Response {
     let user_agent = headers
         .get(header::USER_AGENT)
@@ -480,7 +528,6 @@ pub async fn login_handler(
         )
     };
     let supplied_username = body.username.as_deref().unwrap_or("");
-    let administrator = supplied_username == admin_username;
     let entry = if administrator {
         LoginEntry::Admin
     } else {
@@ -491,6 +538,10 @@ pub async fn login_handler(
     } else {
         LoginEntry::Account.fixed_policy()
     };
+    // Serialize the admission check with its success/failure update. Without
+    // this guard, parallel requests can all pass `is_blocked` before any of
+    // them increments the persistent failure counter.
+    let _attempt_guard = state.login_attempts.lock().await;
     match state.login_security.is_blocked(entry, ip).await {
         Ok(true) => return limited_login_response(policy.block_seconds),
         Ok(false) => {}
@@ -506,8 +557,14 @@ pub async fn login_handler(
             .map(|(_, hash, _)| hash.clone())
             .unwrap_or_else(|| admin_hash.clone())
     };
-    let password_valid = valid_password_length(&body.password)
+    let password_matches = valid_password_length(&body.password)
         && state.passwords.verify(password_hash, body.password).await;
+    let password_valid = password_matches
+        && if administrator {
+            supplied_username == admin_username
+        } else {
+            ordinary_candidate.is_some()
+        };
     let supplied_second_factor = body
         .totp_code
         .as_deref()
@@ -527,28 +584,31 @@ pub async fn login_handler(
         })
         .into_response();
     }
-    let mut second_factor_valid = !administrator || admin_totp_secret.is_none();
-    let mut used_totp_counter = None;
-    let mut used_recovery_hash = None;
-    if administrator && password_valid {
+    let second_factor_proof = if administrator && password_valid {
         if let Some(secret) = admin_totp_secret.as_deref() {
-            let supplied = body.totp_code.as_deref().unwrap_or("").trim();
-            used_totp_counter = crate::totp::verify_now_counter(secret, supplied);
-            second_factor_valid = used_totp_counter.is_some();
-            if !second_factor_valid {
-                let recovery = crate::totp::normalize_recovery_code(supplied);
-                if recovery.len() == 10 {
-                    for hash in &recovery_hashes {
-                        if state.passwords.verify(hash.clone(), recovery.clone()).await {
-                            used_recovery_hash = Some(hash.clone());
-                            second_factor_valid = true;
-                            break;
-                        }
-                    }
-                }
-            }
+            verify_admin_second_factor_proof(
+                &state.passwords,
+                secret,
+                &recovery_hashes,
+                body.totp_code.as_deref().unwrap_or("").trim(),
+            )
+            .await
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
+    let second_factor_valid =
+        !administrator || admin_totp_secret.is_none() || second_factor_proof.is_some();
+    let used_totp_counter = match second_factor_proof.as_ref() {
+        Some(AdminSecondFactorProof::TotpCounter(counter)) => Some(*counter),
+        _ => None,
+    };
+    let used_recovery_hash = match second_factor_proof {
+        Some(AdminSecondFactorProof::RecoveryHash(hash)) => Some(hash),
+        _ => None,
+    };
     let authenticated = password_valid
         && second_factor_valid
         && (administrator
@@ -816,6 +876,7 @@ pub async fn gate_handler(
             block_seconds: config.web_login_block_seconds as i64,
         }
     };
+    let _attempt_guard = state.login_attempts.lock().await;
     match state.login_security.is_blocked(LoginEntry::Web, ip).await {
         Ok(true) => return limited_login_response(web_policy.block_seconds),
         Ok(false) => {}
@@ -1044,7 +1105,8 @@ pub async fn is_admin_authenticated(state: &AppState, headers: &axum::http::Head
 
 // ── General auth middleware ───────────────────────────────────────
 
-/// Browser file APIs accept only an administrator session or the web gate token.
+/// Browser file APIs accept an administrator session, an enabled ordinary
+/// account session, or the read-only web gate token.
 pub async fn auth_middleware(
     axum::extract::State(state): axum::extract::State<AppState>,
     request: Request,
@@ -1068,7 +1130,8 @@ pub async fn auth_middleware(
 mod tests {
     use super::{
         extract_basic_auth, invalid_login_response, limited_login_response,
-        requires_second_factor_challenge, AccessTokenStore, SessionStore,
+        requires_second_factor_challenge, verify_admin_second_factor_proof, AccessTokenStore,
+        AdminSecondFactorProof, PasswordService, SessionStore,
     };
     use crate::login_security::LoginEntry;
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -1131,6 +1194,33 @@ mod tests {
             Some("secret"),
             Some("123456")
         ));
+    }
+
+    #[tokio::test]
+    async fn shared_admin_second_factor_verifier_returns_consumable_evidence() {
+        let passwords = PasswordService::new(1);
+        let secret = crate::totp::generate_secret();
+        let code = crate::totp::current_code_for_test(&secret);
+        let proof = verify_admin_second_factor_proof(&passwords, &secret, &[], &code)
+            .await
+            .unwrap();
+        let AdminSecondFactorProof::TotpCounter(counter) = proof else {
+            panic!("current TOTP must produce counter evidence");
+        };
+        let replay = crate::totp::TotpReplayStore::default();
+        assert!(replay.consume(counter).await);
+        assert!(!replay.consume(counter).await);
+
+        let recovery = crate::totp::normalize_recovery_code("ABCDE-23456");
+        let hash = passwords.hash(recovery).await.unwrap();
+        let proof = verify_admin_second_factor_proof(
+            &passwords,
+            &secret,
+            std::slice::from_ref(&hash),
+            "abcde-23456",
+        )
+        .await;
+        assert_eq!(proof, Some(AdminSecondFactorProof::RecoveryHash(hash)));
     }
 
     #[tokio::test]

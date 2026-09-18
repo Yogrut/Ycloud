@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use argon2::PasswordHash;
 
 use super::{
-    paths_overlap, AppError, AppResult, ConfigFile, S3AddressingStyle, S3Provider,
+    paths_overlap, AppError, AppResult, ConfigFile, S3AddressingStyle, S3Provider, S3StorageConfig,
     StorageBackendConfig, StorageInstanceConfig, CONFIG_SCHEMA_VERSION, HARD_MAX_ARCHIVE_BYTES,
     HARD_MAX_ARCHIVE_ENTRIES, HARD_MAX_STORAGE_CAPACITY_BYTES, HARD_MAX_TRANSFER_RATE_BYTES,
     HARD_MAX_UPLOAD_BATCH_BYTES, HARD_MAX_UPLOAD_BATCH_ENTRIES, HARD_MAX_UPLOAD_BYTES,
@@ -14,6 +14,14 @@ use super::{
 
 impl ConfigFile {
     pub fn validate(&self) -> AppResult<()> {
+        self.traffic.validate()?;
+        if let Some(binding) = &self.domain_binding {
+            if binding.clone().normalize()? != *binding {
+                return Err(AppError::BadRequest(
+                    "域名绑定配置必须使用规范化的 HTTPS 地址和代理 IP 列表".into(),
+                ));
+            }
+        }
         if self.schema_version != CONFIG_SCHEMA_VERSION {
             return Err(AppError::BadRequest(
                 "Unsupported configuration schema version".into(),
@@ -74,6 +82,7 @@ impl ConfigFile {
         let mut storage_ids = HashSet::new();
         let mut storage_names = HashSet::new();
         let mut local_mount_ids = HashSet::new();
+        let mut s3_namespaces = Vec::new();
         for storage in &self.storage_instances {
             validate_storage_instance(storage)?;
             if !storage_ids.insert(storage.id.as_str()) {
@@ -89,6 +98,9 @@ impl ConfigFile {
                         "同一个部署挂载点不能配置为多个本地存储实例".into(),
                     ));
                 }
+            } else if let StorageBackendConfig::S3(settings) = &storage.backend {
+                ensure_s3_namespace_available(settings, &s3_namespaces)?;
+                s3_namespaces.push(settings);
             }
         }
         if self.storage_instances.is_empty() {
@@ -164,6 +176,8 @@ impl ConfigFile {
                         "待添加本地存储不能重复使用已有部署挂载点".into(),
                     ));
                 }
+            } else if let StorageBackendConfig::S3(settings) = &pending.backend {
+                ensure_s3_namespace_available(settings, &s3_namespaces)?;
             }
         }
 
@@ -218,6 +232,7 @@ impl ConfigFile {
         }
 
         let mut lock_ids = HashSet::new();
+        let mut lock_scopes = HashSet::new();
         for lock in &self.folder_locks {
             validate_storage_reference(&lock.storage_id, &storage_ids)?;
             if lock.id.is_empty()
@@ -236,6 +251,11 @@ impl ConfigFile {
                 ));
             }
             validate_relative_config_path(&lock.path)?;
+            if !lock_scopes.insert((lock.storage_id.as_str(), lock.path.trim_matches('/'))) {
+                return Err(AppError::Conflict(
+                    "A storage path can only have one folder lock".into(),
+                ));
+            }
             if PasswordHash::new(&lock.password_hash).is_err() {
                 return Err(AppError::BadRequest(
                     "Folder lock password hash is invalid".into(),
@@ -255,7 +275,50 @@ impl ConfigFile {
     }
 }
 
+fn ensure_s3_namespace_available(
+    candidate: &S3StorageConfig,
+    configured: &[&S3StorageConfig],
+) -> AppResult<()> {
+    let candidate_endpoint = s3_endpoint_identity(&candidate.endpoint)?;
+    if configured.iter().any(|existing| {
+        existing.bucket == candidate.bucket
+            && s3_endpoint_identity(&existing.endpoint).ok().as_ref() == Some(&candidate_endpoint)
+            && s3_prefixes_overlap(&existing.prefix, &candidate.prefix)
+    }) {
+        return Err(AppError::Conflict(
+            "同一个 S3 Endpoint、Bucket 下的存储 Prefix 不能重叠".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn s3_endpoint_identity(endpoint: &str) -> AppResult<(String, String, u16)> {
+    let uri: axum::http::Uri = endpoint
+        .parse()
+        .map_err(|_| AppError::BadRequest("S3 Endpoint 地址无效".into()))?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| AppError::BadRequest("S3 Endpoint 缺少协议".into()))?
+        .to_ascii_lowercase();
+    let authority = uri
+        .authority()
+        .ok_or_else(|| AppError::BadRequest("S3 Endpoint 缺少主机".into()))?;
+    let port = authority
+        .port_u16()
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    Ok((scheme, authority.host().to_ascii_lowercase(), port))
+}
+
+fn s3_prefixes_overlap(left: &str, right: &str) -> bool {
+    left.is_empty() || right.is_empty() || left.starts_with(right) || right.starts_with(left)
+}
+
 fn validate_storage_instance(storage: &StorageInstanceConfig) -> AppResult<()> {
+    if !storage.allow_guest_access && storage.allow_guest_download == Some(true) {
+        return Err(AppError::BadRequest(
+            "允许访客下载必须同时开启允许访客访问".into(),
+        ));
+    }
     validate_storage_id(&storage.id)?;
     let name = storage.name.trim();
     if name.is_empty()
@@ -519,10 +582,16 @@ fn validate_s3_prefix(prefix: &str) -> AppResult<()> {
 }
 
 fn validate_relative_config_path(path: &str) -> AppResult<()> {
-    if path.contains('\\')
+    if path.is_empty() {
+        return Ok(());
+    }
+    if path != path.trim_matches('/')
+        || path.contains('\\')
         || path.contains('\0')
-        || path.trim_matches('/').split('/').any(|component| {
-            component == ".."
+        || path.chars().any(char::is_control)
+        || path.split('/').any(|component| {
+            component.is_empty()
+                || matches!(component, "." | "..")
                 || component.contains(':')
                 || component.eq_ignore_ascii_case(crate::storage_transaction::SYSTEM_DIR)
         })

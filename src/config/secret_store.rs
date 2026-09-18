@@ -4,6 +4,7 @@ use anyhow::Context;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand_core::{OsRng, RngCore};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use ring::hmac;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 const KEY_BYTES: usize = 32;
@@ -118,6 +119,17 @@ impl SecretStore {
 
     pub(super) fn is_current_encoding(value: &str) -> bool {
         value.starts_with(SECRET_PREFIX)
+    }
+
+    /// Derive a stable, domain-separated key without exposing or reusing the
+    /// configuration encryption key directly. The result survives S3
+    /// credential rotation and is bound to this Ycloud installation.
+    pub(super) fn derive_key(&self, context: &str) -> [u8; KEY_BYTES] {
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.key);
+        let tag = hmac::sign(&key, context.as_bytes());
+        tag.as_ref()
+            .try_into()
+            .expect("HMAC-SHA256 always produces a 32-byte tag")
     }
 
     fn aead_key(&self) -> anyhow::Result<LessSafeKey> {
@@ -369,5 +381,18 @@ mod tests {
         let encoded = URL_SAFE_NO_PAD.encode([7_u8; KEY_BYTES]);
         assert_eq!(decode_key(&encoded, "test").unwrap(), [7_u8; KEY_BYTES]);
         assert!(decode_key("too-short", "test").is_err());
+    }
+
+    #[test]
+    fn derived_keys_are_stable_and_domain_separated() {
+        let store = SecretStore::for_test();
+        assert_eq!(
+            store.derive_key("ycloud:s3-transaction-auth:v1"),
+            store.derive_key("ycloud:s3-transaction-auth:v1")
+        );
+        assert_ne!(
+            store.derive_key("ycloud:s3-transaction-auth:v1"),
+            store.derive_key("ycloud:other-purpose:v1")
+        );
     }
 }

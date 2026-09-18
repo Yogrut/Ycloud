@@ -29,6 +29,17 @@ async function mountMenu(props: Record<string, unknown>): Promise<HTMLElement> {
 }
 
 describe('BrowserContextMenu', () => {
+  it('keeps upload and new-folder actions visible when no permissions are granted', async () => {
+    const action = vi.fn()
+    const host = await mountMenu({ entry: file, paths: ['test.txt'], x: 20, y: 20, onAction: action,
+      capabilities: { download: false, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false },
+    })
+    const buttons = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+    expect(buttons.map(button => button.textContent)).toEqual(['上传', '新建文件夹'])
+    buttons[0]!.click()
+    buttons[1]!.click()
+    expect(action.mock.calls).toEqual([['upload'], ['mkdir']])
+  })
   it('keeps single-file preview on double-click and exposes download in the menu', async () => {
     const host = await mountMenu({ entry: file, paths: ['test.txt'], canWrite: true, x: 20, y: 20 })
 

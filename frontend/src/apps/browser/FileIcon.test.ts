@@ -27,16 +27,16 @@ function entry(overrides: Partial<FileEntry>): FileEntry {
 }
 
 describe('FileIcon', () => {
-  it('renders duotone SVG icons without exposing font ligature names', () => {
+  it('renders filled SVG icons without exposing font ligature names', () => {
     const folder = mountIcon(entry({ is_dir: true, icon: 'folder' }))
-    const folderIcon = folder.querySelector('[data-icon="folder"][data-weight="duotone"]')
+    const folderIcon = folder.querySelector('[data-icon="folder"][data-weight="fill"]')
     expect(folderIcon).not.toBeNull()
     expect(folderIcon?.tagName.toLowerCase()).toBe('svg')
     expect(folder.textContent).not.toContain('folder')
 
     document.body.replaceChildren()
     const file = mountIcon(entry({}))
-    const fileIcon = file.querySelector('[data-icon="file"][data-weight="duotone"]')
+    const fileIcon = file.querySelector('[data-icon="file-text"][data-weight="fill"]')
     expect(fileIcon?.tagName.toLowerCase()).toBe('svg')
     expect(file.textContent).not.toContain('description')
   })

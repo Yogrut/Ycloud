@@ -26,7 +26,7 @@ pub fn clear_cookie(name: &str, secure: bool) -> String {
 }
 
 pub async fn proxy_boundary_middleware(
-    State(config): State<Config>,
+    State(state): State<crate::state::AppState>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
@@ -35,16 +35,49 @@ pub async fn proxy_boundary_middleware(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(address)| address.ip())
         .or_else(|| {
-            config
+            state
+                .config
                 .bind_address
                 .is_loopback()
-                .then_some(config.bind_address)
+                .then_some(state.config.bind_address)
         })
         .ok_or(StatusCode::FORBIDDEN)?;
+    let config = crate::domain_binding::policy(&state).await;
     validate_request_host(&config, request.headers())?;
     let client_ip = validated_client_ip(&config, peer_ip, request.headers())?;
+    let secure_cookies = config.secure_cookies;
+    request.extensions_mut().insert(config);
     request.extensions_mut().insert(ClientIp(client_ip));
-    Ok(next.run(request).await)
+    let mut response = next.run(request).await;
+    // Handlers share deployment state; HTTPS bindings must also secure cookies
+    // when the deployment started in LAN mode. Never strip an existing Secure flag.
+    if secure_cookies {
+        let cookies = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| {
+                let raw = value
+                    .to_str()
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                if raw
+                    .split(';')
+                    .any(|part| part.trim().eq_ignore_ascii_case("secure"))
+                {
+                    Ok(value.clone())
+                } else {
+                    HeaderValue::from_str(&format!("{raw}; Secure"))
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        response.headers_mut().remove(header::SET_COOKIE);
+        for mut cookie in cookies {
+            cookie.set_sensitive(true);
+            response.headers_mut().append(header::SET_COOKIE, cookie);
+        }
+    }
+    Ok(response)
 }
 
 fn validate_request_host(
@@ -148,18 +181,31 @@ pub async fn csrf_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if is_mutating(request.method()) && uses_cookie_auth(request.headers()) {
-        let same_origin_fetch = request
-            .headers()
-            .get("sec-fetch-site")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == "same-origin");
-        let origin_matches = origin_matches(&config, request.headers());
-        if !same_origin_fetch && !origin_matches {
-            return Err(StatusCode::FORBIDDEN);
-        }
+    let config = request.extensions().get::<Config>().unwrap_or(&config);
+    if !csrf_request_allowed(config, request.method(), request.headers()) {
+        return Err(StatusCode::FORBIDDEN);
     }
     Ok(next.run(request).await)
+}
+
+fn csrf_request_allowed(config: &Config, method: &Method, headers: &axum::http::HeaderMap) -> bool {
+    if !is_mutating(method) {
+        return true;
+    }
+    let browser_context = uses_cookie_auth(headers)
+        || headers.contains_key(header::ORIGIN)
+        || headers.contains_key("sec-fetch-site");
+    if !browser_context {
+        // Preserve non-browser API clients, which do not send browser origin
+        // metadata. Browser writes are checked even before login sets a cookie,
+        // preventing login CSRF from replacing the current browser identity.
+        return true;
+    }
+    let same_origin_fetch = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "same-origin");
+    same_origin_fetch || origin_matches(config, headers)
 }
 
 pub async fn security_headers_middleware(
@@ -167,8 +213,18 @@ pub async fn security_headers_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    let config = request
+        .extensions()
+        .get::<Config>()
+        .cloned()
+        .unwrap_or(config);
+    let sensitive_response =
+        request.uri().path().starts_with("/api/") || request.uri().path().starts_with("/dav/");
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
+    if sensitive_response {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -192,7 +248,9 @@ pub async fn security_headers_middleware(
         HeaderName::from_static("cross-origin-opener-policy"),
         HeaderValue::from_static("same-origin"),
     );
-    headers.insert(
+    // Multiple CSP policies are enforced together. Do not replace the stricter
+    // sandbox policy attached by the untrusted-file response layer.
+    headers.append(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
             "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; \
@@ -246,8 +304,8 @@ fn origin_matches(config: &Config, headers: &axum::http::HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_cookie, origin_matches, session_cookie, single_header, trusted_lan_client,
-        validate_request_host, validated_client_ip,
+        clear_cookie, csrf_request_allowed, origin_matches, session_cookie, single_header,
+        trusted_lan_client, validate_request_host, validated_client_ip,
     };
     use crate::config::Config;
     use axum::http::{header, HeaderMap, HeaderValue};
@@ -275,6 +333,42 @@ mod tests {
             HeaderValue::from_static("http://evil.cloud.local:18473"),
         );
         assert!(!origin_matches(&local_config(), &headers));
+    }
+
+    #[test]
+    fn browser_login_write_requires_same_origin_before_cookie_exists() {
+        let config = local_config();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("cloud.local:18473"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://attacker.example"),
+        );
+        headers.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+        assert!(!csrf_request_allowed(
+            &config,
+            &axum::http::Method::POST,
+            &headers
+        ));
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://cloud.local:18473"),
+        );
+        headers.insert("sec-fetch-site", HeaderValue::from_static("same-origin"));
+        assert!(csrf_request_allowed(
+            &config,
+            &axum::http::Method::POST,
+            &headers
+        ));
+
+        let mut api_headers = HeaderMap::new();
+        api_headers.insert(header::HOST, HeaderValue::from_static("cloud.local:18473"));
+        assert!(csrf_request_allowed(
+            &config,
+            &axum::http::Method::POST,
+            &api_headers
+        ));
     }
 
     #[test]
@@ -401,6 +495,7 @@ mod tests {
             trusted_proxy_ips: Default::default(),
             allowed_hosts: Default::default(),
             s3_allowed_endpoints: Default::default(),
+            transaction_auth_key: [0x31; 32],
         }
     }
 }

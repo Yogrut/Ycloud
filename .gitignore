@@ -10,7 +10,10 @@
 # Runtime secrets and atomic-write backups
 /config.json
 /config.json.bak
+/config.json.pre-migration
 /initial-credentials.json
+/traffic-usage.json
+/traffic-usage.jsonl
 /security-events.json
 /security-events.json.bak
 /security-events.jsonl

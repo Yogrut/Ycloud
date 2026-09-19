@@ -21,24 +21,30 @@
 
 | 模块 | 职责 |
 | --- | --- |
+| `bootstrap.rs`、`state.rs` | 启动流程、共享运行状态和后台清理任务 |
 | `app.rs` | 路由、中间件、存活和就绪接口 |
-| `api.rs` | 文件 API |
+| `api.rs`、`batch_operations.rs`、`file_access.rs` | 单项／批量文件 API、授权和路径策略 |
 | `admin_api.rs`、`admin_api/` | 管理 API、用户和 TOTP |
 | `admin_execution.rs` | 有界管理操作执行，接收完整请求后不随 HTTP 等待者取消 |
-| `auth.rs`、`login_security.rs`、`security.rs` | 认证、会话、登录限制和代理边界 |
+| `auth.rs`、`login_security.rs`、`security.rs`、`totp.rs` | 认证、会话、TOTP、登录限制和代理边界 |
 | `config.rs`、`config/` | 配置模型、迁移、校验、持久化和密钥 |
-| `storage_backend.rs` | 存储注册表和统一接口 |
+| `domain_binding.rs` | HTTPS 域名绑定和可信代理配置 |
+| `storage_backend.rs`、`storage_catalog.rs` | 存储注册表、统一接口和部署挂载目录 |
 | `storage.rs`、`storage/`、`storage_transaction.rs` | 本地路径、读写和事务恢复 |
 | `s3_backend.rs`、`s3_backend/` | S3 客户端、对象操作、Multipart 和恢复 |
 | `capacity.rs` | 容量预留和账本 |
 | `upload_batch.rs` | 批量上传清单和上传票据 |
-| `directory_listing.rs` | 排序、搜索和分页 |
+| `directory_listing.rs`、`directory_size.rs`、`directory_snapshot.rs` | 排序、搜索、分页、按需大小统计和有界目录快照 |
 | `archive.rs` | 流式 ZIP |
-| `webdav.rs` | WebDAV 协议层 |
+| `traffic.rs`、`transfer_limit.rs` | 流量账本、额度统计和传输速率限制 |
+| `webdav.rs`、`webdav_path.rs`、`webdav_xml.rs` | WebDAV 协议、路径处理和 XML 响应 |
 
 ## 前端结构
 
-- `frontend/src/apps/`：登录、文件浏览、预览和管理页面。
+- `frontend/src/apps/`：登录、文件浏览、预览和管理页面；页面专用状态与操作逻辑和页面放在同一目录，例如 `apps/browser/useBrowser*.ts`。
+- `frontend/src/apps/login/main.ts`：前端唯一启动入口，由 `App.vue` 根据路径选择页面。
+- `frontend/src/components/ui/`：可直接维护的基础 UI 组件源码。
+- `frontend/src/lib/`：基础 UI 组件使用的通用工具。
 - `frontend/src/shared/api/`：API 客户端。
 - `frontend/src/shared/components/`：共享组件。
 - `frontend/src/shared/composables/`：共享状态逻辑。

@@ -65,7 +65,7 @@ sudo cat ./data/initial-credentials.json
 
 ```bash
 cargo build --release --locked
-BIND_ADDRESS=0.0.0.0 ALLOW_LAN_HTTP=true ./target/release/ycloud
+BIND_ADDRESS=0.0.0.0 ./target/release/ycloud
 ```
 
 默认配置和存储目录为当前目录下的 `config.json`、`storage/`。
@@ -78,46 +78,31 @@ BIND_ADDRESS=0.0.0.0 ALLOW_LAN_HTTP=true ./target/release/ycloud
 | `PORT` | HTTP 端口，默认 `18473` |
 | `CONFIG_PATH` | 配置文件路径 |
 | `STORAGE_PATH` | 默认本地存储路径 |
-| `ALLOW_LAN_HTTP` | 允许非回环地址直接使用 HTTP |
 | `ALLOWED_HOSTS` | 允许的内网 Host，多个值用逗号分隔 |
 | `LOCAL_STORAGE_MOUNTS` | 后台可选本地挂载点的 JSON 数组 |
 | `S3_ALLOWED_ENDPOINTS` | 自建 S3 Endpoint 白名单，多个值用逗号分隔 |
 | `RUST_LOG` | 日志级别 |
 
-Dockerfile 已设置容器内的监听地址、端口和数据路径，普通 Compose 部署只需 `ALLOW_LAN_HTTP=true`。
+Dockerfile 已设置容器内的监听地址、端口和数据路径，普通 Compose 部署无需设置访问模式参数。
 
 ### HTTPS 反向代理
 
-也可以先通过内网地址登录后台，在 **管理员设置 → 域名绑定** 中填写
-`https://cloud.example.com` 和 Ycloud 实际收到连接的反向代理 IP。
-支持非默认 HTTPS 端口，暂不支持多个域名。先完成 DNS、证书和反向代理配置；
-Ycloud 不会自动操作 DNS 或申请证书。
+先通过 HTTP 地址登录后台，在 **管理员设置 → 域名绑定** 中填写
+`https://cloud.example.com`。支持非默认 HTTPS 端口，暂不支持多个域名。
+先完成 DNS、证书和转发配置；Ycloud 不会自动操作 DNS、申请证书或配置反向代理。
 
 点击确认后立即保存并生效，无验证等待期，也不会自动恢复旧配置。
 此后文件页、后台、API 和 WebDAV 仅接受该域名，内网 IP 直连关闭，请通过新域名重新登录。
-保存前请核对域名及代理 IP；程序仅校验配置格式，不主动请求域名验证连通性。
+保存前请核对域名；程序仅校验配置格式，不主动请求域名验证连通性。
 
-确认后的配置保存在数据目录的 `config.json` 中，优先于部署时的域名配置，
-并自动应用 HTTPS 代理模式及 Secure Cookie，无需为此修改容器环境变量或重建容器。
-可信代理必须填写准确 IP（最多 16 个），不能填写访客 IP、通配地址或任意网段。
-容器代理 IP 变化时需重新设置。后台可以解除绑定，解除后恢复部署变量配置。
+确认后的配置保存在数据目录的 `config.json` 中，并自动启用严格域名校验、
+Secure Cookie 和 HSTS，无需修改容器环境变量或重建容器。Ycloud 不读取
+`X-Forwarded-For` 或 `X-Forwarded-Proto`；访问日志与登录限制使用
+Ycloud 实际收到连接的来源 IP。后台解除绑定后立即恢复 HTTP 访问模式。
 
 如果已确认的域名后来失效，可停止服务，将持久化 `config.json` 的
-`domain_binding` 改为 `null`，再启动服务恢复部署配置；不要删除整个配置文件。
-若原部署变量仍指定公网域名，也需相应调整原变量。该功能不修改容器端口映射或监听地址。
-
-以下是仍然支持的环境变量部署方式：
-
-Ycloud 不内置 TLS。反向代理模式需要同时设置：
-
-```env
-ALLOW_LAN_HTTP=false
-SECURE_COOKIES=true
-PUBLIC_BASE_URL=https://cloud.example.com
-TRUSTED_PROXY_IPS=172.18.0.1
-```
-
-代理必须传递原始 `Host`、单值 `X-Forwarded-For` 和 `X-Forwarded-Proto: https`。
+`domain_binding` 改为 `null`，再启动服务恢复 HTTP 访问；不要删除整个配置文件。
+该功能不修改容器端口映射或监听地址。
 
 ### 配置主密钥
 

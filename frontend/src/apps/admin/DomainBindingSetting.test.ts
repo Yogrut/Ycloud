@@ -4,7 +4,7 @@ import type { DomainBindingView } from '../../shared/api/admin'
 import DomainBindingSetting from './DomainBindingSetting.vue'
 
 const empty: DomainBindingView = { binding: null, source: 'none' }
-const binding = { public_url: 'https://cloud.example.com', trusted_proxy_ips: ['172.18.0.1'] }
+const binding = { public_url: 'https://cloud.example.com' }
 const response = (body: unknown) => new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } })
 const settle = async () => { await new Promise(resolve => setTimeout(resolve, 0)); await nextTick() }
 
@@ -17,7 +17,7 @@ function mount(initial = empty) {
 }
 
 describe('DomainBindingSetting', () => {
-  it('always shows proxy fields and saves immediately with one confirmation', async () => {
+  it('saves an HTTPS domain immediately with one confirmation', async () => {
     const saved: DomainBindingView = { binding, source: 'settings' }
     const fetch = vi.fn().mockResolvedValueOnce(response(empty)).mockResolvedValueOnce(response(saved))
     vi.stubGlobal('fetch', fetch)
@@ -27,18 +27,17 @@ describe('DomainBindingSetting', () => {
     expect(host.querySelector('.settings-drawer-head')?.textContent).not.toContain('返回')
     expect(host.querySelector('details')).toBeNull()
     expect(host.querySelector('summary')).toBeNull()
-    expect(host.textContent).toContain('可信反向代理 IP')
+    expect(host.textContent).toContain('不填写则使用 HTTP')
     expect(host.textContent).not.toContain('验证期')
     const inputs = host.querySelectorAll<HTMLInputElement>('.domain-binding-form input')
-    expect(inputs).toHaveLength(2)
+    expect(inputs).toHaveLength(1)
     inputs[0]!.value = binding.public_url; inputs[0]!.dispatchEvent(new Event('input'))
-    inputs[1]!.value = '172.18.0.1, 172.18.0.2'; inputs[1]!.dispatchEvent(new Event('input'))
     await nextTick()
     expect(fetch).toHaveBeenCalledTimes(1)
     host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true })); await settle()
     expect(fetch).toHaveBeenCalledTimes(2)
     expect(fetch).toHaveBeenLastCalledWith('/api/admin/domain-binding', expect.objectContaining({
-      method: 'PUT', body: JSON.stringify({ public_url: binding.public_url, trusted_proxy_ips: ['172.18.0.1', '172.18.0.2'] }),
+      method: 'PUT', body: JSON.stringify({ public_url: binding.public_url }),
     }))
     expect(document.querySelector('.app-toast.success')?.textContent).toContain('域名绑定已立即生效')
     expect(host.querySelector<HTMLInputElement>('input[type="url"]')?.value).toBe(binding.public_url)
@@ -75,10 +74,10 @@ describe('DomainBindingSetting', () => {
     host.querySelector<HTMLButtonElement>('.setting-row button')!.click(); await settle()
     host.querySelector<HTMLButtonElement>('.domain-remove')!.click(); await nextTick()
     expect(fetch).toHaveBeenCalledTimes(1)
-    expect(host.textContent).toContain('恢复部署时的访问配置')
+    expect(host.textContent).toContain('恢复 HTTP 访问')
     host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true })); await settle()
     expect(fetch).toHaveBeenLastCalledWith('/api/admin/domain-binding', expect.objectContaining({ method: 'DELETE' }))
-    expect(document.querySelector('.app-toast.success')?.textContent).toContain('已解除后台绑定')
+    expect(document.querySelector('.app-toast.success')?.textContent).toContain('已解除域名绑定')
     app.unmount()
   })
 

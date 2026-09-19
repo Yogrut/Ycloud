@@ -53,10 +53,6 @@ impl Config {
         let request_timeout_secs = env_parse("REQUEST_TIMEOUT_SECS", 300_u64)?;
         let upload_timeout_secs = env_parse("UPLOAD_TIMEOUT_SECS", 6_u64 * 60 * 60)?;
         let disk_reserve_bytes = env_parse("DISK_RESERVE_BYTES", 512_u64 * 1024 * 1024)?;
-        let secure_cookies = env_parse("SECURE_COOKIES", false)?;
-        let allow_lan_http = env_parse("ALLOW_LAN_HTTP", false)?;
-        let (public_base_url, public_host, trusted_proxy_ips) =
-            public_proxy_config(bind_address, secure_cookies, allow_lan_http)?;
         let allowed_hosts = allowed_hosts()?;
         let s3_allowed_endpoints = s3_allowed_endpoints()?;
         Ok(Self {
@@ -75,11 +71,9 @@ impl Config {
             request_timeout_secs,
             upload_timeout_secs,
             disk_reserve_bytes,
-            secure_cookies,
-            allow_lan_http,
-            public_base_url,
-            public_host,
-            trusted_proxy_ips,
+            secure_cookies: false,
+            public_base_url: None,
+            public_host: None,
             allowed_hosts,
             s3_allowed_endpoints,
             // Bootstrap replaces this only after the persisted configuration
@@ -199,78 +193,6 @@ pub fn normalize_s3_endpoint(endpoint: &str) -> AppResult<String> {
         scheme.to_ascii_lowercase(),
         authority.as_str().to_ascii_lowercase()
     ))
-}
-
-fn public_proxy_config(
-    bind_address: IpAddr,
-    secure_cookies: bool,
-    allow_lan_http: bool,
-) -> anyhow::Result<(Option<String>, Option<String>, HashSet<IpAddr>)> {
-    let public_requested = std::env::var_os("PUBLIC_BASE_URL").is_some()
-        || std::env::var_os("TRUSTED_PROXY_IPS").is_some();
-    if public_requested {
-        if allow_lan_http {
-            anyhow::bail!("ALLOW_LAN_HTTP cannot be combined with public HTTPS proxy mode");
-        }
-        if !secure_cookies {
-            anyhow::bail!("SECURE_COOKIES=true is required for public HTTPS proxy mode");
-        }
-        return configured_public_proxy();
-    }
-    if bind_address.is_loopback() {
-        return Ok((None, None, HashSet::new()));
-    }
-    if allow_lan_http {
-        if secure_cookies {
-            anyhow::bail!(
-                "SECURE_COOKIES must be false for direct LAN HTTP; use public HTTPS proxy mode instead"
-            );
-        }
-        return Ok((None, None, HashSet::new()));
-    }
-    if !secure_cookies {
-        anyhow::bail!("SECURE_COOKIES=true is required when BIND_ADDRESS is not loopback");
-    }
-    anyhow::bail!(
-        "PUBLIC_BASE_URL and TRUSTED_PROXY_IPS are required when BIND_ADDRESS is not loopback"
-    )
-}
-
-fn configured_public_proxy() -> anyhow::Result<(Option<String>, Option<String>, HashSet<IpAddr>)> {
-    let raw_url = std::env::var("PUBLIC_BASE_URL")
-        .context("PUBLIC_BASE_URL=https://your-domain is required for public mode")?;
-    let uri: axum::http::Uri = raw_url
-        .parse()
-        .context("PUBLIC_BASE_URL must be a valid HTTPS origin")?;
-    if uri.scheme_str() != Some("https")
-        || uri.authority().is_none()
-        || !matches!(uri.path(), "" | "/")
-        || uri.query().is_some()
-    {
-        anyhow::bail!("PUBLIC_BASE_URL must be an HTTPS origin without a path or query");
-    }
-    let host = uri
-        .authority()
-        .expect("authority checked above")
-        .as_str()
-        .to_string();
-    let origin = format!("https://{host}");
-    let raw_proxies = std::env::var("TRUSTED_PROXY_IPS")
-        .context("TRUSTED_PROXY_IPS is required for public mode")?;
-    let trusted_proxy_ips: HashSet<IpAddr> = raw_proxies
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            value
-                .parse::<IpAddr>()
-                .with_context(|| format!("Invalid trusted proxy IP: {value}"))
-        })
-        .collect::<anyhow::Result<_>>()?;
-    if trusted_proxy_ips.is_empty() {
-        anyhow::bail!("TRUSTED_PROXY_IPS must contain at least one exact IP address");
-    }
-    Ok((Some(origin), Some(host), trusted_proxy_ips))
 }
 
 fn env_parse<T>(name: &str, default: T) -> anyhow::Result<T>

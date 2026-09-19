@@ -60,12 +60,11 @@ export interface AdminInfo {
 
 export interface DomainBinding {
   public_url: string
-  trusted_proxy_ips: string[]
 }
 
 export interface DomainBindingView {
   binding: DomainBinding | null
-  source: 'none' | 'environment' | 'settings'
+  source: 'none' | 'settings'
 }
 
 export function getDomainBinding(): Promise<DomainBindingView> {

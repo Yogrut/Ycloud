@@ -78,8 +78,8 @@
 
 - 默认监听 `127.0.0.1:18473`。
 - Ycloud 不内置 TLS。
-- 局域网 HTTP 需要 `ALLOW_LAN_HTTP=true`。
-- HTTPS 代理模式需要 `PUBLIC_BASE_URL`、`TRUSTED_PROXY_IPS` 和 `SECURE_COOKIES=true`。
+- 后台未绑定域名时使用 HTTP；绑定 HTTPS 域名后启用严格域名校验、Secure Cookie 和 HSTS。
+- DNS、证书和转发属于部署环境；Ycloud 不要求代理 IP 或 `X-Forwarded-*` 参数。
 - `LOCAL_STORAGE_MOUNTS` 限制后台可选本地路径。
 - `S3_ALLOWED_ENDPOINTS` 限制自建 S3 Endpoint。
 - `YCLOUD_CONFIG_KEY_FILE` 用于外部配置主密钥。

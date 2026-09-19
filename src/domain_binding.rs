@@ -14,7 +14,10 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub struct DomainBinding {
     pub public_url: String,
-    pub trusted_proxy_ips: Vec<IpAddr>,
+    /// Accept the field written by older releases so existing installations
+    /// keep starting, but stop exposing or persisting proxy-specific policy.
+    #[serde(default, rename = "trusted_proxy_ips", skip_serializing)]
+    _legacy_trusted_proxy_ips: Vec<IpAddr>,
 }
 
 impl DomainBinding {
@@ -50,17 +53,6 @@ impl DomainBinding {
         {
             return Err(invalid());
         }
-        if self.trusted_proxy_ips.is_empty()
-            || self.trusted_proxy_ips.len() > 16
-            || self
-                .trusted_proxy_ips
-                .iter()
-                .any(|ip| ip.is_unspecified() || ip.is_multicast())
-        {
-            return Err(AppError::BadRequest(
-                "请填写 1–16 个可信反向代理的准确 IP 地址，不能使用通配地址".into(),
-            ));
-        }
         Ok(())
     }
 
@@ -75,8 +67,7 @@ impl DomainBinding {
         if self.public_url.ends_with(":443") {
             self.public_url.truncate(self.public_url.len() - 4);
         }
-        self.trusted_proxy_ips.sort();
-        self.trusted_proxy_ips.dedup();
+        self._legacy_trusted_proxy_ips.clear();
         Ok(self)
     }
 
@@ -89,8 +80,6 @@ impl DomainBinding {
                 .trim_end_matches('/')
                 .into(),
         );
-        config.trusted_proxy_ips = self.trusted_proxy_ips.iter().copied().collect();
-        config.allow_lan_http = false;
         config.secure_cookies = true;
         config
     }
@@ -106,22 +95,11 @@ pub async fn view(state: &AppState) -> BindingView {
     let persisted = state.config_file.read().await.domain_binding.clone();
     let source = if persisted.is_some() {
         "settings"
-    } else if state.config.is_public_mode() {
-        "environment"
     } else {
         "none"
     };
     BindingView {
-        binding: persisted.or_else(|| {
-            state
-                .config
-                .public_base_url
-                .as_ref()
-                .map(|url| DomainBinding {
-                    public_url: url.clone(),
-                    trusted_proxy_ips: state.config.trusted_proxy_ips.iter().copied().collect(),
-                })
-        }),
+        binding: persisted,
         source,
     }
 }
@@ -180,7 +158,7 @@ mod tests {
     fn binding() -> DomainBinding {
         DomainBinding {
             public_url: "https://cloud.example.com".into(),
-            trusted_proxy_ips: vec!["127.0.0.1".parse().unwrap()],
+            _legacy_trusted_proxy_ips: Vec::new(),
         }
     }
 
@@ -220,7 +198,7 @@ mod tests {
         } else {
             "http://127.0.0.1:18473"
         };
-        let mut builder = Request::builder()
+        let builder = Request::builder()
             .method(method)
             .uri(path)
             .header(header::HOST, host)
@@ -229,11 +207,7 @@ mod tests {
             .extension(ConnectInfo(
                 "127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap(),
             ));
-        if public {
-            builder = builder
-                .header("x-forwarded-for", "192.168.1.10")
-                .header("x-forwarded-proto", "https");
-        }
+        let mut builder = builder;
         if let Some(token) = token {
             builder = builder.header(header::COOKIE, format!("session={token}"));
         }
@@ -244,7 +218,6 @@ mod tests {
     fn normalizes_domain_and_supports_custom_https_port() {
         let mut value = binding();
         value.public_url = " HTTPS://CLOUD.EXAMPLE.COM:443/ ".into();
-        value.trusted_proxy_ips.push(value.trusted_proxy_ips[0]);
         assert_eq!(value.normalize().unwrap(), binding());
         value = binding();
         value.public_url = "https://cloud.example.com:8443".into();
@@ -255,13 +228,23 @@ mod tests {
     }
 
     #[test]
-    fn requires_https_domain_and_explicit_proxy_configuration() {
+    fn requires_https_domain() {
         let mut value = binding();
         value.public_url = "http://cloud.example.com".into();
         assert!(value.normalize().is_err());
-        value = binding();
-        value.trusted_proxy_ips.clear();
-        assert!(value.normalize().is_err());
+    }
+
+    #[test]
+    fn accepts_but_drops_legacy_proxy_ips() {
+        let value: DomainBinding = serde_json::from_value(serde_json::json!({
+            "public_url": "https://cloud.example.com",
+            "trusted_proxy_ips": ["127.0.0.1"]
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(value.normalize().unwrap()).unwrap(),
+            serde_json::json!({"public_url": "https://cloud.example.com"})
+        );
     }
 
     #[tokio::test]
@@ -285,7 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saves_immediately_persists_across_restart_and_restores_deployment_on_removal() {
+    async fn saves_immediately_persists_across_restart_and_returns_to_http_on_removal() {
         let (state, root) = fixture().await;
         let router = crate::app::build_router(state.clone());
         let token = state.sessions.create().await;

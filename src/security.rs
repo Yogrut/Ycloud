@@ -44,10 +44,9 @@ pub async fn proxy_boundary_middleware(
         .ok_or(StatusCode::FORBIDDEN)?;
     let config = crate::domain_binding::policy(&state).await;
     validate_request_host(&config, request.headers())?;
-    let client_ip = validated_client_ip(&config, peer_ip, request.headers())?;
     let secure_cookies = config.secure_cookies;
     request.extensions_mut().insert(config);
-    request.extensions_mut().insert(ClientIp(client_ip));
+    request.extensions_mut().insert(ClientIp(peer_ip));
     let mut response = next.run(request).await;
     // Handlers share deployment state; HTTPS bindings must also secure cookies
     // when the deployment started in LAN mode. Never strip an existing Secure flag.
@@ -104,60 +103,11 @@ fn validate_request_host(
     }
     let host = authority.host();
     if host.eq_ignore_ascii_case("localhost") {
-        return config
-            .bind_address
-            .is_loopback()
-            .then_some(())
-            .ok_or(StatusCode::FORBIDDEN);
+        return Ok(());
     }
-    let ip = host.parse::<IpAddr>().map_err(|_| StatusCode::FORBIDDEN)?;
-    let allowed = if config.allow_lan_http {
-        trusted_lan_client(ip)
-    } else {
-        config.bind_address.is_loopback() && ip.is_loopback()
-    };
-    allowed.then_some(()).ok_or(StatusCode::FORBIDDEN)
-}
-
-fn validated_client_ip(
-    config: &Config,
-    peer_ip: IpAddr,
-    headers: &axum::http::HeaderMap,
-) -> Result<IpAddr, StatusCode> {
-    if config.allow_lan_http && !config.is_public_mode() {
-        return trusted_lan_client(peer_ip)
-            .then_some(peer_ip)
-            .ok_or(StatusCode::FORBIDDEN);
-    }
-    if !config.is_public_mode() {
-        return Ok(peer_ip);
-    }
-    if !config.trusted_proxy_ips.contains(&peer_ip) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let forwarded_for = single_header(headers, "x-forwarded-for")?;
-    let forwarded_proto = single_header(headers, "x-forwarded-proto")?;
-    let host = single_header(headers, header::HOST.as_str())?;
-    if forwarded_proto != "https" || Some(host) != config.public_host.as_deref() {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    forwarded_for
-        .parse::<IpAddr>()
-        .map_err(|_| StatusCode::BAD_REQUEST)
-}
-
-fn trusted_lan_client(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unicast_link_local()
-                || (ip.segments()[0] & 0xfe00) == 0xfc00
-                || ip.to_ipv4_mapped().is_some_and(|mapped| {
-                    mapped.is_loopback() || mapped.is_private() || mapped.is_link_local()
-                })
-        }
-    }
+    host.parse::<IpAddr>()
+        .map(|_| ())
+        .map_err(|_| StatusCode::FORBIDDEN)
 }
 
 fn single_header<'a>(
@@ -304,8 +254,7 @@ fn origin_matches(config: &Config, headers: &axum::http::HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_cookie, csrf_request_allowed, origin_matches, session_cookie, single_header,
-        trusted_lan_client, validate_request_host, validated_client_ip,
+        clear_cookie, csrf_request_allowed, origin_matches, session_cookie, validate_request_host,
     };
     use crate::config::Config;
     use axum::http::{header, HeaderMap, HeaderValue};
@@ -402,69 +351,13 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_headers_must_be_single_values() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
-        assert_eq!(
-            single_header(&headers, "x-forwarded-for").unwrap(),
-            "203.0.113.9"
-        );
-        headers.insert(
-            "x-forwarded-for",
-            HeaderValue::from_static("203.0.113.9, 127.0.0.1"),
-        );
-        assert!(single_header(&headers, "x-forwarded-for").is_err());
-    }
-
-    #[test]
-    fn public_mode_rejects_untrusted_or_insecure_proxy_requests() {
-        let mut config = local_config();
-        config.public_base_url = Some("https://cloud.example".into());
-        config.public_host = Some("cloud.example".into());
-        config
-            .trusted_proxy_ips
-            .insert("127.0.0.1".parse().unwrap());
-        let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, HeaderValue::from_static("cloud.example"));
-        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-
-        assert_eq!(
-            validated_client_ip(&config, "127.0.0.1".parse().unwrap(), &headers).unwrap(),
-            "203.0.113.9".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert!(validated_client_ip(&config, "192.0.2.10".parse().unwrap(), &headers).is_err());
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
-        assert!(validated_client_ip(&config, "127.0.0.1".parse().unwrap(), &headers).is_err());
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        headers.insert(header::HOST, HeaderValue::from_static("evil.example"));
-        assert!(validated_client_ip(&config, "127.0.0.1".parse().unwrap(), &headers).is_err());
-    }
-
-    #[test]
-    fn direct_lan_mode_accepts_only_non_public_peers() {
-        assert!(trusted_lan_client("127.0.0.1".parse().unwrap()));
-        assert!(trusted_lan_client("192.168.2.86".parse().unwrap()));
-        assert!(trusted_lan_client("10.0.0.8".parse().unwrap()));
-        assert!(trusted_lan_client("169.254.10.2".parse().unwrap()));
-        assert!(trusted_lan_client("fd00::8".parse().unwrap()));
-        assert!(!trusted_lan_client("203.0.113.8".parse().unwrap()));
-        assert!(!trusted_lan_client("2001:db8::8".parse().unwrap()));
-
-        let mut config = local_config();
-        config.bind_address = "0.0.0.0".parse().unwrap();
-        config.allow_lan_http = true;
-        let mut spoofed_headers = HeaderMap::new();
-        spoofed_headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.99"));
-        assert_eq!(
-            validated_client_ip(&config, "192.168.2.10".parse().unwrap(), &spoofed_headers)
-                .unwrap(),
-            "192.168.2.10".parse::<std::net::IpAddr>().unwrap()
-        );
-        assert!(
-            validated_client_ip(&config, "203.0.113.8".parse().unwrap(), &HeaderMap::new())
-                .is_err()
-        );
+    fn direct_http_accepts_public_and_private_ip_hosts() {
+        let config = local_config();
+        for host in ["127.0.0.1:18473", "192.168.2.86:18473", "203.0.113.8:18473"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            assert!(validate_request_host(&config, &headers).is_ok(), "{host}");
+        }
     }
 
     fn local_config() -> Config {
@@ -489,10 +382,8 @@ mod tests {
             upload_timeout_secs: 1,
             disk_reserve_bytes: 0,
             secure_cookies: false,
-            allow_lan_http: false,
             public_base_url: None,
             public_host: None,
-            trusted_proxy_ips: Default::default(),
             allowed_hosts: Default::default(),
             s3_allowed_endpoints: Default::default(),
             transaction_auth_key: [0x31; 32],

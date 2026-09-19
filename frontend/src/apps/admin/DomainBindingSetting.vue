@@ -13,7 +13,6 @@ const status = ref<DomainBindingView>(props.initial ?? { binding: null, source: 
 const open = ref(false)
 const busy = ref(false)
 const url = ref('')
-const proxies = ref('')
 const error = ref('')
 const message = ref('')
 const removing = ref(false)
@@ -29,7 +28,6 @@ async function refresh(): Promise<void> {
 
 function syncDraft(): void {
   url.value = status.value.binding?.public_url ?? ''
-  proxies.value = status.value.binding?.trusted_proxy_ips.join(', ') ?? ''
 }
 
 async function show(): Promise<void> {
@@ -49,9 +47,9 @@ async function submit(): Promise<void> {
       status.value = await removeDomainBinding()
       removing.value = false
       syncDraft()
-      message.value = locale.text('已解除后台绑定，恢复部署配置；请使用部署时的访问地址。', 'Binding removed. Use your deployment address; deployment settings apply again.')
+      message.value = locale.text('已解除域名绑定，Ycloud 已恢复 HTTP 访问模式。', 'Domain binding removed. Ycloud is using HTTP access again.')
     } else {
-      status.value = await saveDomainBinding({ public_url: url.value.trim(), trusted_proxy_ips: proxies.value.split(/[\s,，]+/).filter(Boolean) })
+      status.value = await saveDomainBinding({ public_url: url.value.trim() })
       syncDraft()
       message.value = locale.text('域名绑定已立即生效，请使用绑定域名访问。', 'Domain binding is active. Use the bound domain to access Ycloud.')
     }
@@ -70,16 +68,13 @@ function cancel(): void {
   <SettingsDrawer v-if="open" :title="label" :busy="busy" @close="open = false">
     <form class="drawer-form domain-binding-form" @submit.prevent="feedbackRevision++; submit()">
       <template v-if="removing">
-        <p class="domain-notice confirmation-warning">{{ locale.text('确认解除域名绑定？解除后恢复部署时的访问配置，当前地址可能立即无法访问。', 'Remove domain binding? Deployment access settings will be restored and this address may stop working immediately.') }}</p>
-        <p>{{ locale.text('请先确认你知道部署时的内网访问地址；若部署变量已配置域名，则恢复该域名。', 'Make sure you know the original LAN address. If deployment variables specify a domain, that domain will be restored.') }}</p>
+        <p class="domain-notice confirmation-warning">{{ locale.text('确认解除域名绑定？解除后 Ycloud 恢复 HTTP 访问，当前 HTTPS 地址可能立即无法访问。', 'Remove domain binding? Ycloud will return to HTTP access and this HTTPS address may stop working immediately.') }}</p>
+        <p>{{ locale.text('请先确认你知道 Ycloud 的 HTTP 访问地址。', 'Make sure you know Ycloud’s HTTP address.') }}</p>
       </template>
       <template v-else>
         <label>{{ locale.text('访问地址', 'Public address') }}<input v-model="url" class="input" type="url" required maxlength="300" placeholder="https://cloud.example.com" autocomplete="off"></label>
-        <p class="field-hint">{{ locale.text('仅支持 HTTPS 域名，可带端口。确认后文件页面、后台及 WebDAV 均使用该域名，内网 IP 直连将关闭。', 'Use an HTTPS domain, optionally with a port. After confirmation, files, admin and WebDAV use this domain; direct LAN IP access is disabled.') }}</p>
-        <label>{{ locale.text('可信反向代理 IP', 'Trusted proxy IPs') }}<input v-model="proxies" class="input" required maxlength="720" placeholder="172.18.0.1" autocomplete="off"></label>
-        <p class="field-hint">{{ locale.text('填写 Ycloud 实际收到连接的代理 IP，多个用逗号分隔，不是访客 IP。代理须传递原始 Host、单值 X-Forwarded-For 和 X-Forwarded-Proto: https。', 'Enter the proxy peer IP seen by Ycloud, not visitor IPs; separate multiple addresses with commas. Forward the original Host, one X-Forwarded-For IP, and X-Forwarded-Proto: https.') }}</p>
-        <p class="field-hint">{{ locale.text('请先完成 DNS 解析、证书和反向代理配置。点击确认后立即生效，请核对地址及代理 IP；填写错误可能导致无法访问。', 'Configure DNS, a certificate and the reverse proxy first. Changes apply immediately on confirmation; incorrect addresses or proxy IPs may prevent access.') }}</p>
-        <p v-if="status.source === 'environment'" class="field-hint">{{ locale.text('当前配置来自部署变量。新绑定确认后优先生效，无需修改容器变量。', 'Current settings come from deployment variables. A confirmed binding takes precedence without changing those variables.') }}</p>
+        <p class="field-hint">{{ locale.text('仅支持 HTTPS 域名，可带端口。填写后 Ycloud 使用 HTTPS 模式；不填写则使用 HTTP。域名解析、证书和转发由部署环境负责。', 'Use an HTTPS domain, optionally with a port. Ycloud uses HTTPS mode when set and HTTP when unset. DNS, certificates and forwarding belong to the deployment environment.') }}</p>
+        <p class="field-hint">{{ locale.text('确认后文件页面、后台及 WebDAV 均校验该域名，并启用 HTTPS Cookie；内网 IP 直连将关闭。', 'After confirmation, files, admin and WebDAV validate this domain and use HTTPS cookies; direct LAN IP access is disabled.') }}</p>
         <button v-if="status.source === 'settings'" class="domain-remove" type="button" @click="removing = true; error = ''; message = ''">{{ locale.text('解除域名绑定', 'Remove domain binding') }}</button>
       </template>
       <AppFeedback :revision="feedbackRevision" :message="message" kind="success" />

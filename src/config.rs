@@ -170,12 +170,8 @@ pub struct Config {
     pub upload_timeout_secs: u64,
     pub disk_reserve_bytes: u64,
     pub secure_cookies: bool,
-    /// Allows direct HTTP access only from loopback, private, and link-local peers.
-    /// This is deliberately separate from the strict public HTTPS proxy mode.
-    pub allow_lan_http: bool,
     pub public_base_url: Option<String>,
     pub public_host: Option<String>,
-    pub trusted_proxy_ips: HashSet<IpAddr>,
     /// Additional exact Host authorities accepted only in local/LAN mode.
     /// Public proxy mode always uses `public_host` exclusively.
     pub allowed_hosts: HashSet<String>,
@@ -833,10 +829,8 @@ mod tests {
             upload_timeout_secs: 21_600,
             disk_reserve_bytes: 512 * 1024 * 1024,
             secure_cookies: false,
-            allow_lan_http: false,
             public_base_url: None,
             public_host: None,
-            trusted_proxy_ips: Default::default(),
             allowed_hosts: Default::default(),
             s3_allowed_endpoints: [endpoint].into_iter().collect(),
             transaction_auth_key: [0x31; 32],

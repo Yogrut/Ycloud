@@ -24,7 +24,6 @@ import {
   PhFilePpt,
   PhFileVideo,
   PhFileXls,
-  PhFolder,
   PhFolderOpen,
   PhFolderPlus,
   PhFolderSimple,
@@ -86,7 +85,6 @@ export type AppIconName =
   | 'file-ppt'
   | 'file-video'
   | 'file-xls'
-  | 'folder'
   | 'folder-open'
   | 'folder-plus'
   | 'folder-simple'
@@ -147,7 +145,6 @@ const icons = {
   'file-ppt': PhFilePpt,
   'file-video': PhFileVideo,
   'file-xls': PhFileXls,
-  folder: PhFolder,
   'folder-open': PhFolderOpen,
   'folder-plus': PhFolderPlus,
   'folder-simple': PhFolderSimple,

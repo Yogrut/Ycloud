@@ -340,8 +340,6 @@ function handleMenuAction(action: BrowserAction): void {
     case 'mkdir':
       openFolderDialog()
       break
-    case 'folder':
-      break
   }
 }
 

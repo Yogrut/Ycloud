@@ -432,14 +432,6 @@ export function updateLocalStorage(storageId: string, name: string, path: string
   })
 }
 
-export function updateStorageAccess(storageId: string, enabled: boolean, allowGuestAccess: boolean, allowGuestDownload?: boolean): Promise<{ success: boolean }> {
-  return adminRequest(`/api/admin/storage/${encodeURIComponent(storageId)}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload }),
-  })
-}
-
 export function setDefaultStorage(storageId: string): Promise<{ success: boolean }> {
   return adminRequest(`/api/admin/storage/${encodeURIComponent(storageId)}/default`, { method: 'PUT' })
 }

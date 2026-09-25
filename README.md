@@ -37,6 +37,14 @@ cargo run --release --locked
     <td><img src="docs/images/web-login.png" alt="Ycloud 访客入口"></td>
     <td><img src="docs/images/file-browser.png" alt="Ycloud 文件管理"></td>
   </tr>
+  <tr>
+    <th>普通用户登录</th>
+    <th>管理员登录</th>
+  </tr>
+  <tr>
+    <td><img src="docs/images/user-login.png" alt="Ycloud 普通用户登录"></td>
+    <td><img src="docs/images/admin-login.png" alt="Ycloud 管理员登录"></td>
+  </tr>
 </table>
 
 管理后台概览：

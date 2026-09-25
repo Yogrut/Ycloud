@@ -15,9 +15,11 @@ use tokio::{
 #[cfg(all(unix, any(not(target_os = "linux"), test)))]
 use tokio::fs::File;
 
+#[cfg(not(target_os = "linux"))]
+use crate::storage_transaction::SYSTEM_DIR;
 use crate::{
     error::{AppError, AppResult},
-    storage_transaction::{DeletionObserver, TransactionPaths, SYSTEM_DIR},
+    storage_transaction::{DeletionObserver, TransactionPaths},
 };
 
 mod atomic_write;

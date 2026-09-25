@@ -12,7 +12,7 @@ use tokio::{
     sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
 };
 
-#[cfg(unix)]
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
 use tokio::fs::File;
 
 use crate::{
@@ -513,6 +513,7 @@ impl StorageService {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn calculate_plain_path_size(path: &Path, skip_reserved_root_entry: bool) -> AppResult<u64> {
     let root_metadata = std::fs::symlink_metadata(path)
         .map_err(|error| AppError::with_source("failed to inspect local storage usage", error))?;
@@ -615,7 +616,7 @@ async fn copy_file_synced(source: &Path, destination: &Path) -> AppResult<()> {
         .map_err(|error| AppError::with_source("failed to flush copied file", error))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
 async fn sync_parent_directory(path: &Path) -> AppResult<()> {
     let parent = path
         .parent()

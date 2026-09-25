@@ -885,7 +885,7 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .any(|entry| entry.name == OsString::from("escape")));
+            .any(|entry| entry.name == "escape"));
 
         let first = handle
             .remove_any_bounded("copy", 1)

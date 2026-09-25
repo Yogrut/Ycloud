@@ -482,7 +482,7 @@ impl TransactionPaths {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(test)))]
     pub(crate) async fn create_upload_file(&self, path: &Path) -> AppResult<std::fs::File> {
         if path.parent() != Some(self.uploads.as_path()) {
             return Err(AppError::internal(
@@ -904,6 +904,7 @@ impl TransactionPaths {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn private_file_options() -> fs::OpenOptions {
     let mut options = fs::OpenOptions::new();
     options.create_new(true).write(true);
@@ -914,6 +915,7 @@ fn private_file_options() -> fs::OpenOptions {
     options
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn ensure_private_directory(path: &Path) -> AppResult<()> {
     match fs::symlink_metadata(path).await {
         Ok(metadata) => {
@@ -946,7 +948,7 @@ async fn ensure_private_directory(path: &Path) -> AppResult<()> {
     secure_directory_permissions(path).await
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 async fn secure_directory_permissions(path: &Path) -> AppResult<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
@@ -964,7 +966,7 @@ async fn secure_directory_permissions(_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 async fn secure_file_permissions(path: &Path) -> AppResult<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -979,6 +981,7 @@ async fn secure_file_permissions(_path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) async fn remove_any_bounded(
     path: &Path,
     max_removed_nodes: usize,
@@ -995,6 +998,7 @@ pub(crate) async fn remove_any_bounded(
         .map_err(|error| AppError::with_source("bounded cleanup task failed", error))?
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn remove_any_bounded_blocking(
     path: &Path,
     max_removed_nodes: usize,
@@ -1256,7 +1260,7 @@ async fn validate_destination(root: &Path, relative: &str) -> AppResult<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 async fn sync_parent(path: &Path) -> AppResult<()> {
     let parent = path
         .parent()

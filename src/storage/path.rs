@@ -44,7 +44,7 @@ impl StorageService {
             self.linux_root
                 .validate_existing(&resolved.relative)
                 .await?;
-            return Ok(resolved);
+            Ok(resolved)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -74,7 +74,7 @@ impl StorageService {
         #[cfg(target_os = "linux")]
         {
             self.linux_root.validate_for_write(&relative).await?;
-            return Ok(ResolvedPath { relative, absolute });
+            Ok(ResolvedPath { relative, absolute })
         }
 
         #[cfg(not(target_os = "linux"))]

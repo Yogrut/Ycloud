@@ -11,6 +11,8 @@ interface BrowserAccessContext {
   isAdministrator: Ref<boolean>
   navigate: (destination: string) => Promise<void>
   resetAfterSignIn: (requestedStorageId: string) => Promise<void>
+  openPreviewImage: (entry: FileEntry) => boolean
+  openPreviewFile: (entry: FileEntry) => void
   openAccountMenu: () => void
   disposeListing: () => void
 }
@@ -47,8 +49,8 @@ export function useBrowserAccess(context: BrowserAccessContext) {
       return
     }
     if (!context.capabilities.value.download) return
-    const params = new URLSearchParams({ path: `/${entry.path}`, storage_id: context.storageId.value })
-    window.open(`${appPath('/preview')}?${params.toString()}`, '_blank', 'noopener')
+    if (context.openPreviewImage(entry)) return
+    context.openPreviewFile(entry)
   }
 
   async function submitUnlock(): Promise<void> {

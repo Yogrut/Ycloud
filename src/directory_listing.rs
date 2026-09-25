@@ -28,6 +28,33 @@ pub enum SortDirection {
     Desc,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectoryEntryFilter {
+    #[default]
+    All,
+    Gallery,
+}
+
+impl DirectoryEntryFilter {
+    pub(crate) fn accepts(self, entry: &BackendEntry) -> bool {
+        match self {
+            Self::All => true,
+            Self::Gallery => !entry.is_dir && is_gallery_image_name(&entry.name),
+        }
+    }
+}
+
+pub(crate) fn is_gallery_image_name(name: &str) -> bool {
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "png" | "webp" | "avif" | "gif"
+    )
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryPosition {
@@ -120,6 +147,7 @@ pub struct DirectoryListRequest {
     pub search: Option<String>,
     pub sort: DirectorySort,
     pub direction: SortDirection,
+    pub filter: DirectoryEntryFilter,
     pub after: Option<EntryPosition>,
 }
 
@@ -147,6 +175,9 @@ impl DirectoryPageCollector {
     }
 
     pub fn consider(&mut self, entry: BackendEntry) {
+        if !self.request.filter.accepts(&entry) {
+            return;
+        }
         if self
             .request
             .search
@@ -242,8 +273,8 @@ fn normalized_name(entry: &BackendEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        page_from_snapshot, prepare_snapshot, BackendEntry, DirectoryListRequest,
-        DirectoryPageCollector, DirectorySort, SortDirection,
+        page_from_snapshot, prepare_snapshot, BackendEntry, DirectoryEntryFilter,
+        DirectoryListRequest, DirectoryPageCollector, DirectorySort, SortDirection,
     };
 
     fn entry(name: &str, size: u64) -> BackendEntry {
@@ -263,6 +294,7 @@ mod tests {
             search: None,
             sort: DirectorySort::Name,
             direction: SortDirection::Asc,
+            filter: DirectoryEntryFilter::All,
             after: None,
         });
         for value in [entry("d", 4), entry("a", 1), entry("c", 3), entry("b", 2)] {
@@ -283,6 +315,7 @@ mod tests {
             search: None,
             sort: DirectorySort::Name,
             direction: SortDirection::Asc,
+            filter: DirectoryEntryFilter::All,
             after: first.next_position,
         });
         for value in [entry("d", 4), entry("a", 1), entry("c", 3), entry("b", 2)] {
@@ -307,6 +340,7 @@ mod tests {
             search: Some("LOG".into()),
             sort: DirectorySort::Size,
             direction: SortDirection::Desc,
+            filter: DirectoryEntryFilter::All,
             after: None,
         });
         for value in [
@@ -346,6 +380,7 @@ mod tests {
                         search: Some("0".into()),
                         sort,
                         direction: SortDirection::Asc,
+                        filter: DirectoryEntryFilter::All,
                         after,
                     });
                     for index in 0..count {
@@ -399,6 +434,7 @@ mod tests {
                             search: Some("0".into()),
                             sort,
                             direction: SortDirection::Asc,
+                            filter: DirectoryEntryFilter::All,
                             after,
                         },
                     );
@@ -411,5 +447,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn gallery_filter_accepts_only_mainstream_browser_images() {
+        for name in [
+            "photo.JPG",
+            "photo.jpeg",
+            "photo.png",
+            "photo.webp",
+            "photo.avif",
+            "photo.gif",
+        ] {
+            assert!(super::is_gallery_image_name(name), "{name}");
+        }
+        for name in [
+            "photo.bmp",
+            "photo.ico",
+            "photo.svg",
+            "photo.tiff",
+            "photo.jxl",
+            "photo.heic",
+            "photo.raw",
+            "png",
+        ] {
+            assert!(!super::is_gallery_image_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn gallery_filter_runs_before_pagination() {
+        let mut collector = DirectoryPageCollector::new(DirectoryListRequest {
+            limit: 20,
+            search: None,
+            sort: DirectorySort::Name,
+            direction: SortDirection::Asc,
+            filter: DirectoryEntryFilter::Gallery,
+            after: None,
+        });
+        for index in 0..25 {
+            collector.consider(entry(&format!("image-{index:02}.jpg"), index));
+            collector.consider(entry(&format!("note-{index:02}.txt"), index));
+        }
+        let first = collector.finish();
+        assert_eq!(first.entries.len(), 20);
+        assert!(first.entries.iter().all(|item| item.name.ends_with(".jpg")));
+        assert!(first.next_position.is_some());
+
+        let mut second = DirectoryPageCollector::new(DirectoryListRequest {
+            limit: 20,
+            search: None,
+            sort: DirectorySort::Name,
+            direction: SortDirection::Asc,
+            filter: DirectoryEntryFilter::Gallery,
+            after: first.next_position,
+        });
+        for index in 0..25 {
+            second.consider(entry(&format!("image-{index:02}.jpg"), index));
+            second.consider(entry(&format!("note-{index:02}.txt"), index));
+        }
+        let second = second.finish();
+        assert_eq!(second.entries.len(), 5);
+        assert!(second.next_position.is_none());
     }
 }

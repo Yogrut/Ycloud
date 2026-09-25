@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onBeforeUnmount, onMounted } from 'vue'
 import AdminView from '../admin/AdminView.vue'
 import BrowserView from '../browser/BrowserView.vue'
 import LoginView from './LoginView.vue'
@@ -15,6 +15,13 @@ const route = computed(() => currentAppPath())
 const isBrowser = computed(() => route.value === '/browse')
 const isAdmin = computed(() => route.value === '/admin' || route.value.startsWith('/admin/'))
 const isPreview = computed(() => route.value === '/preview')
+
+function suppressNativeContextMenu(event: MouseEvent): void {
+  event.preventDefault()
+}
+
+onMounted(() => document.addEventListener('contextmenu', suppressNativeContextMenu))
+onBeforeUnmount(() => document.removeEventListener('contextmenu', suppressNativeContextMenu))
 </script>
 
 <template>

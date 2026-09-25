@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { batchOperation, cancelUploadBatch, checkDownload, createFolder, downloadUrl, fileApi, getUploadBatchStatus, prepareArchive, prepareUploadBatch, uploadFile } from './browser'
+import { batchOperation, cancelUploadBatch, checkDownload, createFolder, downloadUrl, fileApi, getUploadBatchStatus, isPreviewTrafficExhausted, prepareArchive, prepareUploadBatch, uploadFile } from './browser'
 import { formatSize } from '../format'
 
 describe('browser API paths', () => {
@@ -10,6 +10,14 @@ describe('browser API paths', () => {
     vi.stubGlobal('fetch', fetchMock)
     await expect(checkDownload('/api/download?path=test')).rejects.toMatchObject({ status: 429 })
     expect(fetchMock).toHaveBeenCalledWith('/api/download?path=test', expect.objectContaining({ method: 'HEAD' }))
+  })
+
+  it('distinguishes a preview traffic denial with a body-free HEAD request', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(null, { status: 429 })).mockResolvedValueOnce(new Response(null, { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    expect(await isPreviewTrafficExhausted('/api/preview?path=audio.flac')).toBe(true)
+    expect(await isPreviewTrafficExhausted('/api/preview?path=video.mp4')).toBe(false)
+    expect(fetchMock).toHaveBeenCalledWith('/api/preview?path=audio.flac', expect.objectContaining({ method: 'HEAD', credentials: 'same-origin' }))
   })
 
   it('keeps the root endpoint minimal', () => {
@@ -29,6 +37,15 @@ describe('browser API paths', () => {
       sort: 'time',
       direction: 'desc',
     })).toBe('/api/files?storage_id=primary&limit=20&cursor=MjA&search=%E6%B5%8B%E8%AF%95+%E6%96%87%E4%BB%B6&sort=time&direction=desc')
+  })
+
+  it('marks gallery listings without changing the fixed page size', () => {
+    expect(fileApi('photos', 'primary', {
+      limit: 20,
+      sort: 'name',
+      direction: 'asc',
+      gallery: true,
+    })).toBe('/api/files?path=%2Fphotos&storage_id=primary&limit=20&sort=name&direction=asc&gallery=true')
   })
 
   it('creates a folder below the current path without client-side path concatenation', async () => {

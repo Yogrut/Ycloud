@@ -13,6 +13,14 @@
   --icon-color: #0564e1;
   --accent-strong: #0667db;
   --accent-soft: #eaf3ff;
+  --audio-accent: #9d512f;
+  --audio-accent-soft: #faeee7;
+  --audio-ink: #33465e;
+  --file-document-color: #5f7732;
+  --file-visual-color: #7850a2;
+  --file-audio-color: #a77414;
+  --file-utility-color: #8d6642;
+  --folder-icon-color: #b84f38;
   --colored-button-text: #005fee;
   --colored-button-bg: #e5eefd;
   --colored-button-border: #7faef5;
@@ -21,6 +29,17 @@
   --selected-row: #eef5ff;
   --shadow: 0 12px 34px rgba(35, 42, 54, .055);
   --font: Inter, "Noto Sans SC", "Microsoft YaHei", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* Give the light file browser a softer surface hierarchy without changing dark mode. */
+:root:not([data-theme="dark"]):has(.browser-shell) {
+  --bg: #e9ecf1;
+  --panel: #f7f8fa;
+  --panel-soft: #eef1f5;
+  --field: #f2f4f7;
+  --line: #dbe0e7;
+  --line-strong: #cfd6df;
+  --folder-icon-color: #b23d57;
 }
 
 :root[data-theme="dark"] {
@@ -37,6 +56,14 @@
   --accent: #1681ff;
   --accent-strong: #0874f9;
   --accent-soft: #18345c;
+  --audio-accent: #e3a477;
+  --audio-accent-soft: #3b2c25;
+  --audio-ink: #e0e7ef;
+  --file-document-color: #b1cb80;
+  --file-visual-color: #bc95de;
+  --file-audio-color: #e4bb64;
+  --file-utility-color: #cda277;
+  --folder-icon-color: #e88970;
   --danger: #fb7185;
   --success: #52ca96;
   --selected-row: #1a2c47;
@@ -912,10 +939,11 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 .select-box.checked::after { content: ''; position: absolute; top: 2px; left: 5px; width: 4px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
 .file-icon { position: relative; width: 25px; height: 25px; display: inline-grid; place-items: center; flex: 0 0 auto; color: var(--muted); }
 .file-icon svg { width: 23px; height: 23px; }
-.file-icon .app-icon { color: #c9cdd3 !important; }
-.file-icon.folder .app-icon { color: #ffc83d !important; }
-:root[data-theme="dark"] .file-icon .app-icon { color: #a4abb7 !important; }
-:root[data-theme="dark"] .file-icon.folder .app-icon { color: #eeba3a !important; }
+.file-icon.tone-document .app-icon { color: var(--file-document-color) !important; }
+.file-icon.tone-visual .app-icon { color: var(--file-visual-color) !important; }
+.file-icon.tone-audio .app-icon { color: var(--file-audio-color) !important; }
+.file-icon.tone-utility .app-icon { color: var(--file-utility-color) !important; }
+.file-icon.tone-folder .app-icon { color: var(--folder-icon-color) !important; }
 .directory-size-button { padding: 3px 0; border: 0; background: transparent; color: var(--accent); font: inherit; cursor: pointer; }
 .directory-size-button:hover:not(:disabled) { text-decoration: underline; }
 .directory-size-button:disabled { color: var(--muted); cursor: not-allowed; }

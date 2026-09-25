@@ -28,6 +28,7 @@ export function useBrowserListing(context: BrowserListingContext) {
   const sort = ref<SortKey>('name')
   const ascending = ref(true)
   const pageSize = ref<PageSize>(20)
+  const galleryMode = ref(false)
   const currentCursor = ref<string>()
   const nextCursor = ref<string | null>(null)
   const cursorHistory = ref<Array<string | undefined>>([])
@@ -80,11 +81,12 @@ export function useBrowserListing(context: BrowserListingContext) {
     loading.value = true
     try {
       const data = await listFiles(path.value, currentStorageId.value || undefined, {
-        limit: pageSize.value,
+        limit: galleryMode.value ? 20 : pageSize.value,
         cursor: currentCursor.value,
         search: appliedQuery.value || undefined,
         sort: sort.value,
         direction: ascending.value ? 'asc' : 'desc',
+        gallery: galleryMode.value || undefined,
       })
       if (sequence !== refreshSequence) return
       currentStorageId.value = data.storage_id
@@ -188,6 +190,13 @@ export function useBrowserListing(context: BrowserListingContext) {
   }
 
   function changePageSize(): void {
+    if (galleryMode.value) return
+    resetPagination()
+    void refresh()
+  }
+
+  function toggleGalleryMode(): void {
+    galleryMode.value = !galleryMode.value
     resetPagination()
     void refresh()
   }
@@ -247,6 +256,7 @@ export function useBrowserListing(context: BrowserListingContext) {
     directorySizes,
     disposeListing,
     entries,
+    galleryMode,
     isAdministrator,
     loading,
     maxArchiveBytes,
@@ -270,6 +280,7 @@ export function useBrowserListing(context: BrowserListingContext) {
     storageOptions,
     storages,
     switchStorage,
+    toggleGalleryMode,
     visibleEntries,
   }
 }

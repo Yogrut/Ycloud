@@ -16,26 +16,39 @@ import {
   PhFileArchive,
   PhFileAudio,
   PhFileCode,
+  PhFileCsv,
   PhFileDoc,
   PhFileImage,
+  PhFileMd,
   PhFilePdf,
+  PhFilePpt,
   PhFileVideo,
+  PhFileXls,
   PhFolder,
   PhFolderOpen,
   PhFolderPlus,
+  PhFolderSimple,
   PhGearSix,
   PhHardDrives,
   PhHouse,
+  PhImages,
   PhListBullets,
   PhLockKey,
   PhMagnifyingGlass,
   PhMoon,
   PhPause,
+  PhPauseCircle,
   PhPencilSimple,
   PhPlay,
+  PhPlayCircle,
   PhPlugsConnected,
+  PhRepeat,
   PhShieldCheck,
+  PhSkipBackCircle,
+  PhSkipForwardCircle,
   PhSlidersHorizontal,
+  PhSpeakerHigh,
+  PhSpeakerX,
   PhStar,
   PhSun,
   PhStop,
@@ -43,6 +56,7 @@ import {
   PhTranslate,
   PhUserCircle,
   PhUsersThree,
+  PhVinylRecord,
   PhX,
   PhXCircle,
 } from '@phosphor-icons/vue'
@@ -64,33 +78,48 @@ export type AppIconName =
   | 'file-archive'
   | 'file-audio'
   | 'file-code'
+  | 'file-csv'
   | 'file-doc'
   | 'file-image'
+  | 'file-md'
   | 'file-pdf'
+  | 'file-ppt'
   | 'file-video'
+  | 'file-xls'
   | 'folder'
   | 'folder-open'
   | 'folder-plus'
+  | 'folder-simple'
   | 'home'
+  | 'gallery'
   | 'language'
   | 'limits'
   | 'lock'
+  | 'list'
   | 'logs'
   | 'moon'
   | 'move'
   | 'pause'
+  | 'pause-circle'
+  | 'play-circle'
   | 'rename'
+  | 'repeat'
   | 'retry'
   | 'resume'
   | 'search'
   | 'settings'
   | 'sign-out'
+  | 'skip-back-circle'
+  | 'skip-forward-circle'
   | 'storage'
   | 'star'
   | 'stop'
   | 'sun'
   | 'upload'
   | 'users'
+  | 'vinyl-record'
+  | 'volume'
+  | 'volume-off'
   | 'webdav'
 
 const icons = {
@@ -110,33 +139,48 @@ const icons = {
   'file-archive': PhFileArchive,
   'file-audio': PhFileAudio,
   'file-code': PhFileCode,
+  'file-csv': PhFileCsv,
   'file-doc': PhFileDoc,
   'file-image': PhFileImage,
+  'file-md': PhFileMd,
   'file-pdf': PhFilePdf,
+  'file-ppt': PhFilePpt,
   'file-video': PhFileVideo,
+  'file-xls': PhFileXls,
   folder: PhFolder,
   'folder-open': PhFolderOpen,
   'folder-plus': PhFolderPlus,
+  'folder-simple': PhFolderSimple,
   home: PhHouse,
+  gallery: PhImages,
   language: PhTranslate,
   limits: PhSlidersHorizontal,
   lock: PhLockKey,
+  list: PhListBullets,
   logs: PhListBullets,
   moon: PhMoon,
   move: PhArrowsOutCardinal,
   pause: PhPause,
+  'pause-circle': PhPauseCircle,
+  'play-circle': PhPlayCircle,
   rename: PhPencilSimple,
+  repeat: PhRepeat,
   retry: PhArrowClockwise,
   resume: PhPlay,
   search: PhMagnifyingGlass,
   settings: PhGearSix,
   'sign-out': PhArrowCircleRight,
+  'skip-back-circle': PhSkipBackCircle,
+  'skip-forward-circle': PhSkipForwardCircle,
   storage: PhHardDrives,
   star: PhStar,
   stop: PhStop,
   sun: PhSun,
   upload: PhArrowCircleUp,
   users: PhUsersThree,
+  'vinyl-record': PhVinylRecord,
+  volume: PhSpeakerHigh,
+  'volume-off': PhSpeakerX,
   webdav: PhPlugsConnected,
 } as const
 

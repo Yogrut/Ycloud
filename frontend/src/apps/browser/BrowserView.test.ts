@@ -173,6 +173,253 @@ describe('BrowserView', () => {
     app.unmount()
   })
 
+  it('toggles a fixed twenty-image gallery and returns to the normal list', async () => {
+    const images = Array.from({ length: 20 }, (_, index) => ({
+      name: `photo-${index}.jpg`,
+      path: `photo-${index}.jpg`,
+      is_dir: false,
+      size: index + 1,
+      modified: '',
+      mime: 'image/jpeg',
+      icon: 'image',
+      locked: false,
+    }))
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const gallery = new URL(String(input), 'http://localhost').searchParams.get('gallery') === 'true'
+      const body = gallery
+        ? { ...listResponse([]), entries: images, page_start: 1, page_size: 20 }
+        : listResponse(['notes.txt'])
+      return Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    const toggle = host.querySelector<HTMLButtonElement>('.gallery-toggle')!
+    expect(toggle.getAttribute('aria-pressed')).toBe('false')
+    toggle.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc&gallery=true', { credentials: 'same-origin' })
+    expect(host.querySelectorAll('.gallery-card')).toHaveLength(20)
+    expect(host.querySelector('.file-head')).toBeNull()
+    expect(host.querySelector('.gallery-page-size')?.textContent).toContain('20')
+    expect(toggle.getAttribute('aria-pressed')).toBe('true')
+
+    host.querySelector<HTMLButtonElement>('.gallery-select')!.click()
+    await nextTick()
+    expect(host.querySelector('.gallery-card.selected')).not.toBeNull()
+    expect(host.querySelector('.gallery-selection-actions')).toBeNull()
+    const galleryCard = host.querySelector<HTMLElement>('.gallery-card.selected')!
+    const contextEvent = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: 40, clientY: 40 })
+    galleryCard.dispatchEvent(contextEvent)
+    await nextTick()
+    expect(contextEvent.defaultPrevented).toBe(true)
+    expect(host.querySelector('.context-menu')).not.toBeNull()
+
+    toggle.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc', { credentials: 'same-origin' })
+    expect(host.querySelector('.file-row')?.textContent).toContain('notes.txt')
+    expect(host.querySelector('.gallery-card')).toBeNull()
+    app.unmount()
+  })
+
+  it('opens a supported list image in the same draggable viewer as the gallery', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['photo.jpg', 'notes.txt'])), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    host.querySelector<HTMLElement>('[data-entry-path="photo.jpg"]')!
+      .dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    await nextTick()
+    expect(document.body.querySelector('.gallery-lightbox-stage img')?.getAttribute('alt')).toBe('photo.jpg')
+    expect(document.body.querySelector('.gallery-lightbox-close svg')).not.toBeNull()
+    expect(document.body.querySelector('.gallery-lightbox-close .app-icon')).toBeNull()
+    expect(open).not.toHaveBeenCalled()
+    app.unmount()
+    open.mockRestore()
+  })
+
+  it('downloads multiple selected gallery images through the right-click archive action', async () => {
+    const images = ['one.jpg', 'two.jpg'].map(name => ({
+      name, path: name, is_dir: false, size: 12, modified: '', mime: 'image/jpeg', icon: 'image', locked: false,
+    }))
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      if (String(input).startsWith('/api/archive/prepare')) return Promise.resolve(new Response(JSON.stringify({ error: { message: 'limit reached' } }), { status: 429 }))
+      const gallery = new URL(String(input), 'http://localhost').searchParams.get('gallery') === 'true'
+      return Promise.resolve(new Response(JSON.stringify(gallery ? { ...listResponse([]), entries: images } : listResponse([])), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    host.querySelector<HTMLButtonElement>('.gallery-toggle')!.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    host.querySelectorAll<HTMLButtonElement>('.gallery-select').forEach(button => button.click())
+    await nextTick()
+    expect(host.querySelector('.gallery-selection-actions')).toBeNull()
+    host.querySelector<HTMLElement>('.gallery-card.selected')!.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 }))
+    await nextTick()
+    const archiveAction = [...host.querySelectorAll<HTMLButtonElement>('.context-menu .menu-item')].find(button => button.textContent?.includes('打包下载'))
+    expect(archiveAction).toBeDefined()
+    archiveAction!.click()
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    const archiveCall = fetchMock.mock.calls.find(([input]) => String(input).startsWith('/api/archive/prepare'))
+    expect(archiveCall?.[1]).toEqual(expect.objectContaining({ method: 'POST', body: JSON.stringify({ paths: ['/one.jpg', '/two.jpg'] }) }))
+    app.unmount()
+  })
+
+  it('shows a left-side music icon that toggles the player while videos preview and unsupported files ask before downloading', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['song.flac', 'other.mp3', 'clip.mp4', 'setup.msi'])), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    host.querySelector<HTMLElement>('[data-entry-path="song.flac"]')!
+      .dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    await nextTick()
+    expect(host.querySelector('.browser-chrome .ycloud-media-player')).toBeNull()
+    expect(host.querySelector('.ycloud-audio-dock .ycloud-media-player.audio')).not.toBeNull()
+    expect(host.querySelector('.ycloud-audio-dock audio')?.hasAttribute('controls')).toBe(false)
+    expect(host.querySelector('.ycloud-audio-dock .ycloud-audio-volume input[type="range"]')).toBeNull()
+    const audioNav = host.querySelector<HTMLDetailsElement>('.ycloud-audio-dock')!
+    const audioElement = audioNav.querySelector('audio')
+    expect(audioNav.open).toBe(false)
+    expect(audioNav.querySelector('summary')?.getAttribute('aria-label')).toBe('展开或收起音乐播放器')
+    expect(audioNav.querySelector('summary [data-icon="vinyl-record"][data-weight="fill"]')).not.toBeNull()
+    const controlIcons = [...audioNav.querySelectorAll('.ycloud-media-player.audio .app-icon')]
+    expect(controlIcons).toHaveLength(6)
+    expect(controlIcons.map(icon => icon.getAttribute('data-icon'))).toEqual(expect.arrayContaining([
+      'skip-back-circle', 'skip-forward-circle', 'repeat', 'volume', 'close',
+    ]))
+    expect(audioNav.querySelector('.ycloud-media-player.audio [data-icon="vinyl-record"]')).toBeNull()
+    expect(audioNav.querySelector('.ycloud-audio-play [data-icon="play-circle"], .ycloud-audio-play [data-icon="pause-circle"]')).not.toBeNull()
+    expect(controlIcons.filter(icon => icon.getAttribute('data-icon') !== 'close').every(icon => icon.getAttribute('data-weight') === 'fill')).toBe(true)
+    audioNav.querySelector<HTMLElement>('summary')!.click()
+    expect(audioNav.open).toBe(true)
+    audioNav.querySelector<HTMLElement>('summary')!.click()
+    expect(audioNav.open).toBe(false)
+    expect(audioNav.querySelector('audio')).toBe(audioElement)
+    audioNav.querySelector<HTMLElement>('summary')!.click()
+    expect(audioNav.open).toBe(true)
+    expect(audioNav.querySelector('.ycloud-audio-track > span')).toBeNull()
+    const loopButton = audioNav.querySelector<HTMLButtonElement>('.ycloud-audio-loop')!
+    expect(loopButton.getAttribute('aria-pressed')).toBe('false')
+    loopButton.click()
+    await nextTick()
+    expect(loopButton.getAttribute('aria-pressed')).toBe('true')
+    expect(loopButton.classList.contains('active')).toBe(true)
+    expect(audioElement?.loop).toBe(true)
+    const volumeControl = audioNav.querySelector<HTMLElement>('.ycloud-audio-volume')!
+    const volumeButton = volumeControl.querySelector<HTMLButtonElement>('button')!
+    expect(volumeButton.getAttribute('aria-expanded')).toBe('false')
+    volumeButton.click()
+    await nextTick()
+    expect(volumeButton.getAttribute('aria-expanded')).toBe('true')
+    expect(volumeControl.classList.contains('is-open')).toBe(true)
+    const volumeSlider = volumeControl.querySelector<HTMLInputElement>('input[type="range"]')!
+    expect(volumeSlider.getAttribute('aria-orientation')).toBe('vertical')
+    volumeSlider.value = '0.1'
+    volumeSlider.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    expect(audioElement?.volume).toBeCloseTo(0.1)
+    expect(volumeControl.querySelector('.ycloud-audio-volume-popover span')?.textContent).toBe('10%')
+    volumeSlider.value = '0'
+    volumeSlider.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    expect(volumeControl.querySelector('[data-icon="volume-off"][data-weight="fill"]')).not.toBeNull()
+    volumeButton.click()
+    await nextTick()
+    expect(volumeButton.getAttribute('aria-expanded')).toBe('false')
+    expect(volumeControl.classList.contains('is-open')).toBe(false)
+    volumeButton.click()
+    await nextTick()
+    volumeControl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    expect(volumeButton.getAttribute('aria-expanded')).toBe('false')
+    volumeButton.click()
+    await nextTick()
+    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }))
+    await nextTick()
+    expect(volumeButton.getAttribute('aria-expanded')).toBe('false')
+    expect(audioNav.querySelector('.ycloud-audio-close [data-icon="close"][data-weight="regular"]')).not.toBeNull()
+    expect(document.body.querySelector('.ycloud-preview-dialog, .ycloud-preview-overlay')).toBeNull()
+    expect(host.querySelector('.file-panel')).not.toBeNull()
+    host.querySelector<HTMLButtonElement>('.ycloud-audio-dock button[aria-label="下一首"]')!.click()
+    await nextTick()
+    expect(document.body.querySelector('.ycloud-audio-track strong')?.textContent).toBe('other')
+    expect(document.body.querySelector('.ycloud-audio-track strong')?.getAttribute('title')).toBe('other.mp3')
+    host.querySelector<HTMLButtonElement>('.ycloud-audio-dock button[aria-label="关闭播放器"]')!.click()
+    await nextTick()
+    expect(host.querySelector('.ycloud-audio-dock')).toBeNull()
+
+    host.querySelector<HTMLElement>('[data-entry-path="clip.mp4"]')!
+      .dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    await nextTick()
+    expect(document.body.querySelector('.ycloud-preview-dialog .ycloud-media-player.video')).not.toBeNull()
+    expect(document.body.querySelector('.ycloud-preview-dialog video')?.hasAttribute('controls')).toBe(false)
+    document.body.querySelector<HTMLButtonElement>('.ycloud-preview-close')!.click()
+    await nextTick()
+
+    host.querySelector<HTMLElement>('[data-entry-path="setup.msi"]')!
+      .dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    await nextTick()
+    expect(document.body.querySelector('.confirmation-dialog')?.textContent).toContain('setup.msi')
+    expect(document.body.querySelector('.ycloud-preview-dialog')).toBeNull()
+    expect(open).not.toHaveBeenCalled()
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'HEAD')).toBe(false)
+    document.body.querySelector<HTMLButtonElement>('.confirmation-actions .secondary')!.click()
+    app.unmount()
+    open.mockRestore()
+  })
+
+  it('reports exhausted download traffic instead of suggesting another doomed audio download', async () => {
+    const fetchMock = vi.fn().mockImplementation((_input: RequestInfo | URL, init?: RequestInit) => Promise.resolve(
+      init?.method === 'HEAD'
+        ? new Response(null, { status: 429 })
+        : new Response(JSON.stringify(listResponse(['song.flac'])), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    host.querySelector<HTMLElement>('[data-entry-path="song.flac"]')!
+      .dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+    await nextTick()
+    host.querySelector('audio')!.dispatchEvent(new Event('error'))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(document.body.querySelector('.app-toast.error')?.textContent).toContain('下载流量已用尽或剩余流量不足')
+    expect(document.body.querySelector('.confirmation-dialog')).toBeNull()
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'HEAD')).toBe(true)
+    app.unmount()
+  })
+
   it('lets an administrator switch storage without mixing the previous path or selection', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({

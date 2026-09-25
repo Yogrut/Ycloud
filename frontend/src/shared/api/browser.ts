@@ -27,6 +27,15 @@ export async function checkDownload(url: string): Promise<void> {
   throw new ApiError(message, response.status)
 }
 
+export async function isPreviewTrafficExhausted(url: string): Promise<boolean> {
+  try {
+    const response = await fetch(url, { method: 'HEAD', credentials: 'same-origin', cache: 'no-store' })
+    return response.status === 429
+  } catch {
+    return false
+  }
+}
+
 export interface FileListResponse {
   storage_id: string
   storages: BrowserStorage[]
@@ -52,6 +61,7 @@ export interface FileListOptions {
   search?: string
   sort?: 'name' | 'size' | 'time'
   direction?: 'asc' | 'desc'
+  gallery?: boolean
 }
 
 export interface BrowserCapabilities {
@@ -147,6 +157,7 @@ export function fileApi(path: string, storageId?: string, options: FileListOptio
   if (options.search) parameters.set('search', options.search)
   if (options.sort) parameters.set('sort', options.sort)
   if (options.direction) parameters.set('direction', options.direction)
+  if (options.gallery) parameters.set('gallery', 'true')
   const query = parameters.toString()
   return query ? `/api/files?${query}` : '/api/files'
 }
@@ -180,6 +191,11 @@ export function createFolder(path: string, name: string, storageId?: string): Pr
 export function downloadUrl(path: string, storageId?: string): string {
   const clean = cleanPath(path)
   return withStorage(`/api/download?path=${encodeURIComponent(`/${clean}`)}`, storageId)
+}
+
+export function previewUrl(path: string, storageId?: string): string {
+  const clean = cleanPath(path)
+  return withStorage(`/api/preview?path=${encodeURIComponent(`/${clean}`)}`, storageId)
 }
 
 export function renameItem(currentPath: string, path: string, newName: string, storageId?: string): Promise<{ success?: boolean }> {

@@ -39,7 +39,7 @@ export const en: Record<MessageKey, string> = {
   'preview.missingPath': 'No file was selected',
   'preview.missingPathHelp': 'Return to the file browser and open the preview again.',
   'preview.truncated': '[Preview truncated after the first 2 MiB]',
-  'preview.unsupported': 'This file type is not on the safe preview list.',
+  'preview.unsupported': 'This file cannot be previewed in the browser. You can download it instead.',
   'preview.downloadFile': 'Download file',
   'picker.root': '/ Root',
   'picker.parent': '↩ Parent folder',

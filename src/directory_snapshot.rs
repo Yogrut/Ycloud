@@ -8,8 +8,8 @@ use std::{
 use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 
 use crate::directory_listing::{
-    normalized_search, BackendEntry, DirectoryListRequest, DirectoryPage, DirectoryPageCollector,
-    DirectorySort, SortDirection,
+    normalized_search, BackendEntry, DirectoryEntryFilter, DirectoryListRequest, DirectoryPage,
+    DirectoryPageCollector, DirectorySort, SortDirection,
 };
 
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
@@ -58,6 +58,9 @@ impl DirectorySnapshotCandidate {
     }
 
     pub(crate) fn consider(&mut self, entry: BackendEntry) {
+        if !self.request.filter.accepts(&entry) {
+            return;
+        }
         if self
             .search
             .as_ref()
@@ -110,6 +113,7 @@ pub(crate) struct DirectorySnapshotKey {
     search: Option<String>,
     sort: DirectorySort,
     direction: SortDirection,
+    filter: DirectoryEntryFilter,
 }
 
 impl DirectorySnapshotKey {
@@ -119,6 +123,7 @@ impl DirectorySnapshotKey {
             search: normalized_search(request.search.as_deref()),
             sort: request.sort,
             direction: request.direction,
+            filter: request.filter,
         }
     }
 
@@ -406,6 +411,7 @@ mod tests {
                 search: None,
                 sort: DirectorySort::Name,
                 direction: SortDirection::Asc,
+                filter: DirectoryEntryFilter::All,
                 after: None,
             },
         )
@@ -472,6 +478,7 @@ mod tests {
             search: None,
             sort: DirectorySort::Name,
             direction: SortDirection::Asc,
+            filter: DirectoryEntryFilter::All,
             after: None,
         };
         let mut candidate = DirectorySnapshotCandidate::with_limits(request, 2, usize::MAX);

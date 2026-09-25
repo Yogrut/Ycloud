@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
-import type { BrowserCapabilities, FileEntry } from '../../shared/api/browser'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { isPreviewTrafficExhausted, previewUrl, type BrowserCapabilities, type FileEntry } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import AppFeedback from '../../shared/components/AppFeedback.vue'
@@ -14,6 +14,8 @@ import { useLocale } from '../../shared/i18n'
 import BrowserContextMenu from './BrowserContextMenu.vue'
 import type { BrowserAction } from './BrowserActionIcon.vue'
 import FileIcon from './FileIcon.vue'
+import GalleryGrid from './GalleryGrid.vue'
+import GalleryLightbox from './GalleryLightbox.vue'
 import UserAccountMenu from './UserAccountMenu.vue'
 import FolderPicker from './FolderPicker.vue'
 import UploadQueueDialog from './UploadQueueDialog.vue'
@@ -23,12 +25,19 @@ import { useBrowserFileOperations } from './useBrowserFileOperations'
 import { useBrowserListing } from './useBrowserListing'
 import { useBrowserAccess } from './useBrowserAccess'
 import { batchSummary } from './operationFeedback'
+import { previewKind } from '../../shared/previewFormats'
+import FilePreviewDialog from './FilePreviewDialog.vue'
+import MediaPlayer from '../../shared/components/MediaPlayer.vue'
 
 defineProps<{ theme: ThemeController }>()
 const locale = useLocale()
 const notice = ref('')
 const noticeKind = ref<'error' | 'success'>('error')
 const noticeRevision = ref(0)
+const previewEntry = ref<FileEntry | null>(null)
+const pendingDownload = ref<FileEntry | null>(null)
+const audioPlayback = ref<{ entry: FileEntry; storageId: string; queue: FileEntry[] } | null>(null)
+const audioNav = ref<HTMLDetailsElement | null>(null)
 const userAccountMenu = ref<InstanceType<typeof UserAccountMenu>>()
 let resetListingSelection = (): void => undefined
 let openLockedEntry: (entry: FileEntry) => void = () => undefined
@@ -54,6 +63,7 @@ const {
   directorySizes,
   disposeListing,
   entries,
+  galleryMode,
   isAdministrator,
   loading,
   maxArchiveBytes,
@@ -77,6 +87,7 @@ const {
   storageOptions,
   storages,
   switchStorage,
+  toggleGalleryMode,
   visibleEntries,
 } = useBrowserListing({
   announce,
@@ -84,6 +95,66 @@ const {
   openLockedEntry: entry => openLockedEntry(entry),
   requestStorageLogin: storageId => openRestrictedStorage(storageId),
 })
+
+const galleryExtensions = new Set(['jpg', 'jpeg', 'png', 'webp', 'avif', 'gif'])
+const galleryImages = computed(() => visibleEntries.value.filter(entry => {
+  if (entry.is_dir || !entry.name.includes('.')) return false
+  return galleryExtensions.has(entry.name.split('.').pop()?.toLowerCase() ?? '')
+}))
+const activeGalleryPath = ref('')
+const activeGalleryIndex = computed(() => galleryImages.value.findIndex(entry => entry.path === activeGalleryPath.value))
+const activeGalleryEntry = computed(() => galleryImages.value[activeGalleryIndex.value] ?? null)
+const audioIndex = computed(() => audioPlayback.value?.queue.findIndex(entry => entry.path === audioPlayback.value?.entry.path) ?? -1)
+const audioSource = computed(() => audioPlayback.value ? previewUrl(audioPlayback.value.entry.path, audioPlayback.value.storageId) : '')
+
+function playAudio(entry: FileEntry): void {
+  const queue = visibleEntries.value.filter(item => !item.is_dir && previewKind(item.name) === 'audio')
+  audioPlayback.value = { entry, storageId: currentStorageId.value, queue: queue.length ? queue : [entry] }
+}
+
+function moveAudio(offset: number): void {
+  const playback = audioPlayback.value
+  if (!playback) return
+  const entry = playback.queue[audioIndex.value + offset]
+  if (entry) audioPlayback.value = { ...playback, entry }
+}
+
+async function onAudioError(): Promise<void> {
+  const playback = audioPlayback.value
+  const entry = playback?.entry
+  audioPlayback.value = null
+  if (!entry || !playback) return
+  const trafficExhausted = await isPreviewTrafficExhausted(previewUrl(entry.path, playback.storageId))
+  if (audioPlayback.value) return
+  if (trafficExhausted) {
+    announce(locale.text('下载流量已用尽或剩余流量不足，请等待重置或联系管理员', 'Download allowance is exhausted or insufficient. Wait for the reset or contact the administrator.'))
+    return
+  }
+  pendingDownload.value = entry
+}
+
+watch(currentStorageId, storageId => {
+  if (audioPlayback.value && audioPlayback.value.storageId !== storageId) audioPlayback.value = null
+})
+
+function openGalleryEntry(entry: FileEntry): void {
+  activeGalleryPath.value = entry.path
+}
+
+function closeGalleryEntry(): void {
+  activeGalleryPath.value = ''
+}
+
+function moveGalleryEntry(offset: number): void {
+  const next = activeGalleryIndex.value + offset
+  const entry = galleryImages.value[next]
+  if (entry) activeGalleryPath.value = entry.path
+}
+
+function changeGalleryMode(): void {
+  closeGalleryEntry()
+  toggleGalleryMode()
+}
 
 const {
   adminError,
@@ -112,6 +183,20 @@ const {
   isAdministrator,
   navigate,
   resetAfterSignIn,
+  openPreviewImage: entry => {
+    if (!galleryImages.value.some(image => image.path === entry.path)) return false
+    openGalleryEntry(entry)
+    return true
+  },
+  openPreviewFile: entry => {
+    const kind = previewKind(entry.name)
+    if (kind === 'audio') playAudio(entry)
+    else if (kind === 'unsupported') pendingDownload.value = entry
+    else {
+      if (kind === 'video') audioPlayback.value = null
+      previewEntry.value = entry
+    }
+  },
   openAccountMenu: () => userAccountMenu.value?.open(),
   disposeListing,
 })
@@ -262,13 +347,19 @@ function handleMenuAction(action: BrowserAction): void {
 
 function handleEscape(event: KeyboardEvent): void {
   if (event.key !== 'Escape') return
+  if (audioNav.value) audioNav.value.open = false
   closeContextMenu()
   if (showUpload.value) closeUploadDialog()
+}
+
+function closeAudioNavOnOutsideClick(event: MouseEvent): void {
+  if (audioNav.value && !audioNav.value.contains(event.target as Node)) audioNav.value.open = false
 }
 
 onMounted(() => {
   void refresh()
   document.addEventListener('click', handleDocumentClick)
+  document.addEventListener('click', closeAudioNavOnOutsideClick)
   document.addEventListener('keydown', handleEscape)
   window.addEventListener('mousemove', updateDragSelection, { passive: false })
   window.addEventListener('mouseup', finishDragSelection)
@@ -278,6 +369,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   document.removeEventListener('click', handleDocumentClick)
+  document.removeEventListener('click', closeAudioNavOnOutsideClick)
   document.removeEventListener('keydown', handleEscape)
   window.removeEventListener('mousemove', updateDragSelection)
   window.removeEventListener('mouseup', finishDragSelection)
@@ -298,6 +390,17 @@ onBeforeUnmount(() => {
         <AppSelect :model-value="currentStorageId" :options="storageOptions" :label="locale.text('切换存储', 'Switch storage')" @change="switchStorage" />
       </div>
       <div class="top-actions">
+        <button
+          class="icon-btn flat gallery-toggle"
+          :class="{ active: galleryMode }"
+          type="button"
+          :aria-pressed="galleryMode"
+          :title="galleryMode ? locale.text('返回列表模式', 'Return to list view') : locale.text('打开画廊模式', 'Open gallery view')"
+          :aria-label="galleryMode ? locale.text('返回列表模式', 'Return to list view') : locale.text('打开画廊模式', 'Open gallery view')"
+          @click="changeGalleryMode"
+        >
+          <AppIcon :name="galleryMode ? 'list' : 'gallery'" />
+        </button>
         <UserAccountMenu ref="userAccountMenu" :storage-name="storages.find(storage => storage.id === currentStorageId)?.name ?? ''" :capabilities="capabilities" @signed-in="onUserSignedIn" @sign-out="signOut" @closed="pendingStorageId = ''" />
         <button class="icon-btn flat" type="button" :title="locale.text('管理员', 'Administrator')" :aria-label="locale.text('管理员', 'Administrator')" @click="openAdmin()"><AppIcon name="administrator" /></button>
         <ThemeToggle :theme="theme.current.value" class="flat" @toggle="theme.toggle" />
@@ -312,9 +415,9 @@ onBeforeUnmount(() => {
       <section
         ref="filePanel"
         class="file-panel glass"
-        :class="{ 'drag-selecting': dragSelecting, 'upload-drop-active': uploadDropActive }"
+        :class="{ 'drag-selecting': dragSelecting, 'upload-drop-active': uploadDropActive, 'gallery-mode': galleryMode }"
         :aria-busy="loading"
-        @mousedown="startDragSelection"
+        @mousedown="!galleryMode && startDragSelection($event)"
         @contextmenu="openBackgroundMenu"
         @dragenter="handleUploadDragEnter"
         @dragover="handleUploadDragOver"
@@ -340,14 +443,15 @@ onBeforeUnmount(() => {
           </template>
         </nav>
 
-        <div class="file-head">
+        <div v-if="!galleryMode" class="file-head">
           <button class="select-box" :class="{ checked: allSelected }" type="button" :aria-label="locale.text('全选', 'Select all')" @click="toggleSelectAll"><span class="visually-hidden">{{ locale.text('全选', 'Select all') }}</span></button>
           <button class="sort-btn" type="button" @click="changeSort('name')">{{ locale.text('名称', 'Name') }} <span>{{ sort === 'name' ? (ascending ? '▲' : '▼') : '' }}</span></button>
           <button class="sort-btn right" type="button" @click="changeSort('size')">{{ locale.text('大小', 'Size') }} <span>{{ sort === 'size' ? (ascending ? '▲' : '▼') : '' }}</span></button>
           <button class="sort-btn right modified" type="button" @click="changeSort('time')">{{ locale.text('修改时间', 'Modified') }} <span>{{ sort === 'time' ? (ascending ? '▲' : '▼') : '' }}</span></button>
         </div>
         <div v-if="loading" class="empty file-list-body">{{ locale.t('common.loading') }}</div>
-        <div v-else-if="!visibleEntries.length" class="empty file-list-body">{{ appliedQuery ? locale.text('没有匹配的文件', 'No matching files') : locale.text('此文件夹为空', 'This folder is empty') }}</div>
+        <div v-else-if="!(galleryMode ? galleryImages.length : visibleEntries.length)" class="empty file-list-body">{{ appliedQuery ? locale.text('没有匹配的文件', 'No matching files') : galleryMode ? locale.text('此文件夹没有可展示的图片', 'No supported images in this folder') : locale.text('此文件夹为空', 'This folder is empty') }}</div>
+        <GalleryGrid v-else-if="galleryMode" :entries="visibleEntries" :storage-id="currentStorageId" :selected="selected" @open="openGalleryEntry" @select="toggleSelection($event.path)" @context-menu="openRowMenu" />
         <div v-else class="file-list-body">
           <div
             v-for="entry in visibleEntries"
@@ -384,7 +488,8 @@ onBeforeUnmount(() => {
         </div>
         <footer class="file-pagination">
           <div class="pagination-summary">
-            <AppSelect v-model="pageSize" class="page-size-select" placement="top" :options="pageSizeOptions" :label="locale.text('每页显示数量', 'Items per page')" @change="changePageSize" />
+            <span v-if="galleryMode" class="gallery-page-size">{{ locale.text('每页 20 张', '20 images per page') }}</span>
+            <AppSelect v-else v-model="pageSize" class="page-size-select" placement="top" :options="pageSizeOptions" :label="locale.text('每页显示数量', 'Items per page')" @change="changePageSize" />
           </div>
           <nav class="pagination-controls" :aria-label="locale.text('文件翻页', 'File pagination')">
             <button class="page-arrow" type="button" :disabled="!cursorHistory.length || loading" :title="locale.text('上一页', 'Previous page')" :aria-label="locale.text('上一页', 'Previous page')" @click="previousPage"><span class="page-chevron previous" aria-hidden="true" /></button>
@@ -395,6 +500,51 @@ onBeforeUnmount(() => {
       </section>
     </main>
   </div>
+
+  <details v-if="audioPlayback" ref="audioNav" class="ycloud-audio-dock">
+    <summary :title="audioPlayback.entry.name" :aria-label="locale.text('展开或收起音乐播放器', 'Expand or collapse music player')">
+      <AppIcon name="vinyl-record" :size="28" weight="fill" />
+    </summary>
+    <div class="ycloud-audio-popover" role="region" :aria-label="locale.text('音乐播放器', 'Music player')">
+      <MediaPlayer
+        :key="`${audioPlayback.storageId}:${audioPlayback.entry.path}`"
+        :src="audioSource"
+        :name="audioPlayback.entry.name"
+        kind="audio"
+        :has-previous="audioIndex > 0"
+        :has-next="audioIndex < audioPlayback.queue.length - 1"
+        :show-close="true"
+        :autoplay="true"
+        @previous="moveAudio(-1)"
+        @next="moveAudio(1)"
+        @close="audioPlayback = null"
+        @error="onAudioError"
+      />
+    </div>
+  </details>
+
+  <GalleryLightbox
+    v-if="activeGalleryEntry"
+    :entry="activeGalleryEntry"
+    :storage-id="currentStorageId"
+    :index="activeGalleryIndex"
+    :total="galleryImages.length"
+    @close="closeGalleryEntry"
+    @previous="moveGalleryEntry(-1)"
+    @next="moveGalleryEntry(1)"
+  />
+
+  <FilePreviewDialog v-if="previewEntry" :entry="previewEntry" :storage-id="currentStorageId" @close="previewEntry = null" />
+
+  <ConfirmDialog
+    v-if="pendingDownload"
+    :title="locale.text('下载文件', 'Download file')"
+    :message="locale.text('浏览器无法预览此文件，是否下载？', 'This file cannot be previewed in the browser. Download it?')"
+    :target="pendingDownload.name"
+    :confirm-label="locale.text('下载', 'Download')"
+    @close="pendingDownload = null"
+    @confirm="startDownload(pendingDownload.path); pendingDownload = null"
+  />
 
   <BrowserContextMenu
     v-if="contextVisible"
@@ -488,3 +638,29 @@ onBeforeUnmount(() => {
     </section>
   </div>
 </template>
+
+<style scoped>
+.gallery-toggle.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+}
+.gallery-page-size {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.file-panel.gallery-mode { overflow-y: auto; }
+.ycloud-audio-dock { position: fixed; z-index: 80; bottom: clamp(90px, 27vh, 290px); left: clamp(14px, 1.8vw, 34px); width: 56px; height: 56px; }
+.ycloud-audio-dock summary { display: grid; place-items: center; width: 56px; height: 56px; color: var(--audio-accent); background: var(--panel); border: 1px solid var(--line); border-radius: 50%; box-shadow: 0 4px 16px rgb(0 0 0 / 10%); cursor: pointer; list-style: none; }
+.ycloud-audio-dock summary::-webkit-details-marker { display: none; }
+.ycloud-audio-dock summary:hover, .ycloud-audio-dock[open] summary { background: var(--audio-accent-soft); border-color: var(--audio-accent); }
+.ycloud-audio-dock summary :deep(.app-icon) { color: currentColor !important; }
+.ycloud-audio-dock summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.ycloud-audio-popover { position: absolute; bottom: 0; left: calc(100% + 12px); width: min(380px, calc(100vw - 120px)); padding: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 11px; box-shadow: 0 12px 30px rgb(0 0 0 / 12%); }
+.ycloud-audio-popover :deep(.ycloud-media-player.audio) { width: 100%; max-width: none; background: transparent; border: 0; }
+@media (max-width: 520px) { .ycloud-audio-popover { bottom: calc(100% + 10px); left: 0; width: calc(100vw - 28px); } }
+</style>

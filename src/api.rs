@@ -10,7 +10,9 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
-use crate::directory_listing::{DirectoryListRequest, DirectorySort, EntryPosition, SortDirection};
+use crate::directory_listing::{
+    DirectoryEntryFilter, DirectoryListRequest, DirectorySort, EntryPosition, SortDirection,
+};
 use crate::error::{AppError, AppResult};
 use crate::file_access::{
     check_folder_lock_tree, check_folder_locks, ensure_non_root, ensure_storage_action,
@@ -69,6 +71,8 @@ pub struct FileListQuery {
     pub cursor: Option<String>,
     pub search: Option<String>,
     #[serde(default)]
+    gallery: bool,
+    #[serde(default)]
     sort: DirectorySort,
     #[serde(default)]
     direction: SortDirection,
@@ -104,6 +108,8 @@ struct DirectoryCursorToken {
     search: Option<String>,
     sort: DirectorySort,
     direction: SortDirection,
+    #[serde(default)]
+    filter: DirectoryEntryFilter,
     delivered: usize,
     position: EntryPosition,
 }
@@ -128,6 +134,7 @@ fn decode_cursor(
     search: Option<&str>,
     sort: DirectorySort,
     direction: SortDirection,
+    filter: DirectoryEntryFilter,
 ) -> AppResult<Option<DirectoryCursorToken>> {
     let Some(cursor) = cursor else {
         return Ok(None);
@@ -146,6 +153,7 @@ fn decode_cursor(
         || token.search != normalized_search(search)
         || token.sort != sort
         || token.direction != direction
+        || token.filter != filter
     {
         return Err(AppError::BadRequest(
             "Directory cursor does not match this listing request".into(),
@@ -293,7 +301,16 @@ pub async fn list_files(
     }
     let lock_authorizer = FolderLockAuthorizer::new(&state, &headers, &share.storage_id).await;
     lock_authorizer.ensure_access(&share_storage_path(&share, request_path))?;
-    let page_size = page_size(query.limit)?;
+    let filter = if query.gallery {
+        DirectoryEntryFilter::Gallery
+    } else {
+        DirectoryEntryFilter::All
+    };
+    let page_size = if query.gallery {
+        DEFAULT_PAGE_SIZE
+    } else {
+        page_size(query.limit)?
+    };
     let cursor = decode_cursor(
         query.cursor.as_deref(),
         &share.storage_id,
@@ -301,6 +318,7 @@ pub async fn list_files(
         query.search.as_deref(),
         query.sort,
         query.direction,
+        filter,
     )?;
     let delivered = cursor.as_ref().map_or(0, |cursor| cursor.delivered);
     let page = backend
@@ -311,6 +329,7 @@ pub async fn list_files(
                 search: normalized_search(query.search.as_deref()),
                 sort: query.sort,
                 direction: query.direction,
+                filter,
                 after: cursor.map(|cursor| cursor.position),
             },
         )
@@ -325,6 +344,7 @@ pub async fn list_files(
                 search: normalized_search(query.search.as_deref()),
                 sort: query.sort,
                 direction: query.direction,
+                filter,
                 delivered: delivered
                     .checked_add(page.entries.len())
                     .ok_or_else(|| AppError::BadRequest("Invalid directory cursor".into()))?,
@@ -800,6 +820,7 @@ mod pagination_tests {
             search: Some("log".into()),
             sort: DirectorySort::Time,
             direction: SortDirection::Desc,
+            filter: DirectoryEntryFilter::Gallery,
             delivered: 40,
             position: EntryPosition::from(&crate::directory_listing::BackendEntry {
                 name: "server.log".into(),
@@ -818,10 +839,21 @@ mod pagination_tests {
             Some("LOG"),
             DirectorySort::Time,
             SortDirection::Desc,
+            DirectoryEntryFilter::Gallery,
         )
         .unwrap()
         .unwrap();
         assert_eq!(decoded.delivered, 40);
+        assert!(decode_cursor(
+            Some(&cursor),
+            "primary",
+            "docs",
+            Some("LOG"),
+            DirectorySort::Time,
+            SortDirection::Desc,
+            DirectoryEntryFilter::All,
+        )
+        .is_err());
         assert!(decode_cursor(
             Some("not-a-cursor"),
             "primary",
@@ -829,6 +861,7 @@ mod pagination_tests {
             None,
             DirectorySort::Name,
             SortDirection::Asc,
+            DirectoryEntryFilter::All,
         )
         .is_err());
         assert!(decode_cursor(
@@ -838,6 +871,7 @@ mod pagination_tests {
             None,
             DirectorySort::Name,
             SortDirection::Asc,
+            DirectoryEntryFilter::All,
         )
         .is_err());
     }

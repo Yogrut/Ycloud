@@ -37,7 +37,7 @@ export const zhCN = {
   'preview.missingPath': '缺少文件路径',
   'preview.missingPathHelp': '请返回文件浏览器后重新打开预览。',
   'preview.truncated': '[预览已截断，仅显示前 2 MiB]',
-  'preview.unsupported': '此文件类型不在安全预览列表中。',
+  'preview.unsupported': '浏览器无法预览此文件，可下载后打开。',
   'preview.downloadFile': '下载文件',
   'picker.root': '/ 根目录',
   'picker.parent': '↩ 返回上级',

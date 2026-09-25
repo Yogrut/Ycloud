@@ -845,7 +845,9 @@ mod tests {
 
     use super::{StorageBackend, StorageRegistry};
     use crate::capacity::load_capacity_ledger;
-    use crate::directory_listing::{DirectoryListRequest, DirectorySort, SortDirection};
+    use crate::directory_listing::{
+        DirectoryEntryFilter, DirectoryListRequest, DirectorySort, SortDirection,
+    };
     use crate::storage::StorageService;
     use crate::test_support::TestDirectory;
 
@@ -855,6 +857,7 @@ mod tests {
             search: None,
             sort: DirectorySort::Name,
             direction: SortDirection::Asc,
+            filter: DirectoryEntryFilter::All,
             after: None,
         }
     }

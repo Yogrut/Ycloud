@@ -2,20 +2,6 @@
 
 Rust + Vue 构建的自托管文件管理服务，支持本地存储和 S3 兼容对象存储。
 
-## 支持范围
-
-- 生产部署：Linux 原生进程、Docker、Docker Compose。
-- Windows：开发、编译和本机运行。
-
-## Windows 开发运行
-
-```powershell
-cd Ycloud-v2
-cargo run --release --locked
-```
-
-访问 `http://127.0.0.1:18473`。首次启动凭据位于 `initial-credentials.json`。
-
 ## 功能
 
 - 本地存储、阿里云 OSS、腾讯云 COS、MinIO、RustFS 和通用 S3。
@@ -51,6 +37,26 @@ cargo run --release --locked
 
 ![Ycloud 管理后台概览](docs/images/admin-dashboard.png)
 
+## 开发环境与编译
+
+- Rust 与 Cargo：`rust-toolchain.toml` 固定 1.96.1；需安装对应平台的原生编译工具链。
+- Node.js：`^20.19.0` 或 `>=22.12.0`；npm：11.17.0。前端依赖以 `frontend/package-lock.json` 为准。
+- Docker 部署另需 Docker Engine 和 Compose 插件。
+
+从仓库根目录先构建前端，再编译后端；Rust 会将 `static/app/` 中的前端产物嵌入可执行文件：
+
+```bash
+cd frontend
+npm ci
+npm run build
+cd ..
+cargo build --release --locked
+```
+
+可执行文件位于 `target/release/ycloud`（Windows 为 `ycloud.exe`）。修改前端后需重新构建，并提交更新后的 `static/app/`。
+
+开发时在仓库根目录运行 `cargo run --locked`，另开终端在 `frontend/` 运行 `npm run dev`，访问 `http://127.0.0.1:5173`。Vite 将 API 请求转发到默认的后端地址 `127.0.0.1:18473`。首次启动生成的凭据保存在运行目录的 `initial-credentials.json`，请勿提交。
+
 ## Docker Compose
 
 ```bash
@@ -71,8 +77,9 @@ sudo cat ./data/initial-credentials.json
 
 ## Linux 原生运行
 
+完成上方编译后，从仓库根目录运行：
+
 ```bash
-cargo build --release --locked
 BIND_ADDRESS=0.0.0.0 ./target/release/ycloud
 ```
 
@@ -93,28 +100,9 @@ BIND_ADDRESS=0.0.0.0 ./target/release/ycloud
 
 Dockerfile 已设置容器内的监听地址、端口和数据路径，普通 Compose 部署无需设置访问模式参数。
 
-### HTTPS 反向代理
-
-先通过 HTTP 地址登录后台，在 **管理员设置 → 域名绑定** 中填写
-`https://cloud.example.com`。支持非默认 HTTPS 端口，暂不支持多个域名。
-先完成 DNS、证书和转发配置；Ycloud 不会自动操作 DNS、申请证书或配置反向代理。
-
-点击确认后立即保存并生效，无验证等待期，也不会自动恢复旧配置。
-此后文件页、后台、API 和 WebDAV 仅接受该域名，内网 IP 直连关闭，请通过新域名重新登录。
-保存前请核对域名；程序仅校验配置格式，不主动请求域名验证连通性。
-
-确认后的配置保存在数据目录的 `config.json` 中，并自动启用严格域名校验、
-Secure Cookie 和 HSTS，无需修改容器环境变量或重建容器。Ycloud 不读取
-`X-Forwarded-For` 或 `X-Forwarded-Proto`；访问日志与登录限制使用
-Ycloud 实际收到连接的来源 IP。后台解除绑定后立即恢复 HTTP 访问模式。
-
-如果已确认的域名后来失效，可停止服务，将持久化 `config.json` 的
-`domain_binding` 改为 `null`，再启动服务恢复 HTTP 访问；不要删除整个配置文件。
-该功能不修改容器端口映射或监听地址。
-
 ### 配置主密钥
 
-单机自动生成主密钥并保存在数据目录。Docker、集群或外部密钥管理场景可设置 `YCLOUD_CONFIG_KEY_FILE`，也可用 `YCLOUD_CONFIG_KEY` 覆盖。密钥为 32 个随机字节的 URL-safe Base64；密钥丢失后，已加密的 S3 SecretKey 和 TOTP 密钥无法恢复。
+单机自动生成主密钥并保存在数据目录。容器部署或使用外部密钥管理时可设置 `YCLOUD_CONFIG_KEY_FILE`，也可用 `YCLOUD_CONFIG_KEY` 覆盖。密钥为 32 个随机字节的 URL-safe Base64；密钥丢失后，已加密的 S3 SecretKey 和 TOTP 密钥无法恢复。
 
 ### 存储
 
@@ -148,25 +136,17 @@ S3_ALLOWED_ENDPOINTS=http://192.168.2.37:9000
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-cargo build --release --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --locked
 
 cd frontend
-npm ci
 npm run check
 ```
-
-前端构建产物写入 `static/app` 并嵌入 Rust 可执行文件。
 
 项目结构见 [ARCHITECTURE.md](ARCHITECTURE.md)，开发规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## 流量额度与统计
 
-管理后台默认进入“仪表盘”：上方“概览”显示存储空间、普通用户、WebDAV 挂载和文件夹锁数量；中部“流量信息”在同一面板展示总流量下载、总流量上传、访客下载、用户下载和用户上传五个独立圆环；下方“流量统计”提供按日上传／下载柱状趋势和占比环图，日期使用项目自有选择器。“传输限制”集中设置全站、访客共享下载、普通用户共享总额度和账号独立额度。共享额度与账号额度同时生效，上传／下载独立，0 表示不限额；关闭限制仍记录用量。访客没有上传权限，不使用 IP 额度。
-
-管理员流量计入全站统计，但不受流量额度限制；独立 WebDAV 仍受全站额度限制。所有身份共用可配置的小时／天／月重置周期和起始时间（固定时区偏移），改周期不立即清零；日统计筛选与额度重置互不影响。
-
-存储可分别设置“允许访客访问”和“允许访客下载”。仅开启访问时可浏览文件列表，不能获取文件内容（下载、预览、打包均拒绝）；开启下载必须先允许访问，关闭访问同时关闭下载。旧配置保留既有访问／下载行为，新建存储的访客下载默认关闭。此设置不改变账号用户或独立 WebDAV 权限。
-
-配置目录中的 `traffic-usage.json` 和 `traffic-usage.jsonl` 保存用量；备份应停服并一并保存配置和账本，勿单独删除或恢复旧账本。损坏或持久化失败会停止传输，不能靠重启清除额度。计量是应用文件内容字节，不等于运营商流量；中止时可能保守计入尚未被对端接收的最后一帧。同步记账的真实 NAS 吞吐和断电恢复仍需部署验收。
+- 限额：全站、访客共享下载、普通用户共享和账号独立额度；上传／下载分开计算，`0` 表示不限额。
+- 统计：仪表盘展示每日趋势；下载、预览和打包计入下载流量。关闭限额仍计量；管理员计量但不限额，独立 WebDAV 受全站限额约束。
+- 重置与备份：按小时／天／月周期重置，重启不清零。停服备份时需将配置与 `traffic-usage.json`、`traffic-usage.jsonl` 一同保存。

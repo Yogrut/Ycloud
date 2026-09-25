@@ -13,13 +13,13 @@ npm run check
 
 ## 开发模式
 
-终端 1：
+终端 1（仓库根目录）：
 
 ```bash
 cargo run --locked
 ```
 
-终端 2：
+终端 2（仓库根目录）：
 
 ```bash
 cd frontend

@@ -77,7 +77,7 @@ impl LinuxRoot {
         }
     }
 
-    pub(super) async fn metadata(&self, relative: &str) -> AppResult<std::fs::Metadata> {
+    pub(crate) async fn metadata(&self, relative: &str) -> AppResult<std::fs::Metadata> {
         let descriptor = self
             .open_path(relative, OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC)
             .await?;
@@ -90,7 +90,7 @@ impl LinuxRoot {
         Ok(metadata)
     }
 
-    pub(super) async fn open_file_for_read(&self, relative: &str) -> AppResult<File> {
+    pub(crate) async fn open_file_for_read(&self, relative: &str) -> AppResult<File> {
         let descriptor = self
             .open_path(
                 relative,
@@ -740,7 +740,7 @@ fn map_mutation_error(context: &'static str, error: Errno) -> AppError {
     match error {
         Errno::EXIST => AppError::Conflict("Destination already exists".into()),
         Errno::NOENT => AppError::NotFound,
-        Errno::LOOP | Errno::XDEV | Errno::NOTDIR | Errno::ACCES | Errno::PERM => {
+        Errno::LOOP | Errno::XDEV | Errno::NOTDIR | Errno::ACCESS | Errno::PERM => {
             AppError::Forbidden
         }
         Errno::NOSYS => AppError::ServiceUnavailable(
@@ -753,7 +753,7 @@ fn map_mutation_error(context: &'static str, error: Errno) -> AppError {
 fn map_resolution_error(error: Errno) -> AppError {
     match error {
         Errno::NOENT => AppError::NotFound,
-        Errno::LOOP | Errno::XDEV | Errno::NOTDIR | Errno::ACCES | Errno::PERM => {
+        Errno::LOOP | Errno::XDEV | Errno::NOTDIR | Errno::ACCESS | Errno::PERM => {
             AppError::Forbidden
         }
         Errno::NOSYS => AppError::ServiceUnavailable(

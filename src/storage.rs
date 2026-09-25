@@ -35,8 +35,10 @@ mod upload_cleanup;
 pub use atomic_write::{AtomicFileWriter, AtomicWriteResult};
 pub use cleanup::CleanupStatus;
 pub(crate) use path::is_link_or_reparse_point;
+use path::reject_root_or_descendant;
+#[cfg(any(not(target_os = "linux"), test))]
+use path::require_plain_directory;
 pub use path::ResolvedPath;
-use path::{reject_root_or_descendant, require_plain_directory};
 pub use response::FileResponseMode;
 pub(crate) use response::{attachment_header, parse_range, FileResponsePolicy};
 pub use upload_cleanup::UploadCleanupStatus;

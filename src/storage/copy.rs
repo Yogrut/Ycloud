@@ -12,6 +12,7 @@ use crate::{
     storage_transaction::TransactionId,
 };
 use std::{future::Future, path::PathBuf};
+#[cfg(any(not(target_os = "linux"), test))]
 use tokio::fs;
 
 impl StorageService {

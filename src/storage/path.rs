@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(any(not(target_os = "linux"), test))]
 use tokio::fs;
 
 #[cfg(windows)]
@@ -46,16 +47,19 @@ impl StorageService {
             return Ok(resolved);
         }
         #[cfg(not(target_os = "linux"))]
-        let canonical = fs::canonicalize(&resolved.absolute)
-            .await
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => AppError::NotFound,
-                _ => AppError::with_source("failed to resolve storage path", error),
-            })?;
-        if !canonical.starts_with(self.root()) {
-            return Err(AppError::Forbidden);
+        {
+            let canonical =
+                fs::canonicalize(&resolved.absolute)
+                    .await
+                    .map_err(|error| match error.kind() {
+                        std::io::ErrorKind::NotFound => AppError::NotFound,
+                        _ => AppError::with_source("failed to resolve storage path", error),
+                    })?;
+            if !canonical.starts_with(self.root()) {
+                return Err(AppError::Forbidden);
+            }
+            Ok(resolved)
         }
-        Ok(resolved)
     }
 
     pub async fn resolve_for_write(&self, path: &str) -> AppResult<ResolvedPath> {
@@ -74,36 +78,38 @@ impl StorageService {
         }
 
         #[cfg(not(target_os = "linux"))]
-        let mut existing_ancestor = absolute.clone();
-        loop {
-            match fs::symlink_metadata(&existing_ancestor).await {
-                Ok(metadata) => {
-                    if is_link_or_reparse_point(&metadata) {
-                        return Err(AppError::Forbidden);
+        {
+            let mut existing_ancestor = absolute.clone();
+            loop {
+                match fs::symlink_metadata(&existing_ancestor).await {
+                    Ok(metadata) => {
+                        if is_link_or_reparse_point(&metadata) {
+                            return Err(AppError::Forbidden);
+                        }
+                        break;
                     }
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if !existing_ancestor.pop() {
-                        return Err(AppError::Forbidden);
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if !existing_ancestor.pop() {
+                            return Err(AppError::Forbidden);
+                        }
                     }
-                }
-                Err(error) => {
-                    return Err(AppError::with_source(
-                        "failed to validate storage path",
-                        error,
-                    ));
+                    Err(error) => {
+                        return Err(AppError::with_source(
+                            "failed to validate storage path",
+                            error,
+                        ));
+                    }
                 }
             }
-        }
-        let canonical_ancestor = fs::canonicalize(&existing_ancestor)
-            .await
-            .map_err(|error| AppError::with_source("failed to validate storage path", error))?;
-        if !canonical_ancestor.starts_with(self.root()) {
-            return Err(AppError::Forbidden);
-        }
+            let canonical_ancestor = fs::canonicalize(&existing_ancestor)
+                .await
+                .map_err(|error| AppError::with_source("failed to validate storage path", error))?;
+            if !canonical_ancestor.starts_with(self.root()) {
+                return Err(AppError::Forbidden);
+            }
 
-        Ok(ResolvedPath { relative, absolute })
+            Ok(ResolvedPath { relative, absolute })
+        }
     }
 }
 
@@ -143,6 +149,7 @@ pub(super) fn reject_root_or_descendant(
     Ok(())
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 pub(super) async fn require_plain_directory(parent: Option<&Path>) -> AppResult<()> {
     let parent = parent.ok_or_else(|| AppError::BadRequest("Invalid destination path".into()))?;
     let metadata = fs::symlink_metadata(parent)

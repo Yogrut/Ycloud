@@ -40,3 +40,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"

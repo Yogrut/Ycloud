@@ -10,7 +10,9 @@ use tokio::{
     sync::{Mutex as AsyncMutex, OwnedSemaphorePermit},
 };
 
-use super::{is_link_or_reparse_point, StorageService};
+#[cfg(any(not(target_os = "linux"), test))]
+use super::is_link_or_reparse_point;
+use super::StorageService;
 use crate::{
     error::{AppError, AppResult},
     storage_transaction::{TransactionId, TransactionPaths, UploadOwnership},

@@ -18,12 +18,16 @@ impl S3Backend {
         self.recover_transactions_locked().await
     }
 
-    pub(crate) async fn recover_runtime_transactions(&self) -> AppResult<Option<usize>> {
+    pub(crate) async fn recover_runtime_transactions(
+        &self,
+        capacity: &crate::capacity::CapacityTracker,
+    ) -> AppResult<Option<usize>> {
         let _recovery = self.recovery_gate.write().await;
         let _mutation = self.mutation_gate.lock().await;
         if !self.recovery_runtime.has_pending() {
             return Ok(None);
         }
+        capacity.mark_uncertain();
         self.recover_transactions_locked().await.map(Some)
     }
 

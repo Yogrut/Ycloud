@@ -289,6 +289,7 @@ impl LinuxRoot {
         .map_err(|error| AppError::with_source("local storage sync task failed", error))?
     }
 
+    #[cfg(test)]
     pub(crate) async fn read_directory(
         &self,
         relative: &str,
@@ -306,6 +307,24 @@ impl LinuxRoot {
         tokio::task::spawn_blocking(move || read_directory(&descriptor, &relative, reject_links))
             .await
             .map_err(|error| AppError::with_source("local storage listing task failed", error))?
+    }
+
+    pub(crate) fn scan_directory(
+        &self,
+        relative: &str,
+    ) -> (
+        tokio::sync::mpsc::Receiver<LinuxDirectoryEntry>,
+        tokio::task::JoinHandle<AppResult<()>>,
+    ) {
+        let descriptor = self.descriptor.clone();
+        let relative = relative.to_owned();
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        let task = tokio::task::spawn_blocking(move || {
+            visit_directory(&descriptor, &relative, false, |entry| {
+                sender.blocking_send(entry).is_ok()
+            })
+        });
+        (receiver, task)
     }
 
     pub(crate) async fn copy_path(
@@ -425,6 +444,20 @@ fn read_directory(
     relative: &str,
     reject_links: bool,
 ) -> AppResult<Vec<LinuxDirectoryEntry>> {
+    let mut result = Vec::new();
+    visit_directory(descriptor, relative, reject_links, |entry| {
+        result.push(entry);
+        true
+    })?;
+    Ok(result)
+}
+
+fn visit_directory(
+    descriptor: &OwnedFd,
+    relative: &str,
+    reject_links: bool,
+    mut consume: impl FnMut(LinuxDirectoryEntry) -> bool,
+) -> AppResult<()> {
     let directory = openat2(
         descriptor,
         if relative.is_empty() { "." } else { relative },
@@ -435,7 +468,6 @@ fn read_directory(
     .map_err(map_resolution_error)?;
     let mut directory = Dir::new(directory)
         .map_err(|error| linux_error("failed to read local storage directory", error))?;
-    let mut result = Vec::new();
     while let Some(entry) = directory.next() {
         let entry = entry
             .map_err(|error| linux_error("failed to read local storage directory entry", error))?;
@@ -467,12 +499,14 @@ fn read_directory(
             }
             continue;
         }
-        result.push(LinuxDirectoryEntry {
+        if !consume(LinuxDirectoryEntry {
             name: OsString::from_vec(name.to_vec()),
             metadata,
-        });
+        }) {
+            break;
+        }
     }
-    Ok(result)
+    Ok(())
 }
 
 fn join_relative(parent: &str, name: &str) -> String {

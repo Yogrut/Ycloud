@@ -155,6 +155,32 @@ struct ActiveStorage {
     directory_snapshots: DirectorySnapshotStore,
 }
 
+/// Cancellation or a task panic must not leave a possibly published S3
+/// mutation advertised as accurately accounted for.
+struct S3CapacityAccounting {
+    capacity: CapacityTracker,
+    storage: S3Backend,
+    settled: bool,
+}
+
+impl S3CapacityAccounting {
+    fn new(capacity: &CapacityTracker, storage: &S3Backend) -> Self {
+        Self {
+            capacity: capacity.clone(),
+            storage: storage.clone(),
+            settled: false,
+        }
+    }
+}
+
+impl Drop for S3CapacityAccounting {
+    fn drop(&mut self) {
+        if !self.settled {
+            schedule_s3_capacity_reconcile(self.capacity.clone(), self.storage.clone());
+        }
+    }
+}
+
 impl Drop for ActiveStorage {
     fn drop(&mut self) {
         if let Some(wake) = &self.local_reconcile_wake {
@@ -241,7 +267,7 @@ impl StorageBackend {
         let active = &backend.active;
         if let StorageBackendKind::S3(storage) = &active.kind {
             schedule_s3_capacity_reconcile(active.capacity.clone(), storage.clone());
-            spawn_s3_recovery_reconciler(storage.clone());
+            spawn_s3_recovery_reconciler(storage.clone(), active.capacity.clone());
         }
         Ok(backend)
     }
@@ -451,26 +477,44 @@ impl StorageBackend {
                 };
                 let capacity_reservation =
                     capacity.reserve_replacement(old_size, content_length)?;
-                let result = match storage
-                    .upload_file(
-                        relative,
-                        body,
-                        content_length,
-                        max_upload_bytes,
-                        content_type,
-                    )
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        drop(capacity_reservation);
-                        schedule_s3_capacity_reconcile(capacity.clone(), storage.clone());
-                        return Err(error);
+                let storage = storage.clone();
+                let relative = relative.to_owned();
+                let content_type = content_type.map(str::to_owned);
+                let failure_capacity = capacity.clone();
+                let failure_storage = storage.clone();
+                let snapshots = active.directory_snapshots.clone();
+                tokio::spawn(async move {
+                    let _snapshot_invalidation = snapshots.invalidate_on_drop();
+                    let _accounting = storage.acquire_capacity_mutation().await;
+                    let mut accounting = S3CapacityAccounting::new(&capacity, &storage);
+                    let result = storage
+                        .upload_file(
+                            &relative,
+                            body,
+                            content_length,
+                            max_upload_bytes,
+                            content_type.as_deref(),
+                        )
+                        .await;
+                    match result {
+                        Ok(result) => {
+                            capacity_reservation.commit(result.previous_size, result.size);
+                            persist_capacity(&capacity).await;
+                            accounting.settled = true;
+                            Ok(result.size)
+                        }
+                        Err(error) => {
+                            drop(capacity_reservation);
+                            schedule_s3_capacity_reconcile(capacity, storage);
+                            Err(error)
+                        }
                     }
-                };
-                capacity_reservation.commit(result.previous_size, result.size);
-                persist_capacity(&capacity).await;
-                Ok(result.size)
+                })
+                .await
+                .map_err(|error| {
+                    schedule_s3_capacity_reconcile(failure_capacity, failure_storage);
+                    AppError::with_source("S3 upload execution task failed", error)
+                })?
             }
         }
     }
@@ -500,6 +544,8 @@ impl StorageBackend {
                     .map(|_| ())
             }
             StorageBackendKind::S3(storage) => {
+                let _accounting = storage.acquire_capacity_mutation().await;
+                let mut accounting = S3CapacityAccounting::new(&capacity, storage);
                 let metadata = storage.metadata(relative).await?;
                 let removal = if metadata.is_dir {
                     storage.delete_directory(relative).await
@@ -515,6 +561,7 @@ impl StorageBackend {
                 };
                 capacity.remove_used(removed_size);
                 persist_capacity(&capacity).await;
+                accounting.settled = true;
                 Ok(())
             }
         }
@@ -535,6 +582,8 @@ impl StorageBackend {
                 result
             }
             StorageBackendKind::S3(storage) => {
+                let _accounting = storage.acquire_capacity_mutation().await;
+                let mut accounting = S3CapacityAccounting::new(&capacity, storage);
                 let result = if storage.metadata(source).await?.is_dir {
                     storage.move_directory(source, destination).await
                 } else {
@@ -542,6 +591,8 @@ impl StorageBackend {
                 };
                 if result.is_err() {
                     schedule_s3_capacity_reconcile(capacity.clone(), storage.clone());
+                } else {
+                    accounting.settled = true;
                 }
                 result
             }
@@ -564,23 +615,47 @@ impl StorageBackend {
             StorageBackendKind::S3(storage) => {
                 let copied_size = storage.path_size(source).await?;
                 let reservation = capacity.reserve_replacement(0, copied_size)?;
-                let result = if storage.metadata(source).await?.is_dir {
-                    storage
-                        .copy_directory_with_expected_size(source, destination, copied_size)
-                        .await
-                } else {
-                    storage
-                        .copy_file_with_expected_size(source, destination, copied_size)
-                        .await
-                };
-                if let Err(error) = result {
-                    drop(reservation);
-                    schedule_s3_capacity_reconcile(capacity.clone(), storage.clone());
-                    return Err(error);
-                }
-                reservation.commit(0, copied_size);
-                persist_capacity(&capacity).await;
-                Ok(())
+                let storage = storage.clone();
+                let source = source.to_owned();
+                let destination = destination.to_owned();
+                let failure_capacity = capacity.clone();
+                let failure_storage = storage.clone();
+                let snapshots = active.directory_snapshots.clone();
+                tokio::spawn(async move {
+                    let _snapshot_invalidation = snapshots.invalidate_on_drop();
+                    let _accounting = storage.acquire_capacity_mutation().await;
+                    let mut accounting = S3CapacityAccounting::new(&capacity, &storage);
+                    let result: AppResult<()> = async {
+                        if storage.metadata(&source).await?.is_dir {
+                            storage
+                                .copy_directory_with_expected_size(
+                                    &source,
+                                    &destination,
+                                    copied_size,
+                                )
+                                .await
+                        } else {
+                            storage
+                                .copy_file_with_expected_size(&source, &destination, copied_size)
+                                .await
+                        }
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        drop(reservation);
+                        schedule_s3_capacity_reconcile(capacity, storage);
+                        return Err(error);
+                    }
+                    reservation.commit(0, copied_size);
+                    persist_capacity(&capacity).await;
+                    accounting.settled = true;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| {
+                    schedule_s3_capacity_reconcile(failure_capacity, failure_storage);
+                    AppError::with_source("S3 copy execution task failed", error)
+                })?
             }
         }
     }
@@ -685,11 +760,8 @@ fn schedule_s3_capacity_reconcile(capacity: CapacityTracker, storage: S3Backend)
         return;
     }
     tokio::spawn(async move {
-        match storage.user_data_size().await {
-            Ok(used) => {
-                capacity.reconcile(used);
-                persist_capacity(&capacity).await;
-            }
+        match storage.reconcile_capacity_snapshot(&capacity).await {
+            Ok(()) => {}
             Err(error) => {
                 capacity.reconciliation_failed();
                 tracing::error!(%error, "failed to reconcile S3 capacity in the background");
@@ -698,7 +770,7 @@ fn schedule_s3_capacity_reconcile(capacity: CapacityTracker, storage: S3Backend)
     });
 }
 
-pub(crate) fn spawn_s3_recovery_reconciler(storage: S3Backend) {
+pub(crate) fn spawn_s3_recovery_reconciler(storage: S3Backend, capacity: CapacityTracker) {
     const QUIET_PERIOD: Duration = Duration::from_secs(1);
     const RETRY_MIN: Duration = Duration::from_secs(1);
     const RETRY_MAX: Duration = Duration::from_secs(60);
@@ -740,11 +812,12 @@ pub(crate) fn spawn_s3_recovery_reconciler(storage: S3Backend) {
                     break;
                 }
                 storage.runtime_recovery_started();
-                match storage.recover_runtime_transactions().await {
+                match storage.recover_runtime_transactions(&capacity).await {
                     Ok(recovered) => {
                         storage.runtime_recovery_succeeded();
                         if let Some(recovered) = recovered {
                             tracing::info!(recovered, "runtime S3 recovery completed");
+                            schedule_s3_capacity_reconcile(capacity.clone(), storage.clone());
                         }
                         break;
                     }
@@ -786,12 +859,15 @@ async fn list_local_directory(
     if !storage.metadata(&directory).await?.is_dir() {
         return Err(AppError::NotFound);
     }
-    let mut entries = storage
-        .read_directory(&directory)
-        .await?
-        .into_iter()
-        .filter_map(|entry| local_backend_entry(relative, entry))
-        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    storage
+        .scan_directory(&directory, |entry| {
+            if let Some(entry) = local_backend_entry(relative, entry) {
+                entries.push(entry);
+            }
+            Ok(entries.len() <= max_entries)
+        })
+        .await?;
     let truncated = entries.len() > max_entries;
     entries.truncate(max_entries);
     Ok((entries, truncated))
@@ -809,11 +885,14 @@ where
     if !storage.metadata(&directory).await?.is_dir() {
         return Err(AppError::NotFound);
     }
-    for entry in storage.read_directory(&directory).await? {
-        if let Some(entry) = local_backend_entry(relative, entry) {
-            consume(entry);
-        }
-    }
+    storage
+        .scan_directory(&directory, |entry| {
+            if let Some(entry) = local_backend_entry(relative, entry) {
+                consume(entry);
+            }
+            Ok(true)
+        })
+        .await?;
     Ok(())
 }
 

@@ -1,5 +1,5 @@
 import { useLocale } from '../i18n'
-import { readJson } from './client'
+import { requestJson } from './client'
 
 const locale = useLocale()
 
@@ -19,22 +19,20 @@ interface GateResponse {
 }
 
 export async function getIdentity(): Promise<Identity> {
-  const response = await fetch('/api/me', { credentials: 'same-origin' })
+  const { response, body: identity } = await requestJson<Identity>('/api/me')
   if (!response.ok) throw new Error(locale.t('login.identityUnavailable'))
 
-  const identity = await readJson<Identity>(response)
   if (!identity) throw new Error(locale.t('login.invalidIdentity'))
   return identity
 }
 
 export async function enterGate(password: string): Promise<void> {
-  const response = await fetch('/api/gate', {
+  const { response, body: result } = await requestJson<GateResponse>('/api/gate', {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ password }),
   })
-  const result = await readJson<GateResponse>(response)
   if (!response.ok || !result?.success) {
     throw new Error(result?.message ?? result?.error?.message ?? locale.t('login.wrongPassword'))
   }

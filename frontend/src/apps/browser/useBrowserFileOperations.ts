@@ -4,6 +4,7 @@ import type { BatchOperation, BatchResponse, BrowserCapabilities, FileEntry } fr
 import { batchOperation, checkDownload, createFolder, downloadUrl, prepareArchive, renameItem } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import { useLocale } from '../../shared/i18n'
+import { ApiError } from '../../shared/api/client'
 import { batchSummary } from './operationFeedback'
 
 interface BrowserFileOperationsContext {
@@ -32,12 +33,16 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
   const renaming = ref(false)
   const showDelete = ref(false)
   const pendingDelete = ref<string[]>([])
+  const deleteStorageId = ref('')
   const operationBusy = ref(false)
   const operationError = ref('')
+  const operationRetryBlocked = ref(false)
   const pickerOperation = ref<'move' | 'copy' | null>(null)
   const pickerPaths = ref<string[]>([])
   const pickerStorageId = ref('')
   const batchResult = ref<BatchResponse | null>(null)
+  const pendingDownloads = new Set<string>()
+  let archivePreparing = false
 
   const pickerTitle = computed(() => locale.text(
     `${pickerOperation.value === 'move' ? '移动' : '复制'} ${pickerPaths.value.length} 个项目到…`,
@@ -74,17 +79,22 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
 
   async function startDownload(entryPath: string): Promise<void> {
     if (!context.capabilities.value.download) return
+    const url = downloadUrl(entryPath, context.storageId.value)
+    if (pendingDownloads.has(url)) return
+    pendingDownloads.add(url)
     try {
-      const url = downloadUrl(entryPath, context.storageId.value)
       await checkDownload(url)
       window.location.href = url
     } catch (error) {
       context.announce(error instanceof Error ? error.message : locale.text('下载失败', 'Download failed'))
+    } finally {
+      pendingDownloads.delete(url)
     }
   }
 
   async function startArchive(paths: string[]): Promise<void> {
-    if (!paths.length || !context.capabilities.value.download) return
+    if (archivePreparing || !paths.length || !context.capabilities.value.download) return
+    archivePreparing = true
     try {
       const result = await prepareArchive(paths, context.storageId.value)
       context.announce(locale.text(
@@ -105,6 +115,8 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
           `An archive can contain at most ${context.maxArchiveEntries.value} entries; split the selection`,
         ))
       } else context.announce(message)
+    } finally {
+      archivePreparing = false
     }
   }
 
@@ -134,21 +146,25 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
   }
 
   function requestTransfer(operation: 'move' | 'copy', paths: string[]): void {
-    if (!paths.length || !context.requireCapability(operation === 'move' ? 'move_items' : 'copy')) return
+    if (operationBusy.value || !paths.length || !context.requireCapability(operation === 'move' ? 'move_items' : 'copy')) return
     pickerOperation.value = operation
     pickerPaths.value = [...paths]
     pickerStorageId.value = context.storageId.value
     operationError.value = ''
+    operationRetryBlocked.value = false
   }
 
   function requestDelete(paths: string[]): void {
-    if (!paths.length || !context.requireCapability('delete')) return
+    if (operationBusy.value || !paths.length || !context.requireCapability('delete')) return
     pendingDelete.value = [...paths]
+    deleteStorageId.value = context.storageId.value
     operationError.value = ''
+    operationRetryBlocked.value = false
     showDelete.value = true
   }
 
   async function runBatch(operation: BatchOperation, paths: string[], target = '', storageId = context.storageId.value): Promise<void> {
+    if (operationBusy.value || !paths.length) return
     operationBusy.value = true
     operationError.value = ''
     try {
@@ -163,6 +179,7 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
       context.selected.value = new Set()
       await context.refresh()
     } catch (error) {
+      operationRetryBlocked.value = error instanceof ApiError && error.blocksRetry
       operationError.value = error instanceof Error ? error.message : locale.t('common.failed')
       context.announce(operationError.value)
     } finally {
@@ -171,6 +188,7 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
   }
 
   async function confirmTransfer(target: string): Promise<void> {
+    if (operationBusy.value) return
     const operation = pickerOperation.value
     const paths = [...pickerPaths.value]
     const storageId = pickerStorageId.value
@@ -179,8 +197,9 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
   }
 
   async function confirmDelete(): Promise<void> {
+    if (operationBusy.value || operationRetryBlocked.value || !showDelete.value) return
     const paths = [...pendingDelete.value]
-    await runBatch('delete', paths)
+    await runBatch('delete', paths, '', deleteStorageId.value)
     if (!operationError.value) showDelete.value = false
   }
 
@@ -195,6 +214,8 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
     openFolderDialog,
     openRenameDialog,
     operationBusy,
+    operationError,
+    operationRetryBlocked,
     pendingDelete,
     pickerOperation,
     pickerStorageId,

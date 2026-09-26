@@ -204,7 +204,7 @@ describe('BrowserView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc&gallery=true', { credentials: 'same-origin' })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc&gallery=true', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
     expect(host.querySelectorAll('.gallery-card')).toHaveLength(20)
     expect(host.querySelector('.file-head')).toBeNull()
     expect(host.querySelector('.gallery-page-size')?.textContent).toContain('20')
@@ -224,7 +224,7 @@ describe('BrowserView', () => {
     toggle.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
-    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc', { credentials: 'same-origin' })
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
     expect(host.querySelector('.file-row')?.textContent).toContain('notes.txt')
     expect(host.querySelector('.gallery-card')).toBeNull()
     app.unmount()
@@ -458,7 +458,7 @@ describe('BrowserView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=rustfs&limit=20&sort=name&direction=asc', { credentials: 'same-origin' })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=rustfs&limit=20&sort=name&direction=asc', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
     expect(host.textContent).toContain('remote.txt')
     expect(host.textContent).not.toContain('one.txt')
     expect(host.querySelector('.file-row.selected')).toBeNull()
@@ -527,14 +527,14 @@ describe('BrowserView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=20&cursor=MjA&sort=name&direction=asc', { credentials: 'same-origin' })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=20&cursor=MjA&sort=name&direction=asc', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
     expect(host.textContent).toContain('second.txt')
     expect(host.querySelector('.current-page')?.textContent).toBe('2')
 
     host.querySelector<HTMLButtonElement>('.page-arrow')!.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
-    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc', { credentials: 'same-origin' })
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
     expect(host.textContent).toContain('first.txt')
     app.unmount()
   })
@@ -557,7 +557,7 @@ describe('BrowserView', () => {
     await chooseOption(host, '.page-size-select', '10')
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=10&sort=name&direction=asc', { credentials: 'same-origin' })
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=10&sort=name&direction=asc', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
     app.unmount()
   })
 

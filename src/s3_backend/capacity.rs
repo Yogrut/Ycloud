@@ -9,6 +9,29 @@ impl S3Backend {
         self.sum_object_bytes(&self.prefix, true, None).await
     }
 
+    /// Take a capacity snapshot while no upload, recovery, or other mutation
+    /// can publish objects. A pending recovery must settle before the snapshot
+    /// may be advertised as accurate.
+    pub(crate) async fn acquire_capacity_mutation(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.capacity_gate.clone().lock_owned().await
+    }
+
+    pub(crate) async fn reconcile_capacity_snapshot(
+        &self,
+        capacity: &crate::capacity::CapacityTracker,
+    ) -> AppResult<()> {
+        let _accounting = self.acquire_capacity_mutation().await;
+        let _recovery = self.recovery_gate.write().await;
+        let _mutation = self.mutation_gate.lock().await;
+        if self.recovery_has_pending() {
+            return Err(AppError::ServiceUnavailable(
+                "对象存储恢复尚未完成，容量统计暂不可用".into(),
+            ));
+        }
+        let used = self.user_data_size().await?;
+        capacity.persist_reconciled(used).await
+    }
+
     pub async fn path_size(&self, relative: &str) -> AppResult<u64> {
         let metadata = self.metadata(relative).await?;
         if !metadata.is_dir {

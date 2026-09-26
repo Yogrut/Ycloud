@@ -110,6 +110,12 @@ impl S3Backend {
             Err(()) => return range_not_satisfiable(metadata.size),
         };
         let key = object_key(&self.prefix, &metadata.relative)?;
+        let stream_permit = self
+            .stream_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("Storage is shutting down".into()))?;
         let permit = self.acquire_request().await?;
         let mut request = self.client.get_object().bucket(&self.bucket).key(key);
         if let Some(etag) = metadata.etag.as_deref() {
@@ -145,10 +151,11 @@ impl S3Backend {
             });
         }
 
+        drop(permit);
         let reader = output.body.into_async_read();
         let stream = PermitStream {
             inner: ReaderStream::new(reader),
-            _permit: permit,
+            _permit: stream_permit,
         };
         let mut response = Response::builder()
             .status(status)

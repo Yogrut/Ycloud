@@ -1956,7 +1956,10 @@ async fn runtime_worker_settles_a_tracked_activation_probe_intent() {
     let journal_key =
         format!("tenant/.ycloud-system/activation-probe-intents/{INTERNAL_INTENT_ID}");
     backend.recovery_runtime.journal_write_started(&journal_key);
-    crate::storage_backend::spawn_s3_recovery_reconciler(backend.clone());
+    crate::storage_backend::spawn_s3_recovery_reconciler(
+        backend.clone(),
+        crate::capacity::CapacityTracker::new(None, 0),
+    );
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -1989,7 +1992,10 @@ async fn runtime_worker_never_adopts_a_journal_owned_by_an_active_upload() {
     let journal_key = "tenant/.ycloud-system/transactions/foreground";
     let upload_owner = backend.recovery_gate.read().await;
     backend.recovery_runtime.journal_write_started(journal_key);
-    crate::storage_backend::spawn_s3_recovery_reconciler(backend.clone());
+    crate::storage_backend::spawn_s3_recovery_reconciler(
+        backend.clone(),
+        crate::capacity::CapacityTracker::new(None, 0),
+    );
 
     tokio::time::timeout(Duration::from_secs(3), async {
         while !backend.recovery_status().recovering {

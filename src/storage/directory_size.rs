@@ -25,7 +25,7 @@ impl StorageService {
                 ));
             }
             let directory = self.resolve_existing(&relative).await?;
-            for entry in self.read_directory(&directory).await? {
+            self.scan_directory(&directory, |entry| {
                 count += 1;
                 if count > max_entries {
                     return Err(AppError::BadRequest(
@@ -34,7 +34,7 @@ impl StorageService {
                 }
                 let name = entry.name;
                 if name.eq_ignore_ascii_case(SYSTEM_DIR) {
-                    continue;
+                    return Ok(true);
                 }
                 if entry.metadata.is_dir() {
                     let name = name
@@ -51,7 +51,9 @@ impl StorageService {
                         .checked_add(entry.metadata.len())
                         .ok_or_else(|| AppError::internal("directory size overflow"))?;
                 }
-            }
+                Ok(true)
+            })
+            .await?;
         }
         Ok(total)
     }

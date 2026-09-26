@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import type { FileEntry } from '../../shared/api/browser'
 import { listFiles } from '../../shared/api/browser'
 import { useLocale } from '../../shared/i18n'
@@ -14,8 +14,10 @@ const path = ref('')
 const directories = ref<FileEntry[]>([])
 const loading = ref(false)
 const error = ref('')
+let requestVersion = 0
 
 async function load(destination: string): Promise<void> {
+  const version = ++requestVersion
   loading.value = true
   error.value = ''
   try {
@@ -24,6 +26,7 @@ async function load(destination: string): Promise<void> {
     const found: FileEntry[] = []
     do {
       const data = await listFiles(destination, props.storageId, { limit: 100, cursor })
+      if (version !== requestVersion) return
       currentPath = data.current_path
       found.push(...data.entries.filter(entry => entry.is_dir && !entry.locked))
       cursor = data.next_cursor ?? undefined
@@ -31,9 +34,9 @@ async function load(destination: string): Promise<void> {
     path.value = currentPath.replace(/^\/+|\/+$/g, '')
     directories.value = found
   } catch (reason) {
-    error.value = reason instanceof Error ? reason.message : locale.t('picker.loadFailed')
+    if (version === requestVersion) error.value = reason instanceof Error ? reason.message : locale.t('picker.loadFailed')
   } finally {
-    loading.value = false
+    if (version === requestVersion) loading.value = false
   }
 }
 
@@ -42,6 +45,7 @@ function parentPath(): string {
 }
 
 onMounted(() => load(''))
+onBeforeUnmount(() => { requestVersion++ })
 </script>
 
 <template>

@@ -65,7 +65,7 @@ impl StorageService {
         }
 
         let permit = self
-            .io_gate
+            .stream_gate
             .clone()
             .acquire_owned()
             .await

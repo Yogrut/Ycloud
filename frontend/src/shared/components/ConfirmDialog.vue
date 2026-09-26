@@ -4,7 +4,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, useId } from 'vue'
 import { useLocale } from '../i18n'
 import AppIcon from './AppIcon.vue'
 
-const props = defineProps<{ title: string; message: string; target?: string; detail?: string; error?: string; busy?: boolean; confirmLabel?: string; danger?: boolean }>()
+const props = defineProps<{ title: string; message: string; target?: string; detail?: string; error?: string; busy?: boolean; confirmDisabled?: boolean; confirmLabel?: string; danger?: boolean }>()
 const emit = defineEmits<{ close: []; confirm: [] }>()
 const locale = useLocale()
 const id = useId()
@@ -48,7 +48,7 @@ onBeforeUnmount(() => { document.body.style.overflow = overflow; previous?.focus
       </div>
       <footer class="confirmation-actions">
         <button ref="cancelButton" class="btn secondary" type="button" :disabled="busy" @click="close">{{ locale.t('common.cancel') }}</button>
-        <button class="btn" :class="{ danger }" type="button" :disabled="busy" @click="!busy && emit('confirm')">{{ busy ? locale.text('处理中…', 'Working…') : (confirmLabel || locale.t('common.confirm')) }}</button>
+        <button class="btn" :class="{ danger }" type="button" :disabled="busy || confirmDisabled" @click="!busy && !confirmDisabled && emit('confirm')">{{ busy ? locale.text('处理中…', 'Working…') : (confirmLabel || locale.t('common.confirm')) }}</button>
       </footer>
     </section>
   </div>

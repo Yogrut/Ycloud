@@ -109,17 +109,20 @@ pub fn path_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
     let path_components: Vec<&str> = path
         .trim_matches('/')
         .split('/')
-        .filter(|component| !component.is_empty())
+        .filter(|component| !component.is_empty() && *component != ".")
         .collect();
     let ancestor_components: Vec<&str> = ancestor
         .trim_matches('/')
         .split('/')
-        .filter(|component| !component.is_empty())
+        .filter(|component| !component.is_empty() && *component != ".")
         .collect();
 
     !ancestor_components.is_empty()
         && path_components.len() >= ancestor_components.len()
-        && path_components[..ancestor_components.len()] == ancestor_components
+        && path_components[..ancestor_components.len()]
+            .iter()
+            .zip(&ancestor_components)
+            .all(|(path, ancestor)| path_component_eq(path, ancestor))
 }
 
 /// WebDAV and browser folder-lock namespaces must never overlap. This includes
@@ -128,12 +131,12 @@ pub fn paths_overlap(left: &str, right: &str) -> bool {
     let left: Vec<&str> = left
         .trim_matches('/')
         .split('/')
-        .filter(|part| !part.is_empty())
+        .filter(|part| !part.is_empty() && *part != ".")
         .collect();
     let right: Vec<&str> = right
         .trim_matches('/')
         .split('/')
-        .filter(|part| !part.is_empty())
+        .filter(|part| !part.is_empty() && *part != ".")
         .collect();
     let shared = left.len().min(right.len());
     left[..shared]

@@ -44,6 +44,7 @@ export function useBrowserListing(context: BrowserListingContext) {
   let directorySizeSequence = 0
   let searchTimer: number | undefined
   let refreshSequence = 0
+  let listingRequest: AbortController | undefined
 
   const visibleEntries = computed(() => entries.value)
   const pageNumber = computed(() => cursorHistory.value.length + 1)
@@ -78,9 +79,13 @@ export function useBrowserListing(context: BrowserListingContext) {
   async function refresh(): Promise<void> {
     resetDirectorySizes()
     const sequence = ++refreshSequence
+    listingRequest?.abort()
+    const controller = new AbortController()
+    listingRequest = controller
     loading.value = true
     try {
       const data = await listFiles(path.value, currentStorageId.value || undefined, {
+        signal: controller.signal,
         limit: galleryMode.value ? 20 : pageSize.value,
         cursor: currentCursor.value,
         search: appliedQuery.value || undefined,
@@ -113,11 +118,19 @@ export function useBrowserListing(context: BrowserListingContext) {
     } catch (error) {
       if (sequence !== refreshSequence) return
       if (!storages.value.length) {
-        try { storages.value = await listStorages() } catch { /* Keep the original file-list error. */ }
+        try {
+          const available = await listStorages(controller.signal)
+          if (sequence !== refreshSequence) return
+          storages.value = available
+        } catch { /* Keep the original file-list error. */ }
       }
+      if (sequence !== refreshSequence) return
       context.announce(error instanceof Error ? error.message : locale.text('目录加载失败', 'Unable to load this folder'))
     } finally {
-      if (sequence === refreshSequence) loading.value = false
+      if (sequence === refreshSequence) {
+        loading.value = false
+        listingRequest = undefined
+      }
     }
   }
 
@@ -220,12 +233,16 @@ export function useBrowserListing(context: BrowserListingContext) {
 
   async function resetAfterSignIn(requestedStorageId: string): Promise<void> {
     resetDirectorySizes()
-    ++refreshSequence
+    const sequence = ++refreshSequence
+    listingRequest?.abort()
+    const controller = new AbortController()
+    listingRequest = controller
     if (searchTimer !== undefined) window.clearTimeout(searchTimer)
     entries.value = []
     capabilities.value = { download: false, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false }
     isAdministrator.value = false
-    const available = await listStorages().catch(() => [])
+    const available = await listStorages(controller.signal).catch(() => [])
+    if (sequence !== refreshSequence) return
     storages.value = available
     const requested = available.find(storage => storage.id === requestedStorageId && !storage.requires_login)
     const current = available.find(storage => storage.id === currentStorageId.value && !storage.requires_login)
@@ -238,6 +255,9 @@ export function useBrowserListing(context: BrowserListingContext) {
   }
 
   function disposeListing(): void {
+    ++refreshSequence
+    listingRequest?.abort()
+    listingRequest = undefined
     resetDirectorySizes()
     if (searchTimer !== undefined) window.clearTimeout(searchTimer)
   }

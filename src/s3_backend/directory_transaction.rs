@@ -41,6 +41,7 @@ enum Operation {
 #[serde(rename_all = "snake_case")]
 enum Stage {
     CopyingTargets,
+    CopyCompleted,
     DeletingSources,
     SourcesDeleted,
 }
@@ -311,13 +312,19 @@ impl S3Backend {
             journal_key,
             transaction,
         )?;
-        if transaction.stage != Stage::SourcesDeleted {
+        if transaction.stage != Stage::SourcesDeleted && transaction.stage != Stage::CopyCompleted {
             journal_etag = self
                 .copy_missing_targets(journal_key, journal_etag, transaction)
                 .await?;
         }
 
         if transaction.operation == Operation::Copy {
+            if transaction.stage != Stage::CopyCompleted {
+                transaction.stage = Stage::CopyCompleted;
+                journal_etag = self
+                    .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
+                    .await?;
+            }
             if let Err(error) = self
                 .delete_key_confirmed(journal_key, Some(&journal_etag))
                 .await
@@ -732,12 +739,17 @@ fn validate_transaction_structure(
     let target_prefix = expected_target_prefix(prefix, transaction, &source)?;
 
     if transaction.operation == Operation::Copy
-        && (transaction.stage != Stage::CopyingTargets
-            || transaction
-                .objects
-                .iter()
-                .any(|object| object.source_deleted))
+        && (!matches!(
+            transaction.stage,
+            Stage::CopyingTargets | Stage::CopyCompleted
+        ) || transaction
+            .objects
+            .iter()
+            .any(|object| object.source_deleted))
     {
+        return Err(invalid_transaction());
+    }
+    if transaction.operation != Operation::Copy && transaction.stage == Stage::CopyCompleted {
         return Err(invalid_transaction());
     }
     if transaction.stage == Stage::SourcesDeleted
@@ -745,6 +757,14 @@ fn validate_transaction_structure(
             .objects
             .iter()
             .any(|object| !object.source_deleted)
+    {
+        return Err(invalid_transaction());
+    }
+    if transaction.stage == Stage::CopyCompleted
+        && transaction
+            .objects
+            .iter()
+            .any(|object| object.target_etag.is_none())
     {
         return Err(invalid_transaction());
     }
@@ -913,6 +933,21 @@ mod tests {
         let mut oversized = copy_transaction(id);
         oversized.objects[1].size = super::MAX_SINGLE_COPY_BYTES + 1;
         assert!(validate_transaction_structure("tenant/", &key, &oversized).is_err());
+    }
+
+    #[test]
+    fn completed_copy_checkpoint_requires_every_target_to_be_recorded() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let key = internal_key("tenant/", JOURNAL_CATEGORY, id);
+        let mut transaction = copy_transaction(id);
+        transaction.stage = Stage::CopyCompleted;
+        assert!(validate_transaction_structure("tenant/", &key, &transaction).is_err());
+        for object in &mut transaction.objects {
+            object.target_etag = Some("copied-etag".into());
+        }
+        assert!(validate_transaction_structure("tenant/", &key, &transaction).is_ok());
+        transaction.operation = Operation::Move;
+        assert!(validate_transaction_structure("tenant/", &key, &transaction).is_err());
     }
 
     #[test]

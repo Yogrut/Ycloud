@@ -54,6 +54,7 @@ pub(crate) struct LocalDirectoryEntry {
 pub struct StorageService {
     root: Arc<PathBuf>,
     io_gate: Arc<Semaphore>,
+    stream_gate: Arc<Semaphore>,
     max_upload_bytes: Arc<AtomicU64>,
     max_list_entries: usize,
     disk_reserve_bytes: u64,
@@ -214,6 +215,7 @@ impl StorageService {
             upload_cleanup::UploadCleanupWorker::start(transactions.clone(), io_gate.clone());
         Ok(Self {
             root: Arc::new(root),
+            stream_gate: Arc::new(Semaphore::new(io_gate.available_permits().max(1))),
             io_gate,
             max_upload_bytes: Arc::new(AtomicU64::new(max_upload_bytes)),
             max_list_entries: max_list_entries.max(1),
@@ -282,31 +284,40 @@ impl StorageService {
         }
     }
 
-    pub(crate) async fn read_directory(
+    pub(crate) async fn scan_directory(
         &self,
         path: &ResolvedPath,
-    ) -> AppResult<Vec<LocalDirectoryEntry>> {
+        mut consume: impl FnMut(LocalDirectoryEntry) -> AppResult<bool>,
+    ) -> AppResult<()> {
         #[cfg(target_os = "linux")]
         {
-            self.linux_root
-                .read_directory(path.relative())
-                .await
-                .map(|entries| {
-                    entries
-                        .into_iter()
-                        .map(|entry| LocalDirectoryEntry {
-                            name: entry.name,
-                            metadata: entry.metadata,
-                        })
-                        .collect()
-                })
+            let (mut receiver, task) = self.linux_root.scan_directory(path.relative());
+            let mut outcome = Ok(());
+            while let Some(entry) = receiver.recv().await {
+                match consume(LocalDirectoryEntry {
+                    name: entry.name,
+                    metadata: entry.metadata,
+                }) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(error) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            }
+            drop(receiver);
+            let scan_result = task.await.map_err(|error| {
+                AppError::with_source("local storage listing task failed", error)
+            })?;
+            outcome?;
+            scan_result
         }
         #[cfg(not(target_os = "linux"))]
         {
             let mut directory = fs::read_dir(path.absolute())
                 .await
                 .map_err(|error| AppError::with_source("failed to list directory", error))?;
-            let mut entries = Vec::new();
             while let Some(entry) = directory
                 .next_entry()
                 .await
@@ -318,12 +329,14 @@ impl StorageService {
                 if is_link_or_reparse_point(&metadata) {
                     continue;
                 }
-                entries.push(LocalDirectoryEntry {
+                if !consume(LocalDirectoryEntry {
                     name: entry.file_name(),
                     metadata,
-                });
+                })? {
+                    break;
+                }
             }
-            Ok(entries)
+            Ok(())
         }
     }
 

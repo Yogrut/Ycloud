@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { batchOperation, cancelUploadBatch, checkDownload, createFolder, downloadUrl, fileApi, getUploadBatchStatus, isPreviewTrafficExhausted, prepareArchive, prepareUploadBatch, uploadFile } from './browser'
 import { formatSize } from '../format'
+import { REQUEST_TIMEOUT_MS } from './client'
 
 describe('browser API paths', () => {
   afterEach(() => vi.unstubAllGlobals())
@@ -190,7 +191,46 @@ describe('browser API paths', () => {
 })
 
 describe('mutation result transport', () => {
-  afterEach(() => vi.unstubAllGlobals())
+  afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers() })
+
+  function stalledUpload() {
+    class StallRequest extends EventTarget {
+      static current: StallRequest
+      status = 200
+      withCredentials = false
+      upload = new EventTarget()
+      abort = vi.fn(() => this.dispatchEvent(new Event('abort')))
+      constructor() { super(); StallRequest.current = this }
+      open(): void {}
+      setRequestHeader(): void {}
+      send(): void {}
+    }
+    vi.stubGlobal('XMLHttpRequest', StallRequest)
+    const pending = uploadFile('one.txt', new File(['one'], 'one.txt'), vi.fn())
+    return { request: StallRequest.current, pending }
+  }
+
+  it('aborts a stalled upload and requires result verification', async () => {
+    vi.useFakeTimers()
+    const { request, pending } = stalledUpload()
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'operation_result_unknown', blocksRetry: true })
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS)
+    await rejected
+    expect(request.abort).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not impose a total time limit on a progressing upload', async () => {
+    vi.useFakeTimers()
+    const { request, pending } = stalledUpload()
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS - 1)
+    request.upload.dispatchEvent(new ProgressEvent('progress', { lengthComputable: true, loaded: 1, total: 3 }))
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS - 1)
+    expect(request.abort).not.toHaveBeenCalled()
+    request.dispatchEvent(new Event('load'))
+    await pending
+    expect(vi.getTimerCount()).toBe(0)
+  })
 
   it('keeps upload commit metadata and treats lost responses as unknown', async () => {
     for (const event of ['load', 'error']) {

@@ -20,7 +20,7 @@ export function saveTraffic(settings: Pick<TrafficSettings, 'total' | 'guest' | 
   return adminRequest('/api/admin/traffic', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) })
 }
 
-import { ApiError, errorMetadata, readJson } from './client'
+import { ApiError, errorMetadata, requestJson } from './client'
 
 const locale = useLocale()
 
@@ -304,9 +304,8 @@ export class AdminApiError extends ApiError {
 }
 
 async function adminRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, { credentials: 'same-origin', ...options })
+  const { response, body } = await requestJson<T>(url, options)
   if (response.status === 204) return undefined as T
-  const body = await readJson<T>(response)
   if (!response.ok) {
     const details = errorMetadata(response, body ?? {})
     throw new AdminApiError(

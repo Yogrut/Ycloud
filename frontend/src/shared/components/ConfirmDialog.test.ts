@@ -4,13 +4,26 @@ import ConfirmDialog from './ConfirmDialog.vue'
 
 afterEach(() => { document.body.replaceChildren(); document.body.style.overflow = '' })
 
-function mountDialog(host: HTMLElement, options: {busy?: boolean; onClose: () => void; onConfirm?: () => void}) {
+function mountDialog(host: HTMLElement, options: {busy?: boolean; confirmDisabled?: boolean; onClose: () => void; onConfirm?: () => void}) {
   const app = createApp(ConfirmDialog, {title:'删除', message:'是否继续？', target:'example', ...options})
   app.mount(host)
   return app
 }
 
 describe('ConfirmDialog', () => {
+  it('allows closing while blocking an unconfirmed operation from being repeated', async () => {
+    const host = document.createElement('div'); document.body.append(host)
+    const close = vi.fn(); const confirm = vi.fn()
+    const app = mountDialog(host, {confirmDisabled:true,onClose:close,onConfirm:confirm})
+    await nextTick()
+    const buttons = host.querySelectorAll<HTMLButtonElement>('button')
+    expect(buttons[2]!.disabled).toBe(true)
+    buttons[2]!.click()
+    buttons[1]!.click()
+    expect(confirm).not.toHaveBeenCalled()
+    expect(close).toHaveBeenCalledTimes(1)
+    app.unmount()
+  })
   it('focuses cancel, traps focus, supports Escape and restores focus on unmount', async () => {
     const trigger = document.createElement('button'); document.body.append(trigger); trigger.focus()
     const host = document.createElement('div'); document.body.append(host)

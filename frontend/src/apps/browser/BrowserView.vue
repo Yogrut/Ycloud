@@ -281,6 +281,8 @@ const {
   openFolderDialog,
   openRenameDialog,
   operationBusy,
+  operationError,
+  operationRetryBlocked,
   pendingDelete,
   pickerOperation,
   pickerStorageId,
@@ -620,7 +622,7 @@ onBeforeUnmount(() => {
     v-if="showDelete"
     :title="locale.text('确认永久删除', 'Confirm permanent deletion')"
     :message="locale.text(`将永久删除 ${pendingDelete.length} 个项目，此操作无法撤销。`, `${pendingDelete.length} item(s) will be permanently deleted. This cannot be undone.`)"
-    :busy="operationBusy" @close="showDelete = false" @confirm="confirmDelete"
+    :busy="operationBusy" :error="operationError" :confirm-disabled="operationRetryBlocked" @close="showDelete = false" @confirm="confirmDelete"
   />
 
   <div v-if="batchResult" class="overlay active" @click.self="batchResult = null">

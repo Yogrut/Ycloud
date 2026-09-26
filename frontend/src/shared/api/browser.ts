@@ -11,13 +11,13 @@ export interface FileEntry {
 
 import { appPath } from '../routes'
 import { useLocale } from '../i18n'
-import { ApiError, errorMetadata, readJson } from './client'
+import { ApiError, errorMetadata, requestJson, requestWithDeadline, REQUEST_TIMEOUT_MS } from './client'
 import type { ErrorEnvelope, OperationOutcome } from './client'
 
 const locale = useLocale()
 
 export async function checkDownload(url: string): Promise<void> {
-  const response = await fetch(url, { method: 'HEAD', credentials: 'same-origin', cache: 'no-store' })
+  const response = await requestWithDeadline(url, { method: 'HEAD', cache: 'no-store' }, async response => response)
   if (response.ok) return
   const message = response.status === 429
     ? locale.text('下载流量不足或请求过于频繁，请稍后重试或联系管理员', 'Insufficient download allowance or too many requests. Try later or contact the administrator.')
@@ -29,7 +29,7 @@ export async function checkDownload(url: string): Promise<void> {
 
 export async function isPreviewTrafficExhausted(url: string): Promise<boolean> {
   try {
-    const response = await fetch(url, { method: 'HEAD', credentials: 'same-origin', cache: 'no-store' })
+    const response = await requestWithDeadline(url, { method: 'HEAD', cache: 'no-store' }, async response => response)
     return response.status === 429
   } catch {
     return false
@@ -56,6 +56,7 @@ export interface FileListResponse {
 }
 
 export interface FileListOptions {
+  signal?: AbortSignal
   limit?: 10 | 20 | 50 | 100
   cursor?: string
   search?: string
@@ -123,13 +124,12 @@ export interface BatchResponse {
 export type BatchOperation = 'delete' | 'move' | 'copy'
 
 export async function apiRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, { credentials: 'same-origin', ...options })
+  const { response, body } = await requestJson<T>(url, options)
   if (response.status === 401) {
     window.location.replace(appPath('/'))
     throw new ApiError(locale.t('common.sessionExpired'), response.status, 'unauthorized', response.headers.get('x-request-id') ?? undefined)
   }
 
-  const body = await readJson<T>(response)
   if (!response.ok) {
     const details = errorMetadata(response, body ?? {})
     throw new ApiError(details.message ?? locale.t('common.requestFailed', { status: response.status }), response.status, details.code, details.requestId, details.operation)
@@ -163,11 +163,11 @@ export function fileApi(path: string, storageId?: string, options: FileListOptio
 }
 
 export function listFiles(path: string, storageId?: string, options: FileListOptions = {}): Promise<FileListResponse> {
-  return apiRequest<FileListResponse>(fileApi(path, storageId, options))
+  return apiRequest<FileListResponse>(fileApi(path, storageId, options), { signal: options.signal })
 }
 
-export function listStorages(): Promise<BrowserStorage[]> {
-  return apiRequest<BrowserStorage[]>('/api/storages')
+export function listStorages(signal?: AbortSignal): Promise<BrowserStorage[]> {
+  return apiRequest<BrowserStorage[]>('/api/storages', { signal })
 }
 
 export function calculateDirectorySize(path: string, storageId: string, signal: AbortSignal): Promise<{ size: number }> {
@@ -237,36 +237,47 @@ export async function cancelUploadBatch(ticket: string, storageId?: string, path
 }
 
 export async function batchOperation(operation: BatchOperation, paths: string[], target = '', storageId?: string): Promise<BatchResponse> {
-  const response = await fetch(withStorage(`/api/batch/${operation}`, storageId), {
+  const { response, body } = await requestJson<BatchResponse & ErrorEnvelope>(withStorage(`/api/batch/${operation}`, storageId), {
     method: operation === 'move' ? 'PUT' : 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ paths, target: target ? `/${cleanPath(target)}` : '' }),
-  }).catch(() => {
-    throw new ApiError(locale.text('连接中断，操作结果尚未确认，请先核对文件，不要直接重试。', 'Connection lost. Verify the operation result before retrying.'), 0, 'operation_result_unknown')
   })
   if (response.status === 401) {
     window.location.replace(appPath('/'))
     throw new Error(locale.t('common.sessionExpired'))
   }
 
-  const body = await readJson<BatchResponse & ErrorEnvelope>(response)
   if (body && Array.isArray(body.results)) return body
-  if (!response.ok) throw new Error(body?.error?.message ?? body?.message ?? locale.t('common.requestFailed', { status: response.status }))
-  throw new Error(locale.text('服务返回了无效的批量操作结果', 'The server returned an invalid batch result'))
+  const details = errorMetadata(response, body)
+  if (!response.ok) throw new ApiError(details.message ?? locale.t('common.requestFailed', { status: response.status }), response.status, details.code, details.requestId, details.operation)
+  throw new ApiError(locale.text('服务返回了无效的批量操作结果，请先核对结果，不要直接重试', 'The server returned an invalid batch result. Verify before retrying.'), response.status, 'operation_result_unknown')
 }
 
 export function uploadFile(path: string, file: File, onProgress: (loaded: number) => void, storageId?: string, batch?: string, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest()
     const abortRequest = () => request.abort()
-    const cleanup = () => signal?.removeEventListener('abort', abortRequest)
+    let idleTimer: ReturnType<typeof setTimeout> | undefined
+    const cleanup = () => {
+      clearTimeout(idleTimer)
+      signal?.removeEventListener('abort', abortRequest)
+    }
+    const resetIdleTimer = () => {
+      clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        cleanup()
+        reject(new ApiError(locale.text('上传长时间无响应，请先核对上传结果，不要直接重试。', 'Upload stalled. Verify the upload result before retrying.'), 0, 'operation_result_unknown'))
+        request.abort()
+      }, REQUEST_TIMEOUT_MS)
+    }
     const target = new URL(actionApi('upload', path, storageId), window.location.origin)
     if (batch) target.searchParams.set('batch', batch)
     request.open('PUT', `${target.pathname}${target.search}`)
     request.withCredentials = true
     request.setRequestHeader('Content-Type', 'application/octet-stream')
     request.upload.addEventListener('progress', event => {
+      resetIdleTimer()
       if (event.lengthComputable) onProgress(Math.min(file.size, event.loaded))
     })
     request.addEventListener('load', () => {
@@ -309,6 +320,7 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
       return
     }
     signal?.addEventListener('abort', abortRequest, { once: true })
+    resetIdleTimer()
     request.send(file)
   })
 }

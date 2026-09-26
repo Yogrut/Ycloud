@@ -668,4 +668,73 @@ mod tests {
         assert_eq!(status.items[0].status, UploadStatus::Cancelled);
         assert_eq!(status.items[1].status, UploadStatus::InProgress);
     }
+
+    #[tokio::test]
+    async fn concurrent_confirmation_starts_an_upload_only_once() {
+        let store = UploadBatchStore::new(Duration::from_secs(60));
+        let owner = subject("owner");
+        let ticket = store
+            .create(owner.clone(), "local".into(), items())
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut attempts = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let (store, owner, ticket, barrier) = (
+                store.clone(),
+                owner.clone(),
+                ticket.clone(),
+                barrier.clone(),
+            );
+            attempts.spawn(async move {
+                barrier.wait().await;
+                store
+                    .begin(&ticket, &owner, "local", "folder/one.txt", 11)
+                    .await
+            });
+        }
+        let mut started = 0;
+        let mut conflicts = 0;
+        while let Some(result) = attempts.join_next().await {
+            match result.unwrap() {
+                Ok(UploadBegin::Start) => started += 1,
+                Err(AppError::Conflict(_)) => conflicts += 1,
+                other => panic!("unexpected upload admission: {other:?}"),
+            }
+        }
+        assert_eq!(started, 1);
+        assert_eq!(conflicts, 31);
+        store.finish(&ticket, "folder/one.txt", true).await;
+        assert_eq!(
+            store
+                .begin(&ticket, &owner, "local", "folder/one.txt", 11)
+                .await
+                .unwrap(),
+            UploadBegin::AlreadyComplete(None)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_batch_queue_rejects_admission_and_recovers_after_cancellation() {
+        let store = UploadBatchStore::new(Duration::from_secs(60));
+        let owner = subject("owner");
+        let mut tickets = Vec::new();
+        for _ in 0..MAX_ACTIVE_BATCHES {
+            tickets.push(
+                store
+                    .create(owner.clone(), "local".into(), items())
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            store.create(owner.clone(), "local".into(), items()).await,
+            Err(AppError::TooManyRequests)
+        ));
+        store
+            .cancel(&tickets[0], &owner, "local", None)
+            .await
+            .unwrap();
+        store.create(owner, "local".into(), items()).await.unwrap();
+    }
 }

@@ -16,7 +16,7 @@ describe('authentication API', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await expect(getIdentity()).resolves.toEqual({ logged_in: true })
-    expect(fetchMock).toHaveBeenCalledWith('/api/me', { credentials: 'same-origin' })
+    expect(fetchMock).toHaveBeenCalledWith('/api/me', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
   })
 
   it('preserves the server error when gate authentication fails', async () => {

@@ -20,6 +20,9 @@ interface UploadQueueContext {
   refresh: () => Promise<void>
 }
 
+// Match the server's active item budget; keep admission bounded across drops.
+const MAX_UPLOAD_QUEUE_TASKS = 20_000
+
 export function useUploadQueue(context: UploadQueueContext) {
   const locale = useLocale()
   const fileInput = ref<HTMLInputElement>()
@@ -93,10 +96,24 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   async function queueUploads(candidates: UploadCandidate[]): Promise<void> {
-    if (!candidates.length || !context.requireUpload()) return
+    if (disposed || !candidates.length || !context.requireUpload()) return
     const storageId = context.storageId.value
     const basePath = context.path.value
-    const addedTasks: UploadTask[] = candidates.map(candidate => {
+    const occupied = new Set(uploadTasks.value.filter(task => task.storageId === storageId
+      && (['preparing', 'queued', 'uploading', 'paused', 'verifying'].includes(task.status) || task.retryBlocked))
+      .map(task => task.targetPath))
+    const unique = candidates.filter(candidate => {
+      const target = joinUploadPath(basePath, candidate.relativePath)
+      if (occupied.has(target)) return false
+      occupied.add(target)
+      return true
+    })
+    if (unique.length !== candidates.length) context.announce(locale.text('已忽略重复排队的文件，请等待当前任务完成', 'Duplicate queued files were ignored; wait for the current task to finish'))
+    if (uploadTasks.value.length + unique.length > MAX_UPLOAD_QUEUE_TASKS) {
+      context.announce(locale.text('上传队列已满，请清除已完成记录或分批上传', 'Upload queue is full; clear completed records or split the upload'))
+      return
+    }
+    const addedTasks: UploadTask[] = unique.map(candidate => {
       const error = uploadLimitError(candidate.file)
       return {
         ...candidate,
@@ -376,6 +393,7 @@ export function useUploadQueue(context: UploadQueueContext) {
     if (disposed || !task.ticket || !uploadTasks.value.includes(task)) return
     try {
       const batch = await getUploadBatchStatus(task.ticket, task.storageId)
+      if (disposed || !uploadTasks.value.includes(task)) return
       const item = batch.items.find(candidate => candidate.path === task.targetPath)
       if (!item) {
         scheduleReconcile(task, attempt)
@@ -389,6 +407,7 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   function scheduleReconcile(task: UploadTask, attempt: number): void {
+    if (disposed || !uploadTasks.value.includes(task)) return
     const delay = reconcileDelays[attempt]
     if (delay === undefined) {
       markUnconfirmed(task)

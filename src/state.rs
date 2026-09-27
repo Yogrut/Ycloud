@@ -44,6 +44,7 @@ pub struct AppState {
     pub(crate) config_updates: Arc<Mutex<()>>,
     storage_updates: Arc<Mutex<()>>,
     local_io_gate: Arc<Semaphore>,
+    pub(crate) retired_storage: crate::config::RetiredStorage,
 }
 
 pub struct LocalStorageEdit {
@@ -80,19 +81,32 @@ impl AppState {
         }
         let local_io_gate = Arc::new(Semaphore::new(config.io_concurrency.max(1)));
         let backends = StorageRegistry::new();
+        let retired_storage = crate::config::RetiredStorage::load(&config.config_path)
+            .await
+            .map_err(|error| {
+                AppError::with_source("failed to load old storage recovery responsibility", error)
+            })?;
+        let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         for instance in &persisted.storage_instances {
             if !instance.enabled {
                 continue;
             }
-            match prepare_storage_backend(
-                &config,
-                &local_io_gate,
-                max_upload_bytes,
-                &instance.id,
-                &instance.backend,
+            match tokio::time::timeout_at(
+                startup_deadline,
+                prepare_storage_backend(
+                    &config,
+                    &local_io_gate,
+                    max_upload_bytes,
+                    &instance.id,
+                    &instance.backend,
+                ),
             )
             .await
-            {
+            .unwrap_or_else(|_| {
+                Err(AppError::ServiceUnavailable(
+                    "存储启动初始化总时限已到，请在后台重试".into(),
+                ))
+            }) {
                 Ok(backend) => backends.insert_ready(instance.id.clone(), backend).await,
                 Err(error) => {
                     tracing::error!(
@@ -118,6 +132,7 @@ impl AppState {
         let traffic =
             crate::traffic::TrafficStore::load(&config.config_path, config_file.clone()).await?;
         Ok(Self {
+            retired_storage,
             traffic,
             config,
             config_file,
@@ -398,6 +413,15 @@ impl AppState {
             download: allow_guest_download,
         } = allow_guest_access.into();
         let backend_config = StorageBackendConfig::S3(settings.clone());
+        if !self
+            .retired_storage
+            .activation_allowed(&settings, &*self.config_file.read().await)
+            .await
+        {
+            return Err(AppError::Conflict(
+                "该旧连接正在自动清理临时任务，请稍后再添加".into(),
+            ));
+        }
         if enabled {
             let backend = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
             tokio::time::timeout(Duration::from_secs(60), backend.activation_probe())
@@ -844,6 +868,31 @@ impl AppState {
         next.storage_instances = candidate.storage_instances.clone();
         next.pending_storage_instance = candidate.pending_storage_instance.clone();
         next.validate()?;
+        self.retired_storage
+            .remember_removed(&*self.config_file.read().await, &next)
+            .await
+            .map_err(|error| {
+                AppError::with_source(
+                    "failed to preserve old storage cleanup responsibility",
+                    error,
+                )
+            })?;
+        for entry in self.retired_storage.snapshot().await {
+            let current = self.config_file.read().await.clone();
+            if let Some(instance) = current
+                .storage_instances
+                .iter()
+                .find(|item| item.id == entry.id)
+            {
+                if let (StorageBackendConfig::S3(settings), Some(backend)) =
+                    (&instance.backend, self.backends.cached(&entry.id).await)
+                {
+                    self.retired_storage
+                        .bind_runtime(&entry.id, settings, backend)
+                        .await;
+                }
+            }
+        }
         save_config_refresh_backup(&self.config.config_path, &next)
             .await
             .map_err(|error| AppError::with_source("failed to persist storage settings", error))?;
@@ -868,6 +917,23 @@ async fn prepare_storage_backend(
     storage_id: &str,
     backend: &StorageBackendConfig,
 ) -> AppResult<StorageBackend> {
+    if let StorageBackendConfig::S3(settings) = backend {
+        let retired = crate::config::RetiredStorage::load(&config.config_path)
+            .await
+            .map_err(|error| {
+                AppError::with_source("failed to read old storage recovery responsibility", error)
+            })?;
+        let current = crate::config::load_config(&config.config_path)
+            .await
+            .map_err(|error| {
+                AppError::with_source("failed to read current storage configuration", error)
+            })?;
+        if !retired.activation_allowed(settings, &current).await {
+            return Err(AppError::Conflict(
+                "该旧连接正在自动清理临时任务，请稍后再添加；其他存储不受影响".into(),
+            ));
+        }
+    }
     tokio::time::timeout(
         Duration::from_secs(60),
         prepare_storage_backend_inner(config, local_io_gate, max_upload_bytes, storage_id, backend),

@@ -308,7 +308,8 @@ impl S3Backend {
             return Err(AppError::Conflict("目标是目录而不是文件".into()));
         }
         let key = object_key(&self.prefix, &relative)?;
-        self.delete_key(&key, metadata.etag.as_deref()).await?;
+        self.delete_key_confirmed(&key, metadata.etag.as_deref())
+            .await?;
         Ok(metadata.size)
     }
 
@@ -335,7 +336,7 @@ impl S3Backend {
                 "隐式目录没有可安全删除的目录标记".into(),
             ));
         };
-        self.delete_key(&marker, marker_metadata.etag.as_deref())
+        self.delete_key_confirmed(&marker, marker_metadata.etag.as_deref())
             .await
     }
 
@@ -577,20 +578,33 @@ impl S3Backend {
         };
         if etag.is_some() && current.etag.as_deref() != etag {
             return Err(AppError::ServiceUnavailable(
-                "对象存储待清理对象已发生变化；已保留恢复记录".into(),
+                "对象存储待删除对象已发生变化，本次未删除".into(),
             ));
         }
         if let Err(error) = self.delete_key(key, etag).await {
-            if self.head_key(key).await?.is_some() {
-                return Err(error);
+            if let Some(current) = self.head_key(key).await.map_err(|error| {
+                error.with_operation(CommitState::Unknown, CleanupState::Pending)
+            })? {
+                let commit = if etag.is_some() && current.etag.as_deref() == etag {
+                    CommitState::NotCommitted
+                } else {
+                    CommitState::Unknown
+                };
+                return Err(error.with_operation(commit, CleanupState::Pending));
             }
             self.recovery_runtime.journal_settled(key);
             return Ok(());
         }
-        if self.head_key(key).await?.is_some() {
-            return Err(AppError::ServiceUnavailable(
-                "对象存储未能确认对象已经删除；已保留恢复记录".into(),
-            ));
+        if self
+            .head_key(key)
+            .await
+            .map_err(|error| error.with_operation(CommitState::Unknown, CleanupState::Pending))?
+            .is_some()
+        {
+            return Err(
+                AppError::ServiceUnavailable("对象存储未能确认对象已经删除".into())
+                    .with_operation(CommitState::Unknown, CleanupState::Pending),
+            );
         }
         self.recovery_runtime.journal_settled(key);
         Ok(())

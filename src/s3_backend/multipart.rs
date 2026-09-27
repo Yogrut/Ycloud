@@ -93,6 +93,15 @@ impl S3Backend {
             _ = cancellation.cancelled() => Err(AppError::Conflict("存储配置已变更，上传已中断，请重试".into())),
             result = transfer => result,
         };
+        // The persisted session is enough for the recovery worker to abort
+        // this exact upload. Do not make an administrator edit wait for a
+        // remote HEAD/Abort round trip after payload transfer was cancelled.
+        if cancellation.is_cancelled() {
+            return Err(
+                AppError::Conflict("存储配置已变更，上传已中断，请重试".into())
+                    .with_operation(CommitState::NotCommitted, CleanupState::Pending),
+            );
+        }
         match result {
             Ok(()) => {
                 self.delete_transaction_best_effort(&session_key, session_etag.as_deref())

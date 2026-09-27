@@ -25,6 +25,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     let (cleanup_stop, cleanup_signal) = watch::channel(false);
     let health_task = spawn_health_task(state.clone(), cleanup_signal.clone());
+    let retired_task = spawn_retired_cleanup_task(state.clone(), cleanup_signal.clone());
     let cleanup_task = spawn_cleanup_task(state.clone(), cleanup_signal);
     let router = app::build_router(state);
     let address = SocketAddr::new(runtime.bind_address, runtime.port);
@@ -47,8 +48,80 @@ pub async fn run() -> anyhow::Result<()> {
     let _ = cleanup_stop.send(true);
     let _ = cleanup_task.await;
     let _ = health_task.await;
+    let _ = retired_task.await;
     result?;
     Ok(())
+}
+
+fn spawn_retired_cleanup_task(
+    state: AppState,
+    mut stop: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut cursor = 0_usize;
+        loop {
+            tokio::select! {
+                _ = stop.changed() => return,
+                _ = interval.tick() => {}
+            }
+            // One pass, no initialization loop or concurrent workers. Neither
+            // config publication nor unrelated administrator edits wait here.
+            let entries = state.retired_storage.snapshot().await;
+            let selected = if entries.is_empty() {
+                None
+            } else {
+                let entry = entries[cursor % entries.len()].clone();
+                cursor = cursor.wrapping_add(1);
+                Some(entry)
+            };
+            if let Some(entry) = selected {
+                let current = state.config_file.read().await.clone();
+                let live = current.storage_instances.iter().find(|instance| matches!(&instance.backend,
+                    config::StorageBackendConfig::S3(settings) if config::retired_storage_namespace_matches(settings, &entry.settings)));
+                let work = async {
+                    if let Some(live) = live {
+                        let Some(backend) = state.backends.cached(&live.id).await else {
+                            return Ok(false);
+                        };
+                        // Never scan a live namespace using an independent
+                        // client: the backend gate prevents adopting uploads.
+                        match backend.recover_abandoned_uploads().await {
+                            Ok(_guard) => Ok(true),
+                            Err(crate::error::AppError::Conflict(_)) => Ok(false),
+                            Err(error) => Err(error),
+                        }
+                    } else if let Some(backend) = &entry.runtime {
+                        match backend.recover_abandoned_uploads().await {
+                            Ok(_guard) => Ok(true),
+                            Err(crate::error::AppError::Conflict(_)) => Ok(false),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        let backend =
+                            crate::s3_backend::S3Backend::new(&entry.settings, &state.config)?;
+                        backend.recover_transactions().await.map(|_| true)
+                    }
+                };
+                let result = tokio::select! {
+                    _ = stop.changed() => return,
+                    result = tokio::time::timeout(std::time::Duration::from_secs(30), work) => result,
+                };
+                match result {
+                    Ok(Ok(true)) => {
+                        if let Err(error) = state.retired_storage.finish(&entry).await {
+                            tracing::warn!(storage_id = %entry.id, %error, "old storage recovery record remains durable");
+                        }
+                    }
+                    Ok(Ok(false)) => {}
+                    _ => {
+                        tracing::warn!(storage_id = %entry.id, "old storage cleanup unavailable; retaining encrypted responsibility for the next bounded attempt")
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn spawn_health_task(

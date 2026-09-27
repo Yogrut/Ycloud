@@ -100,6 +100,18 @@ impl S3Backend {
         };
         if let Err(error) = upload {
             tracing::warn!(%error, "S3 temporary upload failed");
+            if interrupted
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                // No formal copy has started. The authenticated intent/session
+                // remains durable; cleanup belongs to recovery, not this
+                // cancelled transfer's administrator-edit barrier.
+                return Err(
+                    AppError::Conflict("存储配置已变更，上传已中断，请重试".into())
+                        .with_operation(CommitState::NotCommitted, CleanupState::Pending),
+                );
+            }
             return Err(self
                 .finish_uncommitted_internal_upload(
                     &intent_key,
@@ -117,7 +129,17 @@ impl S3Backend {
                 .await);
         }
 
-        let temporary = match self.head_key(&temporary_key).await {
+        let cancellation = interrupted.clone().unwrap_or_default();
+        let cancelled = || {
+            AppError::Conflict("存储配置已变更，上传已中断，请重试".into())
+                .with_operation(CommitState::NotCommitted, CleanupState::Pending)
+        };
+        let temporary_probe = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(cancelled()),
+            result = self.head_key(&temporary_key) => result,
+        };
+        let temporary = match temporary_probe {
             Err(error) => {
                 return Err(self
                     .finish_uncommitted_internal_upload(
@@ -152,9 +174,27 @@ impl S3Backend {
         };
 
         if let Some(owner) = commit_owner {
-            *owner.lock().await = Some(self.acquire_capacity_mutation().await);
+            let capacity = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(cancelled()),
+                guard = self.acquire_capacity_mutation() => guard,
+            };
+            *owner.lock().await = Some(capacity);
         }
-        let _mutation = self.mutation_gate.lock().await;
+        let _mutation = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(cancelled()),
+            guard = self.mutation_gate.lock() => guard,
+        };
+        if interrupted
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(
+                AppError::Conflict("存储配置已变更，上传已中断，请重试".into())
+                    .with_operation(CommitState::NotCommitted, CleanupState::Pending),
+            );
+        }
         if let Err(error) = self.ensure_parent_directory(&relative).await {
             return Err(self
                 .finish_uncommitted_internal_upload(
@@ -289,16 +329,25 @@ impl S3Backend {
             )
             .await;
         let committed = match commit {
-            Ok(committed_etag) => self.head_key(&destination_key).await?.filter(|value| {
-                value.size == content_length && value.etag.as_ref() == Some(&committed_etag)
-            }),
+            Ok(committed_etag) => self
+                .head_key(&destination_key)
+                .await
+                .map_err(|error| error.with_operation(CommitState::Unknown, CleanupState::Pending))?
+                .filter(|value| {
+                    value.size == content_length && value.etag.as_ref() == Some(&committed_etag)
+                }),
             Err(error) => {
                 tracing::warn!(%error, "S3 upload commit returned an ambiguous failure");
-                self.head_key(&destination_key).await?.filter(|value| {
-                    value.size == content_length
-                        && (value.operation_id.as_deref() == Some(upload_id.as_str())
-                            || (temporary.etag.is_some() && value.etag == temporary.etag))
-                })
+                self.head_key(&destination_key)
+                    .await
+                    .map_err(|error| {
+                        error.with_operation(CommitState::Unknown, CleanupState::Pending)
+                    })?
+                    .filter(|value| {
+                        value.size == content_length
+                            && (value.operation_id.as_deref() == Some(upload_id.as_str())
+                                || (temporary.etag.is_some() && value.etag == temporary.etag))
+                    })
             }
         };
 
@@ -383,19 +432,29 @@ impl S3Backend {
         };
 
         transaction.stage = S3UploadStage::DestinationCommitted;
-        journal_etag = self
-            .write_upload_transaction(&journal_key, &transaction, journal_etag.as_deref())
-            .await?;
+        // The pre-commit journal is already durable. Recovery proves commit
+        // from the formal object's operation marker and size, independently
+        // of the journal stage; another remote journal write adds no evidence
+        // and must not hold a verified result hostage.
 
-        self.finish_upload_and_intent(
-            &journal_key,
-            journal_etag.as_deref(),
-            &transaction,
-            &intent_key,
-            intent_etag.as_deref(),
+        // Success describes the verified formal object, not garbage
+        // collection. Cleanup has a durable journal and a background worker;
+        // a slow remote delete must not turn a successful upload into failure
+        // or keep the administrator edit barrier occupied indefinitely.
+        let cleanup = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.finish_upload_and_intent(
+                &journal_key,
+                journal_etag.as_deref(),
+                &transaction,
+                &intent_key,
+                intent_etag.as_deref(),
+            ),
         )
-        .await
-        .map_err(|error| error.with_operation(CommitState::Committed, CleanupState::Pending))?;
+        .await;
+        if !matches!(cleanup, Ok(Ok(()))) {
+            tracing::warn!(transaction_id = %upload_id, "verified S3 upload committed; temporary cleanup deferred to recovery");
+        }
         Ok(S3UploadResult {
             relative,
             size: committed.size,

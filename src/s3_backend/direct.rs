@@ -198,7 +198,7 @@ mod tests {
         assert!(direct_part_length(130, 64, 4).is_err());
     }
     #[tokio::test]
-    async fn administrator_cancellation_aborts_direct_multipart_without_completing_it() {
+    async fn administrator_cancellation_defers_direct_cleanup_without_completing_it() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -260,14 +260,20 @@ mod tests {
             panic!("multipart setup failed: {:?}", worker.await.unwrap());
         }
         signal.cancel();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), worker)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err()
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.operation().unwrap().commit,
+            crate::error::CommitState::NotCommitted
         );
-        assert_eq!(aborted.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            error.operation().unwrap().cleanup,
+            crate::error::CleanupState::Pending
+        );
+        assert_eq!(aborted.load(Ordering::SeqCst), 0);
         assert_eq!(completed.load(Ordering::SeqCst), 0);
         server.abort();
     }

@@ -31,6 +31,149 @@ use crate::{
 const SOURCE_ETAG: &str = "\"source-etag\"";
 
 #[tokio::test]
+async fn verified_upload_success_does_not_wait_for_slow_temporary_deletion() {
+    let objects = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let stored = objects.clone();
+    let router = axum::Router::new().route("/{*key}", axum::routing::any(
+        move |method: axum::http::Method, uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+            let objects = stored.clone();
+            async move {
+                let path = uri.path().to_owned();
+                let response = axum::http::Response::builder().header("etag", "\"journal-etag\"");
+                if method == axum::http::Method::GET {
+                    response.header("content-type", "application/xml").body(Body::from(
+                        "<ListBucketResult><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"))
+                } else if method == axum::http::Method::PUT {
+                    objects.lock().unwrap().insert(path);
+                    if headers.contains_key("x-amz-copy-source") {
+                        response.header("content-type", "application/xml").body(Body::from(
+                            "<CopyObjectResult><ETag>\"journal-etag\"</ETag></CopyObjectResult>"))
+                    } else { response.body(Body::empty()) }
+                } else if method == axum::http::Method::HEAD {
+                    let present = objects.lock().unwrap().contains(&path);
+                    if present {
+                        response.header("content-length", "7")
+                            .header("x-amz-meta-ycloud-operation", INTERNAL_INTENT_ID)
+                            .body(Body::empty())
+                    } else { response.status(404).body(Body::empty()) }
+                } else if method == axum::http::Method::DELETE {
+                    if path.contains("/.ycloud-system/uploads/") {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    objects.lock().unwrap().remove(&path);
+                    response.status(204).body(Body::empty())
+                } else { response.status(400).body(Body::empty()) }.unwrap()
+            }
+        }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let mut input = super::UploadInput::relay(Body::from("payload"));
+    input.operation_id = Some(INTERNAL_INTENT_ID.into());
+    let result = tokio::time::timeout(
+        Duration::from_millis(1500),
+        backend.upload_file_mode("file.txt", input, 7, 1024, None, true),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.size, 7);
+    assert!(objects.lock().unwrap().contains("/bucket/tenant/file.txt"));
+    assert!(objects.lock().unwrap().contains(&format!(
+        "/bucket/tenant/.ycloud-system/transactions/{INTERNAL_INTENT_ID}"
+    )));
+    assert!(backend.recovery_has_pending());
+    server.abort();
+}
+
+#[tokio::test]
+async fn deletion_confirms_absence_instead_of_trusting_http_status() {
+    for (remove, lose_response) in [(false, false), (true, false), (true, true)] {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let present = Arc::new(AtomicBool::new(true));
+        let server_present = present.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let present = server_present.clone();
+                tokio::spawn(async move {
+                    let Some((method, _, _)) = read_request(&mut stream).await else {
+                        return;
+                    };
+                    let response = match method.as_str() {
+                        "HEAD" if present.load(Ordering::SeqCst) => object_response_with_metadata(7, SOURCE_ETAG, "text/plain", None),
+                        "HEAD" => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                        "GET" => list_response(None),
+                        "DELETE" => {
+                            if remove { present.store(false, Ordering::SeqCst); }
+                            if lose_response { error_response() } else { delete_object_response() }
+                        },
+                        _ => bad_request_response(),
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let result = test_backend(&endpoint).delete_file("file.txt").await;
+        if remove {
+            assert_eq!(result.unwrap(), 7);
+        } else {
+            assert_eq!(result.unwrap_err().code(), "operation_result_unknown");
+        }
+        assert_eq!(present.load(Ordering::SeqCst), !remove);
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn cancelled_upload_leaves_owned_intent_without_waiting_for_remote_cleanup() {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server_requests = requests.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let requests = server_requests.clone();
+            tokio::spawn(async move {
+                let Some((method, path, _)) = read_request(&mut stream).await else {
+                    return;
+                };
+                requests.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(method, "PUT");
+                assert!(path.contains("internal-upload-intents"));
+                let _ = stream.write_all(put_object_response().as_bytes()).await;
+            });
+        }
+    });
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    let mut input = super::UploadInput::relay(Body::from("payload"));
+    input.cancellation = Some(cancellation);
+    let backend = test_backend(&endpoint);
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.upload_file_mode("file.txt", input, 7, 1024, None, true),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.operation().unwrap().commit, CommitState::NotCommitted);
+    assert_eq!(
+        error.operation().unwrap().cleanup,
+        crate::error::CleanupState::Pending
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!(backend.recovery_has_pending());
+    task.abort();
+}
+
+#[tokio::test]
 async fn capacity_mutations_queue_on_the_same_s3_backend() {
     // No network requests: test only the shared accounting gate, not NAS throughput.
     let backend = test_backend("http://127.0.0.1:1");

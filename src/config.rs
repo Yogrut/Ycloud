@@ -66,8 +66,11 @@ mod migration;
 mod model;
 mod password;
 mod persistence;
+mod retired_storage;
 mod runtime;
 mod secret_store;
+pub(crate) use retired_storage::same_namespace as retired_storage_namespace_matches;
+pub(crate) use retired_storage::RetiredStorage;
 mod validation;
 
 pub use commit::{ConfigCommit, ConfigDurability};

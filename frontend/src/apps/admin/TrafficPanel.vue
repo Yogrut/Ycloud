@@ -43,8 +43,8 @@ function directionLabel(direction: Direction): string {
 }
 const users = computed(() => info.value?.users_total ?? { upload: 0, download: 0 })
 const meters = computed<TrafficMeter[]>(() => info.value ? [
-  { id: 'total-download', label: locale.text('VPS 下载流量', 'VPS file downloads'), direction: 'download', use: info.value.total, quota: info.value.settings.total },
-  { id: 'total-upload', label: locale.text('VPS 上传流量', 'VPS file uploads'), direction: 'upload', use: info.value.total, quota: info.value.settings.total },
+  { id: 'total-download', label: locale.text('总下载', 'Total downloads'), direction: 'download', use: info.value.total, quota: info.value.settings.total },
+  { id: 'total-upload', label: locale.text('总上传', 'Total uploads'), direction: 'upload', use: info.value.total, quota: info.value.settings.total },
   { id: 'guest-download', label: locale.text('访客下载', 'Guest download'), direction: 'download', use: info.value.guest, quota: info.value.settings.guest },
   { id: 'users-download', label: locale.text('用户下载', 'User download'), direction: 'download', use: users.value, quota: info.value.settings.users_total },
   { id: 'users-upload', label: locale.text('用户上传', 'User upload'), direction: 'upload', use: users.value, quota: info.value.settings.users_total },
@@ -220,7 +220,7 @@ defineExpose({ openEditor })
     <template v-if="mode === 'dashboard'">
       <section class="dashboard-block glass traffic-usage-block" :aria-label="locale.text('流量信息', 'Traffic information')">
         <header class="traffic-usage-heading"><h2>{{ locale.text('流量信息', 'Traffic information') }}</h2></header>
-        <p class="traffic-note">{{ locale.text('仅统计经 VPS 的文件传输，S3 直传不计。上传为用户上传，下载为用户下载；非网卡总流量。', 'Only file transfers through the VPS are counted; direct S3 transfers are excluded. Directions are from the user perspective, not total network-interface traffic.') }}</p>
+        <p class="traffic-note">{{ locale.text('仅统计Ycloud的文件传输', 'Only Ycloud file transfers are counted.') }}</p>
         <p v-if="!info">{{ loading ? locale.text('正在读取流量统计…', 'Loading traffic…') : locale.text('暂未取得流量统计', 'Traffic statistics unavailable') }}</p>
         <div v-if="info" class="traffic-meters">
           <article v-for="meter in meters" :key="meter.id" class="traffic-meter" :class="`meter-${meter.direction}`">

@@ -172,10 +172,11 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
       const label = operation === 'move'
         ? locale.text('移动', 'Move')
         : operation === 'copy' ? locale.text('复制', 'Copy') : locale.text('删除', 'Delete')
-      if (result.failed) batchResult.value = result
-      context.announce(result.failed
+      const needsAttention = result.results.some(item => item.status >= 400)
+      if (needsAttention) batchResult.value = result
+      context.announce(needsAttention
         ? locale.text(`${label}${batchSummary(result)}`, `${label}: ${batchSummary(result, true)}`)
-        : locale.text(`${label}成功`, `${label} completed`), result.failed ? 'error' : 'success')
+        : locale.text(`${label}成功`, `${label} completed`), result.failed || result.pending ? 'error' : 'success')
       context.selected.value = new Set()
       await context.refresh()
     } catch (error) {

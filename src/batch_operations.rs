@@ -7,7 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::AppResult,
+    error::{AppResult, CommitState},
     file_access::{
         batch_destination_path, ensure_copy_target_outside_source, ensure_non_root,
         ensure_storage_action, ensure_writable, resolve_share, share_storage_path,
@@ -37,6 +37,7 @@ struct BatchItemResult {
 struct BatchResponse {
     success: usize,
     failed: usize,
+    pending: usize,
     results: Vec<BatchItemResult>,
 }
 
@@ -132,22 +133,74 @@ async fn execute(
             },
         });
     }
-    let success = results.iter().filter(|item| item.status < 400).count();
-    let failed = results.len().saturating_sub(success);
-    let status = if failed == 0 {
+    Ok(batch_response(results).into_response())
+}
+
+fn batch_response(results: Vec<BatchItemResult>) -> (StatusCode, Json<BatchResponse>) {
+    let success = results
+        .iter()
+        .filter(|item| {
+            item.status < 400
+                || item
+                    .operation
+                    .is_some_and(|outcome| outcome.commit == CommitState::Committed)
+        })
+        .count();
+    let pending = results
+        .iter()
+        .filter(|item| {
+            item.operation
+                .is_some_and(|outcome| outcome.commit == CommitState::Unknown)
+        })
+        .count();
+    let failed = results.len().saturating_sub(success + pending);
+    let status = if failed == 0 && pending == 0 {
         StatusCode::OK
     } else if success == 0 {
         StatusCode::CONFLICT
     } else {
         StatusCode::MULTI_STATUS
     };
-    Ok((
+    (
         status,
         Json(BatchResponse {
             success,
             failed,
+            pending,
             results,
         }),
     )
-        .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{AppError, CleanupState};
+
+    #[test]
+    fn counts_verified_commits_and_unknown_results_separately_from_failures() {
+        let results = [
+            CommitState::Committed,
+            CommitState::Unknown,
+            CommitState::NotCommitted,
+        ]
+        .into_iter()
+        .map(|commit| {
+            let error = AppError::ServiceUnavailable("test".into())
+                .with_operation(commit, CleanupState::Pending);
+            BatchItemResult {
+                path: "file".into(),
+                status: error.status().as_u16(),
+                code: error.code(),
+                message: error.public_message().into_owned(),
+                operation: error.operation(),
+            }
+        })
+        .collect();
+        let (status, Json(response)) = batch_response(results);
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        assert_eq!(response.success, 1);
+        assert_eq!(response.pending, 1);
+        assert_eq!(response.failed, 1);
+    }
 }

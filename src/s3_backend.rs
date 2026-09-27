@@ -47,6 +47,7 @@ mod body;
 mod capabilities;
 mod capacity;
 mod client;
+mod committed_cleanup;
 mod direct;
 mod directory_transaction;
 mod file_move_transaction;
@@ -64,6 +65,7 @@ mod relay;
 mod upload;
 
 pub use capabilities::S3CapabilityReport;
+use committed_cleanup::CompletionMode;
 pub(crate) use direct::{DirectChannel, DirectCommand, DirectDescriptor, SignedPart, UploadInput};
 
 use body::{range_not_satisfiable, ExactLengthBody, PermitStream};

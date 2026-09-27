@@ -9,7 +9,8 @@ describe('operation feedback', () => {
       { path: 'c', status: 409, code: 'operation_result_unknown', message: 'unknown' },
       { path: 'd', status: 403, code: 'forbidden', message: 'denied' },
     ] }
-    expect(batchSummary(result)).toContain('已提交待收尾 1 项，结果待核对 1 项，失败 1 项')
+    expect(batchSummary(result)).toContain('已提交待收尾 1 项，结果待确认 1 项，失败 1 项')
     expect(batchSummary(result, true)).toContain('Do not repeat pending items')
+    expect(batchSummary({ ...result, success: 2, failed: 1, pending: 1 })).toBe(batchSummary(result))
   })
 })

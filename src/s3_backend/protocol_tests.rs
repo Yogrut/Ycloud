@@ -202,6 +202,7 @@ struct CopyResponseLossSimulator {
     move_journal_present: Arc<AtomicBool>,
     move_journal_writes: Arc<AtomicUsize>,
     move_journal_deletes: Arc<AtomicUsize>,
+    fail_journal_cleanup: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
 
@@ -215,6 +216,7 @@ struct CopyHandlerState {
     move_journal_present: Arc<AtomicBool>,
     move_journal_writes: Arc<AtomicUsize>,
     move_journal_deletes: Arc<AtomicUsize>,
+    fail_journal_cleanup: Arc<AtomicBool>,
 }
 
 impl CopyResponseLossSimulator {
@@ -230,6 +232,7 @@ impl CopyResponseLossSimulator {
         let move_journal_present = Arc::new(AtomicBool::new(false));
         let move_journal_writes = Arc::new(AtomicUsize::new(0));
         let move_journal_deletes = Arc::new(AtomicUsize::new(0));
+        let fail_journal_cleanup = Arc::new(AtomicBool::new(false));
         let handler_state = CopyHandlerState {
             destination_etag,
             committed: committed.clone(),
@@ -239,6 +242,7 @@ impl CopyResponseLossSimulator {
             move_journal_present: move_journal_present.clone(),
             move_journal_writes: move_journal_writes.clone(),
             move_journal_deletes: move_journal_deletes.clone(),
+            fail_journal_cleanup: fail_journal_cleanup.clone(),
         };
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
@@ -258,6 +262,7 @@ impl CopyResponseLossSimulator {
             move_journal_present,
             move_journal_writes,
             move_journal_deletes,
+            fail_journal_cleanup,
             task,
         }
     }
@@ -819,6 +824,10 @@ async fn handle_connection(mut stream: TcpStream, state: CopyHandlerState) {
         ("DELETE", path)
             if path.starts_with("/bucket/tenant/.ycloud-system/file-move-transactions/") =>
         {
+            if state.fail_journal_cleanup.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                return;
+            }
             state.move_journal_present.store(false, Ordering::SeqCst);
             state.move_journal_deletes.fetch_add(1, Ordering::SeqCst);
             delete_object_response()
@@ -1818,6 +1827,21 @@ async fn file_move_survives_lost_copy_and_source_delete_responses() {
     assert!(!simulator.move_journal_present.load(Ordering::SeqCst));
     assert_eq!(simulator.move_journal_writes.load(Ordering::SeqCst), 2);
     assert_eq!(simulator.move_journal_deletes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn verified_file_move_succeeds_with_slow_journal_cleanup_pending() {
+    let simulator = CopyResponseLossSimulator::start(SOURCE_ETAG).await;
+    simulator.fail_journal_cleanup.store(true, Ordering::SeqCst);
+    let backend = test_backend(&simulator.endpoint);
+    backend
+        .move_file("source.txt", "destination.txt")
+        .await
+        .unwrap();
+    assert!(simulator.committed.load(Ordering::SeqCst));
+    assert!(!simulator.source_present.load(Ordering::SeqCst));
+    assert!(simulator.move_journal_present.load(Ordering::SeqCst));
+    assert!(backend.recovery_has_pending());
 }
 
 #[tokio::test]

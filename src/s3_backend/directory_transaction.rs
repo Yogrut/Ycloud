@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     authenticated_journal, capabilities, internal_key, list_prefix, non_negative_size,
-    valid_transaction_id, S3Backend, S3_MAX_LIST_PAGES, S3_MAX_PENDING_TRANSACTIONS, S3_PAGE_SIZE,
+    valid_transaction_id, CompletionMode, S3Backend, S3_MAX_LIST_PAGES,
+    S3_MAX_PENDING_TRANSACTIONS, S3_PAGE_SIZE,
 };
 use crate::{
-    error::{AppError, AppResult},
+    error::{AppError, AppResult, CleanupState, CommitState},
     storage::StorageService,
 };
 
@@ -88,14 +89,19 @@ impl S3Backend {
 
     /// Recover bounded prefix transactions before S3 is allowed to serve
     /// requests. Any state that cannot be proven from object size and ETag is
-    /// preserved for manual inspection instead of being guessed.
+    /// retained for later automatic recovery instead of being guessed.
     pub(super) async fn recover_directory_transactions(&self) -> AppResult<usize> {
         let keys = self.list_directory_transaction_keys().await?;
         let recovered = keys.len();
         for key in keys {
             let (mut transaction, journal_etag) = self.read_directory_transaction(&key).await?;
-            self.execute_directory_transaction(&key, journal_etag, &mut transaction)
-                .await?;
+            self.execute_directory_transaction(
+                &key,
+                journal_etag,
+                &mut transaction,
+                CompletionMode::Recovery,
+            )
+            .await?;
         }
         Ok(recovered)
     }
@@ -208,9 +214,16 @@ impl S3Backend {
         };
         let journal_etag = self
             .write_directory_transaction(&journal_key, &mut transaction, None)
-            .await?;
-        self.execute_directory_transaction(&journal_key, journal_etag, &mut transaction)
-            .await?;
+            .await
+            .map_err(|error| error.with_operation(CommitState::Unknown, CleanupState::Pending))?;
+        self.execute_directory_transaction(
+            &journal_key,
+            journal_etag,
+            &mut transaction,
+            CompletionMode::Foreground,
+        )
+        .await
+        .map_err(super::committed_cleanup::uncertain_transaction)?;
         Ok(snapshot_size)
     }
 
@@ -319,6 +332,7 @@ impl S3Backend {
         journal_key: &str,
         mut journal_etag: String,
         transaction: &mut Transaction,
+        completion: CompletionMode,
     ) -> AppResult<()> {
         validate_transaction(
             &self.transaction_auth_key,
@@ -333,19 +347,22 @@ impl S3Backend {
         }
 
         if transaction.operation == Operation::Copy {
-            if transaction.stage != Stage::CopyCompleted {
-                transaction.stage = Stage::CopyCompleted;
-                journal_etag = self
-                    .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
-                    .await?;
-            }
-            if let Err(error) = self
-                .delete_key_confirmed(journal_key, Some(&journal_etag))
-                .await
-            {
-                tracing::warn!(%error, "completed directory copy retained its recovery journal");
-            }
-            return Ok(());
+            return completion
+                .finish(async {
+                    if transaction.stage != Stage::CopyCompleted {
+                        transaction.stage = Stage::CopyCompleted;
+                        journal_etag = self
+                            .write_directory_transaction(
+                                journal_key,
+                                transaction,
+                                Some(&journal_etag),
+                            )
+                            .await?;
+                    }
+                    self.delete_key_confirmed(journal_key, Some(&journal_etag))
+                        .await
+                })
+                .await;
         }
 
         if transaction.stage != Stage::SourcesDeleted {
@@ -359,21 +376,22 @@ impl S3Backend {
                 .delete_sources(journal_key, journal_etag, transaction)
                 .await?;
             transaction.stage = Stage::SourcesDeleted;
-            journal_etag = self
-                .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
-                .await?;
         }
 
-        if transaction.operation == Operation::Delete {
-            self.cleanup_delete_trash(transaction).await?;
-        }
-        if let Err(error) = self
-            .delete_key_confirmed(journal_key, Some(&journal_etag))
+        completion
+            .finish(async {
+                // The formal change has been verified. Persisting its final stage
+                // and removing owned trash are cleanup, not another file commit.
+                journal_etag = self
+                    .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
+                    .await?;
+                if transaction.operation == Operation::Delete {
+                    self.cleanup_delete_trash(transaction).await?;
+                }
+                self.delete_key_confirmed(journal_key, Some(&journal_etag))
+                    .await
+            })
             .await
-        {
-            tracing::warn!(%error, "completed directory mutation retained its recovery journal");
-        }
-        Ok(())
     }
 
     async fn copy_missing_targets(
@@ -449,7 +467,9 @@ impl S3Backend {
                 ));
             }
             transaction.objects[index].target_etag = Some(target_etag);
-            if should_checkpoint(index, transaction.objects.len()) {
+            if index + 1 < transaction.objects.len()
+                && should_checkpoint(index, transaction.objects.len())
+            {
                 journal_etag = self
                     .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
                     .await?;
@@ -507,7 +527,9 @@ impl S3Backend {
                 }
             }
             transaction.objects[index].source_deleted = true;
-            if should_checkpoint(index, transaction.objects.len()) {
+            if index + 1 < transaction.objects.len()
+                && should_checkpoint(index, transaction.objects.len())
+            {
                 journal_etag = self
                     .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
                     .await?;
@@ -925,6 +947,102 @@ mod tests {
         TRASH_CATEGORY,
     };
     use crate::s3_backend::internal_key;
+
+    #[tokio::test]
+    async fn verified_directory_delete_does_not_fail_or_settle_when_trash_changed() {
+        use axum::{
+            body::Body,
+            http::{Method, Response, Uri},
+            routing::any,
+            Router,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let deletions = Arc::new(AtomicUsize::new(0));
+        let observed = deletions.clone();
+        let router = Router::new().route(
+            "/{*key}",
+            any(move |method: Method, uri: Uri| {
+                let observed = observed.clone();
+                async move {
+                    let response = Response::builder();
+                    if method == Method::PUT {
+                        response
+                            .header("etag", "\"journal-etag\"")
+                            .body(Body::empty())
+                    } else if method == Method::HEAD && uri.path().contains("/directory-trash/") {
+                        // An external change to owned trash must not be deleted.
+                        response
+                            .header("content-length", "43")
+                            .header("etag", "changed-etag")
+                            .body(Body::empty())
+                    } else {
+                        if method == Method::DELETE {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        response.status(400).body(Body::empty())
+                    }
+                    .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = crate::s3_backend::protocol_tests::test_backend(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let id = "fedcba9876543210fedcba9876543210";
+        let key = internal_key("tenant/", JOURNAL_CATEGORY, id);
+        let mut transaction = Transaction {
+            schema_version: SCHEMA_VERSION,
+            id: id.into(),
+            operation: Operation::Delete,
+            source_relative: "source".into(),
+            destination_relative: None,
+            stage: Stage::SourcesDeleted,
+            objects: vec![ObjectRecord {
+                source_key: "tenant/source/file.bin".into(),
+                target_key: internal_key("tenant/", TRASH_CATEGORY, &format!("{id}/file.bin")),
+                size: 42,
+                source_etag: "source-etag".into(),
+                target_etag: Some("trash-etag".into()),
+                source_deleted: true,
+            }],
+            auth_tag: String::new(),
+        };
+        sign_transaction(&[0x31; 32], &mut transaction).unwrap();
+        backend
+            .execute_directory_transaction(
+                &key,
+                "\"journal-etag\"".into(),
+                &mut transaction,
+                super::CompletionMode::Foreground,
+            )
+            .await
+            .unwrap();
+        assert!(backend.recovery_has_pending());
+        let error = backend
+            .execute_directory_transaction(
+                &key,
+                "\"journal-etag\"".into(),
+                &mut transaction,
+                super::CompletionMode::Recovery,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.operation().unwrap().commit,
+            crate::error::CommitState::Committed
+        );
+        assert!(backend.recovery_has_pending());
+        assert_eq!(deletions.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
 
     #[test]
     fn authenticated_large_delete_manifest_binds_its_multipart_target() {

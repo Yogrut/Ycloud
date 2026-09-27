@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    internal_key, object_key, valid_transaction_id, RawS3Metadata, S3Backend,
+    internal_key, object_key, valid_transaction_id, CompletionMode, RawS3Metadata, S3Backend,
     S3_FILE_MOVE_JOURNAL_PURPOSE,
 };
 use crate::{
@@ -79,8 +79,14 @@ impl S3Backend {
             .write_file_move_transaction(&journal_key, &transaction, None)
             .await
             .map_err(|error| error.with_operation(CommitState::Unknown, CleanupState::Pending))?;
-        self.execute_file_move_transaction(&journal_key, journal_etag, &mut transaction)
-            .await
+        self.execute_file_move_transaction(
+            &journal_key,
+            journal_etag,
+            &mut transaction,
+            CompletionMode::Foreground,
+        )
+        .await
+        .map_err(super::committed_cleanup::uncertain_transaction)
     }
 
     pub(super) async fn recover_file_move_transactions(&self) -> AppResult<usize> {
@@ -88,8 +94,13 @@ impl S3Backend {
         let recovered = keys.len();
         for key in keys {
             let (mut transaction, journal_etag) = self.read_file_move_transaction(&key).await?;
-            self.execute_file_move_transaction(&key, Some(journal_etag), &mut transaction)
-                .await?;
+            self.execute_file_move_transaction(
+                &key,
+                Some(journal_etag),
+                &mut transaction,
+                CompletionMode::Recovery,
+            )
+            .await?;
         }
         Ok(recovered)
     }
@@ -99,6 +110,7 @@ impl S3Backend {
         journal_key: &str,
         mut journal_etag: Option<String>,
         transaction: &mut Transaction,
+        completion: CompletionMode,
     ) -> AppResult<()> {
         validate_transaction(&self.prefix, journal_key, transaction)?;
         let source_key = object_key(&self.prefix, &transaction.source_relative)?;
@@ -202,10 +214,9 @@ impl S3Backend {
             }
         }
 
-        self.delete_key_confirmed(journal_key, journal_etag.as_deref())
+        completion
+            .finish(self.delete_key_confirmed(journal_key, journal_etag.as_deref()))
             .await
-            .map_err(|error| error.with_operation(CommitState::Committed, CleanupState::Pending))?;
-        Ok(())
     }
 
     async fn write_file_move_transaction(

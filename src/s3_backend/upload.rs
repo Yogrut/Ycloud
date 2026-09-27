@@ -441,20 +441,15 @@ impl S3Backend {
         // collection. Cleanup has a durable journal and a background worker;
         // a slow remote delete must not turn a successful upload into failure
         // or keep the administrator edit barrier occupied indefinitely.
-        let cleanup = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            self.finish_upload_and_intent(
+        super::CompletionMode::Foreground
+            .finish(self.finish_upload_and_intent(
                 &journal_key,
                 journal_etag.as_deref(),
                 &transaction,
                 &intent_key,
                 intent_etag.as_deref(),
-            ),
-        )
-        .await;
-        if !matches!(cleanup, Ok(Ok(()))) {
-            tracing::warn!(transaction_id = %upload_id, "verified S3 upload committed; temporary cleanup deferred to recovery");
-        }
+            ))
+            .await?;
         Ok(S3UploadResult {
             relative,
             size: committed.size,

@@ -122,6 +122,7 @@ export interface BatchItemResult {
 export interface BatchResponse {
   success: number
   failed: number
+  pending?: number
   results: BatchItemResult[]
 }
 

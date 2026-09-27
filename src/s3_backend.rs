@@ -36,7 +36,7 @@ const S3_MAX_MULTIPART_INTENT_MATCHES: usize = 1_000;
 const S3_MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
 const S3_MULTIPART_PART_BYTES: u64 = 64 * 1024 * 1024;
 const S3_MULTIPART_MAX_PARTS: u64 = 10_000;
-// Keep one buffered part bounded even when the deployment envelope is set far
+// Bound each buffered part even when the deployment envelope is set far
 // above the defaults. With 10,000 parts this supports objects up to 5 TiB.
 const S3_MULTIPART_MAX_PART_BYTES: u64 = 512 * 1024 * 1024;
 const S3_SINGLE_COPY_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
@@ -47,6 +47,7 @@ mod body;
 mod capabilities;
 mod capacity;
 mod client;
+mod direct;
 mod directory_transaction;
 mod file_move_transaction;
 mod internal_upload_intent;
@@ -59,9 +60,11 @@ mod object_read;
 mod protocol_tests;
 mod recovery;
 mod recovery_runtime;
+mod relay;
 mod upload;
 
 pub use capabilities::S3CapabilityReport;
+pub(crate) use direct::{DirectChannel, DirectCommand, DirectDescriptor, SignedPart, UploadInput};
 
 use body::{range_not_satisfiable, ExactLengthBody, PermitStream};
 use keyspace::{
@@ -666,10 +669,14 @@ fn validate_multipart_session(
                 && within_provider_limit
                 && match session.purpose {
                     Some(S3MultipartPurpose::Upload) => {
-                        internal_upload && expected_size >= S3_MULTIPART_THRESHOLD
+                        // Direct uploads use multipart even below the relay threshold.
+                        internal_upload && session.expected_size.is_some()
                     }
                     Some(S3MultipartPurpose::Copy) => {
-                        (regular_object || internal_backup) && expected_size > S3_SINGLE_COPY_LIMIT
+                        (regular_object
+                            || internal_backup
+                            || directory_trash_transaction_id(prefix, &session.key).is_some())
+                            && expected_size > S3_SINGLE_COPY_LIMIT
                     }
                     None => false,
                 }
@@ -704,9 +711,22 @@ fn is_internal_multipart_backup_key(prefix: &str, key: &str) -> bool {
 fn is_owned_internal_multipart_key(prefix: &str, session: &S3MultipartSession) -> bool {
     match session.purpose {
         Some(S3MultipartPurpose::Upload) => is_internal_multipart_upload_key(prefix, &session.key),
-        Some(S3MultipartPurpose::Copy) => is_internal_multipart_backup_key(prefix, &session.key),
+        Some(S3MultipartPurpose::Copy) => {
+            is_internal_multipart_backup_key(prefix, &session.key)
+                || directory_trash_transaction_id(prefix, &session.key).is_some()
+        }
         None => false,
     }
+}
+
+fn directory_trash_transaction_id<'a>(prefix: &str, key: &'a str) -> Option<&'a str> {
+    let relative = key.strip_prefix(&internal_key(prefix, "directory-trash", ""))?;
+    let (id, suffix) = relative.split_once('/')?;
+    (valid_transaction_id(id)
+        && (suffix.is_empty()
+            || StorageService::normalize_relative(suffix)
+                .is_ok_and(|normalized| normalized == suffix.trim_end_matches('/'))))
+    .then_some(id)
 }
 
 fn multipart_session_matches(metadata: &RawS3Metadata, session: &S3MultipartSession) -> bool {

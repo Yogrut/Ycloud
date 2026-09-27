@@ -2,6 +2,7 @@
 .github
 .cargo-audit-home
 .obsidian
+Temporary
 .ycloud-system
 target
 frontend

@@ -46,6 +46,8 @@ pub struct FileEntry {
 pub struct ListResponse {
     pub storage_id: String,
     pub storages: Vec<BrowserStorageView>,
+    pub selection_scope: String,
+    pub empty_reason: Option<&'static str>,
     pub current_path: String,
     pub parent_path: Option<String>,
     pub entries: Vec<FileEntry>,
@@ -178,29 +180,39 @@ pub struct BrowserStorageView {
     pub id: String,
     pub name: String,
     pub requires_login: bool,
+    pub enabled: bool,
+    pub ready: bool,
+}
+
+async fn browser_selection_scope(state: &AppState, headers: &HeaderMap) -> String {
+    match crate::auth::current_principal(state, headers).await {
+        Some(crate::auth::SessionPrincipal::Administrator) => "administrator".into(),
+        Some(crate::auth::SessionPrincipal::User(id)) => format!("user:{id}"),
+        None => "guest".into(),
+    }
 }
 
 async fn browser_storage_views(state: &AppState, headers: &HeaderMap) -> Vec<BrowserStorageView> {
-    let (mut storage_configs, default_storage_id) = {
-        let config = state.config_file.read().await;
-        (
-            config.storage_instances.clone(),
-            config.default_storage_id.clone(),
-        )
-    };
-    storage_configs.sort_by_key(|storage| usize::from(storage.id != default_storage_id));
+    let storage_configs = state.config_file.read().await.storage_instances.clone();
+    let administrator = matches!(
+        crate::auth::current_principal(state, headers).await,
+        Some(crate::auth::SessionPrincipal::Administrator)
+    );
     let mut storages = Vec::with_capacity(storage_configs.len());
     for storage in storage_configs {
-        if !storage.enabled || !state.backends.is_ready(&storage.id).await {
-            continue;
-        }
         let can_browse = storage_permission(state, headers, &storage.id)
             .await
             .is_some_and(|permission| permission.browse);
+        if !administrator && !can_browse {
+            continue;
+        }
+        let ready = storage.enabled && state.backends.is_ready(&storage.id).await;
         storages.push(BrowserStorageView {
             id: storage.id,
             name: storage.name,
-            requires_login: !can_browse,
+            requires_login: false,
+            enabled: storage.enabled,
+            ready,
         });
     }
     storages
@@ -292,7 +304,47 @@ pub async fn list_files(
         ));
     }
     let file_query = query.file_query();
-    let share = resolve_share(&state, &headers, &file_query).await?;
+    let share = match resolve_share(&state, &headers, &file_query).await {
+        Ok(share) => share,
+        Err(status)
+            if query.storage_id.is_none() && status != axum::http::StatusCode::UNAUTHORIZED =>
+        {
+            let storages = browser_storage_views(&state, &headers).await;
+            let selection_scope = browser_selection_scope(&state, &headers).await;
+            let config = state.config_file.read().await.clone();
+            let empty_reason = if config.storage_instances.is_empty() {
+                "unconfigured"
+            } else if storages.is_empty() {
+                "forbidden"
+            } else {
+                "unavailable"
+            };
+            return Ok(Json(ListResponse {
+                storage_id: String::new(),
+                storages,
+                selection_scope,
+                empty_reason: Some(empty_reason),
+                current_path: String::new(),
+                parent_path: None,
+                entries: Vec::new(),
+                page_start: 0,
+                page_size: page_size(query.limit)?,
+                next_cursor: None,
+                can_write: false,
+                is_admin: matches!(
+                    crate::auth::current_principal(&state, &headers).await,
+                    Some(crate::auth::SessionPrincipal::Administrator)
+                ),
+                capabilities: BrowserCapabilities::default(),
+                max_upload_bytes: config.max_upload_bytes,
+                max_upload_batch_bytes: config.max_upload_batch_bytes,
+                max_upload_batch_entries: config.max_upload_batch_entries,
+                max_archive_bytes: config.max_archive_bytes,
+                max_archive_entries: config.max_archive_entries,
+            }));
+        }
+        Err(status) => return Err(status.into()),
+    };
     let backend = state.storage_backend(&share.storage_id).await?;
     let request_path = query.path.as_deref().unwrap_or("");
     let storage_directory = share_storage_path(&share, request_path);
@@ -452,6 +504,8 @@ pub async fn list_files(
         .is_some_and(|permission| permission.grants_write());
     Ok(Json(ListResponse {
         storage_id: share.storage_id,
+        selection_scope: browser_selection_scope(&state, &headers).await,
+        empty_reason: None,
         storages,
         current_path,
         parent_path,
@@ -548,7 +602,8 @@ pub async fn upload_file(
     let storage_path = share_storage_path(&share, file_request_path);
     let content_type = headers
         .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok());
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let traffic_subject = crate::traffic::browser_subject(&state, &headers).await;
     let max_upload_bytes = state.config_file.read().await.max_upload_bytes;
     if query.batch.is_some() && expected_bytes.is_none() {
@@ -579,41 +634,86 @@ pub async fn upload_file(
             }
         }
     }
-    let upload_result = async {
-        state
-            .traffic
-            .preflight(
-                &traffic_subject,
-                crate::traffic::Direction::Upload,
-                expected_bytes.unwrap_or(1),
-            )
-            .await?;
-        let (body, meter) =
+    let operation_id = query
+        .batch
+        .as_deref()
+        .map(|ticket| crate::upload_batch::operation_id(ticket, &storage_path));
+    let execution = query.batch.map(|ticket| {
+        crate::upload_batch::UploadExecutionGuard::new(
+            state.upload_batches.clone(),
+            ticket,
+            storage_path.clone(),
+        )
+    });
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(state.config.upload_timeout_secs);
+    let body = Body::from_stream(futures_util::stream::unfold(
+        (body.into_data_stream(), false),
+        move |(mut stream, finished)| async move {
+            if finished {
+                return None;
+            }
+            use futures_util::StreamExt;
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(chunk)) => Some((chunk.map_err(std::io::Error::other), (stream, false))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "upload body deadline reached",
+                    )),
+                    (stream, true),
+                )),
+            }
+        },
+    ));
+    // Detaching the waiter must not detach result registration from a backend
+    // publication which may already own an independent commit task.
+    tokio::spawn(async move {
+        let mut execution = execution;
+        let upload_result = async {
             state
                 .traffic
-                .meter(body, traffic_subject, crate::traffic::Direction::Upload);
-        let result = backend
-            .upload_file(
-                &storage_path,
-                state.upload_limiter.wrap_body(body),
-                expected_bytes,
-                max_upload_bytes,
-                content_type,
-            )
-            .await;
-        meter.finish(result)
-    }
-    .await;
-    if let Some(ticket) = query.batch.as_deref() {
-        state
-            .upload_batches
-            .finish_result(ticket, &storage_path, &upload_result)
-            .await;
-    }
-    upload_result?;
-    Ok(Json(
-        serde_json::json!({ "success": true, "uploaded": [file_name] }),
-    ))
+                .preflight(
+                    &traffic_subject,
+                    crate::traffic::Direction::Upload,
+                    expected_bytes.unwrap_or(1),
+                )
+                .await?;
+            let (body, meter) =
+                state
+                    .traffic
+                    .meter(body, traffic_subject, crate::traffic::Direction::Upload);
+            let mut input =
+                crate::s3_backend::UploadInput::relay(state.upload_limiter.wrap_body(body));
+            input.operation_id = operation_id;
+            let result = backend
+                .upload_tracked_new_file(
+                    &storage_path,
+                    input,
+                    expected_bytes,
+                    max_upload_bytes,
+                    content_type.as_deref(),
+                )
+                .await;
+            meter.finish(result)
+        }
+        .await;
+        if let Some(execution) = &mut execution {
+            execution.finish(&upload_result).await;
+        }
+        upload_result?;
+        Ok(Json(
+            serde_json::json!({ "success": true, "uploaded": [file_name] }),
+        ))
+    })
+    .await
+    .map_err(|error| {
+        AppError::with_source("upload execution failed", error).with_operation(
+            crate::error::CommitState::Unknown,
+            crate::error::CleanupState::Unknown,
+        )
+    })?
 }
 
 pub async fn download_file(
@@ -874,6 +974,107 @@ mod pagination_tests {
             DirectoryEntryFilter::All,
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn navigation_is_permission_scoped_and_admin_can_see_disabled_storages() {
+        use crate::config::{ConfigFile, StoragePermission, UserAccount};
+        let directory = crate::test_support::TestDirectory::new("storage-navigation");
+        let state =
+            crate::test_support::app_state(&directory, ConfigFile::with_test_storage()).await;
+        {
+            let mut config = state.config_file.write().await;
+            let mut private = config.storage_instances[0].clone();
+            private.id = "private".into();
+            private.allow_guest_access = false;
+            let mut disabled = private.clone();
+            disabled.id = "disabled".into();
+            disabled.enabled = false;
+            config.storage_instances.extend([private, disabled]);
+            config.user_accounts.push(UserAccount {
+                id: "alice".into(),
+                username: "alice".into(),
+                password_hash: "unused".into(),
+                enabled: true,
+                permissions: vec![StoragePermission {
+                    storage_id: "private".into(),
+                    browse: true,
+                    ..Default::default()
+                }],
+            });
+        }
+        let mut headers = HeaderMap::new();
+        let gate = state.gate_access.create("__gate__".into()).await;
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("gate_access={gate}").parse().unwrap(),
+        );
+        let guest = browser_storage_views(&state, &headers).await;
+        assert_eq!(
+            guest
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary"]
+        );
+        let token = state.sessions.create_user("alice".into()).await;
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("session={token}").parse().unwrap(),
+        );
+        let user = browser_storage_views(&state, &headers).await;
+        assert_eq!(
+            user.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            vec!["private"]
+        );
+        assert_eq!(
+            browser_selection_scope(&state, &headers).await,
+            "user:alice"
+        );
+        let token = state.sessions.create().await;
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("session={token}").parse().unwrap(),
+        );
+        let admin = browser_storage_views(&state, &headers).await;
+        assert_eq!(admin.len(), 3);
+        assert!(!admin[2].enabled);
+        assert!(!admin[2].ready);
+        assert!(resolve_share(
+            &state,
+            &headers,
+            &FileQuery {
+                storage_id: Some("disabled".into()),
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn zero_storage_listing_is_an_explicit_non_writable_empty_state() {
+        let directory = crate::test_support::TestDirectory::new("empty-storage-list");
+        let state =
+            crate::test_support::app_state(&directory, crate::config::ConfigFile::default()).await;
+        let token = state.sessions.create().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("session={token}").parse().unwrap(),
+        );
+        let query = serde_json::from_value(serde_json::json!({})).unwrap();
+        let Json(list) = list_files(State(state.clone()), headers, Query(query))
+            .await
+            .unwrap();
+        assert_eq!(list.empty_reason, Some("unconfigured"));
+        assert_eq!(list.selection_scope, "administrator");
+        assert!(list.storages.is_empty());
+        assert!(list.entries.is_empty());
+        assert!(list.storage_id.is_empty());
+        assert!(!list.capabilities.upload);
+        assert!(!list.capabilities.download);
+        assert!(state.config_file.read().await.storage_instances.is_empty());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import { formatSize } from '../../shared/format'
 import { useLocale } from '../../shared/i18n'
@@ -28,6 +28,35 @@ const locale = useLocale()
 const filter = ref<UploadFilter>('all')
 const dropActive = ref(false)
 let dragDepth = 0
+const uploadSpeed = ref(0)
+let speedTimer: ReturnType<typeof setInterval> | undefined
+let sampledAt = 0
+let samples = new Map<number, { loaded: number; status: UploadTaskStatus }>()
+
+function sampleSpeed(): void {
+  const now = performance.now()
+  let transferred = 0
+  const next = new Map<number, { loaded: number; status: UploadTaskStatus }>()
+  for (const task of props.tasks) {
+    const loaded = Math.max(0, Math.min(task.file.size, task.loaded))
+    const previous = samples.get(task.id)
+    if (previous?.status === 'uploading' && ['uploading', 'verifying', 'succeeded'].includes(task.status)) {
+      transferred += Math.max(0, loaded - previous.loaded)
+    }
+    next.set(task.id, { loaded, status: task.status })
+  }
+  const elapsed = now - sampledAt
+  uploadSpeed.value = props.tasks.some(task => task.status === 'uploading') && elapsed > 0
+    ? Math.round(transferred * 1000 / elapsed) : 0
+  sampledAt = now
+  samples = next
+}
+
+onMounted(() => {
+  sampleSpeed()
+  speedTimer = setInterval(sampleSpeed, 500)
+})
+onUnmounted(() => clearInterval(speedTimer))
 
 const succeeded = computed(() => countStatus('succeeded'))
 const failed = computed(() => countStatus('failed'))
@@ -152,7 +181,7 @@ function handleDrop(event: DragEvent): void {
       </div>
 
       <progress class="upload-overall-progress" :value="overallPercent" max="100" :aria-label="locale.text('全部文件上传进度', 'Overall upload progress')">{{ overallPercent }}%</progress>
-      <div class="upload-overall-meta"><span><strong>{{ completionLabel }}</strong> · {{ locale.text(`成功 ${succeeded} · 失败/异常 ${failed} · 已终止 ${cancelled}`, `${succeeded} succeeded · ${failed} failed · ${cancelled} terminated`) }}</span><span class="upload-overall-percent">{{ overallPercent }}%</span></div>
+      <div class="upload-overall-meta"><span><strong>{{ completionLabel }}</strong> · {{ locale.text(`成功 ${succeeded} · 失败/异常 ${failed} · 已终止 ${cancelled}`, `${succeeded} succeeded · ${failed} failed · ${cancelled} terminated`) }}</span><span class="upload-overall-transfer"><span class="upload-overall-speed" :title="locale.text('浏览器到 Ycloud 的实时上传速率，不代表存储已写入完成', 'Live browser-to-Ycloud upload speed, not final storage completion')">{{ formatSize(uploadSpeed) }}/s</span><span class="upload-overall-percent">{{ overallPercent }}%</span></span></div>
 
       <div v-if="visibleTasks.length" class="upload-task-list">
         <article v-for="task in visibleTasks" :key="task.id" class="upload-task" :class="`is-${task.status}`">

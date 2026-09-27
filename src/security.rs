@@ -159,7 +159,7 @@ fn csrf_request_allowed(config: &Config, method: &Method, headers: &axum::http::
 }
 
 pub async fn security_headers_middleware(
-    State(config): State<Config>,
+    State(state): State<crate::state::AppState>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -167,7 +167,7 @@ pub async fn security_headers_middleware(
         .extensions()
         .get::<Config>()
         .cloned()
-        .unwrap_or(config);
+        .unwrap_or_else(|| state.config.clone());
     let sensitive_response =
         request.uri().path().starts_with("/api/") || request.uri().path().starts_with("/dav/");
     let mut response = next.run(request).await;
@@ -200,14 +200,37 @@ pub async fn security_headers_middleware(
     );
     // Multiple CSP policies are enforced together. Do not replace the stricter
     // sandbox policy attached by the untrusted-file response layer.
-    headers.append(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; \
-             form-action 'self'; script-src 'self'; style-src 'self'; \
-             img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self'",
-        ),
-    );
+    let policy = state.config_file.read().await;
+    let mut origins = std::collections::BTreeSet::new();
+    for instance in policy
+        .storage_instances
+        .iter()
+        .filter(|instance| instance.enabled)
+    {
+        if let crate::config::StorageBackendConfig::S3(settings) = &instance.backend {
+            if !settings.relay_upload {
+                if let Ok(endpoint) = settings.endpoint.parse::<axum::http::Uri>() {
+                    if let (Some(scheme), Some(authority)) =
+                        (endpoint.scheme_str(), endpoint.authority())
+                    {
+                        origins.insert(format!("{scheme}://{authority}"));
+                        if settings.addressing_style
+                            == crate::config::S3AddressingStyle::VirtualHosted
+                        {
+                            origins.insert(format!("{scheme}://{}.{authority}", settings.bucket));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let csp = format!("default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; \
+        form-action 'self'; script-src 'self'; style-src 'self'; \
+        img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self'; connect-src 'self' {}", origins.into_iter().collect::<Vec<_>>().join(" "));
+    let value = HeaderValue::from_str(&csp).unwrap_or_else(|_| HeaderValue::from_static(
+        "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self'; connect-src 'self'",
+    ));
+    headers.append(header::CONTENT_SECURITY_POLICY, value);
     response
 }
 
@@ -385,7 +408,6 @@ mod tests {
             public_base_url: None,
             public_host: None,
             allowed_hosts: Default::default(),
-            s3_allowed_endpoints: Default::default(),
             transaction_auth_key: [0x31; 32],
         }
     }

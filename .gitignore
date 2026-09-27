@@ -2,6 +2,9 @@
 /target/
 /.cargo-audit-home/
 
+# Local working notes, audit reports and non-project material
+/Temporary/
+
 # User data (contains personal files — do NOT version)
 /storage/*
 !/storage/.gitkeep

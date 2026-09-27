@@ -176,14 +176,12 @@ onMounted(load)
           v-else-if="info && activeSection === 'locks'"
           :locks="info.folder_locks"
           :storages="info.storage_instances"
-          :default-storage-id="info.default_storage_id"
           @changed="showNotice"
         />
         <WebDavView
           v-else-if="info && activeSection === 'webdav'"
           :mounts="info.shares"
           :storages="info.storage_instances"
-          :default-storage-id="info.default_storage_id"
           @changed="showNotice"
         />
         <AccountView v-else-if="info" :info="info" @saved="showNotice" @expired="sessionExpired" />

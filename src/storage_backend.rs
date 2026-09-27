@@ -2,7 +2,10 @@ use axum::{body::Body, http::HeaderMap, response::Response};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Weak,
+};
 use std::time::Duration;
 
 use tokio::{sync::Notify, sync::RwLock};
@@ -23,6 +26,10 @@ use crate::{
 
 pub use crate::directory_listing::BackendEntry;
 
+// Detached HTTP waiters must not admit an unbounded number of mutation owners.
+const MAX_MUTATION_OWNERS: usize = 32;
+type AdmissionLease = std::sync::Mutex<Option<tokio::sync::OwnedRwLockReadGuard<()>>>;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendMetadata {
     pub is_dir: bool,
@@ -37,6 +44,8 @@ pub struct BackendMetadata {
 #[derive(Clone)]
 pub struct StorageBackend {
     active: Arc<ActiveStorage>,
+    lease: Option<Arc<AdmissionLease>>,
+    transfer: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// Routes every storage operation through an immutable storage identity.
@@ -53,6 +62,7 @@ pub struct StorageRegistry {
 #[derive(Clone)]
 enum RegisteredStorage {
     Ready(StorageBackend),
+    Disabled(StorageBackend),
     Unavailable,
 }
 
@@ -89,11 +99,38 @@ impl StorageRegistry {
 
     pub async fn get(&self, storage_id: &str) -> AppResult<StorageBackend> {
         match self.entries.read().await.get(storage_id) {
-            Some(RegisteredStorage::Ready(backend)) => Ok(backend.clone()),
+            Some(RegisteredStorage::Ready(backend)) => backend.admitted(),
+            Some(RegisteredStorage::Disabled(_)) => Err(AppError::Forbidden),
             Some(RegisteredStorage::Unavailable) => Err(AppError::ServiceUnavailable(
                 "存储实例当前不可用，请检查连接后重试".into(),
             )),
             None => Err(AppError::NotFound),
+        }
+    }
+
+    pub async fn cached(&self, storage_id: &str) -> Option<StorageBackend> {
+        match self.entries.read().await.get(storage_id) {
+            Some(RegisteredStorage::Ready(backend) | RegisteredStorage::Disabled(backend)) => {
+                Some(backend.clone())
+            }
+            _ => None,
+        }
+    }
+
+    pub async fn set_enabled(&self, storage_id: &str, enabled: bool) {
+        let mut entries = self.entries.write().await;
+        if let Some(RegisteredStorage::Ready(backend) | RegisteredStorage::Disabled(backend)) =
+            entries.get(storage_id)
+        {
+            let backend = backend.clone();
+            entries.insert(
+                storage_id.to_owned(),
+                if enabled {
+                    RegisteredStorage::Ready(backend)
+                } else {
+                    RegisteredStorage::Disabled(backend)
+                },
+            );
         }
     }
 
@@ -115,7 +152,9 @@ impl StorageRegistry {
             .await
             .values()
             .filter_map(|entry| match entry {
-                RegisteredStorage::Ready(backend) => Some(backend.clone()),
+                RegisteredStorage::Ready(backend) | RegisteredStorage::Disabled(backend) => {
+                    Some(backend.clone())
+                }
                 RegisteredStorage::Unavailable => None,
             })
             .collect::<Vec<_>>();
@@ -131,7 +170,9 @@ impl StorageRegistry {
             .await
             .values()
             .filter_map(|entry| match entry {
-                RegisteredStorage::Ready(backend) => Some(backend.clone()),
+                RegisteredStorage::Ready(backend) | RegisteredStorage::Disabled(backend) => {
+                    Some(backend.clone())
+                }
                 RegisteredStorage::Unavailable => None,
             })
             .collect::<Vec<_>>();
@@ -147,12 +188,52 @@ enum StorageBackendKind {
     S3(S3Backend),
 }
 
-#[derive(Clone)]
 struct ActiveStorage {
     kind: StorageBackendKind,
     capacity: CapacityTracker,
     local_reconcile_wake: Option<Arc<Notify>>,
     directory_snapshots: DirectorySnapshotStore,
+    lifecycle: Arc<RwLock<()>>,
+    retired: AtomicBool,
+    mutation_owners: Arc<tokio::sync::Semaphore>,
+    editing: AtomicBool,
+    transfer: std::sync::Mutex<tokio_util::sync::CancellationToken>,
+    leases: std::sync::Mutex<Vec<Weak<AdmissionLease>>>,
+}
+
+pub struct StorageEditGuard {
+    backend: StorageBackend,
+    _gate: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    _owners: Option<tokio::sync::OwnedSemaphorePermit>,
+    interrupted: bool,
+    _remote: Option<(
+        tokio::sync::OwnedRwLockWriteGuard<()>,
+        tokio::sync::OwnedMutexGuard<()>,
+    )>,
+}
+
+impl StorageEditGuard {
+    pub fn retire(&self) {
+        self.backend.active.retired.store(true, Ordering::Release);
+        if let StorageBackendKind::S3(storage) = &self.backend.active.kind {
+            storage.stop_recovery_worker();
+        }
+    }
+}
+
+impl Drop for StorageEditGuard {
+    fn drop(&mut self) {
+        if self.interrupted {
+            *self
+                .backend
+                .active
+                .transfer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                tokio_util::sync::CancellationToken::new();
+            self.backend.active.editing.store(false, Ordering::Release);
+        }
+    }
 }
 
 /// Cancellation or a task panic must not leave a possibly published S3
@@ -196,6 +277,156 @@ impl Drop for ActiveStorage {
 }
 
 impl StorageBackend {
+    fn admitted(&self) -> AppResult<Self> {
+        if self.active.editing.load(Ordering::Acquire) {
+            return Err(AppError::Conflict("存储配置正在更新，请重试".into()));
+        }
+        let gate = self
+            .active
+            .lifecycle
+            .clone()
+            .try_read_owned()
+            .map_err(|_| AppError::Conflict("存储连接正在调整，请稍后重试".into()))?;
+        if self.active.retired.load(Ordering::Acquire) {
+            return Err(AppError::Conflict("存储连接已更新，请重试".into()));
+        }
+        let mut leases = self
+            .active
+            .leases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.active.editing.load(Ordering::Acquire) {
+            return Err(AppError::Conflict("存储配置正在更新，请重试".into()));
+        }
+        leases.retain(|lease| lease.strong_count() > 0);
+        let lease = Arc::new(std::sync::Mutex::new(Some(gate)));
+        leases.push(Arc::downgrade(&lease));
+        Ok(Self {
+            active: self.active.clone(),
+            lease: Some(lease),
+            transfer: Some(self.transfer_token()),
+        })
+    }
+
+    pub async fn edit_guard(&self) -> AppResult<StorageEditGuard> {
+        if self.active.editing.load(Ordering::Acquire) {
+            return Err(AppError::Conflict("存储配置正在更新".into()));
+        }
+        let gate = self
+            .active
+            .lifecycle
+            .clone()
+            .try_write_owned()
+            .map_err(|_| {
+                AppError::Conflict("存储仍有进行中的操作，请完成后再修改连接或删除".into())
+            })?;
+        let remote = match &self.active.kind {
+            StorageBackendKind::S3(storage) => Some(storage.quiesce_for_edit().await?),
+            StorageBackendKind::Local(_) => None,
+        };
+        Ok(StorageEditGuard {
+            backend: self.clone(),
+            _gate: Some(gate),
+            _owners: None,
+            interrupted: false,
+            _remote: remote,
+        })
+    }
+
+    fn transfer_token(&self) -> tokio_util::sync::CancellationToken {
+        self.transfer.clone().unwrap_or_else(|| {
+            self.active
+                .transfer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+
+    /// Administrator edits stop transfer admission and cancel payload transfer,
+    /// rather than requiring clients to voluntarily finish uploading.
+    pub(crate) async fn interrupt_for_edit(&self) -> AppResult<StorageEditGuard> {
+        self.active.editing.store(true, Ordering::Release);
+        self.transfer_token().cancel();
+        let mut guard = StorageEditGuard {
+            backend: self.clone(),
+            _gate: None,
+            _owners: None,
+            interrupted: true,
+            _remote: None,
+        };
+        guard._owners = Some(
+            self.active
+                .mutation_owners
+                .clone()
+                .acquire_many_owned(MAX_MUTATION_OWNERS as u32)
+                .await
+                .map_err(|_| AppError::ServiceUnavailable("存储操作已关闭".into()))?,
+        );
+        {
+            let mut leases = self
+                .active
+                .leases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for lease in leases.drain(..).filter_map(|lease| lease.upgrade()) {
+                lease
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+            }
+        }
+        guard._gate = Some(self.active.lifecycle.clone().write_owned().await);
+        if let StorageBackendKind::S3(storage) = &self.active.kind {
+            guard._remote = Some(storage.quiesce_after_interrupt().await);
+        }
+        Ok(guard)
+    }
+
+    pub fn set_capacity_limit(&self, limit: Option<u64>) {
+        self.active.capacity.set_limit(limit);
+    }
+
+    /// Hold exclusive admission while settling abandoned uploads.
+    /// No live upload may be adopted as abandoned recovery work.
+    pub(crate) async fn recover_abandoned_uploads(&self) -> AppResult<StorageEditGuard> {
+        let guard = self.edit_guard().await?;
+        match &self.active.kind {
+            StorageBackendKind::S3(storage) => {
+                storage.recover_quiesced_uploads().await?;
+                self.active.capacity.mark_uncertain();
+            }
+            StorageBackendKind::Local(storage) => {
+                storage.recover_quiesced_uploads().await?;
+                self.active.capacity.mark_uncertain();
+            }
+        }
+        Ok(guard)
+    }
+
+    pub(crate) async fn recovered_upload_committed(
+        &self,
+        path: &str,
+        size: u64,
+        operation_id: &str,
+    ) -> AppResult<bool> {
+        match &self.active.kind {
+            StorageBackendKind::S3(storage) => {
+                storage.upload_committed(path, size, operation_id).await
+            }
+            StorageBackendKind::Local(storage) => {
+                // Browser destinations were reserved while absent and remain
+                // reserved until this check; recovery has settled atomic writes.
+                let target = match storage.resolve_existing(path).await {
+                    Ok(target) => target,
+                    Err(AppError::NotFound) => return Ok(false),
+                    Err(error) => return Err(error),
+                };
+                let metadata = storage.metadata(&target).await?;
+                Ok(metadata.is_file() && metadata.len() == size)
+            }
+        }
+    }
     fn set_local_max_upload_bytes(&self, max_upload_bytes: u64) {
         let active = &self.active;
         if let StorageBackendKind::Local(storage) = &active.kind {
@@ -205,7 +436,15 @@ impl StorageBackend {
 
     pub fn local(storage: StorageService) -> Self {
         Self {
+            lease: None,
+            transfer: None,
             active: Arc::new(ActiveStorage {
+                lifecycle: Arc::new(RwLock::new(())),
+                retired: AtomicBool::new(false),
+                editing: AtomicBool::new(false),
+                transfer: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
+                leases: std::sync::Mutex::new(Vec::new()),
+                mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
                 kind: StorageBackendKind::Local(storage),
                 capacity: CapacityTracker::new(None, 0),
                 local_reconcile_wake: None,
@@ -225,7 +464,15 @@ impl StorageBackend {
             CapacityTracker::new_with_ledger(capacity_limit, used, true, Some(ledger_path));
         capacity.set_reconcile_wake(&reconcile_wake);
         let backend = Self {
+            lease: None,
+            transfer: None,
             active: Arc::new(ActiveStorage {
+                lifecycle: Arc::new(RwLock::new(())),
+                retired: AtomicBool::new(false),
+                editing: AtomicBool::new(false),
+                transfer: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
+                leases: std::sync::Mutex::new(Vec::new()),
+                mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
                 kind: StorageBackendKind::Local(storage),
                 capacity,
                 local_reconcile_wake: Some(reconcile_wake.clone()),
@@ -252,7 +499,15 @@ impl StorageBackend {
         // as current before an online reconciliation finishes.
         let used = persisted.unwrap_or(0);
         let backend = Self {
+            lease: None,
+            transfer: None,
             active: Arc::new(ActiveStorage {
+                lifecycle: Arc::new(RwLock::new(())),
+                retired: AtomicBool::new(false),
+                editing: AtomicBool::new(false),
+                transfer: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
+                leases: std::sync::Mutex::new(Vec::new()),
+                mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
                 kind: StorageBackendKind::S3(storage),
                 capacity: CapacityTracker::new_with_ledger(
                     capacity_limit,
@@ -408,13 +663,18 @@ impl StorageBackend {
         mode: FileResponseMode,
     ) -> AppResult<Response> {
         let active = &self.active;
-        match &active.kind {
+        let response = match &active.kind {
             StorageBackendKind::Local(storage) => {
                 let path = storage.resolve_existing(relative).await?;
                 storage.stream_file(&path, headers, mode).await
             }
             StorageBackendKind::S3(storage) => storage.stream_file(relative, headers, mode).await,
-        }
+        }?;
+        let (parts, body) = response.into_parts();
+        Ok(Response::from_parts(
+            parts,
+            interruptible_body(body, self.transfer_token()),
+        ))
     }
 
     pub async fn upload_file(
@@ -424,6 +684,149 @@ impl StorageBackend {
         expected_bytes: Option<u64>,
         max_upload_bytes: u64,
         content_type: Option<&str>,
+    ) -> AppResult<u64> {
+        self.upload_file_mode(
+            relative,
+            crate::s3_backend::UploadInput::relay(body),
+            expected_bytes,
+            max_upload_bytes,
+            content_type,
+            false,
+        )
+        .await
+    }
+
+    /// Browser uploads create a new file; a late name collision must not replace user data.
+    pub async fn upload_new_file(
+        &self,
+        relative: &str,
+        body: Body,
+        expected_bytes: Option<u64>,
+        max_upload_bytes: u64,
+        content_type: Option<&str>,
+    ) -> AppResult<u64> {
+        self.upload_file_mode(
+            relative,
+            crate::s3_backend::UploadInput::relay(body),
+            expected_bytes,
+            max_upload_bytes,
+            content_type,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn upload_tracked_new_file(
+        &self,
+        relative: &str,
+        input: crate::s3_backend::UploadInput,
+        expected_bytes: Option<u64>,
+        maximum: u64,
+        content_type: Option<&str>,
+    ) -> AppResult<u64> {
+        self.upload_file_mode(relative, input, expected_bytes, maximum, content_type, true)
+            .await
+    }
+
+    pub(crate) fn supports_direct_upload(&self) -> bool {
+        matches!(&self.active.kind, StorageBackendKind::S3(_))
+    }
+
+    pub(crate) async fn upload_direct_file(
+        &self,
+        relative: &str,
+        size: u64,
+        maximum: u64,
+        channel: crate::s3_backend::DirectChannel,
+        operation_id: String,
+    ) -> AppResult<u64> {
+        self.upload_file_mode(
+            relative,
+            crate::s3_backend::UploadInput {
+                body: Body::empty(),
+                direct: Some(channel),
+                operation_id: Some(operation_id),
+                cancellation: None,
+                commit_owner: None,
+            },
+            Some(size),
+            maximum,
+            Some("application/octet-stream"),
+            true,
+        )
+        .await
+    }
+
+    async fn upload_file_mode(
+        &self,
+        relative: &str,
+        mut input: crate::s3_backend::UploadInput,
+        expected_bytes: Option<u64>,
+        max_upload_bytes: u64,
+        content_type: Option<&str>,
+        create_only: bool,
+    ) -> AppResult<u64> {
+        let cancellation = self.transfer_token();
+        input.body = interruptible_body(input.body, cancellation.clone());
+        input.cancellation = Some(cancellation);
+        let (relative, content_type) = (relative.to_owned(), content_type.map(str::to_owned));
+        self.owned_mutation(move |backend| async move {
+            backend
+                .upload_file_mode_inner(
+                    &relative,
+                    input,
+                    expected_bytes,
+                    max_upload_bytes,
+                    content_type.as_deref(),
+                    create_only,
+                )
+                .await
+        })
+        .await
+    }
+
+    async fn owned_mutation<T: Send + 'static, F, Fut>(&self, work: F) -> AppResult<T>
+    where
+        F: FnOnce(Self) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = AppResult<T>> + Send + 'static,
+    {
+        let owner = self.clone();
+        let permit = owner
+            .active
+            .mutation_owners
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AppError::TooManyRequests)?;
+        if owner.active.editing.load(Ordering::Acquire)
+            || owner.active.retired.load(Ordering::Acquire)
+            || owner.transfer_token().is_cancelled()
+        {
+            return Err(AppError::Conflict(
+                "存储配置已变更，传输已中断，请重试".into(),
+            ));
+        }
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _lease = owner.lease.clone();
+            work(owner).await
+        })
+        .await
+        .map_err(|error| {
+            AppError::with_source("storage mutation owner failed", error).with_operation(
+                crate::error::CommitState::Unknown,
+                crate::error::CleanupState::Unknown,
+            )
+        })?
+    }
+
+    async fn upload_file_mode_inner(
+        &self,
+        relative: &str,
+        mut input: crate::s3_backend::UploadInput,
+        expected_bytes: Option<u64>,
+        max_upload_bytes: u64,
+        content_type: Option<&str>,
+        create_only: bool,
     ) -> AppResult<u64> {
         let active = &self.active;
         let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
@@ -435,6 +838,11 @@ impl StorageBackend {
             StorageBackendKind::Local(storage) => {
                 let destination = storage.resolve_for_write(relative).await?;
                 let old_size = match storage.metadata(&destination).await {
+                    Ok(_) if create_only => {
+                        return Err(AppError::Conflict(
+                            "上传目标已被占用，请重新上传以分配新编号".into(),
+                        ))
+                    }
                     Ok(metadata) if metadata.is_file() => metadata.len(),
                     Ok(_) => return Err(AppError::Conflict("不能用文件覆盖目录".into())),
                     Err(AppError::NotFound) => 0,
@@ -450,17 +858,29 @@ impl StorageBackend {
                     }
                     None => storage.begin_atomic_write(relative).await?,
                 };
-                let mut stream = body.into_data_stream();
+                let mut stream = input.body.into_data_stream();
                 let mut received = 0_u64;
                 while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|_| AppError::ClientClosedRequest)?;
+                    let chunk = chunk.map_err(|_| {
+                        if self.transfer_token().is_cancelled() {
+                            AppError::Conflict("存储配置已变更，上传已中断，请重试".into())
+                        } else {
+                            AppError::ClientClosedRequest
+                        }
+                    })?;
                     received = received
                         .checked_add(chunk.len() as u64)
                         .ok_or(AppError::PayloadTooLarge)?;
                     capacity_reservation.ensure_new_size(received)?;
                     writer.write_chunk(&chunk).await?;
                 }
-                let committed = writer.commit_with_capacity(capacity_reservation).await?;
+                let committed = if create_only {
+                    writer
+                        .commit_new_with_capacity(capacity_reservation)
+                        .await?
+                } else {
+                    writer.commit_with_capacity(capacity_reservation).await?
+                };
                 Ok(committed.size)
             }
             StorageBackendKind::S3(storage) => {
@@ -470,6 +890,11 @@ impl StorageBackend {
                     )
                 })?;
                 let old_size = match storage.metadata(relative).await {
+                    Ok(_) if create_only => {
+                        return Err(AppError::Conflict(
+                            "上传目标已被占用，请重新上传以分配新编号".into(),
+                        ))
+                    }
                     Ok(metadata) if !metadata.is_dir => metadata.size,
                     Ok(_) => return Err(AppError::Conflict("不能用文件覆盖目录".into())),
                     Err(AppError::NotFound) => 0,
@@ -485,15 +910,26 @@ impl StorageBackend {
                 let snapshots = active.directory_snapshots.clone();
                 tokio::spawn(async move {
                     let _snapshot_invalidation = snapshots.invalidate_on_drop();
-                    let _accounting = storage.acquire_capacity_mutation().await;
+                    let commit_owner = if input.direct.is_some() {
+                        Some(Arc::new(tokio::sync::Mutex::new(None)))
+                    } else {
+                        None
+                    };
+                    input.commit_owner = commit_owner.clone();
+                    let _accounting = if commit_owner.is_none() {
+                        Some(storage.acquire_capacity_mutation().await)
+                    } else {
+                        None
+                    };
                     let mut accounting = S3CapacityAccounting::new(&capacity, &storage);
                     let result = storage
-                        .upload_file(
+                        .upload_file_mode(
                             &relative,
-                            body,
+                            input,
                             content_length,
                             max_upload_bytes,
                             content_type.as_deref(),
+                            create_only,
                         )
                         .await;
                     match result {
@@ -506,7 +942,14 @@ impl StorageBackend {
                         Err(error) => {
                             drop(capacity_reservation);
                             schedule_s3_capacity_reconcile(capacity, storage);
-                            Err(error)
+                            if error.operation().is_none() {
+                                Err(error.with_operation(
+                                    crate::error::CommitState::Unknown,
+                                    crate::error::CleanupState::Unknown,
+                                ))
+                            } else {
+                                Err(error)
+                            }
                         }
                     }
                 })
@@ -520,6 +963,14 @@ impl StorageBackend {
     }
 
     pub async fn create_directory(&self, relative: &str) -> AppResult<()> {
+        let relative = relative.to_owned();
+        self.owned_mutation(move |backend| async move {
+            backend.create_directory_inner(&relative).await
+        })
+        .await
+    }
+
+    async fn create_directory_inner(&self, relative: &str) -> AppResult<()> {
         let active = &self.active;
         let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
         match &active.kind {
@@ -532,6 +983,12 @@ impl StorageBackend {
     }
 
     pub async fn remove(&self, relative: &str) -> AppResult<()> {
+        let relative = relative.to_owned();
+        self.owned_mutation(move |backend| async move { backend.remove_inner(&relative).await })
+            .await
+    }
+
+    async fn remove_inner(&self, relative: &str) -> AppResult<()> {
         let active = &self.active;
         let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
         let capacity = active.capacity.clone();
@@ -568,6 +1025,14 @@ impl StorageBackend {
     }
 
     pub async fn move_path(&self, source: &str, destination: &str) -> AppResult<()> {
+        let (source, destination) = (source.to_owned(), destination.to_owned());
+        self.owned_mutation(move |backend| async move {
+            backend.move_path_inner(&source, &destination).await
+        })
+        .await
+    }
+
+    async fn move_path_inner(&self, source: &str, destination: &str) -> AppResult<()> {
         let active = &self.active;
         let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
         let capacity = active.capacity.clone();
@@ -600,6 +1065,14 @@ impl StorageBackend {
     }
 
     pub async fn copy_path(&self, source: &str, destination: &str) -> AppResult<()> {
+        let (source, destination) = (source.to_owned(), destination.to_owned());
+        self.owned_mutation(move |backend| async move {
+            backend.copy_path_inner(&source, &destination).await
+        })
+        .await
+    }
+
+    async fn copy_path_inner(&self, source: &str, destination: &str) -> AppResult<()> {
         let active = &self.active;
         let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
         let capacity = active.capacity.clone();
@@ -694,6 +1167,12 @@ impl StorageBackend {
     }
 
     pub async fn reconcile_capacity(&self) {
+        let Ok(_lease) = self.active.lifecycle.clone().try_read_owned() else {
+            return;
+        };
+        if self.active.retired.load(Ordering::Acquire) {
+            return;
+        }
         let active = &self.active;
         match &active.kind {
             StorageBackendKind::Local(storage) => {
@@ -737,12 +1216,22 @@ fn spawn_local_capacity_reconciler(
                 let Some(current) = active.upgrade() else {
                     return;
                 };
+                if current.retired.load(Ordering::Acquire) {
+                    return;
+                }
+                let lease = current.lifecycle.clone().try_read_owned();
+                let Ok(_lease) = lease else {
+                    drop(current);
+                    tokio::time::sleep(retry).await;
+                    continue;
+                };
                 let result = match &current.kind {
                     StorageBackendKind::Local(storage) => {
                         reconcile_local_capacity(&current.capacity, storage).await
                     }
                     StorageBackendKind::S3(_) => return,
                 };
+                drop(_lease);
                 drop(current);
                 if result.is_ok() {
                     break;
@@ -843,6 +1332,25 @@ pub(crate) fn spawn_s3_recovery_reconciler(storage: S3Backend, capacity: Capacit
     });
 }
 
+fn interruptible_body(body: Body, cancellation: tokio_util::sync::CancellationToken) -> Body {
+    Body::from_stream(futures_util::stream::try_unfold(
+        (body.into_data_stream(), cancellation),
+        |(mut stream, cancellation)| async move {
+            let chunk = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted, "存储配置已变更，传输已中断，请重试")),
+                chunk = stream.next() => chunk,
+            };
+            match chunk {
+                Some(Ok(chunk)) => Ok(Some((chunk, (stream, cancellation)))),
+                Some(Err(error)) => Err(std::io::Error::other(error)),
+                None => Ok(None),
+            }
+        },
+    ))
+}
+
 async fn persist_capacity(capacity: &CapacityTracker) {
     if let Err(error) = capacity.persist().await {
         capacity.mark_uncertain();
@@ -923,6 +1431,99 @@ mod tests {
     use axum::body::Body;
 
     use super::{StorageBackend, StorageRegistry};
+
+    #[tokio::test]
+    async fn administrator_interrupt_cancels_download_and_revokes_old_admission() {
+        use futures_util::StreamExt;
+        let fixture = crate::test_support::TestDirectory::new("admin-download-interrupt");
+        let path = fixture.path().join("files");
+        let storage = crate::storage::StorageService::new(path.clone(), 1024, 1, 100, 0)
+            .await
+            .unwrap();
+        tokio::fs::write(path.join("saved.bin"), b"saved")
+            .await
+            .unwrap();
+        let registry = StorageRegistry::single("primary", StorageBackend::local(storage)).await;
+        let admitted = registry.get("primary").await.unwrap();
+        let response = admitted
+            .stream_file(
+                "saved.bin",
+                &axum::http::HeaderMap::new(),
+                crate::storage::FileResponseMode::Attachment,
+            )
+            .await
+            .unwrap();
+        let cached = registry.cached("primary").await.unwrap();
+        let edit = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            cached.interrupt_for_edit(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(registry.get("primary").await.is_err());
+        assert!(response
+            .into_body()
+            .into_data_stream()
+            .next()
+            .await
+            .unwrap()
+            .is_err());
+        assert_eq!(
+            tokio::fs::read(path.join("saved.bin")).await.unwrap(),
+            b"saved"
+        );
+        drop(edit);
+        let fresh = registry.get("primary").await.unwrap();
+        assert!(!fresh.transfer_token().is_cancelled());
+        assert!(admitted.transfer_token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_admission_survives_disable_and_an_abandoned_mutation_waiter() {
+        let fixture = crate::test_support::TestDirectory::new("backend-lifecycle");
+        let storage =
+            crate::storage::StorageService::new(fixture.path().join("files"), 1024, 1, 100, 0)
+                .await
+                .unwrap();
+        let registry = StorageRegistry::single("primary", StorageBackend::local(storage)).await;
+        let cached = registry.cached("primary").await.unwrap();
+        let admitted = registry.get("primary").await.unwrap();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            admitted
+                .owned_mutation(move |_backend| async move {
+                    started.send(()).unwrap();
+                    finishing.await.unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        entered.await.unwrap();
+        waiter.abort();
+        waiter.await.unwrap_err();
+        assert!(cached.edit_guard().await.is_err());
+        registry.set_enabled("primary", false).await;
+        assert!(registry.get("primary").await.is_err());
+        registry.set_enabled("primary", true).await;
+        assert!(cached.edit_guard().await.is_err());
+        finish.send(()).unwrap();
+        let edit = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(edit) = cached.edit_guard().await {
+                    break edit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(registry.get("primary").await.is_err());
+        edit.retire();
+        drop(edit);
+        assert!(registry.get("primary").await.is_err());
+    }
     use crate::capacity::load_capacity_ledger;
     use crate::directory_listing::{
         DirectoryEntryFilter, DirectoryListRequest, DirectorySort, SortDirection,

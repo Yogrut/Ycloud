@@ -206,6 +206,11 @@ describe('BrowserView', () => {
 
     expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc&gallery=true', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
     expect(host.querySelectorAll('.gallery-card')).toHaveLength(20)
+    const galleryBody = host.querySelector('.gallery-list-body')!
+    expect(galleryBody.classList.contains('file-list-body')).toBe(true)
+    expect(galleryBody.querySelector('.gallery-grid')).not.toBeNull()
+    expect(galleryBody.querySelector('.file-pagination')).toBeNull()
+    expect(galleryBody.nextElementSibling?.classList.contains('file-pagination')).toBe(true)
     expect(host.querySelector('.file-head')).toBeNull()
     expect(host.querySelector('.gallery-page-size')?.textContent).toContain('20')
     expect(toggle.getAttribute('aria-pressed')).toBe('true')
@@ -470,7 +475,7 @@ describe('BrowserView', () => {
     app.unmount()
   })
 
-  it('asks for an authorized account before opening a restricted storage', async () => {
+  it('does not expose a restricted storage in navigation', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       ...listResponse(['public.txt']),
       storages: [
@@ -485,12 +490,13 @@ describe('BrowserView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    await chooseOption(host, '.storage-switcher', 'Private（需登录）')
+    host.querySelector<HTMLButtonElement>('.storage-switcher .app-select-trigger')?.click()
     await nextTick()
 
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(host.querySelector('.storage-switcher .app-select-trigger')?.textContent).toContain('Public')
-    expect(document.querySelector('.user-account-modal')?.textContent).toContain('用户登录')
+    expect(host.querySelector('.storage-switcher')?.textContent).not.toContain('Private')
+    expect(document.querySelector('.user-account-modal')).toBeNull()
     app.unmount()
   })
 
@@ -737,7 +743,9 @@ describe('BrowserView', () => {
   it('retries a failed upload with its existing batch ticket', async () => {
     const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
       const url = String(input)
-      const body = url.includes('/api/upload/prepare') ? { ticket: 'batch-1' } : listResponse([])
+      const body = url.includes('/api/upload/prepare') ? { ticket: 'batch-1' }
+        : url.includes('/api/upload/status') ? { ticket: 'batch-1', items: [{ path: 'retry.txt', size: 5, status: 'failed' }] }
+          : listResponse([])
       return Promise.resolve(new Response(JSON.stringify(body), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },

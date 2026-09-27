@@ -19,10 +19,10 @@ const info: AdminInfo = {
   admin_login_block_seconds: 3600, web_login_block_seconds: 3600,
   security_log_retention_days: 7, security_log_max_entries: 5000,
   storage_instances: [
-    { id: 'primary', name: '本地存储', is_default: true, ready: true, backend: { type: 'local', path: './storage', capacity_limit_bytes: null }, usage_bytes: 0, reserved_bytes: 0 },
-    { id: 'archive', name: '归档盘', is_default: false, ready: true, backend: { type: 'local', mount_id: 'archive', path: '/mnt/archive', capacity_limit_bytes: null }, usage_bytes: 0, reserved_bytes: 0 },
+    { id: 'primary', name: '本地存储', enabled: true, ready: true, backend: { type: 'local', path: './storage', capacity_limit_bytes: null }, usage_bytes: 0, reserved_bytes: 0 },
+    { id: 'archive', name: '归档盘', enabled: true, ready: true, backend: { type: 'local', mount_id: 'archive', path: '/mnt/archive', capacity_limit_bytes: null }, usage_bytes: 0, reserved_bytes: 0 },
   ],
-  pending_storage_instance: null, default_storage_id: 'primary', local_storage_path: './storage',
+  pending_storage_instance: null,  local_storage_path: './storage',
   user_accounts: [{
     id: 'reader', username: 'reader', enabled: true,
     permissions: [{ storage_id: 'primary', browse: true, download: true, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false }],
@@ -49,6 +49,10 @@ describe('UsersView', () => {
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(host.querySelector('.user-traffic-quota')?.textContent).toBe('↓2K | ↑1K')
     expect(host.querySelector('.user-traffic-quota')?.classList.contains('status-pill')).toBe(true)
+    expect(host.querySelector('.user-traffic-usage')?.textContent).toBe('↓200B | ↑100B')
+    expect(host.querySelector('.user-traffic-usage')?.classList.contains('status-pill')).toBe(true)
+    expect(host.querySelector('.user-traffic-usage')?.parentElement).toBe(host.querySelector('.user-row'))
+    expect([...host.querySelectorAll('.user-table-head > span')].map(cell => cell.textContent)).toEqual(['用户', '状态', '流量额度', '已用流量', '可访问存储', '操作'])
     host.querySelector<HTMLButtonElement>('[aria-label="编辑"]')!.click(); await nextTick()
     host.querySelector<HTMLButtonElement>('.storage-grant-heading')!.click(); await nextTick()
     const access = host.querySelector<HTMLInputElement>('.storage-access-option input[role="switch"]')!

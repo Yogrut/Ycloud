@@ -121,14 +121,12 @@ pub async fn resolve_share(
     query: &FileQuery,
 ) -> Result<Share, StatusCode> {
     let config = state.config_file.read().await;
-    let default_storage_id = config.default_storage_id.clone();
-    let mut candidates = config
+    let candidates = config
         .storage_instances
         .iter()
         .filter(|storage| storage.enabled)
         .map(|storage| storage.id.clone())
         .collect::<Vec<_>>();
-    candidates.sort_by_key(|storage_id| usize::from(storage_id != &default_storage_id));
     drop(config);
     let candidates = if let Some(requested) = query.storage_id.as_deref() {
         if !candidates.iter().any(|storage_id| storage_id == requested) {
@@ -340,7 +338,9 @@ mod tests {
             );
         }
         let directory = crate::test_support::TestDirectory::new("guest-download");
-        let state = crate::test_support::app_state(&directory, config::ConfigFile::default()).await;
+        let state =
+            crate::test_support::app_state(&directory, config::ConfigFile::with_test_storage())
+                .await;
         let token = state.gate_access.create("__gate__".into()).await;
         let mut headers = HeaderMap::new();
         headers.insert(

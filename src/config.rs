@@ -76,7 +76,7 @@ pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
 pub const MIN_STORAGE_CAPACITY_BYTES: u64 = 1024 * 1024;
 pub const HARD_MAX_STORAGE_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 13;
+pub const CONFIG_SCHEMA_VERSION: u32 = 15;
 pub const DEFAULT_STORAGE_ID: &str = "primary";
 pub const MAX_STORAGE_INSTANCES: usize = 16;
 pub const MAX_USER_ACCOUNTS: usize = 100;
@@ -181,7 +181,6 @@ pub struct Config {
     /// Exact origins that administrators may use for MinIO/RustFS or generic
     /// S3 endpoints. Official Alibaba and Tencent endpoints are constrained by
     /// their provider presets instead.
-    pub s3_allowed_endpoints: HashSet<String>,
     /// Installation-local authentication key for mutating recovery records.
     /// It is derived from the protected configuration master key and must
     /// never be serialized or returned by an API.
@@ -279,10 +278,7 @@ impl Default for ConfigFile {
             schema_version: CONFIG_SCHEMA_VERSION,
             traffic: crate::traffic::TrafficSettings::default(),
             domain_binding: None,
-            storage_instances: vec![StorageInstanceConfig::primary(
-                StorageBackendConfig::default(),
-            )],
-            default_storage_id: default_storage_id(),
+            storage_instances: Vec::new(),
             pending_storage_instance: None,
             admin_username: default_admin_username(),
             admin_password_hash: default_hash.clone(),
@@ -291,16 +287,7 @@ impl Default for ConfigFile {
             user_accounts: Vec::new(),
             global_web_password_hash: Some(default_hash),
             folder_locks: Vec::new(),
-            shares: vec![Share {
-                id: uuid_v4(),
-                storage_id: default_storage_id(),
-                name: "Default".into(),
-                path: String::new(),
-                username: Some("admin".into()),
-                webdav_enabled: false,
-                password_hash: None,
-                readonly: false,
-            }],
+            shares: Vec::new(),
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             max_upload_batch_bytes: DEFAULT_MAX_UPLOAD_BATCH_BYTES,
             max_upload_batch_entries: DEFAULT_MAX_UPLOAD_BATCH_ENTRIES,
@@ -319,6 +306,18 @@ impl Default for ConfigFile {
 }
 
 #[cfg(test)]
+impl ConfigFile {
+    pub(crate) fn with_test_storage() -> Self {
+        Self {
+            storage_instances: vec![StorageInstanceConfig::primary(
+                StorageBackendConfig::default(),
+            )],
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
 use persistence::{config_backup_path, initial_credentials_path};
 
 #[cfg(test)]
@@ -327,7 +326,7 @@ mod tests {
         config_backup_path, hash_password, initial_credentials_path, load_config,
         normalize_s3_endpoint, path_is_same_or_descendant, paths_overlap,
         remove_initial_credentials, remove_initial_credentials_if_rotated, save_config,
-        verify_password, Config, ConfigFile, FolderLock, InitialCredentials, LocalStorageConfig,
+        verify_password, ConfigFile, FolderLock, InitialCredentials, LocalStorageConfig,
         S3AddressingStyle, S3Provider, S3StorageConfig, StorageBackendConfig,
         StorageInstanceConfig, StoragePermission, UserAccount, CONFIG_SCHEMA_VERSION,
         DEFAULT_MAX_ARCHIVE_BYTES, DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_UPLOAD_BATCH_BYTES,
@@ -374,7 +373,7 @@ mod tests {
 
     #[test]
     fn folder_lock_scope_is_unique_per_storage_and_normalized_path() {
-        let mut config = ConfigFile::default();
+        let mut config = ConfigFile::with_test_storage();
         let password_hash = hash_password("test-password");
         config.folder_locks.push(FolderLock {
             id: "first-lock".into(),
@@ -407,8 +406,17 @@ mod tests {
 
     #[test]
     fn enabled_webdav_requires_credentials() {
-        let mut config = ConfigFile::default();
-        config.shares[0].webdav_enabled = true;
+        let mut config = ConfigFile::with_test_storage();
+        config.shares.push(super::Share {
+            id: "test-share".into(),
+            storage_id: DEFAULT_STORAGE_ID.into(),
+            name: "Test".into(),
+            path: String::new(),
+            username: Some("admin".into()),
+            webdav_enabled: true,
+            password_hash: None,
+            readonly: false,
+        });
         assert!(config.validate().is_err());
         config.shares[0].password_hash = Some(hash_password("test-password"));
         assert!(config.validate().is_ok());
@@ -418,7 +426,7 @@ mod tests {
     fn transfer_limits_reject_values_outside_safe_envelope() {
         let mut config = ConfigFile {
             max_upload_bytes: 0,
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
         assert!(config.validate().is_err());
         config.max_upload_bytes = DEFAULT_MAX_UPLOAD_BYTES;
@@ -439,7 +447,7 @@ mod tests {
     fn adjustable_security_and_rate_limits_keep_hard_boundaries() {
         let mut config = ConfigFile {
             admin_login_failures: 2,
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
         assert!(config.validate().is_err());
         config.admin_login_failures = 3;
@@ -466,7 +474,7 @@ mod tests {
 
     #[test]
     fn ordinary_accounts_require_unique_names_and_storage_scoped_permissions() {
-        let mut config = ConfigFile::default();
+        let mut config = ConfigFile::with_test_storage();
         config.user_accounts.push(UserAccount {
             id: "reader".into(),
             username: "reader".into(),
@@ -498,7 +506,7 @@ mod tests {
 
     #[test]
     fn local_storage_instances_require_distinct_deployment_mounts() {
-        let mut config = ConfigFile::default();
+        let mut config = ConfigFile::with_test_storage();
         config.storage_instances.push(StorageInstanceConfig {
             id: "archive".into(),
             name: "Archive disk".into(),
@@ -539,11 +547,12 @@ mod tests {
                     access_key_id: "access-key".into(),
                     secret_access_key: "secret-key".into(),
                     capacity_limit_bytes: None,
+                    relay_upload: false,
                 }),
             }
         }
 
-        let mut config = ConfigFile::default();
+        let mut config = ConfigFile::with_test_storage();
         config.storage_instances.push(instance("photos", "photos/"));
         config
             .storage_instances
@@ -562,8 +571,17 @@ mod tests {
 
     #[test]
     fn configured_paths_must_be_canonical() {
-        let mut config = ConfigFile::default();
-        config.shares[0].path = "photos/./private".into();
+        let mut config = ConfigFile::with_test_storage();
+        config.shares.push(super::Share {
+            id: "test-share".into(),
+            storage_id: DEFAULT_STORAGE_ID.into(),
+            name: "Test".into(),
+            path: "photos/./private".into(),
+            username: None,
+            webdav_enabled: false,
+            password_hash: None,
+            readonly: false,
+        });
         assert!(config.validate().is_err());
         config.shares[0].path = "/photos/private/".into();
         assert!(config.validate().is_err());
@@ -588,7 +606,7 @@ mod tests {
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
             max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
         save_config(&path, &config).await.unwrap();
         config.admin_username = "second-admin".into();
@@ -656,7 +674,7 @@ mod tests {
         ));
         tokio::fs::create_dir_all(&directory).await.unwrap();
         let path = directory.join("config.json");
-        let mut raw = serde_json::to_value(ConfigFile::default()).unwrap();
+        let mut raw = serde_json::to_value(ConfigFile::with_test_storage()).unwrap();
         raw["schema_version"] = serde_json::json!(5);
         raw["storage_backend"] = serde_json::to_value(StorageBackendConfig::S3(S3StorageConfig {
             provider: S3Provider::Minio,
@@ -668,6 +686,7 @@ mod tests {
             access_key_id: "migration-access-key".into(),
             secret_access_key: "migration-secret-key".into(),
             capacity_limit_bytes: None,
+            relay_upload: false,
         }))
         .unwrap();
         raw["pending_storage_backend"] =
@@ -704,7 +723,7 @@ mod tests {
             Some(800 * 1024 * 1024)
         );
         assert!(migrated.pending_storage_instance.is_none());
-        assert_eq!(migrated.default_storage_id, DEFAULT_STORAGE_ID);
+        assert_eq!(migrated.storage_instances[0].id, DEFAULT_STORAGE_ID);
         tokio::fs::remove_dir_all(directory).await.unwrap();
     }
 
@@ -719,7 +738,7 @@ mod tests {
                 allow_guest_download: None,
                 backend: StorageBackendConfig::Local(LocalStorageConfig::default()),
             }),
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
         assert!(config.validate().is_err());
 
@@ -733,6 +752,7 @@ mod tests {
             access_key_id: "example-access-key".into(),
             secret_access_key: "example-secret-key".into(),
             capacity_limit_bytes: None,
+            relay_upload: false,
         };
         config.pending_storage_instance = Some(StorageInstanceConfig {
             id: "pending-s3".into(),
@@ -748,7 +768,7 @@ mod tests {
     #[test]
     fn storage_capacity_limit_has_safe_numeric_bounds() {
         let mut config = ConfigFile {
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
         config.storage_instances[0].backend = StorageBackendConfig::Local(LocalStorageConfig {
             capacity_limit_bytes: Some(super::MIN_STORAGE_CAPACITY_BYTES - 1),
@@ -774,6 +794,7 @@ mod tests {
             access_key_id: "example-access-key".into(),
             secret_access_key: "example-secret-key".into(),
             capacity_limit_bytes: None,
+            relay_upload: false,
         };
         let mut config = ConfigFile {
             storage_instances: vec![StorageInstanceConfig {
@@ -784,7 +805,7 @@ mod tests {
                 allow_guest_download: None,
                 backend: StorageBackendConfig::S3(settings.clone()),
             }],
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
         assert!(config.validate().is_ok());
 
@@ -808,56 +829,25 @@ mod tests {
     }
 
     #[test]
-    fn custom_s3_endpoint_cannot_expand_deployment_allowlist() {
-        let endpoint = normalize_s3_endpoint("HTTP://10.126.0.2:9000/").unwrap();
-        assert_eq!(endpoint, "http://10.126.0.2:9000");
-        let runtime = Config {
-            bind_address: std::net::IpAddr::from([127, 0, 0, 1]),
-            port: 18_473,
-            storage_path: "./storage".into(),
-            local_mounts: crate::storage_catalog::LocalMountCatalog::new(
-                "./storage".into(),
-                Vec::new(),
-            )
-            .unwrap(),
-            config_path: "./config.json".into(),
-            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
-            max_upload_batch_bytes: super::DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_BYTES,
-            max_upload_batch_entries: super::DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_ENTRIES,
-            max_archive_bytes: super::DEFAULT_DEPLOYMENT_MAX_ARCHIVE_BYTES,
-            max_archive_entries: super::DEFAULT_DEPLOYMENT_MAX_ARCHIVE_ENTRIES,
-            io_concurrency: 4,
-            max_list_entries: 10_000,
-            request_timeout_secs: 300,
-            upload_timeout_secs: 21_600,
-            disk_reserve_bytes: 512 * 1024 * 1024,
-            secure_cookies: false,
-            public_base_url: None,
-            public_host: None,
-            allowed_hosts: Default::default(),
-            s3_allowed_endpoints: [endpoint].into_iter().collect(),
-            transaction_auth_key: [0x31; 32],
-        };
-        let settings = S3StorageConfig {
-            provider: S3Provider::Minio,
-            endpoint: "http://10.126.0.2:9000".into(),
-            bucket: "ycloud-files".into(),
-            region: "us-east-1".into(),
-            prefix: "files/".into(),
-            addressing_style: S3AddressingStyle::Path,
-            access_key_id: "example-access-key".into(),
-            secret_access_key: "example-secret-key".into(),
-            capacity_limit_bytes: None,
-        };
-        assert!(runtime
-            .allows_storage_backend(&StorageBackendConfig::S3(settings.clone()))
-            .is_ok());
-        assert!(runtime
-            .allows_storage_backend(&StorageBackendConfig::S3(S3StorageConfig {
-                endpoint: "http://10.126.0.3:9000".into(),
-                ..settings
-            }))
-            .is_err());
+    fn custom_s3_endpoints_allow_private_servers_but_reject_embedded_credentials() {
+        assert_eq!(
+            normalize_s3_endpoint("HTTP://10.126.0.2:9000/").unwrap(),
+            "http://10.126.0.2:9000"
+        );
+        assert!(normalize_s3_endpoint("http://10.126.0.3:9000").is_ok());
+        for endpoint in [
+            "ftp://example.com",
+            "http://user:password@example.com",
+            "https://example.com/path",
+            "https://example.com?token=secret",
+            "https://example.com/#fragment",
+            "http://example.com:invalid",
+        ] {
+            assert!(
+                normalize_s3_endpoint(endpoint).is_err(),
+                "accepted endpoint: {endpoint}"
+            );
+        }
     }
 
     #[test]
@@ -872,6 +862,7 @@ mod tests {
             access_key_id: "example-access-key".into(),
             secret_access_key: "example-secret-key".into(),
             capacity_limit_bytes: None,
+            relay_upload: false,
         };
         let configured = |settings| ConfigFile {
             storage_instances: vec![StorageInstanceConfig {
@@ -882,7 +873,7 @@ mod tests {
                 allow_guest_download: None,
                 backend: StorageBackendConfig::S3(settings),
             }],
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
 
         assert!(configured(base.clone()).validate().is_ok());
@@ -916,6 +907,12 @@ mod tests {
         let path = directory.join("config.json");
 
         let first = load_config(&path).await.unwrap();
+        assert!(first.shares.is_empty());
+        assert!(ConfigFile::default().shares.is_empty());
+        assert!(ConfigFile::default().storage_instances.is_empty());
+        assert!(first.storage_instances.is_empty());
+        let reloaded = load_config(&path).await.unwrap();
+        assert!(reloaded.shares.is_empty());
         let credentials_path = initial_credentials_path(&path);
         let credentials: InitialCredentials =
             serde_json::from_slice(&tokio::fs::read(&credentials_path).await.unwrap()).unwrap();
@@ -982,7 +979,7 @@ mod tests {
         let config = ConfigFile {
             admin_totp_secret: Some(secret.clone()),
             admin_recovery_code_hashes: vec![hash_password("ABCDE23456")],
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
 
         save_config(&path, &config).await.unwrap();

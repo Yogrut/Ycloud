@@ -102,6 +102,10 @@ impl CapacityTracker {
         state.used = state.used.saturating_sub(bytes);
     }
 
+    pub fn set_limit(&self, limit: Option<u64>) {
+        self.lock_state().limit = limit;
+    }
+
     pub fn reconcile(&self, used: u64) {
         let mut state = self.lock_state();
         state.used = used;

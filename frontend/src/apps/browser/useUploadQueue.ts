@@ -101,7 +101,7 @@ export function useUploadQueue(context: UploadQueueContext) {
     const basePath = context.path.value
     const occupied = new Set(uploadTasks.value.filter(task => task.storageId === storageId
       && (['preparing', 'queued', 'uploading', 'paused', 'verifying'].includes(task.status) || task.retryBlocked))
-      .map(task => task.targetPath))
+      .map(task => task.originalTargetPath ?? task.targetPath))
     const unique = candidates.filter(candidate => {
       const target = joinUploadPath(basePath, candidate.relativePath)
       if (occupied.has(target)) return false
@@ -121,6 +121,7 @@ export function useUploadQueue(context: UploadQueueContext) {
         storageId,
         basePath,
         targetPath: joinUploadPath(basePath, candidate.relativePath),
+        originalTargetPath: joinUploadPath(basePath, candidate.relativePath),
         status: error ? 'failed' : 'queued',
         loaded: 0,
         error,
@@ -143,7 +144,39 @@ export function useUploadQueue(context: UploadQueueContext) {
     uploading.value = true
     const completedContexts = new Set<string>()
     try {
-      const tasksWithoutTicket = tasks.filter(task => !task.ticket)
+      // Revalidate old tickets before resuming. Only definitely unstarted or
+      // confirmed-uncommitted files may receive a fresh reservation.
+      const checkedTickets = new Map<string, Awaited<ReturnType<typeof getUploadBatchStatus>> | Error>()
+      for (const task of tasks) {
+        if (!task.ticket) continue
+        const key = `${task.storageId}\u0000${task.ticket}`
+        if (!checkedTickets.has(key)) {
+          try { checkedTickets.set(key, await getUploadBatchStatus(task.ticket, task.storageId)) }
+          catch (error) { checkedTickets.set(key, error instanceof Error ? error : new Error(String(error))) }
+        }
+        const checked = checkedTickets.get(key)!
+        if (checked instanceof Error) {
+          if (checked instanceof ApiError && checked.code === 'upload_batch_expired' && (!task.attempted || task.safeToPrepare)) {
+            task.ticket = undefined
+            task.targetPath = task.originalTargetPath ?? task.targetPath
+            task.relativePath = task.basePath && task.targetPath.startsWith(task.basePath + '/')
+              ? task.targetPath.slice(task.basePath.length + 1) : task.targetPath
+          } else if (task.attempted && !task.safeToPrepare) {
+            markUnconfirmed(task)
+          } else {
+            task.status = 'failed'
+            task.error = checked.message
+          }
+          continue
+        }
+        const item = checked.items.find(item => item.path === task.targetPath)
+        if (!item) { markUnconfirmed(task); continue }
+        if (item.status !== 'pending' && item.status !== 'failed') {
+          applyServerUploadState(task, item.status, item.operation)
+          if (item.status === 'in_progress' || item.status === 'unknown') void reconcileUploadTask(task)
+        }
+      }
+      const tasksWithoutTicket = tasks.filter(task => task.status === 'queued' && !task.ticket)
       const prepareGroups = new Map<string, UploadTask[]>()
       for (const task of tasksWithoutTicket) {
         prepareGroups.set(task.storageId, [...(prepareGroups.get(task.storageId) ?? []), task])
@@ -163,6 +196,14 @@ export function useUploadQueue(context: UploadQueueContext) {
             group.map(task => ({ path: task.targetPath, size: task.file.size })),
             storageId,
           )
+          for (const task of group) {
+            const assigned = prepared.items?.find(item => item.original_path === task.targetPath)
+            if (assigned) {
+              task.targetPath = assigned.path
+              task.relativePath = task.basePath && assigned.path.startsWith(task.basePath + '/')
+                ? assigned.path.slice(task.basePath.length + 1) : assigned.path
+            }
+          }
           if (disposed) {
             await cancelUploadBatch(prepared.ticket, storageId).catch(() => undefined)
             for (const task of group) {
@@ -179,6 +220,7 @@ export function useUploadQueue(context: UploadQueueContext) {
           for (const task of group) {
             if (task.status === 'cancelled') continue
             task.ticket = prepared.ticket
+            task.directUpload = prepared.upload_mode === 'direct'
             if (task.status === 'preparing') task.status = 'queued'
           }
         } catch (error) {
@@ -209,7 +251,9 @@ export function useUploadQueue(context: UploadQueueContext) {
           try {
             currentUploadTaskId = task.id
             currentUploadController = new AbortController()
-            await uploadFile(task.targetPath, task.file, loaded => { task.loaded = loaded }, task.storageId, ticket, currentUploadController.signal)
+            task.attempted = true
+            task.safeToPrepare = false
+            await uploadFile(task.targetPath, task.file, loaded => { task.loaded = loaded }, task.storageId, ticket, currentUploadController.signal, task.directUpload)
             if (task.cancelRequested) {
               task.status = 'verifying'
               task.error = locale.text('正在确认终止后的实际结果', 'Checking the result after termination')
@@ -243,6 +287,7 @@ export function useUploadQueue(context: UploadQueueContext) {
               } else {
                 task.status = 'failed'
                 task.retryBlocked = false
+                task.safeToPrepare = error instanceof ApiError && (error.code === 'upload_batch_expired' || error.operation?.commit === 'not_committed')
                 context.announce(task.error)
               }
             }
@@ -400,7 +445,7 @@ export function useUploadQueue(context: UploadQueueContext) {
         return
       }
       applyServerUploadState(task, item.status, item.operation)
-      if (item.status === 'in_progress') scheduleReconcile(task, attempt)
+      if (item.status === 'in_progress' || item.status === 'unknown') scheduleReconcile(task, attempt)
     } catch {
       scheduleReconcile(task, attempt)
     }
@@ -421,7 +466,17 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   function applyServerUploadState(task: UploadTask, status: UploadBatchItemState, operation?: ApiError['operation']): void {
+    if (status === 'cancelled' && operation?.commit === 'unknown') {
+      task.status = 'cancelled'
+      task.retryBlocked = true
+      task.safeToPrepare = false
+      task.cancelRequested = false
+      task.pauseRequested = false
+      task.error = locale.text('系统正在自动确认上传结果，请稍后查看', 'The server is automatically checking the upload result; check again shortly')
+      return
+    }
     task.retryBlocked = false
+    task.safeToPrepare = status === 'pending' || status === 'failed' || status === 'cancelled'
     if (status === 'complete') {
       task.loaded = task.file.size
       if (operation) {
@@ -474,7 +529,7 @@ export function useUploadQueue(context: UploadQueueContext) {
   function markUnconfirmed(task: UploadTask): void {
     task.status = 'failed'
     task.retryBlocked = true
-    task.error = locale.text('上传结果无法确认，请核对文件后再操作，不要直接重试', 'The upload result could not be confirmed. Check the file before retrying.')
+    task.error = locale.text('系统正在自动确认上传结果或清理临时数据，请稍后查看', 'The server is checking the upload result or cleaning temporary data; check again shortly')
     context.announce(task.error)
   }
 

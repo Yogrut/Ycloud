@@ -168,7 +168,7 @@ mod tests {
         let persisted = ConfigFile {
             admin_password_hash: config::hash_password("domain-test-password"),
             global_web_password_hash: None,
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
         config::save_config(&runtime.config_path, &persisted)
             .await

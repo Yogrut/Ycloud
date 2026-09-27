@@ -7,7 +7,7 @@ use super::{
     default_max_archive_bytes, default_max_archive_entries, default_max_upload_batch_bytes,
     default_max_upload_batch_entries, default_max_upload_bytes, default_security_log_max_entries,
     default_security_log_retention_days, default_storage_id, default_true,
-    default_web_login_failures, uuid_v4, DEFAULT_STORAGE_ID,
+    default_web_login_failures, uuid_v4,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,13 +133,14 @@ pub struct StorageInstanceConfig {
 }
 
 impl StorageInstanceConfig {
+    #[cfg(test)]
     pub(super) fn primary(backend: StorageBackendConfig) -> Self {
         let name = match &backend {
             StorageBackendConfig::Local(_) => "Local storage",
             StorageBackendConfig::S3(_) => "S3 storage",
         };
         Self {
-            id: DEFAULT_STORAGE_ID.into(),
+            id: super::DEFAULT_STORAGE_ID.into(),
             name: name.into(),
             enabled: true,
             allow_guest_access: true,
@@ -193,6 +194,9 @@ pub struct S3StorageConfig {
     pub addressing_style: S3AddressingStyle,
     pub access_key_id: String,
     pub secret_access_key: String,
+    /// Browser payloads normally go directly to S3; relay is an explicit fallback.
+    #[serde(default)]
+    pub relay_upload: bool,
     #[serde(default)]
     pub capacity_limit_bytes: Option<u64>,
 }
@@ -209,6 +213,7 @@ impl fmt::Debug for S3StorageConfig {
             .field("addressing_style", &self.addressing_style)
             .field("access_key_id", &"[REDACTED]")
             .field("secret_access_key", &"[REDACTED]")
+            .field("relay_upload", &self.relay_upload)
             .field("capacity_limit_bytes", &self.capacity_limit_bytes)
             .finish()
     }
@@ -241,7 +246,6 @@ pub struct ConfigFile {
     pub schema_version: u32,
     #[serde(default)]
     pub storage_instances: Vec<StorageInstanceConfig>,
-    pub default_storage_id: String,
     #[serde(default)]
     pub pending_storage_instance: Option<StorageInstanceConfig>,
     pub admin_username: String,

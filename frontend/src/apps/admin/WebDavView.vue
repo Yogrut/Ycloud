@@ -10,10 +10,9 @@ import AppSelect from '../../shared/components/AppSelect.vue'
 import { useLocale } from '../../shared/i18n'
 
 const MASK = '••••••'
-const { mounts, storages, defaultStorageId } = defineProps<{
+const { mounts, storages } = defineProps<{
   mounts: WebDavMountView[]
   storages: StorageInstanceView[]
-  defaultStorageId: string
 }>()
 const emit = defineEmits<{ changed: [message: string] }>()
 const locale = useLocale()
@@ -70,7 +69,7 @@ const hasChanges = computed(() => {
 function openCreate(): void {
   editing.value = undefined
   name.value = ''
-  storageId.value = defaultStorageId || storages[0]?.id || ''
+  storageId.value = storages.find(storage => storage.enabled && storage.ready)?.id || ''
   path.value = '/'
   username.value = ''
   password.value = ''

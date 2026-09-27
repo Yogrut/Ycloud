@@ -37,6 +37,9 @@ describe('shared Phosphor icon system', () => {
       if (path === join('src', 'apps', 'admin', 'TrafficPanel.vue')) {
         source = source.replace(/<svg data-chart="traffic-(?:usage|share)"[\s\S]*?<\/svg>/g, '')
       }
+      if (path === join('src', 'shared', 'components', 'UserTrafficRings.vue')) {
+        source = source.replace(/<svg data-chart="user-traffic"[\s\S]*?<\/svg>/g, '')
+      }
       return source.includes('<svg')
     })
     expect(handwritten).toEqual([])

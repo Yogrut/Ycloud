@@ -502,7 +502,7 @@ mod response_contract_tests {
                 password_hash: Some(crate::config::hash_password("contract-password")),
                 readonly: true,
             }],
-            ..Default::default()
+            ..crate::config::ConfigFile::with_test_storage()
         };
         let state = crate::test_support::app_state(&directory, persisted).await;
         tokio::fs::write(

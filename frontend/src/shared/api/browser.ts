@@ -39,6 +39,8 @@ export async function isPreviewTrafficExhausted(url: string): Promise<boolean> {
 export interface FileListResponse {
   storage_id: string
   storages: BrowserStorage[]
+  selection_scope?: string
+  empty_reason?: 'unconfigured' | 'forbidden' | 'unavailable' | null
   current_path: string
   parent_path: string | null
   entries: FileEntry[]
@@ -79,6 +81,8 @@ export interface BrowserStorage {
   id: string
   name: string
   requires_login: boolean
+  enabled?: boolean
+  ready?: boolean
 }
 
 export interface ArchivePrepareResponse {
@@ -214,7 +218,7 @@ export function prepareArchive(paths: string[], storageId?: string): Promise<Arc
   })
 }
 
-export function prepareUploadBatch(items: UploadBatchItem[], storageId?: string): Promise<{ ticket: string }> {
+export function prepareUploadBatch(items: UploadBatchItem[], storageId?: string): Promise<{ ticket: string; upload_mode?: 'direct' | 'relay'; items?: Array<{ original_path: string; path: string }> }> {
   return apiRequest(withStorage('/api/upload/prepare', storageId), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -254,7 +258,13 @@ export async function batchOperation(operation: BatchOperation, paths: string[],
   throw new ApiError(locale.text('服务返回了无效的批量操作结果，请先核对结果，不要直接重试', 'The server returned an invalid batch result. Verify before retrying.'), response.status, 'operation_result_unknown')
 }
 
-export function uploadFile(path: string, file: File, onProgress: (loaded: number) => void, storageId?: string, batch?: string, signal?: AbortSignal): Promise<void> {
+export async function uploadFile(path: string, file: File, onProgress: (loaded: number) => void, storageId?: string, batch?: string, signal?: AbortSignal, direct = false): Promise<void> {
+  if (direct) {
+    const target = new URL(actionApi('upload', path, storageId), window.location.origin)
+    if (batch) target.searchParams.set('batch', batch)
+    const { uploadDirectFile } = await import('./directUpload')
+    if (await uploadDirectFile(target.search, file, onProgress, signal)) return
+  }
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest()
     const abortRequest = () => request.abort()
@@ -267,7 +277,7 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
       clearTimeout(idleTimer)
       idleTimer = setTimeout(() => {
         cleanup()
-        reject(new ApiError(locale.text('上传长时间无响应，请先核对上传结果，不要直接重试。', 'Upload stalled. Verify the upload result before retrying.'), 0, 'operation_result_unknown'))
+        reject(new ApiError(locale.text('上传长时间无响应，系统会自动确认结果或清理临时数据。', 'Upload stalled. The server will check the result or clean temporary data.'), 0, 'operation_result_unknown'))
         request.abort()
       }, REQUEST_TIMEOUT_MS)
     }
@@ -304,7 +314,7 @@ export function uploadFile(path: string, file: File, onProgress: (loaded: number
       }
       cleanup()
       const unknown = request.status >= 500 && !details?.operation
-      if (unknown) message = locale.text('上传结果尚未确认，请先核对文件，不要直接重试。', 'Upload result is unknown. Check the file before retrying.')
+      if (unknown) message = locale.text('系统正在自动确认上传结果，请稍后查看。', 'The server is automatically checking the upload result; check again shortly.')
       reject(new ApiError(message, request.status, unknown ? 'operation_result_unknown' : details?.code, request.getResponseHeader('x-request-id') ?? undefined, details?.operation))
     })
     request.addEventListener('error', () => {

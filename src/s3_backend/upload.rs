@@ -26,10 +26,33 @@ impl S3Backend {
         max_upload_bytes: u64,
         content_type: Option<&str>,
     ) -> AppResult<S3UploadResult> {
+        self.upload_file_mode(
+            relative,
+            super::UploadInput::relay(body),
+            content_length,
+            max_upload_bytes,
+            content_type,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn upload_file_mode(
+        &self,
+        relative: &str,
+        mut input: super::UploadInput,
+        content_length: u64,
+        max_upload_bytes: u64,
+        content_type: Option<&str>,
+        create_only: bool,
+    ) -> AppResult<S3UploadResult> {
         if content_length > max_upload_bytes
             || content_length > S3_MULTIPART_MAX_PART_BYTES * S3_MULTIPART_MAX_PARTS
         {
             return Err(AppError::PayloadTooLarge);
+        }
+        if input.direct.is_none() {
+            input.body = crate::relay_budget::wrap(input.body);
         }
         // Upload streams may run concurrently before their short commit turn
         // on mutation_gate. Recovery takes this gate exclusively, so it can
@@ -40,31 +63,40 @@ impl S3Backend {
         let relative = StorageService::normalize_relative(relative)?;
         let destination_key = object_key(&self.prefix, &relative)?;
         self.ensure_parent_directory(&relative).await?;
-        let upload_id = uuid::Uuid::new_v4().simple().to_string();
+        let upload_id = input
+            .operation_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         let temporary_key = internal_key(&self.prefix, "uploads", &upload_id);
         let backup_key = internal_key(&self.prefix, "backups", &upload_id);
         let content_type = sanitize_content_type(content_type)?;
         let (intent_key, intent, intent_etag) = self
             .create_internal_upload_intent(&upload_id, content_length)
             .await?;
-        let upload = if content_length >= S3_MULTIPART_THRESHOLD {
+        let commit_owner = input.commit_owner.clone();
+        let interrupted = input.cancellation.clone();
+        let upload = if content_length >= S3_MULTIPART_THRESHOLD || input.direct.is_some() {
             self.multipart_upload(
                 &temporary_key,
-                body,
+                input,
                 content_length,
                 content_type.as_deref(),
                 &upload_id,
             )
             .await
         } else {
-            self.single_upload(
+            let cancellation = input.cancellation.clone().unwrap_or_default();
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(AppError::Conflict("存储配置已变更，上传已中断，请重试".into())),
+                result = self.single_upload(
                 &temporary_key,
-                body,
+                input.body,
                 content_length,
                 content_type.as_deref(),
                 &upload_id,
-            )
-            .await
+            ) => result,
+            }
         };
         if let Err(error) = upload {
             tracing::warn!(%error, "S3 temporary upload failed");
@@ -73,7 +105,14 @@ impl S3Backend {
                     &intent_key,
                     intent_etag.as_deref(),
                     &intent,
-                    AppError::ServiceUnavailable("对象存储上传失败或请求体长度不一致".into()),
+                    if interrupted
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    {
+                        AppError::Conflict("存储配置已变更，上传已中断，请重试".into())
+                    } else {
+                        AppError::ServiceUnavailable("对象存储上传失败或请求体长度不一致".into())
+                    },
                 )
                 .await);
         }
@@ -112,6 +151,9 @@ impl S3Backend {
             }
         };
 
+        if let Some(owner) = commit_owner {
+            *owner.lock().await = Some(self.acquire_capacity_mutation().await);
+        }
         let _mutation = self.mutation_gate.lock().await;
         if let Err(error) = self.ensure_parent_directory(&relative).await {
             return Err(self
@@ -147,6 +189,16 @@ impl S3Backend {
                     .await);
             }
         };
+        if create_only && existing.is_some() {
+            return Err(self
+                .finish_uncommitted_internal_upload(
+                    &intent_key,
+                    intent_etag.as_deref(),
+                    &intent,
+                    AppError::Conflict("上传目标已被占用，不能覆盖已有文件".into()),
+                )
+                .await);
+        }
         if temporary.etag.is_none()
             || existing
                 .as_ref()
@@ -167,7 +219,7 @@ impl S3Backend {
         let journal_key = internal_key(&self.prefix, "transactions", &upload_id);
         let mut transaction = S3UploadTransaction {
             schema_version: S3_TRANSACTION_SCHEMA_VERSION,
-            id: upload_id,
+            id: upload_id.clone(),
             relative: relative.clone(),
             stage: S3UploadStage::Prepared,
             temporary: S3ObjectSnapshot {
@@ -228,11 +280,12 @@ impl S3Backend {
         }
 
         let commit = self
-            .copy_key(
+            .copy_key_with_operation(
                 &temporary_key,
                 &destination_key,
                 temporary.etag.as_deref(),
-                false,
+                create_only,
+                Some(&upload_id),
             )
             .await;
         let committed = match commit {
@@ -243,8 +296,8 @@ impl S3Backend {
                 tracing::warn!(%error, "S3 upload commit returned an ambiguous failure");
                 self.head_key(&destination_key).await?.filter(|value| {
                     value.size == content_length
-                        && temporary.etag.is_some()
-                        && value.etag == temporary.etag
+                        && (value.operation_id.as_deref() == Some(upload_id.as_str())
+                            || (temporary.etag.is_some() && value.etag == temporary.etag))
                 })
             }
         };

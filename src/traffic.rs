@@ -558,6 +558,36 @@ pub struct TrafficQuery {
     pub end: Option<String>,
 }
 #[derive(Serialize)]
+pub struct UserTrafficView {
+    pub usage: Usage,
+    pub quota: Quota,
+    pub next_reset: i64,
+}
+
+/// Return only the authenticated ordinary account's current-cycle usage.
+pub async fn user_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<UserTrafficView>> {
+    let Some(crate::auth::SessionPrincipal::User(id)) =
+        crate::auth::current_principal(&state, &headers).await
+    else {
+        return Err(AppError::Forbidden);
+    };
+    let settings = state.config_file.read().await.traffic.clone();
+    let runtime = state.traffic.inner.lock().await;
+    if runtime.failed {
+        return Err(AppError::ServiceUnavailable("流量记账暂不可用".into()));
+    }
+    let mut ledger = runtime.ledger.clone();
+    ledger.advance(Utc::now().timestamp(), &settings.cycle);
+    Ok(Json(UserTrafficView {
+        usage: ledger.users.get(&id).cloned().unwrap_or_default(),
+        quota: settings.users.get(&id).cloned().unwrap_or_default(),
+        next_reset: ledger.next_reset,
+    }))
+}
+#[derive(Serialize)]
 pub struct TrafficView {
     pub settings: TrafficSettings,
     pub total: Usage,
@@ -665,6 +695,103 @@ mod tests {
             upload,
             download,
         }
+    }
+
+    #[tokio::test]
+    async fn direct_download_redirects_bypass_all_vps_allowances_and_accounting() {
+        let settings = TrafficSettings {
+            total: quota(1, 1),
+            guest: quota(1, 1),
+            users_total: quota(1, 1),
+            users: BTreeMap::from([("first".into(), quota(1, 1))]),
+            ..Default::default()
+        };
+        let (_directory, store, _config) = fixture(settings).await;
+        // Fill the VPS allowance first: a direct URL must still be returned.
+        store
+            .charge("admin".into(), Direction::Download, 1)
+            .await
+            .unwrap();
+        for subject in ["admin", "guest", "user:first"] {
+            let response = Response::builder()
+                .status(axum::http::StatusCode::TEMPORARY_REDIRECT)
+                .header("location", "https://storage.example/file")
+                .body(Body::empty())
+                .unwrap();
+            let response = store.download(response, subject.into()).await.unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::TEMPORARY_REDIRECT
+            );
+            assert_eq!(
+                response.headers()["location"],
+                "https://storage.example/file"
+            );
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+        }
+        let runtime = store.inner.lock().await;
+        assert_eq!(runtime.ledger.total.download, 1);
+        assert_eq!(runtime.ledger.total.upload, 0);
+        assert_eq!(runtime.ledger.guest.download, 0);
+        assert_eq!(runtime.ledger.users_total.download, 0);
+        assert!(runtime.ledger.users.is_empty());
+        assert_eq!(runtime.records, 1);
+    }
+
+    #[tokio::test]
+    async fn user_traffic_view_is_scoped_to_the_authenticated_account() {
+        use crate::config::{StoragePermission, UserAccount};
+        let directory = TestDirectory::new("user-traffic-view");
+        let mut config = ConfigFile::with_test_storage();
+        let password_hash = crate::config::hash_password("isolated-test-password");
+        for id in ["first", "second"] {
+            config.user_accounts.push(UserAccount {
+                id: id.into(),
+                username: id.into(),
+                password_hash: password_hash.clone(),
+                enabled: true,
+                permissions: vec![StoragePermission {
+                    storage_id: "primary".into(),
+                    browse: true,
+                    ..Default::default()
+                }],
+            });
+        }
+        config.traffic.users.insert("first".into(), quota(100, 200));
+        let state = crate::test_support::app_state(&directory, config).await;
+        state
+            .traffic
+            .charge("user:first".into(), Direction::Upload, 30)
+            .await
+            .unwrap();
+        state
+            .traffic
+            .charge("user:second".into(), Direction::Upload, 60)
+            .await
+            .unwrap();
+        for (id, used) in [("first", 30), ("second", 60)] {
+            let token = state.sessions.create_user(id.into()).await;
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::COOKIE,
+                format!("session={token}").parse().unwrap(),
+            );
+            let view = user_info(State(state.clone()), headers).await.unwrap().0;
+            assert_eq!(view.usage.upload, used);
+            assert_eq!(
+                view.quota.limit(Direction::Upload),
+                if id == "first" { 100 } else { 0 }
+            );
+            let json = serde_json::to_value(view).unwrap();
+            assert!(json.get("users").is_none());
+            assert!(json.get("settings").is_none());
+        }
+        assert!(matches!(
+            user_info(State(state), HeaderMap::new()).await,
+            Err(AppError::Forbidden)
+        ));
     }
     fn timestamp(value: &str) -> i64 {
         DateTime::parse_from_rfc3339(value).unwrap().timestamp()

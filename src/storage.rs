@@ -340,6 +340,11 @@ impl StorageService {
         }
     }
 
+    pub(crate) async fn recover_quiesced_uploads(&self) -> AppResult<()> {
+        let _mutation = self.mutation_gate.lock().await;
+        self.transactions.recover(self.root()).await
+    }
+
     pub async fn remove(&self, path: &ResolvedPath) -> AppResult<u64> {
         self.remove_with_capacity(path, None).await
     }

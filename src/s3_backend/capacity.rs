@@ -21,7 +21,12 @@ impl S3Backend {
         capacity: &crate::capacity::CapacityTracker,
     ) -> AppResult<()> {
         let _accounting = self.acquire_capacity_mutation().await;
-        let _recovery = self.recovery_gate.write().await;
+        if self.recovery_worker_stopped() {
+            return Err(AppError::ServiceUnavailable("存储连接已退役".into()));
+        }
+        let _recovery = self.recovery_gate.try_write().map_err(|_| {
+            AppError::ServiceUnavailable("上传正在进行，容量核对将在任务结束后重试".into())
+        })?;
         let _mutation = self.mutation_gate.lock().await;
         if self.recovery_has_pending() {
             return Err(AppError::ServiceUnavailable(

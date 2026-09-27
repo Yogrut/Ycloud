@@ -60,9 +60,15 @@ function quotaFor(account: UserAccountView): TrafficQuota {
   return trafficInfo.value?.settings.users[account.id] ?? { enabled: false, upload: 0, download: 0 }
 }
 function quotaSummary(account: UserAccountView): string {
+  if (!trafficInfo.value) return '—'
   const quota = quotaFor(account)
   if (!quota.enabled) return '↓∞ | ↑∞'
   return `↓${formatTraffic(quota.download)} | ↑${formatTraffic(quota.upload)}`
+}
+function usageSummary(account: UserAccountView): string {
+  if (!trafficInfo.value) return locale.text('未读取', 'Unavailable')
+  const usage = trafficInfo.value.users[account.id] ?? { download: 0, upload: 0 }
+  return `↓${usage.download ? formatTraffic(usage.download) : '0 B'} | ↑${usage.upload ? formatTraffic(usage.upload) : '0 B'}`
 }
 async function loadTraffic(): Promise<void> {
   trafficInfo.value = await getTraffic()
@@ -158,12 +164,13 @@ async function remove(): Promise<void> {
   <section class="admin-pane list-pane glass" aria-labelledby="users-title">
     <header class="admin-pane-head"><div><h1 id="users-title">{{ locale.text('用户管理', 'User management') }}</h1><p>{{ locale.text('用户只能由管理员创建、授权和修改密码，且不能进入管理后台。', 'Only administrators can create users, assign permissions, or change passwords. Users cannot open the admin console.') }}</p></div><button class="btn" type="button" @click="openEditor()">{{ locale.text('新建用户', 'New user') }}</button></header>
     <div class="admin-pane-body user-list">
-      <div class="record-table-head user-table-head"><span>{{ locale.text('用户', 'User') }}</span><span>{{ locale.text('状态', 'Status') }}</span><span>{{ locale.text('流量额度', 'Traffic allowance') }}</span><span>{{ locale.text('可访问存储', 'Accessible storage') }}</span><span>{{ locale.text('操作', 'Actions') }}</span></div>
+      <div class="record-table-head user-table-head"><span>{{ locale.text('用户', 'User') }}</span><span>{{ locale.text('状态', 'Status') }}</span><span>{{ locale.text('流量额度', 'Traffic allowance') }}</span><span>{{ locale.text('已用流量', 'Traffic usage') }}</span><span>{{ locale.text('可访问存储', 'Accessible storage') }}</span><span>{{ locale.text('操作', 'Actions') }}</span></div>
       <div v-if="!accounts.length" class="admin-empty">{{ locale.text('暂无用户', 'No users') }}</div>
       <article v-for="account in accounts" :key="account.id" class="user-row">
         <strong class="admin-record-name" :title="account.username">{{ account.username }}</strong>
         <div><span class="status-pill" :class="{ inactive: !account.enabled }">{{ account.enabled ? locale.text('已启用', 'Enabled') : locale.text('已停用', 'Disabled') }}</span></div>
         <span class="status-pill user-traffic-quota">{{ quotaSummary(account) }}</span>
+        <span class="status-pill user-traffic-usage">{{ usageSummary(account) }}</span>
         <span class="user-storage-count">{{ locale.text(`${account.permissions.length} 个存储`, `${account.permissions.length} storage(s)`) }}</span>
         <div class="row-actions"><button class="record-text-btn" type="button" :title="locale.t('common.edit')" :aria-label="locale.t('common.edit')" @click="openEditor(account)">{{ locale.t('common.edit') }}</button><button class="record-text-btn danger" type="button" :title="locale.t('common.delete')" :aria-label="locale.t('common.delete')" @click="pendingDelete = account; deleteError = ''">{{ locale.t('common.delete') }}</button></div>
       </article>

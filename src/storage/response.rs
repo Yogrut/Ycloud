@@ -370,7 +370,8 @@ mod tests {
         use axum::{middleware, routing::get, Router};
         use tower::ServiceExt;
         let directory = TestDirectory::new("file-security-middleware");
-        let runtime = crate::test_support::runtime_config(directory.path());
+        let state =
+            crate::test_support::app_state(&directory, crate::config::ConfigFile::default()).await;
         let router = Router::new()
             .route(
                 "/file",
@@ -382,7 +383,7 @@ mod tests {
                 }),
             )
             .layer(middleware::from_fn_with_state(
-                runtime,
+                state,
                 crate::security::security_headers_middleware,
             ));
         let response = router

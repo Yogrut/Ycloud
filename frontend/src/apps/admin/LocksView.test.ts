@@ -10,12 +10,12 @@ afterEach(() => {
 
 function mountLocks(host: HTMLElement, locks: FolderLockView[] = []) {
   const storages: StorageInstanceView[] = [{
-    id: 'primary', name: '本地存储', is_default: true, ready: true,
+    id: 'primary', name: '本地存储', enabled: true, ready: true,
     backend: { type: 'local', path: './storage', capacity_limit_bytes: null },
     usage_bytes: 0, reserved_bytes: 0,
   }]
   const changed = vi.fn()
-  const app = createApp(LocksView, { locks, storages, defaultStorageId: 'primary', onChanged: changed })
+  const app = createApp(LocksView, { locks, storages, onChanged: changed })
   app.mount(host)
   return { app, changed }
 }

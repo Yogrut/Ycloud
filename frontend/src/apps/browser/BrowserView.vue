@@ -63,6 +63,7 @@ const {
   directorySizes,
   disposeListing,
   entries,
+  emptyReason,
   galleryMode,
   isAdministrator,
   loading,
@@ -401,7 +402,7 @@ onBeforeUnmount(() => {
         >
           <AppIcon :name="galleryMode ? 'list' : 'gallery'" />
         </button>
-        <UserAccountMenu ref="userAccountMenu" :storage-name="storages.find(storage => storage.id === currentStorageId)?.name ?? ''" :capabilities="capabilities" @signed-in="onUserSignedIn" @sign-out="signOut" @closed="pendingStorageId = ''" />
+        <UserAccountMenu ref="userAccountMenu" @signed-in="onUserSignedIn" @sign-out="signOut" @closed="pendingStorageId = ''" />
         <button class="icon-btn flat" type="button" :title="locale.text('管理员', 'Administrator')" :aria-label="locale.text('管理员', 'Administrator')" @click="openAdmin()"><AppIcon name="administrator" /></button>
         <ThemeToggle :theme="theme.current.value" class="flat" @toggle="theme.toggle" />
         <LocaleToggle class="flat" />
@@ -450,8 +451,11 @@ onBeforeUnmount(() => {
           <button class="sort-btn right modified" type="button" @click="changeSort('time')">{{ locale.text('修改时间', 'Modified') }} <span>{{ sort === 'time' ? (ascending ? '▲' : '▼') : '' }}</span></button>
         </div>
         <div v-if="loading" class="empty file-list-body">{{ locale.t('common.loading') }}</div>
+        <div v-else-if="emptyReason" class="empty file-list-body">{{ emptyReason === 'unconfigured' ? locale.text('尚未配置存储，请管理员在后台添加存储。', 'No storage configured. Ask an administrator to add one.') : emptyReason === 'forbidden' ? locale.text('当前账号没有可访问的存储。', 'No storage is accessible to this account.') : locale.text('存储暂不可用，请稍后重试。', 'Storage is temporarily unavailable. Please try again later.') }}</div>
         <div v-else-if="!(galleryMode ? galleryImages.length : visibleEntries.length)" class="empty file-list-body">{{ appliedQuery ? locale.text('没有匹配的文件', 'No matching files') : galleryMode ? locale.text('此文件夹没有可展示的图片', 'No supported images in this folder') : locale.text('此文件夹为空', 'This folder is empty') }}</div>
-        <GalleryGrid v-else-if="galleryMode" :entries="visibleEntries" :storage-id="currentStorageId" :selected="selected" @open="openGalleryEntry" @select="toggleSelection($event.path)" @context-menu="openRowMenu" />
+        <div v-else-if="galleryMode" class="file-list-body gallery-list-body">
+          <GalleryGrid :entries="visibleEntries" :storage-id="currentStorageId" :selected="selected" @open="openGalleryEntry" @select="toggleSelection($event.path)" @context-menu="openRowMenu" />
+        </div>
         <div v-else class="file-list-body">
           <div
             v-for="entry in visibleEntries"
@@ -653,7 +657,6 @@ onBeforeUnmount(() => {
   font-size: 12px;
   white-space: nowrap;
 }
-.file-panel.gallery-mode { overflow-y: auto; }
 .ycloud-audio-dock { position: fixed; z-index: 80; bottom: clamp(90px, 27vh, 290px); left: clamp(14px, 1.8vw, 34px); width: 56px; height: 56px; }
 .ycloud-audio-dock summary { display: grid; place-items: center; width: 56px; height: 56px; color: var(--audio-accent); background: var(--panel); border: 1px solid var(--line); border-radius: 50%; box-shadow: 0 4px 16px rgb(0 0 0 / 10%); cursor: pointer; list-style: none; }
 .ycloud-audio-dock summary::-webkit-details-marker { display: none; }

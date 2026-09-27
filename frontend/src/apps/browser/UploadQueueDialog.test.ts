@@ -3,7 +3,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import UploadQueueDialog from './UploadQueueDialog.vue'
 import type { UploadTask, UploadTaskStatus } from './uploadQueue'
 
-afterEach(() => document.body.replaceChildren())
+afterEach(() => {
+  document.body.replaceChildren()
+  vi.useRealTimers()
+})
 
 function task(id: number, status: UploadTaskStatus, error = ''): UploadTask {
   const file = new File(['data'], `${status}.txt`)
@@ -27,6 +30,46 @@ function mountUploadDialog(host: HTMLElement, props: Record<string, unknown>) {
 }
 
 describe('UploadQueueDialog', () => {
+  it('samples live upload speed and resets on stalls, pause, retry and completion', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
+    const host = document.createElement('div')
+    document.body.append(host)
+    const files = reactive([{ ...task(1, 'uploading'), file: new File([new Uint8Array(4096)], 'large.bin') }])
+    const app = mountUploadDialog(host, { tasks: files })
+    const speed = () => host.querySelector('.upload-overall-speed')?.textContent
+    expect(speed()).toBe('0 B/s')
+    files[0]!.loaded = 1024
+    await vi.advanceTimersByTimeAsync(500)
+    await nextTick()
+    expect(speed()).toBe('2.0 KB/s')
+    expect(host.querySelector('.upload-overall-transfer')?.lastElementChild?.className).toBe('upload-overall-percent')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(speed()).toBe('0 B/s')
+    files[0]!.status = 'paused'
+    files[0]!.loaded = 0
+    await vi.advanceTimersByTimeAsync(500)
+    expect(speed()).toBe('0 B/s')
+    files[0]!.status = 'uploading'
+    await vi.advanceTimersByTimeAsync(500)
+    files[0]!.loaded = 512
+    await vi.advanceTimersByTimeAsync(500)
+    expect(speed()).toBe('1.0 KB/s')
+    files[0]!.loaded = 0
+    await vi.advanceTimersByTimeAsync(500)
+    expect(speed()).toBe('0 B/s')
+    files[0]!.loaded = 4096
+    files[0]!.status = 'verifying'
+    await vi.advanceTimersByTimeAsync(500)
+    expect(speed()).toBe('0 B/s')
+    expect(host.querySelector('.upload-overall-percent')?.textContent).toBe('99%')
+    files[0]!.status = 'succeeded'
+    await vi.advanceTimersByTimeAsync(500)
+    expect(speed()).toBe('0 B/s')
+    expect(host.querySelector('.upload-overall-percent')?.textContent).toBe('100%')
+    app.unmount()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('does not offer direct retry for a result requiring verification', async () => {
     const host = document.createElement('div')
     document.body.append(host)

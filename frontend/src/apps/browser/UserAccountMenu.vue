@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { getIdentity, type Identity } from '../../shared/api/auth'
-import { userLogin, type BrowserCapabilities } from '../../shared/api/browser'
+import { getIdentity, getUserTraffic, type Identity, type UserTraffic } from '../../shared/api/auth'
+import { userLogin } from '../../shared/api/browser'
+import UserTrafficRings from '../../shared/components/UserTrafficRings.vue'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import AppFeedback from '../../shared/components/AppFeedback.vue'
 import { useLocale } from '../../shared/i18n'
 
-const props = defineProps<{ storageName: string; capabilities: BrowserCapabilities }>()
 const emit = defineEmits<{ signedIn: []; signOut: []; closed: [] }>()
 const locale = useLocale()
 const identity = ref<Identity | null>(null)
@@ -21,17 +21,26 @@ const trigger = ref<HTMLButtonElement>()
 const keyboardNavigation = ref(false)
 const profilePosition = ref({ left: '0px', top: '0px' })
 const signedIn = computed(() => identity.value?.logged_in && !identity.value.is_admin && !!identity.value.username)
-const permissions = computed(() => {
-  const labels: Array<[keyof BrowserCapabilities, string]> = [
-    ['download', locale.text('下载', 'Download')], ['upload', locale.text('上传', 'Upload')],
-    ['create_directory', locale.text('新建文件夹', 'Create folders')], ['rename', locale.text('重命名', 'Rename')],
-    ['move_items', locale.text('移动', 'Move')], ['copy', locale.text('复制', 'Copy')], ['delete', locale.text('删除', 'Delete')],
-  ]
-  return labels.filter(([key]) => props.capabilities[key]).map(([, label]) => label)
-})
+const traffic = ref<UserTraffic>()
+const trafficError = ref('')
+let identityRevision = 0
 
 async function refreshIdentity(): Promise<void> {
-  try { identity.value = await getIdentity() } catch { identity.value = null }
+  const revision = ++identityRevision
+  try {
+    const result = await getIdentity()
+    if (revision !== identityRevision) return
+    identity.value = result
+  } catch { if (revision === identityRevision) identity.value = null }
+  if (revision !== identityRevision || !visible.value || !signedIn.value) return
+  traffic.value = undefined
+  trafficError.value = ''
+  try {
+    const result = await getUserTraffic()
+    if (revision === identityRevision && visible.value) traffic.value = result
+  } catch {
+    if (revision === identityRevision && visible.value) trafficError.value = locale.text('流量信息读取失败', 'Unable to load traffic usage')
+  }
 }
 function open(): void {
   if (visible.value) { close(); return }
@@ -56,7 +65,7 @@ function placeProfile(): void {
     top: `${bounds.bottom + 8}px`,
   }
 }
-watch([visible, signedIn, permissions, () => props.storageName, () => identity.value?.username], placeProfile, { flush: 'post' })
+watch([visible, signedIn, traffic, trafficError, () => identity.value?.username], placeProfile, { flush: 'post' })
 function dismissOutside(event: Event): void {
   if (!visible.value || !signedIn.value || busy.value) return
   const target = event.target as Node | null
@@ -119,6 +128,7 @@ onMounted(() => {
   window.addEventListener('scroll', placeProfile, true)
 })
 onBeforeUnmount(() => {
+  identityRevision++
   document.removeEventListener('pointerdown', handlePointer)
   document.removeEventListener('focusin', dismissOutside)
   document.removeEventListener('keydown', handleEscape)
@@ -134,11 +144,10 @@ defineExpose({ open, refreshIdentity })
   </button>
   <Teleport to="body">
     <section v-if="visible && signedIn" ref="dialog" class="user-account-popover" :style="profilePosition" role="dialog" :aria-label="locale.text('用户信息', 'User information')">
-      <div class="user-account-summary"><AppIcon name="account" :size="30" /><div><strong>{{ identity?.username }}</strong><p>{{ locale.text('普通用户', 'User') }}</p></div></div>
-      <dl class="user-account-details">
-        <dt>{{ locale.text('当前存储', 'Current storage') }}</dt><dd>{{ storageName || '—' }}</dd>
-        <dt>{{ locale.text('操作权限', 'Permissions') }}</dt><dd>{{ permissions.join('、') || locale.text('仅浏览', 'Browse only') }}</dd>
-      </dl>
+      <div class="user-account-summary"><AppIcon name="account" :size="26" /><div><strong>{{ identity?.username }}</strong><p>{{ locale.text('普通用户', 'User') }}</p></div></div>
+      <UserTrafficRings v-if="traffic" :usage="traffic.usage" :quota="traffic.quota" />
+      <p v-else class="user-traffic-note" role="status">{{ trafficError || locale.text('正在读取流量…', 'Loading traffic…') }}</p>
+      <p v-if="traffic" class="user-traffic-note">{{ locale.text('仅计经服务器的传输，S3 直传不计；另受全站及共享额度限制。', 'Only server-relayed transfers count; direct S3 transfers are excluded. Site and shared allowances also apply.') }}</p>
       <button class="user-account-signout" :class="{ 'keyboard-focus': keyboardNavigation }" type="button" @click="emit('signOut')"><AppIcon name="sign-out" :size="17" />{{ locale.text('退出登录', 'Sign out') }}</button>
     </section>
     <div v-else-if="visible" class="overlay active user-account-overlay" @click.self="close" @keydown.esc="close">
@@ -180,13 +189,11 @@ defineExpose({ open, refreshIdentity })
 .user-login-form .input:not([type="password"]) { font-size: 14px; letter-spacing: normal; }
 .user-login-form .input::placeholder { color: var(--muted); font-size: 13px; font-weight: 400; letter-spacing: normal; }
 .user-login-form .user-login-submit { width: 100%; min-height: 42px; margin-top: 2px; border-radius: 8px; }
-.user-account-popover { position: fixed; z-index: 90; box-sizing: border-box; width: max-content; min-width: min(200px, calc(100vw - 24px)); max-width: min(360px, calc(100vw - 24px)); padding: 14px 12px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); max-height: calc(100dvh - 96px); overflow-y: auto; }
-.user-account-summary { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; font-size: 14px; }
+.user-account-popover { position: fixed; z-index: 90; box-sizing: border-box; width: min(240px, calc(100vw - 24px)); padding: 12px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); max-height: calc(100dvh - 96px); overflow-y: auto; }
+.user-account-summary { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; }
 .user-account-summary svg { color: var(--accent); }
 .user-account-summary strong { overflow-wrap: anywhere; }
-.user-account-summary p { margin: 5px 0 0; font-size: 13px; }
-.user-account-details { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px 12px; margin: 0; font-size: 12px; line-height: 1.6; }
-.user-account-details dt { color: var(--muted); }
-.user-account-details dd { margin: 0; overflow-wrap: anywhere; }
+.user-account-summary p { margin: 4px 0 0; font-size: 12px; }
+.user-traffic-note { color: var(--muted); font-size: 11px; line-height: 1.6; }
 .user-account-signout { display: flex; align-items: center; gap: 8px; width: 100%; margin-top: 14px; padding: 12px 0 0; border: 0; border-top: 1px solid var(--line); background: transparent; color: var(--accent); cursor: pointer; font: inherit; font-size: 13px; }
 </style>

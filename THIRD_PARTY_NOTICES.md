@@ -1,29 +1,17 @@
-# Third-Party Notices
+# 第三方开源组件
 
-Ycloud 前端使用 [Phosphor Icons](https://phosphoricons.com/)（`@phosphor-icons/vue`）。
+Ycloud 使用以下开源组件。准确版本由 `Cargo.lock` 和 `frontend/package-lock.json` 固定；本文件只列主要项目，不逐个介绍。
 
-Phosphor Icons 采用 MIT License：
+| 项目 | 许可证 |
+| --- | --- |
+| Vue、VueUse、Reka UI、Phosphor Icons、Tailwind CSS、tailwind-merge、clsx、shadcn-vue 组件 | MIT |
+| class-variance-authority | Apache-2.0 |
+| Axum、Tokio、Tower、tracing、bytes、http-body、http-body-util、mime_guess、async_zip | MIT |
+| Serde、serde_json、Chrono、UUID、anyhow、Argon2、base64、rand_core、futures-util、fs4、qrcode、windows-sys | MIT 或 Apache-2.0 |
+| rustix | MIT 或 Apache-2.0（另提供 LLVM exception 选项） |
+| AWS SDK for Rust、AWS Smithy | Apache-2.0 |
+| ring | Apache-2.0 与 ISC |
 
-```text
-Copyright (c) 2020 Phosphor Icons
+随产品分发的代码所需版权、许可文本和 NOTICE 统一保存在 [许可附录](THIRD_PARTY_LICENSES.md)，相同许可条款合并保存，并保留各组件的版权信息。附录包含实际前端产物，以及当前 x86_64 Windows/Linux 后端普通依赖的声明；测试依赖、纯构建工具不列入。
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-Rust 与前端依赖的准确版本分别由 `Cargo.lock` 和 `frontend/package-lock.json` 固定。发布二进制或分发前应根据锁文件重新生成完整依赖许可证清单。
+分发可执行文件、前端产物或容器时，应一并携带这两个声明文件。依赖、目标平台或功能发生变化后，应重新核对附录；系统库和容器操作系统组件由对应发行包的版权文件说明。这些许可证不等于 Ycloud 自身的项目许可证。

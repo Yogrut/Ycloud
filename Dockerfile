@@ -19,6 +19,7 @@ RUN apt-get update \
     && install --directory --owner=ycloud --group=ycloud --mode=0700 /var/lib/ycloud /var/lib/ycloud/storage
 
 COPY --from=builder --chown=root:root /build/target/release/ycloud /usr/local/bin/ycloud
+COPY --chown=root:root THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.md /usr/share/doc/ycloud/
 
 WORKDIR /var/lib/ycloud
 ENV BIND_ADDRESS=0.0.0.0 \
@@ -28,7 +29,7 @@ ENV BIND_ADDRESS=0.0.0.0 \
     RUST_LOG=info
 
 EXPOSE 18473
-USER 10001:10001
+# Runtime identity is selected by docker run --user or Compose user.
 STOPSIGNAL SIGTERM
 
 ENTRYPOINT ["/usr/local/bin/ycloud"]

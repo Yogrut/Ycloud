@@ -53,7 +53,6 @@ pub struct AdminInfo {
     pub security_log_max_entries: usize,
     pub storage_instances: Vec<StorageInstanceView>,
     pub pending_storage_instance: Option<StorageInstanceView>,
-    pub default_storage_id: String,
     pub local_storage_path: String,
     pub local_mounts: Vec<LocalMountView>,
     pub user_accounts: Vec<UserAccountView>,
@@ -93,7 +92,6 @@ impl From<&UserAccount> for UserAccountView {
 pub struct StorageInstanceView {
     pub id: String,
     pub name: String,
-    pub is_default: bool,
     pub enabled: bool,
     pub allow_guest_access: bool,
     pub allow_guest_download: bool,
@@ -137,6 +135,7 @@ pub enum StorageBackendView {
         addressing_style: S3AddressingStyle,
         has_access_key_id: bool,
         has_secret_access_key: bool,
+        relay_upload: bool,
         capacity_limit_bytes: Option<u64>,
     },
 }
@@ -162,6 +161,7 @@ impl StorageBackendView {
                 addressing_style: settings.addressing_style,
                 has_access_key_id: !settings.access_key_id.is_empty(),
                 has_secret_access_key: !settings.secret_access_key.is_empty(),
+                relay_upload: settings.relay_upload,
                 capacity_limit_bytes: settings.capacity_limit_bytes,
             },
         }
@@ -269,7 +269,6 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
         security_log_max_entries,
         storage_configs,
         pending_storage_config,
-        default_storage_id,
         user_accounts,
     ) = {
         let config = state.config_file.read().await;
@@ -299,7 +298,6 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
             config.security_log_max_entries,
             config.storage_instances.clone(),
             config.pending_storage_instance.clone(),
-            config.default_storage_id.clone(),
             config
                 .user_accounts
                 .iter()
@@ -318,12 +316,11 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
         })
         .collect::<std::collections::HashMap<_, _>>();
     for instance in storage_configs {
-        storage_instances.push(storage_instance_view(&state, instance, &default_storage_id).await);
+        storage_instances.push(storage_instance_view(&state, instance).await);
     }
     let pending_storage_instance = pending_storage_config.map(|instance| StorageInstanceView {
         id: instance.id,
         name: instance.name,
-        is_default: false,
         enabled: instance.enabled,
         allow_guest_access: instance.allow_guest_access,
         allow_guest_download: instance.allow_guest_access
@@ -396,7 +393,6 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
         security_log_max_entries,
         storage_instances,
         pending_storage_instance,
-        default_storage_id,
         local_storage_path: state.config.storage_path.to_string_lossy().into_owned(),
         local_mounts,
         user_accounts,
@@ -406,7 +402,6 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
 async fn storage_instance_view(
     state: &AppState,
     instance: StorageInstanceConfig,
-    default_storage_id: &str,
 ) -> StorageInstanceView {
     let backend_view = StorageBackendView::from_config(&instance.backend, &state.config);
     let (
@@ -473,7 +468,6 @@ async fn storage_instance_view(
         ),
     };
     StorageInstanceView {
-        is_default: instance.id == default_storage_id,
         status: if !instance.enabled {
             "disabled"
         } else if ready {
@@ -706,14 +700,6 @@ pub async fn update_storage_access(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
-pub async fn set_default_storage(
-    State(state): State<AppState>,
-    Path(storage_id): Path<String>,
-) -> AppResult<Json<serde_json::Value>> {
-    state.set_default_storage(&storage_id).await?;
-    Ok(Json(serde_json::json!({ "success": true })))
-}
-
 pub async fn delete_storage(
     State(state): State<AppState>,
     Path(storage_id): Path<String>,
@@ -777,15 +763,12 @@ pub async fn update_transfer_limits(
             "打包下载策略超过部署环境允许的绝对上限；请调整 MAX_ARCHIVE_BYTES 或 MAX_ARCHIVE_ENTRIES 后重启服务".into(),
         ));
     }
-    let current = state.config_file.read().await.clone();
-    let upload_rate = body
-        .upload_rate_bytes_per_sec
-        .unwrap_or(current.upload_rate_bytes_per_sec);
-    let download_rate = body
-        .download_rate_bytes_per_sec
-        .unwrap_or(current.download_rate_bytes_per_sec);
-    validate_transfer_rate(upload_rate, "上传")?;
-    validate_transfer_rate(download_rate, "下载")?;
+    if let Some(rate) = body.upload_rate_bytes_per_sec {
+        validate_transfer_rate(rate, "上传")?;
+    }
+    if let Some(rate) = body.download_rate_bytes_per_sec {
+        validate_transfer_rate(rate, "下载")?;
+    }
     state
         .update_config(move |config| {
             config.max_upload_bytes = body.max_upload_bytes;
@@ -793,8 +776,12 @@ pub async fn update_transfer_limits(
             config.max_upload_batch_entries = body.max_upload_batch_entries;
             config.max_archive_bytes = body.max_archive_bytes;
             config.max_archive_entries = body.max_archive_entries;
-            config.upload_rate_bytes_per_sec = upload_rate;
-            config.download_rate_bytes_per_sec = download_rate;
+            if let Some(rate) = body.upload_rate_bytes_per_sec {
+                config.upload_rate_bytes_per_sec = rate;
+            }
+            if let Some(rate) = body.download_rate_bytes_per_sec {
+                config.download_rate_bytes_per_sec = rate;
+            }
             Ok(())
         })
         .await?;
@@ -980,10 +967,12 @@ pub async fn create_share(
     Json(body): Json<CreateShareRequest>,
 ) -> AppResult<Json<ShareView>> {
     let password_hash = hash_optional_password(&state, body.password, 12, "WebDAV").await?;
-    let default_storage_id = state.config_file.read().await.default_storage_id.clone();
     let share = Share {
         id: Uuid::new_v4().to_string(),
-        storage_id: body.storage_id.unwrap_or(default_storage_id),
+        storage_id: body
+            .storage_id
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| AppError::BadRequest("请选择存储".into()))?,
         name: body.name.trim().to_string(),
         path: body.path.trim_matches('/').to_string(),
         username: body
@@ -1161,10 +1150,12 @@ pub async fn create_lock(
     Json(body): Json<CreateLockRequest>,
 ) -> AppResult<Json<FolderLockView>> {
     validate_password(&body.password, 8, "文件夹锁")?;
-    let default_storage_id = state.config_file.read().await.default_storage_id.clone();
     let lock = FolderLock {
         id: Uuid::new_v4().to_string(),
-        storage_id: body.storage_id.unwrap_or(default_storage_id),
+        storage_id: body
+            .storage_id
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| AppError::BadRequest("请选择存储".into()))?,
         path: body.path.trim_matches('/').to_string(),
         password_hash: state.passwords.hash(body.password).await?,
     };
@@ -1310,5 +1301,32 @@ mod tests {
         assert!(validate_password("密码安全", 4, "测试").is_ok());
         assert!(validate_password("密码安全", 5, "测试").is_err());
         assert!(validate_password("Dav密码-2026-安全", 12, "WebDAV").is_ok());
+    }
+
+    #[tokio::test]
+    async fn concurrent_partial_rate_updates_preserve_both_explicit_values() {
+        use super::*;
+        use crate::test_support::{app_state, TestDirectory};
+        let directory = TestDirectory::new("partial-rates");
+        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
+        let config = state.config_file.read().await.clone();
+        let request = |upload_rate, download_rate| UpdateTransferLimitsRequest {
+            max_upload_bytes: config.max_upload_bytes,
+            max_upload_batch_bytes: config.max_upload_batch_bytes,
+            max_upload_batch_entries: config.max_upload_batch_entries,
+            max_archive_bytes: config.max_archive_bytes,
+            max_archive_entries: config.max_archive_entries,
+            upload_rate_bytes_per_sec: upload_rate,
+            download_rate_bytes_per_sec: download_rate,
+        };
+        let (first, second) = tokio::join!(
+            update_transfer_limits(State(state.clone()), Json(request(Some(1_048_576), None))),
+            update_transfer_limits(State(state.clone()), Json(request(None, Some(2_097_152))))
+        );
+        let _ = first.unwrap();
+        let _ = second.unwrap();
+        let current = state.config_file.read().await;
+        assert_eq!(current.upload_rate_bytes_per_sec, 1_048_576);
+        assert_eq!(current.download_rate_bytes_per_sec, 2_097_152);
     }
 }

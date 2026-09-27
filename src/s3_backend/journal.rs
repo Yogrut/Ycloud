@@ -164,6 +164,7 @@ impl S3Backend {
         previous_etag: Option<&str>,
     ) -> AppResult<Option<String>> {
         validate_multipart_session(&self.prefix, journal_key, session)?;
+        self.validate_directory_multipart_target(session).await?;
         self.write_authenticated_json_journal(
             journal_key,
             S3_MULTIPART_SESSION_JOURNAL_PURPOSE,
@@ -277,6 +278,7 @@ impl S3Backend {
             .read_authenticated_json_journal(key, S3_MULTIPART_SESSION_JOURNAL_PURPOSE)
             .await?;
         validate_multipart_session(&self.prefix, key, &session)?;
+        self.validate_directory_multipart_target(&session).await?;
         Ok((session, etag))
     }
 

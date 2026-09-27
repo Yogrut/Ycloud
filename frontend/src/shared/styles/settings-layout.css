@@ -79,10 +79,10 @@
 .list-pane .admin-record-name { font-weight: 500; }
 .list-pane .admin-record-end { justify-content: space-between; }
 .list-pane .user-row:hover, .list-pane .storage-source-row:hover, .list-pane .lock-record:hover, .list-pane .webdav-record:hover { background: var(--panel-soft); }
-.user-table-head, .list-pane .user-row { display: grid; grid-template-columns: minmax(100px, .85fr) minmax(80px, .5fr) minmax(190px, 1.15fr) minmax(110px, .75fr) 76px; align-items: center; gap: 16px; }
-.user-table-head > :last-child { text-align: right; }
+.user-table-head, .list-pane .user-row { display: grid; grid-template-columns: minmax(100px, .85fr) minmax(80px, .5fr) minmax(145px, 1fr) minmax(145px, 1fr) minmax(110px, .75fr) 76px; align-items: center; gap: 16px; }
+.user-table-head > *, .list-pane .user-row > * { justify-self: center; text-align: center; }
 .user-storage-count { color: var(--muted); }
-.user-traffic-quota { width: fit-content; color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 24%, var(--line)); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.user-traffic-quota, .user-traffic-usage { width: fit-content; color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 24%, var(--line)); white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 .confirmation-overlay { padding: 20px; backdrop-filter: none; }
 .modal.confirmation-dialog { display: block; width: min(460px, 100%); max-height: calc(100dvh - 40px); overflow: auto; padding: 0; border-radius: 4px; font-size: 14px; line-height: 1.6; }
@@ -188,10 +188,11 @@
   .list-pane .admin-pane-head { padding: 18px 16px 12px; }
   .list-pane .admin-pane-body { padding: 0 16px 14px; }
   .list-pane .user-row { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+  .list-pane .user-row > * { justify-self: start; text-align: left; }
   .list-pane .user-row .row-actions { grid-column: 2; grid-row: 1 / 3; }
   .list-pane .user-row > div:not(.row-actions) { grid-column: 1; }
   .list-pane .user-row .user-storage-count { grid-column: 1; font-size: 12px; }
-  .list-pane .user-row .user-traffic-quota { grid-column: 1; font-size: 12px; }
+  .list-pane .user-row .user-traffic-quota, .list-pane .user-row .user-traffic-usage { grid-column: 1; font-size: 12px; }
   .confirmation-body { padding: 4px 18px 8px; }
   .list-pane .storage-source-row, .list-pane .lock-record, .list-pane .webdav-record { grid-template-columns: minmax(0, 1fr); gap: 10px; }
   .settings-rows { padding: 24px 18px; }

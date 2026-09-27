@@ -24,11 +24,27 @@ use super::{
     S3_SINGLE_COPY_LIMIT,
 };
 use crate::{
-    config::{normalize_s3_endpoint, Config, S3AddressingStyle, S3Provider, S3StorageConfig},
+    config::{Config, S3AddressingStyle, S3Provider, S3StorageConfig},
     error::CommitState,
 };
 
 const SOURCE_ETAG: &str = "\"source-etag\"";
+
+#[tokio::test]
+async fn capacity_mutations_queue_on_the_same_s3_backend() {
+    // No network requests: test only the shared accounting gate, not NAS throughput.
+    let backend = test_backend("http://127.0.0.1:1");
+    let first = backend.acquire_capacity_mutation().await;
+    let second = backend.acquire_capacity_mutation();
+    tokio::pin!(second);
+    assert!(tokio::time::timeout(Duration::from_millis(30), &mut second)
+        .await
+        .is_err());
+    drop(first);
+    let _next = tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .unwrap();
+}
 const SOURCE_LENGTH: usize = 7;
 const MULTIPART_ETAG: &str = "\"multipart-etag-65\"";
 const INTERNAL_INTENT_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -1529,7 +1545,7 @@ fn bad_request_response() -> String {
     "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\nx-amz-request-id: local-test\r\n\r\n".into()
 }
 
-fn test_backend(endpoint: &str) -> S3Backend {
+pub(super) fn test_backend(endpoint: &str) -> S3Backend {
     let settings = S3StorageConfig {
         provider: S3Provider::S3Compatible,
         endpoint: endpoint.into(),
@@ -1540,6 +1556,7 @@ fn test_backend(endpoint: &str) -> S3Backend {
         access_key_id: "local-test-access-key".into(),
         secret_access_key: "local-test-secret-key".into(),
         capacity_limit_bytes: Some(1024 * 1024),
+        relay_upload: false,
     };
     let runtime = Config {
         bind_address: IpAddr::from([127, 0, 0, 1]),
@@ -1565,10 +1582,37 @@ fn test_backend(endpoint: &str) -> S3Backend {
         public_base_url: None,
         public_host: None,
         allowed_hosts: HashSet::new(),
-        s3_allowed_endpoints: HashSet::from([normalize_s3_endpoint(endpoint).unwrap()]),
         transaction_auth_key: [0x31; 32],
     };
     S3Backend::new(&settings, &runtime).unwrap()
+}
+
+#[tokio::test]
+async fn s3_redirect_does_not_forward_authenticated_requests() {
+    for status in [301, 302, 307, 308] {
+        let destination = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", origin.local_addr().unwrap());
+        let location = format!("http://{}/", destination.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let (_, _, headers) = read_request(&mut stream).await.unwrap();
+            assert!(headers.to_ascii_lowercase().contains("authorization:"));
+            stream.write_all(format!("HTTP/1.1 {status} Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let error = test_backend(&endpoint).probe().await.unwrap_err();
+        assert!(!error.to_string().contains("local-test-secret-key"));
+        server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), destination.accept())
+                .await
+                .is_err()
+        );
+    }
 }
 
 #[tokio::test]

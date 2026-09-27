@@ -32,6 +32,9 @@ pub(crate) enum UploadOwnership {
 /// Synchronous notifications at the mutation boundary; publication accounting
 /// must not wait until fallible directory sync or backup cleanup has finished.
 pub(crate) trait ReplacementObserver {
+    fn must_create_new(&self) -> bool {
+        false
+    }
     fn prepare(&mut self, _previous_size: u64) -> AppResult<()> {
         Ok(())
     }
@@ -53,6 +56,7 @@ impl DeletionObserver for () {}
 #[derive(Clone)]
 pub struct TransactionPaths {
     root: PathBuf,
+    _ownership_lock: std::sync::Arc<std::fs::File>,
     #[cfg(target_os = "linux")]
     linux_root: LinuxRoot,
     pub uploads: PathBuf,
@@ -153,8 +157,23 @@ impl TransactionPaths {
             .set_private_file_permissions(&marker_relative)
             .await?;
         linux_root.ensure_private_directory(SYSTEM_DIR).await?;
+        let lock_relative = format!("{SYSTEM_DIR}/instance.lock");
+        let lock = match linux_root.metadata(&lock_relative).await {
+            Ok(metadata) if metadata.is_file() => {
+                linux_root
+                    .open_file_for_read(&lock_relative)
+                    .await?
+                    .into_std()
+                    .await
+            }
+            Err(AppError::NotFound) => linux_root.create_file_new(&lock_relative, 0o600).await?,
+            _ => return Err(AppError::Conflict("本地存储实例锁必须是普通文件".into())),
+        };
+        lock.try_lock()
+            .map_err(|_| AppError::Conflict("本地存储正在由另一个实例使用".into()))?;
         let paths = Self {
             root: root.to_path_buf(),
+            _ownership_lock: std::sync::Arc::new(lock),
             linux_root,
             uploads: system.join("uploads"),
             copies: system.join("copies"),
@@ -251,6 +270,12 @@ impl TransactionPaths {
         }
         let paths = Self {
             root: root.to_path_buf(),
+            _ownership_lock: {
+                let file =
+                    crate::instance_lock::InstanceLock::acquire_file(&system.join("instance.lock"))
+                        .map_err(|_| AppError::Conflict("本地存储正在由另一个实例使用".into()))?;
+                std::sync::Arc::new(file)
+            },
             uploads: system.join("uploads"),
             copies: system.join("copies"),
             backups: system.join("backups"),
@@ -591,7 +616,7 @@ impl TransactionPaths {
         decode_deletion_journal(path, file).await
     }
 
-    async fn recover(&self, root: &Path) -> AppResult<()> {
+    pub(crate) async fn recover(&self, root: &Path) -> AppResult<()> {
         // Inspect the entire bounded recovery set before performing any rename
         // or removal. A bad/unrecognized entry must not leave a half-cleaned set.
         let journal_files = self
@@ -809,6 +834,11 @@ impl TransactionPaths {
         }
         self.validate_destination(relative).await?;
         let metadata = self.rooted_metadata(destination).await?;
+        if observer.must_create_new() && metadata.is_some() {
+            return Err(AppError::Conflict(
+                "上传目标已被占用，不能覆盖已有文件".into(),
+            ));
+        }
         if let Some(metadata) = metadata.as_ref() {
             if !metadata.file_type().is_file() {
                 return Err(AppError::Conflict(
@@ -1316,6 +1346,7 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        drop(paths);
         TransactionPaths::initialize(root.path()).await.unwrap();
         assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"new report");
     }
@@ -1338,6 +1369,7 @@ mod tests {
         tokio::fs::write(paths.journals.join(format!("{id}.json")), bytes)
             .await
             .unwrap();
+        drop(paths);
         TransactionPaths::initialize(root.path()).await.unwrap();
         TransactionPaths::initialize(root.path()).await.unwrap();
         assert_eq!(
@@ -1378,6 +1410,7 @@ mod tests {
         })
         .unwrap();
         tokio::fs::write(&record, &bytes).await.unwrap();
+        drop(paths);
         assert!(TransactionPaths::initialize(root.path()).await.is_err());
         assert_eq!(tokio::fs::read(&record).await.unwrap(), bytes);
         assert_eq!(tokio::fs::read(&pending).await.unwrap(), b"pending data");
@@ -1401,6 +1434,7 @@ mod tests {
             serde_json::to_vec(&ReplaceJournal::new(id, "documents/report.txt".into()).unwrap())
                 .unwrap();
         tokio::fs::write(&record, &bytes).await.unwrap();
+        drop(paths);
         assert!(TransactionPaths::initialize(root.path()).await.is_err());
         assert_eq!(tokio::fs::read(&backup).await.unwrap(), b"original");
         assert_eq!(tokio::fs::read(&record).await.unwrap(), bytes);
@@ -1428,6 +1462,7 @@ mod tests {
         let source = root.path().join("old.txt");
         tokio::fs::write(&source, b"old").await.unwrap();
         let trash = paths.stage_delete(&source, 3, &mut ()).await.unwrap();
+        drop(paths);
         TransactionPaths::initialize(root.path()).await.unwrap();
         TransactionPaths::initialize(root.path()).await.unwrap();
         assert!(!copy.exists());
@@ -1484,6 +1519,7 @@ mod tests {
         .unwrap();
         tokio::fs::write(&record, &bytes).await.unwrap();
 
+        drop(paths);
         assert!(TransactionPaths::initialize(root.path()).await.is_err());
         assert_eq!(tokio::fs::read(&record).await.unwrap(), bytes);
         assert_eq!(tokio::fs::read(&trash).await.unwrap(), b"deleted data");
@@ -1568,6 +1604,7 @@ mod tests {
             .await
             .unwrap();
 
+        drop(paths);
         TransactionPaths::initialize(&root).await.unwrap();
         TransactionPaths::initialize(&root).await.unwrap();
         assert_eq!(

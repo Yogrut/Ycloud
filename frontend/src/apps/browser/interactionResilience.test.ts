@@ -134,6 +134,52 @@ describe('file operation resilience', () => {
   })
 })
 
+describe('upload reservation recovery', () => {
+  it('does not queue the original file again after the server assigns a numbered name', async () => {
+    const pending = deferred<void>()
+    vi.mocked(uploadFile).mockReturnValueOnce(pending.promise)
+    vi.mocked(prepareUploadBatch).mockResolvedValueOnce({ ticket: 'numbered', items: [{ original_path: 'one.txt', path: 'one (2).txt' }] })
+    const { add, queue } = uploads()
+    const file = new File(['one'], 'one.txt')
+    const first = add([file])
+    await settle()
+    expect(queue.uploadTasks.value[0]?.targetPath).toBe('one (2).txt')
+    await add([file])
+    expect(queue.uploadTasks.value).toHaveLength(1)
+    expect(prepareUploadBatch).toHaveBeenCalledTimes(1)
+    pending.resolve()
+    await first
+    queue.disposeUploads()
+  })
+
+  it('prepares a fresh ticket for an expired file that never started', async () => {
+    const { queue } = uploads()
+    const file = new File(['one'], 'one.txt')
+    queue.uploadTasks.value.push({ id: 1, file, relativePath: 'one (2).txt', basePath: '', storageId: 'primary', targetPath: 'one (2).txt', originalTargetPath: 'one.txt', ticket: 'expired', status: 'paused', loaded: 0, error: '' })
+    vi.mocked(getUploadBatchStatus).mockRejectedValueOnce(new ApiError('Expired', 410, 'upload_batch_expired'))
+    vi.mocked(prepareUploadBatch).mockResolvedValueOnce({ ticket: 'fresh', items: [{ original_path: 'one.txt', path: 'one (3).txt' }] })
+    vi.mocked(uploadFile).mockResolvedValueOnce(undefined)
+    queue.resumeUploads([1])
+    await settle()
+    expect(prepareUploadBatch).toHaveBeenCalledWith([{ path: 'one.txt', size: 3 }], 'primary')
+    expect(queue.uploadTasks.value[0]?.status).toBe('succeeded')
+    expect(uploadFile).toHaveBeenCalledWith('one (3).txt', file, expect.any(Function), 'primary', 'fresh', expect.any(AbortSignal), false)
+    queue.disposeUploads()
+  })
+
+  it('never obtains a new ticket when an attempted upload result is missing', async () => {
+    const { queue } = uploads()
+    queue.uploadTasks.value.push({ id: 1, file: new File(['one'], 'one.txt'), relativePath: 'one.txt', basePath: '', storageId: 'primary', targetPath: 'one.txt', originalTargetPath: 'one.txt', ticket: 'expired', attempted: true, status: 'paused', loaded: 0, error: '' })
+    vi.mocked(getUploadBatchStatus).mockRejectedValueOnce(new ApiError('Expired', 410, 'upload_batch_expired'))
+    queue.resumeUploads([1])
+    await settle()
+    expect(prepareUploadBatch).not.toHaveBeenCalled()
+    expect(uploadFile).not.toHaveBeenCalled()
+    expect(queue.uploadTasks.value[0]?.retryBlocked).toBe(true)
+    queue.disposeUploads()
+  })
+})
+
 describe('listing resilience', () => {
   it('cancels superseded requests during rapid navigation and ignores late responses', async () => {
     const first = deferred<FileListResponse>()
@@ -181,6 +227,18 @@ describe('listing resilience', () => {
 })
 
 describe('upload queue resilience', () => {
+  it('uses server-assigned duplicate names for upload and visible task records', async () => {
+    vi.mocked(prepareUploadBatch).mockResolvedValueOnce({ ticket: 'numbered', items: [{ original_path: 'one.txt', path: 'one (6).txt' }] })
+    vi.mocked(uploadFile).mockResolvedValue(undefined)
+    const { add, queue } = uploads()
+    await add([new File(['one'], 'one.txt')])
+    await settle()
+    expect(vi.mocked(uploadFile).mock.calls[0]?.[0]).toBe('one (6).txt')
+    expect(queue.uploadTasks.value[0]?.targetPath).toBe('one (6).txt')
+    expect(queue.uploadTasks.value[0]?.relativePath).toBe('one (6).txt')
+    expect(queue.uploadTasks.value[0]?.status).toBe('succeeded')
+    queue.disposeUploads()
+  })
   it('ignores repeated drops of an active target while keeping uploads sequential', async () => {
     const pending = deferred<void>()
     vi.mocked(uploadFile).mockReturnValueOnce(pending.promise).mockResolvedValue(undefined)
@@ -218,6 +276,26 @@ describe('upload queue resilience', () => {
     add([new File(['one'], 'one.txt')])
     await settle()
     expect(queue.uploadTasks.value[0]?.status).toBe('succeeded')
+    expect(uploadFile).toHaveBeenCalledTimes(1)
+    queue.disposeUploads()
+  })
+
+  it('does not treat an administrator-closed uncertain task as an uncommitted upload', async () => {
+    vi.mocked(uploadFile).mockRejectedValueOnce(new ApiError('offline', 0, 'operation_result_unknown'))
+    vi.mocked(getUploadBatchStatus).mockResolvedValueOnce({ ticket: 'ticket', items: [{
+      path: 'one.txt', size: 3, status: 'cancelled',
+      operation: { commit: 'unknown', cleanup: 'unknown', retry: 'verify_first' },
+    }] })
+    const { add, queue } = uploads()
+    add([new File(['one'], 'one.txt')])
+    await settle()
+    const task = queue.uploadTasks.value[0]!
+    expect(task.status).toBe('cancelled')
+    expect(task.retryBlocked).toBe(true)
+    expect(task.safeToPrepare).toBe(false)
+    expect(task.error).not.toContain('确认未提交')
+    queue.retryUpload(task.id)
+    await settle()
     expect(uploadFile).toHaveBeenCalledTimes(1)
     queue.disposeUploads()
   })

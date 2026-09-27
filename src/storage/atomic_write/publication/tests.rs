@@ -25,6 +25,32 @@ async fn close(storage: StorageService) {
 }
 
 #[tokio::test]
+async fn create_only_publication_preserves_a_late_empty_file_and_releases_quota() {
+    let fixture = TestDirectory::new("new-file-collision");
+    let root = fixture.path().join("files");
+    let storage = StorageService::new(root.clone(), 16, 1, 100, 0)
+        .await
+        .unwrap();
+    let capacity = CapacityTracker::new(Some(16), 0);
+    let reservation = capacity.reserve_replacement(0, 4).unwrap();
+    let mut writer = storage
+        .begin_atomic_write_with_expected("file.txt", 4)
+        .await
+        .unwrap();
+    writer
+        .write_chunk(&Bytes::from_static(b"data"))
+        .await
+        .unwrap();
+    fs::write(root.join("file.txt"), b"").await.unwrap();
+    assert!(writer.commit_new_with_capacity(reservation).await.is_err());
+    assert_eq!(fs::read(root.join("file.txt")).await.unwrap(), b"");
+    assert_eq!(capacity.status().used, 0);
+    assert_eq!(capacity.status().reserved, 0);
+    wait_until(|| storage.io_gate.available_permits() == 1).await;
+    close(storage).await;
+}
+
+#[tokio::test]
 async fn cancelled_waiter_keeps_publication_budgets_and_persists_quota() {
     let fixture = TestDirectory::new("publication-cancel");
     let root = fixture.path().join("files");

@@ -3,7 +3,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import UserAccountMenu from './UserAccountMenu.vue'
 
 afterEach(() => { vi.unstubAllGlobals(); document.body.replaceChildren() })
-const capabilities = { download: true, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false }
 const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } })
 const settle = async () => { await new Promise(resolve => setTimeout(resolve, 0)); await nextTick() }
 
@@ -12,7 +11,7 @@ function mount() {
   const signOut = vi.fn()
   const host = document.createElement('div')
   document.body.append(host)
-  const app = createApp(UserAccountMenu, { storageName: 'Documents', capabilities, onSignedIn: signedIn, onSignOut: signOut })
+  const app = createApp(UserAccountMenu, { onSignedIn: signedIn, onSignOut: signOut })
   app.mount(host)
   return { app, host, signedIn, signOut }
 }
@@ -55,8 +54,12 @@ describe('UserAccountMenu', () => {
     app.unmount()
   })
 
-  it('shows user information and effective permissions when its icon is clicked', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => Promise.resolve(json({ logged_in: true, is_admin: false, username: 'reader' }))))
+  it('shows account traffic with download outside upload and refreshes when reopened', async () => {
+    let uploaded = 256
+    const fetchMock = vi.fn().mockImplementation((url: string) => Promise.resolve(json(url === '/api/user/traffic'
+      ? { usage: { download: 512, upload: uploaded }, quota: { enabled: true, download: 2048, upload: 1024 }, next_reset: 0 }
+      : { logged_in: true, is_admin: false, username: 'reader' })))
+    vi.stubGlobal('fetch', fetchMock)
     const { app, host } = mount()
     await settle()
     expect(host.querySelector('button')?.textContent?.trim()).toBe('')
@@ -68,12 +71,37 @@ describe('UserAccountMenu', () => {
     expect(dialog.classList.contains('user-account-popover')).toBe(true)
     expect(document.querySelector('.overlay')).toBeNull()
     expect(dialog.textContent).toContain('普通用户')
-    expect(dialog.textContent).toContain('Documents')
-    expect(dialog.querySelector('dd:last-child')?.textContent).toBe('下载')
+    expect(dialog.textContent).not.toContain('当前存储')
+    expect(dialog.textContent).not.toContain('操作权限')
+    expect(dialog.querySelector('.traffic-rings-center')?.textContent).toBe('↓25%↑25%')
+    expect([...dialog.querySelectorAll('.traffic-rings-center strong')].map(value => value.textContent)).toEqual(['↓25%', '↑25%'])
+    expect(dialog.querySelector('.traffic-rings-divider')?.getAttribute('aria-hidden')).toBe('true')
+    expect(dialog.querySelector('.traffic-rings-center')?.textContent).not.toContain('账号额度')
+    expect(dialog.textContent).toContain('256 B / 1 KiB')
+    expect([...dialog.querySelectorAll('.ring-progress')].map(ring => ring.getAttribute('r'))).toEqual(['64', '53'])
+    expect([...dialog.querySelectorAll('.ring-progress')].map(ring => ring.getAttribute('stroke-dasharray'))).toEqual(['25 100', '25 100'])
     expect(dialog.querySelector('input[type="password"]')).toBeNull()
     document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }))
     await settle()
     expect(document.querySelector('[role="dialog"]')).toBeNull()
+    uploaded = 1024
+    host.querySelector<HTMLButtonElement>('button')!.click()
+    await settle()
+    expect(document.querySelector('.user-account-popover')?.textContent).toContain('1 KiB / 1 KiB')
+    expect(fetchMock.mock.calls.filter(([url]) => url === '/api/user/traffic')).toHaveLength(2)
+    app.unmount()
+  })
+
+  it('reports traffic retrieval failure without inventing zero usage', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => url === '/api/user/traffic'
+      ? Promise.resolve(new Response('{}', { status: 503 }))
+      : Promise.resolve(json({ logged_in: true, is_admin: false, username: 'reader' }))))
+    const { app, host } = mount()
+    await settle()
+    host.querySelector<HTMLButtonElement>('button')!.click()
+    await settle()
+    expect(document.querySelector('[role="status"]')?.textContent).toBe('流量信息读取失败')
+    expect(document.querySelector('.user-traffic-rings')).toBeNull()
     app.unmount()
   })
 

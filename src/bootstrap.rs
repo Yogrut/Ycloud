@@ -12,10 +12,16 @@ pub async fn run() -> anyhow::Result<()> {
         .init();
 
     let mut runtime = config::Config::from_env()?;
+    // Hold this before configuration bootstrap or any storage recovery can run.
+    let _instance_lock = crate::instance_lock::InstanceLock::acquire(&runtime.config_path)?;
     let config_file = config::load_config(&runtime.config_path).await?;
     runtime.initialize_transaction_auth_key().await?;
     let config_file = Arc::new(RwLock::new(config_file));
     let state = AppState::new(runtime.clone(), config_file).await?;
+    tracing::info!(
+        bytes = crate::relay_budget::bytes(),
+        "global S3 relay payload memory budget"
+    );
 
     let (cleanup_stop, cleanup_signal) = watch::channel(false);
     let cleanup_task = spawn_cleanup_task(state.clone(), cleanup_signal);
@@ -56,8 +62,16 @@ fn spawn_cleanup_task(
         // `interval` ticks immediately; consume the first capacity tick because
         // backend startup already loads or starts an initial reconciliation.
         capacity_interval.tick().await;
+        let mut upload_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        upload_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                _ = upload_interval.tick() => {
+                    tokio::select! {
+                        _ = crate::upload_recovery::recover(&state) => {},
+                        _ = stop.changed() => break,
+                    }
+                }
                 _ = interval.tick() => {
                     state.sessions.cleanup().await;
                     state.gate_access.cleanup().await;

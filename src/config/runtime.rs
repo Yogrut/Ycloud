@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use super::{
-    AppError, AppResult, Config, LocalMountCatalog, S3Provider, StorageBackendConfig,
-    DEFAULT_DEPLOYMENT_MAX_ARCHIVE_BYTES, DEFAULT_DEPLOYMENT_MAX_ARCHIVE_ENTRIES,
-    DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_BYTES, DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_ENTRIES,
-    DEFAULT_DEPLOYMENT_MAX_UPLOAD_BYTES, HARD_MAX_ARCHIVE_BYTES, HARD_MAX_ARCHIVE_ENTRIES,
-    HARD_MAX_UPLOAD_BATCH_BYTES, HARD_MAX_UPLOAD_BATCH_ENTRIES, HARD_MAX_UPLOAD_BYTES,
+    AppError, AppResult, Config, LocalMountCatalog, DEFAULT_DEPLOYMENT_MAX_ARCHIVE_BYTES,
+    DEFAULT_DEPLOYMENT_MAX_ARCHIVE_ENTRIES, DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_BYTES,
+    DEFAULT_DEPLOYMENT_MAX_UPLOAD_BATCH_ENTRIES, DEFAULT_DEPLOYMENT_MAX_UPLOAD_BYTES,
+    HARD_MAX_ARCHIVE_BYTES, HARD_MAX_ARCHIVE_ENTRIES, HARD_MAX_UPLOAD_BATCH_BYTES,
+    HARD_MAX_UPLOAD_BATCH_ENTRIES, HARD_MAX_UPLOAD_BYTES,
 };
 
 impl Config {
@@ -54,7 +54,6 @@ impl Config {
         let upload_timeout_secs = env_parse("UPLOAD_TIMEOUT_SECS", 6_u64 * 60 * 60)?;
         let disk_reserve_bytes = env_parse("DISK_RESERVE_BYTES", 512_u64 * 1024 * 1024)?;
         let allowed_hosts = allowed_hosts()?;
-        let s3_allowed_endpoints = s3_allowed_endpoints()?;
         Ok(Self {
             bind_address,
             port,
@@ -75,7 +74,6 @@ impl Config {
             public_base_url: None,
             public_host: None,
             allowed_hosts,
-            s3_allowed_endpoints,
             // Bootstrap replaces this only after the persisted configuration
             // has been validated. This avoids creating a replacement master
             // key before an existing encrypted configuration is opened.
@@ -92,24 +90,6 @@ impl Config {
 
     pub fn is_public_mode(&self) -> bool {
         self.public_base_url.is_some()
-    }
-
-    pub fn allows_storage_backend(&self, backend: &StorageBackendConfig) -> AppResult<()> {
-        let StorageBackendConfig::S3(settings) = backend else {
-            return Ok(());
-        };
-        if matches!(
-            settings.provider,
-            S3Provider::AlibabaOss | S3Provider::TencentCos
-        ) {
-            return Ok(());
-        }
-        let endpoint = normalize_s3_endpoint(&settings.endpoint)?;
-        if self.s3_allowed_endpoints.contains(&endpoint) {
-            Ok(())
-        } else {
-            Err(AppError::Forbidden)
-        }
     }
 }
 
@@ -136,19 +116,6 @@ fn validate_deployment_envelope(
         anyhow::bail!("MAX_ARCHIVE_ENTRIES is outside the supported format range");
     }
     Ok(())
-}
-
-fn s3_allowed_endpoints() -> anyhow::Result<HashSet<String>> {
-    std::env::var("S3_ALLOWED_ENDPOINTS")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            normalize_s3_endpoint(value)
-                .map_err(|_| anyhow::anyhow!("Invalid S3_ALLOWED_ENDPOINTS origin: {value}"))
-        })
-        .collect()
 }
 
 fn allowed_hosts() -> anyhow::Result<HashSet<String>> {
@@ -183,6 +150,12 @@ pub fn normalize_s3_endpoint(endpoint: &str) -> AppResult<String> {
         || !matches!(uri.path(), "" | "/")
         || uri.query().is_some()
         || authority.as_str().contains('@')
+        || endpoint.contains('#')
+        || (!authority.as_str().ends_with(']')
+            && authority
+                .as_str()
+                .rsplit_once(':')
+                .is_some_and(|(_, port)| port.parse::<u16>().is_err()))
     {
         return Err(AppError::BadRequest(
             "S3 Endpoint 只能是无凭据、无路径和无查询参数的 HTTP(S) 地址".into(),

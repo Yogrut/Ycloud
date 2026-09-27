@@ -9,6 +9,110 @@ use axum::body::Body;
 use std::time::Duration;
 
 #[tokio::test]
+async fn repeated_concurrent_deletes_preserve_unrelated_files_and_accounting() {
+    let fixture = TestDirectory::new("concurrent-delete");
+    let root = fixture.path().join("files");
+    let storage = StorageService::new(root.clone(), 100, 4, 100, 0)
+        .await
+        .unwrap();
+    fs::write(root.join("target.txt"), b"target").await.unwrap();
+    fs::write(root.join("keep.txt"), b"keep").await.unwrap();
+    let backend = StorageBackend::local_configured(
+        storage.clone(),
+        Some(100),
+        fixture.path().join("usage.json"),
+    )
+    .await
+    .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let mut attempts = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let backend = backend.clone();
+        let barrier = barrier.clone();
+        attempts.spawn(async move {
+            barrier.wait().await;
+            backend.remove("target.txt").await
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut successes = 0;
+        while let Some(result) = attempts.join_next().await {
+            match result.unwrap() {
+                Ok(()) => successes += 1,
+                Err(crate::error::AppError::NotFound) => {}
+                other => panic!("unexpected repeated delete result: {other:?}"),
+            }
+        }
+        assert_eq!(successes, 1);
+    })
+    .await
+    .expect("repeated deletes must settle");
+    assert!(!root.join("target.txt").exists());
+    assert_eq!(fs::read(root.join("keep.txt")).await.unwrap(), b"keep");
+    assert_eq!(backend.capacity_status().used, 4);
+    let paths = storage.transactions.clone();
+    drop(backend);
+    drop(storage);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while Arc::strong_count(&paths) > 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn moving_and_deleting_the_same_source_settle_without_affecting_other_files() {
+    let fixture = TestDirectory::new("move-delete-race");
+    let root = fixture.path().join("files");
+    let storage = StorageService::new(root.clone(), 100, 4, 100, 0)
+        .await
+        .unwrap();
+    fs::write(root.join("source.txt"), b"source").await.unwrap();
+    fs::write(root.join("keep.txt"), b"keep").await.unwrap();
+    let backend = StorageBackend::local_configured(
+        storage.clone(),
+        Some(100),
+        fixture.path().join("usage.json"),
+    )
+    .await
+    .unwrap();
+    let (moved, deleted) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            backend.move_path("source.txt", "destination.txt"),
+            backend.remove("source.txt")
+        )
+    })
+    .await
+    .expect("conflicting operations must settle");
+    assert!(!root.join("source.txt").exists());
+    if moved.is_ok() {
+        assert!(deleted.is_err());
+        assert_eq!(
+            fs::read(root.join("destination.txt")).await.unwrap(),
+            b"source"
+        );
+        assert_eq!(backend.capacity_status().used, 10);
+    } else {
+        assert!(deleted.is_ok());
+        assert!(!root.join("destination.txt").exists());
+        assert_eq!(backend.capacity_status().used, 4);
+    }
+    assert_eq!(fs::read(root.join("keep.txt")).await.unwrap(), b"keep");
+    let paths = storage.transactions.clone();
+    drop(backend);
+    drop(storage);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while Arc::strong_count(&paths) > 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn cancelled_delete_waiter_does_not_interrupt_deletion_or_capacity_update() {
     let fixture = TestDirectory::new("delete-result-cancel");
     let root = fixture.path().join("files");

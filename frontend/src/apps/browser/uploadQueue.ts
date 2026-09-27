@@ -10,7 +10,11 @@ export interface UploadTask extends UploadCandidate {
   storageId: string
   basePath: string
   targetPath: string
+  originalTargetPath?: string
+  attempted?: boolean
+  safeToPrepare?: boolean
   ticket?: string
+  directUpload?: boolean
   status: UploadTaskStatus
   loaded: number
   error: string

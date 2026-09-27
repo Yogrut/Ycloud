@@ -5,8 +5,16 @@ services:
     build: .
     image: ycloud:local
     restart: unless-stopped
-    user: "10001:10001"
+    # Optional: use an account that can write to the mounted data directory.
+    # user: "1000:1000"
+    # Optional: allow active requests more time to finish before forced shutdown.
+    # stop_grace_period: 60s
     ports:
       - "18473:18473"
     volumes:
       - ./data:/var/lib/ycloud
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -36,7 +36,6 @@ impl S3Backend {
             ));
         }
         validate_storage_backend(&StorageBackendConfig::S3(settings.clone()))?;
-        runtime.allows_storage_backend(&StorageBackendConfig::S3(settings.clone()))?;
 
         let credentials = Credentials::new(
             settings.access_key_id.clone(),
@@ -50,6 +49,9 @@ impl S3Backend {
             .operation_attempt_timeout(S3_ATTEMPT_TIMEOUT)
             .operation_timeout(S3_OPERATION_TIMEOUT)
             .build();
+        // Use the Smithy/Hyper transport, which does not follow HTTP Location
+        // redirects. Signed requests must remain at the configured S3 endpoint.
+        // The redirect protocol regression test covers this for every upgrade.
         let mut sdk_config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .credentials_provider(credentials)

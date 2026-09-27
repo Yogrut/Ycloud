@@ -9,6 +9,45 @@ use super::{
 use crate::error::{AppError, AppResult};
 
 impl S3Backend {
+    pub(crate) async fn quiesce_after_interrupt(
+        &self,
+    ) -> (
+        tokio::sync::OwnedRwLockWriteGuard<()>,
+        tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        let recovery = self.recovery_gate.clone().write_owned().await;
+        let capacity = self.capacity_gate.clone().lock_owned().await;
+        (recovery, capacity)
+    }
+    pub(crate) async fn upload_committed(
+        &self,
+        relative: &str,
+        size: u64,
+        operation_id: &str,
+    ) -> AppResult<bool> {
+        let key = object_key(&self.prefix, relative)?;
+        Ok(self.head_key(&key).await?.is_some_and(|object| {
+            object.size == size && object.operation_id.as_deref() == Some(operation_id)
+        }))
+    }
+    pub(crate) async fn quiesce_for_edit(
+        &self,
+    ) -> AppResult<(
+        tokio::sync::OwnedRwLockWriteGuard<()>,
+        tokio::sync::OwnedMutexGuard<()>,
+    )> {
+        let recovery = self
+            .recovery_gate
+            .clone()
+            .try_write_owned()
+            .map_err(|_| AppError::Conflict("存储正在执行或恢复操作，请稍后修改连接".into()))?;
+        let capacity = self
+            .capacity_gate
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| AppError::Conflict("存储正在核对容量，请稍后修改连接".into()))?;
+        Ok((recovery, capacity))
+    }
     /// Resolve upload journals left by an interrupted process. Recovery only
     /// accepts states that can be proven to be either the old object or the
     /// newly uploaded object. Anything else stops activation for inspection.
@@ -24,11 +63,16 @@ impl S3Backend {
     ) -> AppResult<Option<usize>> {
         let _recovery = self.recovery_gate.write().await;
         let _mutation = self.mutation_gate.lock().await;
-        if !self.recovery_runtime.has_pending() {
+        if self.recovery_worker_stopped() || !self.recovery_runtime.has_pending() {
             return Ok(None);
         }
         capacity.mark_uncertain();
         self.recover_transactions_locked().await.map(Some)
+    }
+
+    pub(crate) async fn recover_quiesced_uploads(&self) -> AppResult<usize> {
+        let _mutation = self.mutation_gate.lock().await;
+        self.recover_transactions_locked().await
     }
 
     async fn recover_transactions_locked(&self) -> AppResult<usize> {
@@ -260,9 +304,11 @@ impl S3Backend {
         let destination_key = object_key(&self.prefix, &transaction.relative)?;
         let destination = self.head_key(&destination_key).await?;
 
-        let committed = destination
-            .as_ref()
-            .is_some_and(|value| snapshot_matches(value, &transaction.temporary));
+        let committed = destination.as_ref().is_some_and(|value| {
+            snapshot_matches(value, &transaction.temporary)
+                || (value.size == transaction.temporary.size
+                    && value.operation_id.as_deref() == Some(transaction.id.as_str()))
+        });
         let rolled_back = match transaction.previous.as_ref() {
             Some(previous) => destination
                 .as_ref()

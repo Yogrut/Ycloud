@@ -17,9 +17,8 @@ const SCHEMA_VERSION: u32 = 2;
 const JOURNAL_PURPOSE: &str = "directory-transaction:v2";
 const MAX_OBJECTS: usize = 1_000;
 const MAX_JOURNAL_BYTES: usize = 4 * 1024 * 1024;
-// CopyObject is deliberately used instead of multipart copy in this stage.
-// The common AWS-compatible limit is 5 GB, so larger objects are rejected
-// before a journal is created rather than leaving an unrecoverable operation.
+// Keep directory transactions bounded. Objects above the backend's conservative
+// single-copy limit use multipart copy, including authenticated deletion trash.
 const MAX_SINGLE_COPY_BYTES: u64 = 5_000_000_000;
 const CHECKPOINT_OBJECTS: usize = 16;
 const JOURNAL_CATEGORY: &str = "directory-transactions";
@@ -72,6 +71,21 @@ struct Transaction {
 }
 
 impl S3Backend {
+    pub(super) async fn validate_directory_multipart_target(
+        &self,
+        session: &super::S3MultipartSession,
+    ) -> AppResult<()> {
+        let Some(id) = super::directory_trash_transaction_id(&self.prefix, &session.key) else {
+            return Ok(());
+        };
+        let key = internal_key(&self.prefix, JOURNAL_CATEGORY, id);
+        let (transaction, _) = self.read_directory_transaction(&key).await?;
+        if !directory_multipart_target_matches(&transaction, session) {
+            return Err(ambiguous_target());
+        }
+        Ok(())
+    }
+
     /// Recover bounded prefix transactions before S3 is allowed to serve
     /// requests. Any state that cannot be proven from object size and ETag is
     /// preserved for manual inspection instead of being guessed.
@@ -392,18 +406,30 @@ impl S3Backend {
                 .await?;
             let target_etag = match existing_target {
                 None => {
-                    self.copy_key(
+                    self.copy_key_with_operation(
                         &transaction.objects[index].source_key,
                         &transaction.objects[index].target_key,
                         Some(&transaction.objects[index].source_etag),
                         true,
+                        Some(&directory_copy_id(
+                            &transaction.id,
+                            &transaction.objects[index].source_key,
+                        )),
                     )
                     .await?
                 }
                 Some(metadata)
                     if metadata.size == transaction.objects[index].size
-                        && metadata.etag.as_deref()
-                            == Some(transaction.objects[index].source_etag.as_str()) =>
+                        && (metadata.etag.as_deref()
+                            == Some(transaction.objects[index].source_etag.as_str())
+                            || metadata.operation_id.as_deref()
+                                == Some(
+                                    directory_copy_id(
+                                        &transaction.id,
+                                        &transaction.objects[index].source_key,
+                                    )
+                                    .as_str(),
+                                )) =>
                 {
                     metadata.etag.ok_or_else(|| {
                         AppError::ServiceUnavailable("目录事务目标缺少 ETag".into())
@@ -858,6 +884,27 @@ fn expected_target_prefix(
     }
 }
 
+fn directory_multipart_target_matches(
+    transaction: &Transaction,
+    session: &super::S3MultipartSession,
+) -> bool {
+    transaction.operation == Operation::Delete
+        && transaction.objects.iter().any(|object| {
+            object.target_key == session.key && Some(object.size) == session.expected_size
+        })
+}
+
+fn directory_copy_id(transaction_id: &str, source_key: &str) -> String {
+    let digest = ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("{transaction_id}:{source_key}").as_bytes(),
+    );
+    digest.as_ref()[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn should_checkpoint(index: usize, total: usize) -> bool {
     index.saturating_add(1) == total || index.saturating_add(1).is_multiple_of(CHECKPOINT_OBJECTS)
 }
@@ -878,6 +925,60 @@ mod tests {
         TRASH_CATEGORY,
     };
     use crate::s3_backend::internal_key;
+
+    #[test]
+    fn authenticated_large_delete_manifest_binds_its_multipart_target() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let size = super::super::S3_SINGLE_COPY_LIMIT + 1;
+        let target = internal_key("tenant/", TRASH_CATEGORY, &format!("{id}/file.bin"));
+        let mut transaction = Transaction {
+            schema_version: SCHEMA_VERSION,
+            id: id.into(),
+            operation: Operation::Delete,
+            source_relative: "source".into(),
+            destination_relative: None,
+            stage: Stage::CopyingTargets,
+            objects: vec![ObjectRecord {
+                source_key: "tenant/source/file.bin".into(),
+                target_key: target.clone(),
+                size,
+                source_etag: "source-etag".into(),
+                target_etag: None,
+                source_deleted: false,
+            }],
+            auth_tag: String::new(),
+        };
+        sign_transaction(&[0x31; 32], &mut transaction).unwrap();
+        validate_transaction(
+            &[0x31; 32],
+            "tenant/",
+            &internal_key("tenant/", JOURNAL_CATEGORY, id),
+            &transaction,
+        )
+        .unwrap();
+        let session = super::super::S3MultipartSession {
+            schema_version: super::super::S3_MULTIPART_SESSION_SCHEMA_VERSION,
+            id: super::directory_copy_id(id, "tenant/source/file.bin"),
+            key: target,
+            purpose: Some(super::super::S3MultipartPurpose::Copy),
+            expected_size: Some(size),
+            upload_id: None,
+        };
+        assert!(super::directory_multipart_target_matches(
+            &transaction,
+            &session
+        ));
+        super::super::validate_multipart_session(
+            "tenant/",
+            &internal_key("tenant/", "multipart-sessions", &session.id),
+            &session,
+        )
+        .unwrap();
+        assert_eq!(
+            session.id,
+            super::directory_copy_id(id, "tenant/source/file.bin")
+        );
+    }
 
     #[test]
     fn copy_manifest_is_confined_to_exact_prefix_mapping() {

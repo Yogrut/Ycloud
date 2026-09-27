@@ -63,7 +63,7 @@ mod tests {
     #[tokio::test]
     async fn authorized_measurement_and_busy_response() {
         let fixture = TestDirectory::new("directory-size-api");
-        let state = app_state(&fixture, ConfigFile::default()).await;
+        let state = app_state(&fixture, ConfigFile::with_test_storage()).await;
         tokio::fs::create_dir_all(fixture.path().join("storage/notes"))
             .await
             .unwrap();

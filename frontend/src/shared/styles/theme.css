@@ -6,9 +6,9 @@
   --field: #f9fafb;
   --line: #e4e7eb;
   --line-strong: #d9dde4;
-  --text: #30343b;
-  --muted: #747b87;
-  --muted-2: #9aa1ac;
+  --text: #20252d;
+  --muted: #586171;
+  --muted-2: #727c8b;
   --accent: #0874f9;
   --icon-color: #0564e1;
   --accent-strong: #0667db;
@@ -1014,6 +1014,7 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 .upload-task progress::-moz-progress-bar { background: var(--success); border-radius: 999px; }
 .upload-overall-progress { width: calc(100% - 40px); height: 6px; margin: 8px 20px 0; flex: 0 0 auto; }
 .upload-overall-meta { display: flex; justify-content: space-between; gap: 12px; padding: 3px 20px 7px; color: var(--muted); font-size: 10px; }
+.upload-overall-transfer { display: inline-flex; align-items: center; gap: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .upload-overall-meta strong { color: var(--text); font-weight: 650; }
 .upload-task-list { min-height: 0; display: grid; align-content: start; gap: 5px; flex: 1 1 auto; overflow-x: hidden; overflow-y: auto; padding: 3px 20px 10px; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .upload-task {

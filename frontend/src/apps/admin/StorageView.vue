@@ -5,7 +5,7 @@ import AppSwitch from '../../shared/components/AppSwitch.vue'
 import ConfirmDialog from '../../shared/components/ConfirmDialog.vue'
 import { computed, ref, watch } from 'vue'
 import type { LocalMountView, S3AddressingStyle, S3Provider, StorageInstanceView, TestS3StorageRequest } from '../../shared/api/admin'
-import { activatePendingStorage, addLocalStorage, deleteStorage, discardPendingStorage, setDefaultStorage, stageS3Storage, testLocalStorage, testS3Storage, updateLocalStorage, updateS3Storage } from '../../shared/api/admin'
+import { activatePendingStorage, addLocalStorage, deleteStorage, discardPendingStorage, stageS3Storage, testLocalStorage, testS3Storage, updateLocalStorage, updateS3Storage } from '../../shared/api/admin'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import AppSelect from '../../shared/components/AppSelect.vue'
 import { useLocale } from '../../shared/i18n'
@@ -34,6 +34,7 @@ const bucket = ref('')
 const region = ref('us-east-1')
 const prefix = ref('')
 const addressingStyle = ref<S3AddressingStyle>('path')
+const relayUpload = ref(false)
 const accessKeyId = ref('')
 const secretAccessKey = ref('')
 const capacityLimitGiB = ref(0)
@@ -144,6 +145,7 @@ function resetEditor(): void {
   region.value = 'us-east-1'
   prefix.value = ''
   addressingStyle.value = 'path'
+  relayUpload.value = false
   accessKeyId.value = ''
   secretAccessKey.value = ''
   capacityLimitGiB.value = 0
@@ -176,13 +178,14 @@ function openSettings(instance: StorageInstanceView): void {
     region.value = instance.backend.region
     prefix.value = instance.backend.prefix
     addressingStyle.value = instance.backend.addressing_style
+    relayUpload.value = instance.backend.relay_upload ?? false
     capacityLimitGiB.value = bytesToGiB(instance.backend.capacity_limit_bytes)
   }
   editorOpen.value = true
 }
 function requestBody(): TestS3StorageRequest {
   if (provider.value === 'local') throw new Error('local storage does not use S3 credentials')
-  return { provider: provider.value, endpoint: endpoint.value.trim(), bucket: bucket.value.trim(), region: region.value.trim(), prefix: prefix.value.trim(), addressing_style: addressingStyle.value, access_key_id: accessKeyId.value, secret_access_key: secretAccessKey.value, capacity_limit_bytes: capacityLimitBytes() }
+  return { provider: provider.value, endpoint: endpoint.value.trim(), bucket: bucket.value.trim(), region: region.value.trim(), prefix: prefix.value.trim(), addressing_style: addressingStyle.value, access_key_id: accessKeyId.value, secret_access_key: secretAccessKey.value, capacity_limit_bytes: capacityLimitBytes(), relay_upload: relayUpload.value }
 }
 async function run(action: () => Promise<void>, fallback: string): Promise<void> {
   if (busy.value) return
@@ -231,12 +234,9 @@ async function saveStorage(): Promise<void> {
     emit('changed', locale.text('存储源已添加；原路径中的文件会直接显示，文件未被移动或删除', 'Storage added. Existing files at the path are shown directly and were not moved or deleted.'))
   }, locale.text('无法保存存储源', 'Unable to save storage'))
 }
-async function makeDefault(instance: StorageInstanceView): Promise<void> {
-  await run(async () => { await setDefaultStorage(instance.id); emit('changed', locale.text('默认存储已更新', 'Default storage updated')) }, locale.text('无法设置默认存储', 'Unable to set default storage'))
-}
 async function removeInstance(): Promise<void> {
   const instance = pendingDelete.value
-  if (!instance || instance.is_default) return
+  if (!instance) return
   await run(async () => { await deleteStorage(instance.id); pendingDelete.value = undefined; emit('changed', locale.text('存储配置已删除，文件未被删除', 'Storage configuration removed; files were not deleted')) }, locale.text('无法删除存储配置；请先移除相关 WebDAV、文件夹锁或用户权限', 'Unable to remove storage; remove related WebDAV mounts, folder locks, or user permissions first'))
 }
 async function clearPending(): Promise<void> {
@@ -270,11 +270,10 @@ async function clearPending(): Promise<void> {
             <small v-if="(instance.s3_recovery_pending_records ?? 0) > 0 || (instance.s3_recovery_consecutive_failures ?? 0) > 0 || instance.s3_recovery_running" class="storage-cleanup-debt">{{ s3RecoveryLabel(instance) }}</small>
           </div>
           <div class="admin-record-end">
-            <div class="admin-record-status"><span class="status-pill" :class="{ warning: instance.status === 'abnormal', muted: instance.status === 'disabled' }">{{ statusLabel(instance) }}</span><span v-if="instance.is_default" class="status-pill">{{ locale.text('默认', 'Default') }}</span><span v-if="instance.allow_guest_access" class="status-pill">{{ locale.text('访客可访问', 'Guest access') }}</span></div>
+            <div class="admin-record-status"><span class="status-pill" :class="{ warning: instance.status === 'abnormal', muted: instance.status === 'disabled' }">{{ statusLabel(instance) }}</span><span v-if="instance.allow_guest_access" class="status-pill">{{ locale.text('访客可访问', 'Guest access') }}</span></div>
             <div class="storage-instance-actions">
-              <button v-if="!instance.is_default" class="record-icon-btn" type="button" :disabled="busy || !instance.ready" :title="locale.text('设为默认存储', 'Set as default storage')" :aria-label="locale.text('设为默认存储', 'Set as default storage')" @click="makeDefault(instance)"><AppIcon name="star" :size="18" /></button>
               <button class="record-text-btn" type="button" :disabled="busy" :title="locale.text('编辑存储', 'Edit storage')" :aria-label="locale.text('编辑存储', 'Edit storage')" @click="openSettings(instance)">{{ locale.t('common.edit') }}</button>
-              <button class="record-text-btn danger" type="button" :disabled="busy || instance.is_default" :title="instance.is_default ? locale.text('默认存储不能删除', 'The default storage cannot be deleted') : locale.text('删除存储', 'Delete storage')" :aria-label="locale.text('删除存储', 'Delete storage')" @click="pendingDelete = instance; errorMessage = ''">{{ locale.t('common.delete') }}</button>
+              <button class="record-text-btn danger" type="button" :disabled="busy" :title="locale.text('删除存储', 'Delete storage')" :aria-label="locale.text('删除存储', 'Delete storage')" @click="pendingDelete = instance; errorMessage = ''">{{ locale.t('common.delete') }}</button>
             </div>
           </div>
         </article>
@@ -293,9 +292,14 @@ async function clearPending(): Promise<void> {
         <label v-if="provider === 'local'" class="required-field">{{ locale.text('本地存储挂载', 'Local storage mount') }}<AppSelect v-model="localPath" class="local-storage-path" :options="localMountOptions" :label="locale.text('本地存储挂载', 'Local storage mount')" /><small>{{ locale.text('这里只显示启动参数中已声明且尚未使用的挂载点。', 'Only declared and unused deployment mounts are shown.') }}</small></label>
         <label v-if="provider === 'local'">{{ locale.text('容量上限（GiB）', 'Capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input local-capacity-input" type="number" min="0" max="4194304" step="0.001"><small>{{ locale.text('0 表示不设置逻辑上限，最小 1 MiB。', '0 disables the logical limit; minimum 1 MiB.') }}</small></label>
         <template v-if="isS3">
-          <label class="storage-wide">{{ locale.text('Endpoint 完整地址', 'Full endpoint URL') }}<input v-model="endpoint" aria-required="true" class="input" type="url" maxlength="2048" placeholder="https://s3.example.com"><small v-if="provider === 'minio' || provider === 's3_compatible'">{{ locale.text('自定义 Endpoint 必须同时加入启动参数 S3_ALLOWED_ENDPOINTS。', 'Custom endpoints must also be listed in S3_ALLOWED_ENDPOINTS at startup.') }}</small></label><label>Bucket<input v-model="bucket" aria-required="true" class="input" maxlength="63"></label><label>Region<input v-model="region" aria-required="true" class="input" maxlength="64"></label><label class="storage-wide">Prefix<input v-model="prefix" class="input" maxlength="1024" placeholder="ycloud/"></label><label>Access Key ID<input v-model="accessKeyId" :aria-required="!editingInstance" class="input" maxlength="256" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>Secret Access Key<input v-model="secretAccessKey" :aria-required="!editingInstance" class="input" type="password" maxlength="4096" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>{{ locale.text('寻址方式', 'Addressing style') }}<AppSelect v-model="addressingStyle" :options="addressingOptions" :label="locale.text('寻址方式', 'Addressing style')" :disabled="isOfficialCloud" /></label><label>{{ locale.text('容量上限（GiB）', 'Capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input" type="number" min="0" max="4194304" step="0.001"></label>
+          <label class="storage-wide">{{ locale.text('Endpoint 完整地址', 'Full endpoint URL') }}<input v-model="endpoint" aria-required="true" class="input" type="url" maxlength="2048" placeholder="https://s3.example.com"><small>{{ locale.text('填写对象存储的 HTTP(S) 接口地址，不包含桶名、账号或密码。', 'Enter the object storage HTTP(S) endpoint without a bucket name or credentials.') }}</small></label><label>Bucket<input v-model="bucket" aria-required="true" class="input" maxlength="63"></label><label>Region<input v-model="region" aria-required="true" class="input" maxlength="64"></label><label class="storage-wide">Prefix<input v-model="prefix" class="input" maxlength="1024" placeholder="ycloud/"></label><label>Access Key ID<input v-model="accessKeyId" :aria-required="!editingInstance" class="input" maxlength="256" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>Secret Access Key<input v-model="secretAccessKey" :aria-required="!editingInstance" class="input" type="password" maxlength="4096" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>{{ locale.text('寻址方式', 'Addressing style') }}<AppSelect v-model="addressingStyle" :options="addressingOptions" :label="locale.text('寻址方式', 'Addressing style')" :disabled="isOfficialCloud" /></label><label>{{ locale.text('容量上限（GiB）', 'Capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input" type="number" min="0" max="4194304" step="0.001"></label>
         </template>
-        <div class="storage-access-options storage-wide"><AppSwitch v-model="enabled" :label="locale.text('启动', 'Enabled')" :description="locale.text('停用后不会出现在文件页切换器中。', 'Disabled storage is hidden from the file browser.')" :disabled="busy" /><AppSwitch v-model="allowGuestAccess" :label="locale.text('允许访客访问', 'Allow guest access')" :description="locale.text('关闭后需要管理员或已授权用户账号。', 'When off, an administrator or authorized user must sign in.')" :disabled="busy" /><AppSwitch v-model="allowGuestDownload" :label="locale.text('允许访客下载', 'Allow guest downloads')" :description="locale.text('需先允许访客访问；关闭后访客只能浏览文件列表，不能下载或预览文件内容。', 'Requires guest access. When off, guests can only browse the file list, not download or preview content.')" :disabled="busy || !allowGuestAccess" /></div>
+        <div class="storage-access-options storage-wide">
+          <AppSwitch v-model="enabled" :label="locale.text('启动', 'Enabled')" :description="locale.text('停用后不会出现在文件页切换器中。', 'Disabled storage is hidden from the file browser.')" :disabled="busy" />
+          <AppSwitch v-if="isS3" v-model="relayUpload" :label="locale.text('中转上传', 'Relay uploads')" :description="locale.text('无法直传时开启，经服务器转发。关闭则直传，需浏览器可达和跨域配置，不受本站限速。', 'Enable server relay when direct uploads are unavailable. Direct uploads require browser access and CORS, and bypass server rate limits.')" :disabled="busy" />
+          <AppSwitch v-model="allowGuestAccess" :label="locale.text('允许访客访问', 'Allow guest access')" :description="locale.text('关闭后需要管理员或已授权用户账号。', 'When off, an administrator or authorized user must sign in.')" :disabled="busy" />
+          <AppSwitch v-model="allowGuestDownload" :label="locale.text('允许访客下载', 'Allow guest downloads')" :description="locale.text('需先允许访客访问；关闭后访客只能浏览文件列表，不能下载或预览文件内容。', 'Requires guest access. When off, guests can only browse the file list, not download or preview content.')" :disabled="busy || !allowGuestAccess" />
+        </div>
         <div v-if="provider === 'local' && localPath.trim()" class="storage-boundary-note storage-wide">{{ locale.text('保存后直接展示该路径中的现有文件，不进行导入、移动或删除。', 'Existing files at this path are shown directly; nothing is imported, moved, or deleted.') }}</div>
       </div>
       <div class="modal-actions"><button v-if="!editingInstance" class="btn secondary" type="button" :disabled="busy" @click="testConnection">{{ locale.text('测试连接', 'Test connection') }}</button><button class="btn secondary" type="button" :disabled="busy" @click="editorOpen = false">{{ locale.t('common.cancel') }}</button><button class="btn" type="button" :disabled="busy" @click="saveStorage">{{ locale.text('确认', 'Confirm') }}</button></div>

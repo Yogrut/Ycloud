@@ -9,10 +9,9 @@ import AppSelect from '../../shared/components/AppSelect.vue'
 import { useLocale } from '../../shared/i18n'
 
 const MASK = '••••••'
-const { locks, storages, defaultStorageId } = defineProps<{
+const { locks, storages } = defineProps<{
   locks: FolderLockView[]
   storages: StorageInstanceView[]
-  defaultStorageId: string
 }>()
 const emit = defineEmits<{ changed: [message: string] }>()
 const locale = useLocale()
@@ -57,7 +56,7 @@ const hasChanges = computed(() => {
 function openCreate(): void {
   editing.value = undefined
   path.value = ''
-  storageId.value = defaultStorageId || storages[0]?.id || ''
+  storageId.value = storages.find(storage => storage.enabled && storage.ready)?.id || ''
   password.value = ''
   errorMessage.value = ''
   showEditor.value = true

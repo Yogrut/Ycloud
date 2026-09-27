@@ -46,6 +46,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ready", get(readiness_handler))
         .route("/logout", post(auth::logout_handler))
         .route("/me", get(me_handler))
+        .route("/user/traffic", get(crate::traffic::user_info))
         .merge(auth_routes);
 
     let unlock_route = Router::new()
@@ -91,6 +92,22 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/upload/status", get(upload_batch::upload_batch_status))
         .route("/upload", put(api::upload_file))
+        .route(
+            "/upload/direct/start",
+            post(crate::direct_upload::start).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/upload/direct/part",
+            post(crate::direct_upload::sign_part).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/upload/direct/complete",
+            post(crate::direct_upload::complete).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/upload/direct/cancel",
+            post(crate::direct_upload::cancel).layer(DefaultBodyLimit::max(4096)),
+        )
         .route("/rename", put(api::rename_file))
         .merge(batch_api)
         .layer(middleware::from_fn_with_state(
@@ -164,7 +181,6 @@ pub fn build_router(state: AppState) -> Router {
             "/storage/{id}",
             put(admin_api::update_storage_access).delete(admin_api::delete_storage),
         )
-        .route("/storage/{id}/default", put(admin_api::set_default_storage))
         .route("/limits", put(admin_api::update_transfer_limits))
         .route(
             "/security/settings",
@@ -240,13 +256,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/preview", get(serve_index))
         .route("/assets/app.css", get(serve_app_css))
         .route("/assets/app.js", get(serve_app_js))
+        .route("/assets/directUpload.js", get(serve_direct_upload_js))
         .route("/favicon.svg", get(serve_favicon))
         .nest("/api/admin", admin_routes)
         .nest("/api", api_routes)
         .merge(dav_router)
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
-            state.config.clone(),
+            state.clone(),
             security_headers_middleware,
         ))
         .layer(middleware::from_fn_with_state(
@@ -272,11 +289,22 @@ async fn health_handler() -> impl IntoResponse {
 }
 
 async fn readiness_handler(State(state): State<AppState>) -> impl IntoResponse {
-    let default_storage_id = state.config_file.read().await.default_storage_id.clone();
-    let ready = match state.storage_backend(&default_storage_id).await {
-        Ok(backend) => backend.ready().await,
-        Err(_) => false,
-    };
+    let instances = state.config_file.read().await.storage_instances.clone();
+    if instances.is_empty() {
+        return (
+            StatusCode::OK,
+            axum::Json(JsonStatus {
+                status: "ok",
+                storage: "unconfigured",
+            }),
+        );
+    }
+    let mut ready = false;
+    for instance in instances.iter().filter(|instance| instance.enabled) {
+        if let Ok(backend) = state.storage_backend(&instance.id).await {
+            ready |= backend.ready().await;
+        }
+    }
     if ready {
         (
             StatusCode::OK,
@@ -357,6 +385,11 @@ embedded_handler!(
     "application/javascript; charset=utf-8",
     "../static/app/assets/app.js"
 );
+embedded_handler!(
+    serve_direct_upload_js,
+    "application/javascript; charset=utf-8",
+    "../static/app/assets/directUpload.js"
+);
 embedded_handler!(serve_favicon, "image/svg+xml", "../static/favicon.svg");
 
 async fn not_found(_request: Request) -> impl IntoResponse {
@@ -414,7 +447,6 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 allowed_hosts: ["ycloud.test".to_string()].into_iter().collect(),
-                s3_allowed_endpoints: Default::default(),
                 transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(ConfigFile {
@@ -470,9 +502,10 @@ mod tests {
                         access_key_id: "pending-access-key".into(),
                         secret_access_key: "pending-secret-key".into(),
                         capacity_limit_bytes: None,
+                        relay_upload: false,
                     }),
                 }),
-                ..ConfigFile::default()
+                ..ConfigFile::with_test_storage()
             })),
         )
         .await
@@ -667,27 +700,23 @@ mod tests {
             .unwrap();
         assert_eq!(reader_write.status(), StatusCode::FORBIDDEN);
 
-        let unapproved_s3_test = app
-            .clone()
-            .oneshot(
-                test_request()
-                    .method("POST")
-                    .uri("/api/admin/storage/test")
+        for cookie in [
+            String::new(),
+            format!("session={reader_token}"),
+            format!("gate_access={gate_token}"),
+        ] {
+            let response = app.clone().oneshot(
+                test_request().method("POST").uri("/api/admin/storage/test")
                     .header(header::ORIGIN, "http://ycloud.test")
-                    .header(header::COOKIE, format!("session={admin_token}"))
+                    .header(header::COOKIE, cookie)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"provider":"minio","endpoint":"http://127.0.0.1:9000","bucket":"ycloud","region":"us-east-1","prefix":"data/","addressing_style":"path","access_key_id":"test-access","secret_access_key":"test-secret"}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(unapproved_s3_test.status(), StatusCode::FORBIDDEN);
-        let rejected_body = to_bytes(unapproved_s3_test.into_body(), 16 * 1024)
-            .await
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&rejected_body).contains("test-secret"));
+                    .body(Body::from(r#"{"provider":"minio","endpoint":"http://127.0.0.1:9000","bucket":"ycloud","region":"us-east-1","prefix":"data/","addressing_style":"path","access_key_id":"test-access","secret_access_key":"test-secret"}"#))
+                    .unwrap()
+            ).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let rejected = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+            assert!(!String::from_utf8_lossy(&rejected).contains("test-secret"));
+        }
 
         let webdav_challenge = app
             .clone()
@@ -1110,6 +1139,32 @@ mod tests {
         assert_eq!(
             app_asset.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/javascript; charset=utf-8"
+        );
+
+        let direct_upload_asset = app
+            .clone()
+            .oneshot(
+                test_request()
+                    .uri("/assets/directUpload.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(direct_upload_asset.status(), StatusCode::OK);
+        assert_eq!(
+            direct_upload_asset
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+        let direct_upload_bytes = axum::body::to_bytes(direct_upload_asset.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            direct_upload_bytes.as_ref(),
+            include_bytes!("../static/app/assets/directUpload.js")
         );
 
         let removed_legacy_vue = app

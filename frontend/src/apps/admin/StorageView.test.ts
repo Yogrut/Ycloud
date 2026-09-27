@@ -11,7 +11,6 @@ afterEach(() => {
 const localInstance: StorageInstanceView = {
   id: 'primary',
   name: '本地存储',
-  is_default: false,
   enabled: true,
   allow_guest_access: true,
   status: 'enabled',
@@ -70,6 +69,31 @@ async function chooseSelect(host: HTMLElement, selector: string, label: string):
 }
 
 describe('StorageView', () => {
+  it('does not require administrator review of disconnected uploads', async () => {
+    const host = document.createElement('div'); document.body.append(host)
+    const { app } = mountStorage(host)
+    try {
+      expect(button(host, '核对上传任务')).toBeUndefined()
+      expect(host.textContent).not.toContain('已核对，结束旧任务')
+    } finally { app.unmount() }
+  })
+
+  it('groups relay upload with the lower switches for every S3 provider only', async () => {
+    const host = document.createElement('div'); document.body.append(host)
+    const { app } = mountStorage(host)
+    button(host, '新建存储')!.click(); await nextTick()
+    expect(host.querySelector('[aria-label="中转上传"]')).toBeNull()
+    for (const provider of ['阿里云 OSS', '腾讯云 COS', 'MinIO / RustFS', 'S3 通用协议']) {
+      button(host, provider)!.click(); await nextTick()
+      const relay = host.querySelector<HTMLInputElement>('input[role="switch"][aria-label="中转上传"]')!
+      expect(relay.closest('.storage-access-options')).not.toBeNull()
+      expect(relay.checked).toBe(false)
+      expect(relay.closest('.app-switch-field')?.querySelector('small')?.textContent).toBe('无法直传时开启，经服务器转发。关闭则直传，需浏览器可达和跨域配置，不受本站限速。')
+      expect([...host.querySelectorAll('.storage-access-options input')].map(input => input.getAttribute('aria-label')))
+        .toEqual(['启动', '中转上传', '允许访客访问', '允许访客下载'])
+    }
+    app.unmount()
+  })
   it('requires guest access before downloads and clears downloads when access is disabled', async () => {
     const host = document.createElement('div'); document.body.append(host)
     const { app } = mountStorage(host)
@@ -123,7 +147,7 @@ describe('StorageView', () => {
     expect(host.querySelector('button[aria-label="编辑存储"]')?.textContent).toBe('编辑')
     expect(host.querySelector('button[aria-label="删除存储"]')?.textContent).toBe('删除')
     expect(host.querySelector('.record-text-btn svg')).toBeNull()
-    expect(host.querySelector('button[aria-label="设为默认存储"] svg')).not.toBeNull()
+    expect(host.querySelector('button[aria-label="设为默认存储"]')).toBeNull()
 
     button(host, '新建存储')?.click()
     await nextTick()
@@ -294,18 +318,11 @@ describe('StorageView', () => {
     app.unmount()
   })
 
-  it('sets a ready storage as the default', async () => {
-    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(response()))
-    vi.stubGlobal('fetch', fetchMock)
+  it('does not expose a global default storage action', () => {
     const host = document.createElement('div')
     document.body.append(host)
-    const { app, changed } = mountStorage(host)
-
-    host.querySelector<HTMLButtonElement>('button[aria-label="设为默认存储"]')?.click()
-    await new Promise(resolve => window.setTimeout(resolve, 0))
-
-    expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/primary/default', expect.objectContaining({ method: 'PUT' }))
-    expect(changed).toHaveBeenCalledWith('默认存储已更新')
+    const { app } = mountStorage(host)
+    expect(host.querySelector('button[aria-label="设为默认存储"]')).toBeNull()
     app.unmount()
   })
 

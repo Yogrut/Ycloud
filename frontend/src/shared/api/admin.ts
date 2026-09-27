@@ -52,7 +52,6 @@ export interface AdminInfo {
   security_log_max_entries: number
   storage_instances: StorageInstanceView[]
   pending_storage_instance: StorageInstanceView | null
-  default_storage_id: string
   local_storage_path: string
   local_mounts?: LocalMountView[]
   user_accounts?: UserAccountView[]
@@ -127,7 +126,6 @@ export interface UpdateUserAccountRequest {
 export interface StorageInstanceView {
   id: string
   name: string
-  is_default: boolean
   enabled?: boolean
   allow_guest_access?: boolean
   allow_guest_download?: boolean
@@ -169,10 +167,12 @@ export type StorageBackendView =
     addressing_style: S3AddressingStyle
     has_access_key_id: boolean
     has_secret_access_key: boolean
+    relay_upload?: boolean
     capacity_limit_bytes: number | null
   }
 
 export interface TestS3StorageRequest {
+  relay_upload?: boolean
   provider: S3Provider
   endpoint: string
   bucket: string
@@ -429,10 +429,6 @@ export function updateLocalStorage(storageId: string, name: string, path: string
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ storage_id: storageId, name, path, capacity_limit_bytes: capacityLimitBytes, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload }),
   })
-}
-
-export function setDefaultStorage(storageId: string): Promise<{ success: boolean }> {
-  return adminRequest(`/api/admin/storage/${encodeURIComponent(storageId)}/default`, { method: 'PUT' })
 }
 
 export function deleteStorage(storageId: string): Promise<void> {

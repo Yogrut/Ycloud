@@ -4,8 +4,6 @@ use aws_sdk_s3::{
 };
 use aws_smithy_types::{byte_stream::ByteStream, error::metadata::ProvideErrorMetadata};
 use axum::body::Body;
-use bytes::BytesMut;
-use futures_util::StreamExt;
 
 use super::{
     capabilities, copy_source, multipart_part_size, multipart_session_matches, S3Backend,
@@ -14,11 +12,13 @@ use super::{
 };
 use crate::error::{AppError, AppResult, CleanupState, CommitState};
 
+const COPY_PART_BYTES: usize = 64 * 1024 * 1024;
+
 impl S3Backend {
     pub(super) async fn multipart_upload(
         &self,
         key: &str,
-        body: Body,
+        input: super::UploadInput,
         content_length: u64,
         content_type: Option<&str>,
         operation_id: &str,
@@ -78,9 +78,21 @@ impl S3Backend {
                 return Err(error);
             }
         };
-        let result = self
-            .upload_multipart_parts(key, &upload_id, body, content_length)
-            .await;
+        let cancellation = input.cancellation.clone().unwrap_or_default();
+        let transfer = async {
+            if let Some(channel) = input.direct {
+                self.receive_direct_parts(key, &upload_id, content_length, channel)
+                    .await
+            } else {
+                self.upload_multipart_parts(key, &upload_id, input.body, content_length)
+                    .await
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(AppError::Conflict("存储配置已变更，上传已中断，请重试".into())),
+            result = transfer => result,
+        };
         match result {
             Ok(()) => {
                 self.delete_transaction_best_effort(&session_key, session_etag.as_deref())
@@ -124,46 +136,19 @@ impl S3Backend {
         content_length: u64,
     ) -> AppResult<()> {
         let part_size = multipart_part_size(content_length)?;
-        let mut stream = body.into_data_stream();
-        let mut buffer = BytesMut::with_capacity(part_size);
+        let source = super::relay::RelaySource::new(body);
         let mut completed = Vec::new();
-        let mut received = 0_u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|_| AppError::ServiceUnavailable("读取上传请求失败".into()))?;
-            received = received
-                .checked_add(chunk.len() as u64)
-                .ok_or(AppError::PayloadTooLarge)?;
-            if received > content_length {
-                return Err(AppError::PayloadTooLarge);
-            }
-            let mut offset = 0;
-            while offset < chunk.len() {
-                let take = (part_size - buffer.len()).min(chunk.len() - offset);
-                buffer.extend_from_slice(&chunk[offset..offset + take]);
-                offset += take;
-                if buffer.len() == part_size {
-                    completed.push(
-                        self.upload_part(
-                            key,
-                            upload_id,
-                            completed.len() + 1,
-                            buffer.split().freeze(),
-                        )
-                        .await?,
-                    );
-                }
-            }
-        }
-        if received != content_length {
-            return Err(AppError::ServiceUnavailable("上传请求体长度不一致".into()));
-        }
-        if !buffer.is_empty() {
+        let mut offset = 0;
+        while offset < content_length {
+            let length = (content_length - offset).min(part_size as u64);
+            let body = super::relay::RelaySource::part(source.clone(), length);
             completed.push(
-                self.upload_part(key, upload_id, completed.len() + 1, buffer.freeze())
+                self.upload_part(key, upload_id, completed.len() + 1, body, length)
                     .await?,
             );
+            offset += length;
         }
+        source.lock().await.finish().await?;
         let multipart = CompletedMultipartUpload::builder()
             .set_parts(Some(completed))
             .build();
@@ -185,10 +170,11 @@ impl S3Backend {
         key: &str,
         upload_id: &str,
         number: usize,
-        bytes: bytes::Bytes,
+        body: Body,
+        size: u64,
     ) -> AppResult<CompletedPart> {
         let part_number = i32::try_from(number).map_err(|_| AppError::PayloadTooLarge)?;
-        let length = i64::try_from(bytes.len()).map_err(|_| AppError::PayloadTooLarge)?;
+        let length = i64::try_from(size).map_err(|_| AppError::PayloadTooLarge)?;
         let upload_timeouts = TimeoutConfig::builder()
             .connect_timeout(S3_CONNECT_TIMEOUT)
             .operation_attempt_timeout(self.upload_timeout)
@@ -206,7 +192,10 @@ impl S3Backend {
             .upload_id(upload_id)
             .part_number(part_number)
             .content_length(length)
-            .body(ByteStream::from(bytes))
+            .body(ByteStream::from_body_1_x(super::ExactLengthBody::new(
+                body.into_data_stream(),
+                size,
+            )))
             .customize()
             .config_override(operation_override)
             .send()
@@ -287,7 +276,7 @@ impl S3Backend {
             }
         };
         let completed = async {
-            let part_size = multipart_part_size(source_size)? as u64;
+            let part_size = multipart_part_size(source_size)?.max(COPY_PART_BYTES) as u64;
             let mut completed = Vec::new();
             let mut start = 0_u64;
             while start < source_size {

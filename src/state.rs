@@ -1,5 +1,5 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 
@@ -31,6 +31,7 @@ pub struct AppState {
     pub backends: StorageRegistry,
     pub archive_tickets: ArchiveTicketStore,
     pub upload_batches: UploadBatchStore,
+    pub(crate) direct_uploads: crate::direct_upload::DirectUploadStore,
     pub(crate) auth_transitions: Arc<Mutex<()>>,
     pub(crate) login_attempts: Arc<Mutex<()>>,
     pub admin_totp_replay: crate::totp::TotpReplayStore,
@@ -40,7 +41,7 @@ pub struct AppState {
     pub upload_limiter: BandwidthLimiter,
     pub download_limiter: BandwidthLimiter,
     pub traffic: crate::traffic::TrafficStore,
-    config_updates: Arc<Mutex<()>>,
+    pub(crate) config_updates: Arc<Mutex<()>>,
     local_io_gate: Arc<Semaphore>,
 }
 
@@ -117,6 +118,7 @@ impl AppState {
             backends,
             archive_tickets: ArchiveTicketStore::new(),
             upload_batches: UploadBatchStore::new(upload_batch_ttl),
+            direct_uploads: crate::direct_upload::DirectUploadStore::default(),
             auth_transitions: Arc::new(Mutex::new(())),
             login_attempts: Arc::new(Mutex::new(())),
             admin_totp_replay: crate::totp::TotpReplayStore::default(),
@@ -160,45 +162,60 @@ impl AppState {
                 "本地存储目录不存在、不是目录或属于链接/重解析点".into(),
             ));
         }
-        let probe_directory = mount
-            .path
-            .join(crate::storage_transaction::SYSTEM_DIR)
-            .join("connection-tests");
-        tokio::fs::create_dir_all(&probe_directory)
+        // Testing must not create the reserved metadata directory: only the
+        // storage initializer may claim it and write its ownership marker.
+        let probe_name = format!(
+            ".ycloud-connection-test-{}.probe",
+            uuid::Uuid::new_v4().simple()
+        );
+        #[cfg(target_os = "linux")]
+        let root = crate::storage::linux_root::LinuxRoot::open(&mount.path)?;
+        #[cfg(target_os = "linux")]
+        let mut file = tokio::fs::File::from_std(root.create_file_new(&probe_name, 0o600).await?);
+        #[cfg(not(target_os = "linux"))]
+        let probe_path = mount.path.join(&probe_name);
+        #[cfg(not(target_os = "linux"))]
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&probe_path)
             .await
             .map_err(|error| AppError::with_source("本地存储不可写", error))?;
-        let metadata = tokio::fs::symlink_metadata(&probe_directory)
-            .await
-            .map_err(|error| AppError::with_source("无法检查本地存储测试目录", error))?;
-        if !metadata.is_dir() || crate::storage::is_link_or_reparse_point(&metadata) {
-            return Err(AppError::ServiceUnavailable(
-                "本地存储测试目录不安全".into(),
-            ));
-        }
-        let probe_path = probe_directory.join(format!("{}.probe", uuid::Uuid::new_v4().simple()));
         let result = async {
-            let mut file = tokio::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&probe_path)
-                .await?;
-            file.write_all(b"ycloud-local-storage-probe").await?;
-            file.sync_all().await?;
-            drop(file);
-            let bytes = tokio::fs::read(&probe_path).await?;
+            file.write_all(b"ycloud-local-storage-probe")
+                .await
+                .map_err(|error| AppError::with_source("本地存储读写测试失败", error))?;
+            file.sync_all()
+                .await
+                .map_err(|error| AppError::with_source("本地存储读写测试失败", error))?;
+            #[cfg(target_os = "linux")]
+            let reader = root.open_file_for_read(&probe_name).await?;
+            #[cfg(not(target_os = "linux"))]
+            let reader = tokio::fs::File::open(&probe_path)
+                .await
+                .map_err(|error| AppError::with_source("本地存储读写测试失败", error))?;
+            let mut bytes = Vec::new();
+            reader
+                .take(27)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| AppError::with_source("本地存储读写测试失败", error))?;
             if bytes != b"ycloud-local-storage-probe" {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "local storage probe content mismatch",
+                return Err(AppError::ServiceUnavailable(
+                    "本地存储测试内容不一致".into(),
                 ));
             }
-            tokio::fs::remove_file(&probe_path).await
+            Ok(())
         }
         .await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&probe_path).await;
-        }
-        result.map_err(|error| AppError::with_source("本地存储读写测试失败", error))
+        drop(file);
+        #[cfg(target_os = "linux")]
+        let cleanup = root.remove_file(&probe_name).await;
+        #[cfg(not(target_os = "linux"))]
+        let cleanup = tokio::fs::remove_file(&probe_path)
+            .await
+            .map_err(|error| AppError::with_source("无法清理本地存储测试文件", error));
+        result.and(cleanup)
     }
 
     pub async fn add_local_storage(
@@ -346,7 +363,6 @@ impl AppState {
             download: allow_guest_download,
         } = allow_guest_access.into();
         let backend_config = StorageBackendConfig::S3(settings.clone());
-        self.config.allows_storage_backend(&backend_config)?;
         if enabled {
             let backend = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
             backend.activation_probe().await?;
@@ -378,9 +394,6 @@ impl AppState {
         } = allow_guest_access.into();
         let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
-        if !enabled && next.default_storage_id == storage_id {
-            return Err(AppError::Conflict("请先将其他存储设为默认存储".into()));
-        }
         let instance = next
             .storage_instances
             .iter_mut()
@@ -395,9 +408,34 @@ impl AppState {
         if settings.secret_access_key.is_empty() {
             settings.secret_access_key = previous.secret_access_key.clone();
         }
+        let mut connection = settings.clone();
+        connection.capacity_limit_bytes = previous.capacity_limit_bytes;
+        connection.relay_upload = previous.relay_upload;
+        let cached = self.backends.cached(storage_id).await;
+        let reuse = connection == *previous && cached.is_some();
+        let interrupt = !reuse || !enabled || settings.relay_upload != previous.relay_upload;
         let backend_config = StorageBackendConfig::S3(settings.clone());
-        self.config.allows_storage_backend(&backend_config)?;
-        let prepared = if enabled {
+        let mut candidate = self.config_file.read().await.clone();
+        let candidate_instance = candidate
+            .storage_instances
+            .iter_mut()
+            .find(|storage| storage.id == storage_id)
+            .ok_or(AppError::NotFound)?;
+        candidate_instance.backend = backend_config.clone();
+        candidate_instance.enabled = enabled;
+        candidate_instance.name = name.trim().to_string();
+        candidate.validate()?;
+        let edit = if interrupt {
+            match &cached {
+                Some(backend) => Some(backend.interrupt_for_edit().await?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let prepared = if reuse {
+            cached.clone()
+        } else if enabled {
             let probe = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
             probe.activation_probe().await?;
             Some(
@@ -425,10 +463,20 @@ impl AppState {
         next.validate()?;
         self.save_storage_selection(&next).await?;
         *self.config_file.write().await = next;
+        if interrupt {
+            self.upload_batches.invalidate_storage(storage_id).await;
+        }
+        if !reuse {
+            if let Some(edit) = &edit {
+                edit.retire();
+            }
+        }
         if let Some(prepared) = prepared {
+            prepared.set_capacity_limit(settings.capacity_limit_bytes);
             self.backends
                 .insert_ready(storage_id.to_string(), prepared)
                 .await;
+            self.backends.set_enabled(storage_id, enabled).await;
         } else {
             self.backends.remove(storage_id).await;
         }
@@ -462,9 +510,6 @@ impl AppState {
             })?;
         let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
-        if !enabled && next.default_storage_id == storage_id {
-            return Err(AppError::Conflict("请先将其他存储设为默认存储".into()));
-        }
         let position = next
             .storage_instances
             .iter()
@@ -491,7 +536,27 @@ impl AppState {
             mount_id,
             capacity_limit_bytes,
         });
-        let prepared = if enabled {
+        let cached = self.backends.cached(storage_id).await;
+        let reuse = matches!((&next.storage_instances[position].backend, &backend_config),
+            (StorageBackendConfig::Local(old), StorageBackendConfig::Local(new)) if old.mount_id == new.mount_id)
+            && cached.is_some();
+        let interrupt = !reuse || !enabled;
+        let mut candidate = next.clone();
+        candidate.storage_instances[position].name = name.trim().to_string();
+        candidate.storage_instances[position].backend = backend_config.clone();
+        candidate.storage_instances[position].enabled = enabled;
+        candidate.validate()?;
+        let edit = if interrupt {
+            match &cached {
+                Some(backend) => Some(backend.interrupt_for_edit().await?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        let prepared = if reuse {
+            cached.clone()
+        } else if enabled {
             Some(
                 prepare_storage_backend(
                     &self.config,
@@ -521,10 +586,20 @@ impl AppState {
                 AppError::with_source("failed to persist local storage settings", error)
             })?;
         *self.config_file.write().await = next;
+        if interrupt {
+            self.upload_batches.invalidate_storage(storage_id).await;
+        }
+        if !reuse {
+            if let Some(edit) = &edit {
+                edit.retire();
+            }
+        }
         if let Some(prepared) = prepared {
+            prepared.set_capacity_limit(capacity_limit_bytes);
             self.backends
                 .insert_ready(storage_id.to_string(), prepared)
                 .await;
+            self.backends.set_enabled(storage_id, enabled).await;
         } else {
             self.backends.remove(storage_id).await;
         }
@@ -550,7 +625,11 @@ impl AppState {
             .pending_storage_instance
             .clone()
             .ok_or(AppError::NotFound)?;
-        self.config.allows_storage_backend(&pending.backend)?;
+        // Validate namespace isolation before recovery can inspect remote journals.
+        let mut candidate = next.clone();
+        candidate.storage_instances.push(pending.clone());
+        candidate.pending_storage_instance = None;
+        candidate.validate()?;
         let prepared = if pending.enabled {
             Some(
                 prepare_storage_backend(
@@ -607,14 +686,28 @@ impl AppState {
             Some(false)
         };
         let backend_config = instance.backend.clone();
+        let cached = self.backends.cached(storage_id).await;
         next.validate()?;
+        let _edit = if !enabled {
+            match &cached {
+                Some(backend) => Some(backend.interrupt_for_edit().await?),
+                None => None,
+            }
+        } else {
+            None
+        };
         save_config(&self.config.config_path, &next)
             .await
             .map_err(|error| {
                 AppError::with_source("failed to persist storage access settings", error)
             })?;
         *self.config_file.write().await = next.clone();
-        if enabled {
+        if !enabled {
+            self.upload_batches.invalidate_storage(storage_id).await;
+        }
+        if cached.is_some() {
+            self.backends.set_enabled(storage_id, enabled).await;
+        } else if enabled {
             match prepare_storage_backend(
                 &self.config,
                 &self.local_io_gate,
@@ -645,35 +738,9 @@ impl AppState {
         Ok(())
     }
 
-    pub async fn set_default_storage(&self, storage_id: &str) -> AppResult<()> {
-        let _update_guard = self.config_updates.lock().await;
-        let mut next = self.config_file.read().await.clone();
-        let instance = next
-            .storage_instances
-            .iter()
-            .find(|instance| instance.id == storage_id)
-            .ok_or(AppError::NotFound)?;
-        if !instance.enabled {
-            return Err(AppError::Conflict("停用的存储不能设为默认存储".into()));
-        }
-        if !self.backends.is_ready(storage_id).await {
-            return Err(AppError::ServiceUnavailable(
-                "存储当前不可用，不能设为默认存储".into(),
-            ));
-        }
-        next.default_storage_id = storage_id.to_string();
-        self.persist_storage_selection(&next).await?;
-        self.gate_access.clear().await;
-        self.folder_access.clear().await;
-        Ok(())
-    }
-
     pub async fn delete_storage(&self, storage_id: &str) -> AppResult<()> {
         let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
-        if next.default_storage_id == storage_id {
-            return Err(AppError::Conflict("请先将其他存储设为默认存储".into()));
-        }
         if next
             .shares
             .iter()
@@ -698,7 +765,17 @@ impl AppState {
         if before == next.storage_instances.len() {
             return Err(AppError::NotFound);
         }
+        next.validate()?;
+        let cached = self.backends.cached(storage_id).await;
+        let edit = match &cached {
+            Some(backend) => Some(backend.interrupt_for_edit().await?),
+            None => None,
+        };
         self.persist_storage_selection(&next).await?;
+        self.upload_batches.invalidate_storage(storage_id).await;
+        if let Some(edit) = &edit {
+            edit.retire();
+        }
         self.backends.remove(storage_id).await;
         self.gate_access.clear().await;
         self.folder_access.clear().await;
@@ -732,7 +809,6 @@ async fn prepare_storage_backend(
     backend: &StorageBackendConfig,
 ) -> AppResult<StorageBackend> {
     let ledger_path = capacity_ledger_path(config, storage_id);
-    config.allows_storage_backend(backend)?;
     match backend {
         StorageBackendConfig::Local(settings) => {
             let mount = config
@@ -800,7 +876,8 @@ mod tests {
     #[tokio::test]
     async fn accepted_config_update_finishes_after_the_waiter_is_cancelled() {
         let directory = crate::test_support::TestDirectory::new("config-cancellation");
-        let state = crate::test_support::app_state(&directory, ConfigFile::default()).await;
+        let state =
+            crate::test_support::app_state(&directory, ConfigFile::with_test_storage()).await;
         let entered = Arc::new(tokio::sync::Notify::new());
         // Readers do not block candidate creation, but hold memory publication
         // so cancellation happens while the owned update is still active.
@@ -840,7 +917,8 @@ mod tests {
     #[tokio::test]
     async fn published_storage_disable_rejects_new_work_but_keeps_in_flight_backend_alive() {
         let directory = crate::test_support::TestDirectory::new("storage-disable");
-        let state = crate::test_support::app_state(&directory, ConfigFile::default()).await;
+        let state =
+            crate::test_support::app_state(&directory, ConfigFile::with_test_storage()).await;
         let in_flight_backend = state.storage_backend("primary").await.unwrap();
 
         state.config_file.write().await.storage_instances[0].enabled = false;
@@ -854,6 +932,245 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_edits_and_reenable_reuse_backend_and_do_not_recover_live_files() {
+        let directory = crate::test_support::TestDirectory::new("storage-online-settings");
+        let state =
+            crate::test_support::app_state(&directory, ConfigFile::with_test_storage()).await;
+        let backend = state.storage_backend("primary").await.unwrap();
+        let path = state.config.storage_path.to_str().unwrap().to_owned();
+        state
+            .update_local_storage(
+                "primary",
+                "Renamed".into(),
+                path,
+                Some(4 * 1024 * 1024),
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(backend.capacity_status().limit, Some(4 * 1024 * 1024));
+        state
+            .update_storage_access("primary", false, false)
+            .await
+            .unwrap();
+        assert!(state.storage_backend("primary").await.is_err());
+        state
+            .update_storage_access("primary", true, false)
+            .await
+            .unwrap();
+        assert!(state.storage_backend("primary").await.is_ok());
+        state.delete_storage("primary").await.unwrap();
+        assert!(!state
+            .config_file
+            .read()
+            .await
+            .storage_instances
+            .iter()
+            .any(|storage| storage.id == "primary"));
+    }
+
+    #[tokio::test]
+    async fn administrator_disable_interrupts_stalled_upload_and_reenable_accepts_new_upload() {
+        use futures_util::StreamExt;
+        let directory = crate::test_support::TestDirectory::new("admin-interrupt-transfer");
+        let state =
+            crate::test_support::app_state(&directory, ConfigFile::with_test_storage()).await;
+        let backend = state.storage_backend("primary").await.unwrap();
+        let stale = backend.clone();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let body = axum::body::Body::from_stream(
+            futures_util::stream::once(async move {
+                let _ = started.send(());
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"partial"))
+            })
+            .chain(futures_util::stream::pending()),
+        );
+        let upload = tokio::spawn(async move {
+            backend
+                .upload_new_file("interrupted.bin", body, Some(100), 1024, None)
+                .await
+        });
+        entered.await.unwrap();
+        // Harmless metadata changes must not interrupt the existing transfer.
+        state
+            .update_local_storage(
+                "primary",
+                "Renamed".into(),
+                state.config.storage_path.to_str().unwrap().into(),
+                None,
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!upload.is_finished());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.update_storage_access("primary", false, false),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let error = upload.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("存储配置已变更"));
+        assert!(stale.metadata("interrupted.bin").await.is_err());
+        assert!(state.storage_backend("primary").await.is_err());
+        state
+            .update_storage_access("primary", true, false)
+            .await
+            .unwrap();
+        // A request admitted before the edit cannot resume on the new generation.
+        assert!(stale
+            .upload_new_file(
+                "stale.bin",
+                axum::body::Body::from("x"),
+                Some(1),
+                1024,
+                None
+            )
+            .await
+            .is_err());
+        state
+            .storage_backend("primary")
+            .await
+            .unwrap()
+            .upload_new_file(
+                "fresh.bin",
+                axum::body::Body::from("ok"),
+                Some(2),
+                1024,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(state.config.storage_path.join("fresh.bin"))
+                .await
+                .unwrap(),
+            b"ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_connection_tests_leave_no_metadata_and_allow_subsequent_add() {
+        let directory = crate::test_support::TestDirectory::new("local-probe-add");
+        let state = crate::test_support::app_state(&directory, ConfigFile::default()).await;
+        let storage = &state.config.storage_path;
+        tokio::fs::write(storage.join("existing.txt"), b"keep")
+            .await
+            .unwrap();
+        let path = storage.to_str().unwrap();
+        let (first, second, third) = tokio::join!(
+            state.test_local_storage(path),
+            state.test_local_storage(path),
+            state.test_local_storage(path),
+        );
+        first.unwrap();
+        second.unwrap();
+        third.unwrap();
+        assert!(state.config_file.read().await.storage_instances.is_empty());
+        assert!(!storage
+            .join(crate::storage_transaction::SYSTEM_DIR)
+            .exists());
+        let mut entries = tokio::fs::read_dir(storage).await.unwrap();
+        assert_eq!(
+            entries.next_entry().await.unwrap().unwrap().file_name(),
+            "existing.txt"
+        );
+        assert!(entries.next_entry().await.unwrap().is_none());
+        let id = state
+            .add_local_storage(path.into(), "Local".into(), None, true, false)
+            .await
+            .unwrap();
+        assert!(storage.join(".ycloud-system/marker").is_file());
+        state.test_local_storage(path).await.unwrap();
+        state
+            .storage_backend(&id)
+            .await
+            .unwrap()
+            .upload_file("uploaded.txt", Body::from("new"), Some(3), 1024, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(storage.join("existing.txt")).await.unwrap(),
+            b"keep"
+        );
+        assert_eq!(
+            tokio::fs::read(storage.join("uploaded.txt")).await.unwrap(),
+            b"new"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_local_directory_test_can_retry_after_directory_is_created() {
+        let directory = crate::test_support::TestDirectory::new("local-probe-retry");
+        let state = crate::test_support::app_state(&directory, ConfigFile::default()).await;
+        let storage = &state.config.storage_path;
+        tokio::fs::remove_dir(storage).await.unwrap();
+        assert!(state
+            .test_local_storage(storage.to_str().unwrap())
+            .await
+            .is_err());
+        assert!(!storage.exists());
+        tokio::fs::create_dir(storage).await.unwrap();
+        state
+            .test_local_storage(storage.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(tokio::fs::read_dir(storage)
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none());
+        state
+            .add_local_storage(
+                storage.to_str().unwrap().into(),
+                "Local".into(),
+                None,
+                true,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_connection_test_does_not_claim_existing_reserved_metadata() {
+        let directory = crate::test_support::TestDirectory::new("local-probe-reserved");
+        let state = crate::test_support::app_state(&directory, ConfigFile::default()).await;
+        let storage = &state.config.storage_path;
+        let system = storage.join(crate::storage_transaction::SYSTEM_DIR);
+        tokio::fs::create_dir(&system).await.unwrap();
+        tokio::fs::write(system.join("existing-record"), b"keep recovery evidence")
+            .await
+            .unwrap();
+        state
+            .test_local_storage(storage.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(!system.join("marker").exists());
+        assert!(state
+            .add_local_storage(
+                storage.to_str().unwrap().into(),
+                "Local".into(),
+                None,
+                true,
+                false
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            tokio::fs::read(system.join("existing-record"))
+                .await
+                .unwrap(),
+            b"keep recovery evidence"
+        );
+    }
+
+    #[tokio::test]
     async fn declared_local_mounts_run_as_independent_storage_backends() {
         let root =
             std::env::temp_dir().join(format!("ycloud-local-mounts-{}", uuid::Uuid::new_v4()));
@@ -862,7 +1179,7 @@ mod tests {
         tokio::fs::create_dir_all(&archive).await.unwrap();
         let mut persisted = ConfigFile {
             max_upload_bytes: 1024 * 1024,
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
         persisted.storage_instances.push(StorageInstanceConfig {
             id: "archive".into(),
@@ -904,7 +1221,6 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 allowed_hosts: Default::default(),
-                s3_allowed_endpoints: Default::default(),
                 transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(persisted)),
@@ -935,7 +1251,7 @@ mod tests {
         tokio::fs::create_dir_all(&backup).await.unwrap();
         let persisted = ConfigFile {
             max_upload_bytes: 1024 * 1024,
-            ..ConfigFile::default()
+            ..ConfigFile::with_test_storage()
         };
         let state = AppState::new(
             Config {
@@ -973,7 +1289,6 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 allowed_hosts: Default::default(),
-                s3_allowed_endpoints: Default::default(),
                 transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(persisted)),
@@ -1085,10 +1400,9 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 allowed_hosts: Default::default(),
-                s3_allowed_endpoints: Default::default(),
                 transaction_auth_key: [0x31; 32],
             },
-            Arc::new(RwLock::new(ConfigFile::default())),
+            Arc::new(RwLock::new(ConfigFile::with_test_storage())),
         )
         .await
         .unwrap();
@@ -1109,6 +1423,7 @@ mod tests {
                 access_key_id: "credential-to-remove".into(),
                 secret_access_key: "secret-to-remove".into(),
                 capacity_limit_bytes: None,
+                relay_upload: false,
             }),
         });
         state.persist_storage_selection(&pending).await.unwrap();
@@ -1140,6 +1455,7 @@ mod tests {
                 access_key_id: "old-access-key".into(),
                 secret_access_key: "old-secret-key".into(),
                 capacity_limit_bytes: None,
+                relay_upload: false,
             }),
         });
         state.persist_storage_selection(&configured).await.unwrap();
@@ -1157,6 +1473,7 @@ mod tests {
                     access_key_id: "new-access-key".into(),
                     secret_access_key: "new-secret-key".into(),
                     capacity_limit_bytes: None,
+                    relay_upload: false,
                 },
                 false,
                 false,
@@ -1197,7 +1514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_configuration_cannot_delete_default_or_referenced_instances() {
+    async fn storage_configuration_can_delete_last_but_not_referenced_instances() {
         let root =
             std::env::temp_dir().join(format!("ycloud-storage-delete-{}", uuid::Uuid::new_v4()));
         let state = AppState::new(
@@ -1225,16 +1542,24 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 allowed_hosts: Default::default(),
-                s3_allowed_endpoints: Default::default(),
                 transaction_auth_key: [0x31; 32],
             },
-            Arc::new(RwLock::new(ConfigFile::default())),
+            Arc::new(RwLock::new(ConfigFile::with_test_storage())),
         )
         .await
         .unwrap();
 
-        let default_error = state.delete_storage("primary").await.unwrap_err();
-        assert_eq!(default_error.status(), axum::http::StatusCode::CONFLICT);
+        tokio::fs::write(state.config.storage_path.join("keep.txt"), b"keep")
+            .await
+            .unwrap();
+        state.delete_storage("primary").await.unwrap();
+        assert!(state.config_file.read().await.storage_instances.is_empty());
+        assert_eq!(
+            tokio::fs::read(state.config.storage_path.join("keep.txt"))
+                .await
+                .unwrap(),
+            b"keep"
+        );
 
         let mut configured = state.config_file.read().await.clone();
         configured.storage_instances.push(StorageInstanceConfig {
@@ -1253,6 +1578,7 @@ mod tests {
                 access_key_id: "test-access-key".into(),
                 secret_access_key: "test-secret-key".into(),
                 capacity_limit_bytes: None,
+                relay_upload: false,
             }),
         });
         configured.shares.push(Share {

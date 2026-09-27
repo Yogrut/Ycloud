@@ -24,7 +24,7 @@ use tokio::{
 };
 
 use crate::{
-    config::{normalize_s3_endpoint, Config, S3AddressingStyle, S3Provider, S3StorageConfig},
+    config::{Config, S3AddressingStyle, S3Provider, S3StorageConfig},
     error::{AppError, AppResult},
     storage::FileResponseMode,
 };
@@ -242,6 +242,10 @@ async fn forward_fault_proxy_requests(
 fn multipart_part_sizing_stays_within_provider_limits() {
     assert_eq!(
         multipart_part_size(64 * 1024 * 1024).unwrap(),
+        64 * 1024 * 1024
+    );
+    assert_eq!(
+        multipart_part_size(350 * 1024 * 1024).unwrap(),
         64 * 1024 * 1024
     );
     let four_tebibytes = 4_u64 * 1024 * 1024 * 1024 * 1024;
@@ -538,6 +542,7 @@ async fn s3_compatibility_smoke() {
         access_key_id,
         secret_access_key,
         capacity_limit_bytes: Some(capacity_limit),
+        relay_upload: false,
     };
     let runtime = Config {
         bind_address: IpAddr::from([127, 0, 0, 1]),
@@ -567,7 +572,6 @@ async fn s3_compatibility_smoke() {
         public_base_url: None,
         public_host: None,
         allowed_hosts: HashSet::new(),
-        s3_allowed_endpoints: HashSet::from([normalize_s3_endpoint(&endpoint).unwrap()]),
         transaction_auth_key: [0x31; 32],
     };
     let backend = S3Backend::new(&settings, &runtime).unwrap();
@@ -1073,6 +1077,10 @@ fn multipart_recovery_records_are_confined_to_the_backend_namespace() {
     session.purpose = Some(S3MultipartPurpose::Upload);
     session.expected_size = Some(S3_MULTIPART_THRESHOLD);
     assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
+    for size in [0, 1, S3_MULTIPART_THRESHOLD - 1, S3_MULTIPART_THRESHOLD] {
+        session.expected_size = Some(size);
+        assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
+    }
     session.upload_id = Some("provider-upload-id".into());
     assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
 

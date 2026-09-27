@@ -10,6 +10,18 @@ export interface Identity {
   web_password_required?: boolean
 }
 
+export interface UserTraffic {
+  usage: { upload: number; download: number }
+  quota: { enabled: boolean; upload: number; download: number }
+  next_reset: number
+}
+
+export async function getUserTraffic(): Promise<UserTraffic> {
+  const { response, body } = await requestJson<UserTraffic>('/api/user/traffic', { cache: 'no-store' })
+  if (!response.ok || !body?.usage || !body.quota) throw new Error(locale.text('流量信息读取失败', 'Unable to load traffic usage'))
+  return body
+}
+
 interface GateResponse {
   success?: boolean
   message?: string

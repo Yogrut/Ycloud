@@ -60,6 +60,20 @@ fn schema_version(raw: &Value) -> anyhow::Result<u64> {
 
 fn migrate_step(raw: &mut Value, target: u64) -> anyhow::Result<()> {
     match target {
+        15 => {
+            // Keep existing private-network installations working; new S3 settings default to direct.
+            if let Some(instances) = raw
+                .get_mut("storage_instances")
+                .and_then(Value::as_array_mut)
+            {
+                for instance in instances {
+                    preserve_existing_relay(instance);
+                }
+            }
+            if let Some(instance) = raw.get_mut("pending_storage_instance") {
+                preserve_existing_relay(instance);
+            }
+        }
         5 if raw.get("storage_backend").is_none() => {
             raw["storage_backend"] = serde_json::json!({ "type": "local", "settings": {} });
         }
@@ -83,6 +97,11 @@ fn migrate_step(raw: &mut Value, target: u64) -> anyhow::Result<()> {
                 Value::from(DEFAULT_MAX_UPLOAD_BATCH_ENTRIES),
             );
         }
+        14 => {
+            raw.as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("Configuration must be an object"))?
+                .remove("default_storage_id");
+        }
         11 => {
             set_default(raw, "admin_totp_secret", Value::Null);
             set_default(raw, "admin_recovery_code_hashes", serde_json::json!([]));
@@ -90,6 +109,14 @@ fn migrate_step(raw: &mut Value, target: u64) -> anyhow::Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn preserve_existing_relay(instance: &mut Value) {
+    if instance["backend"]["type"] == "s3" {
+        if let Some(settings) = instance["backend"]["settings"].as_object_mut() {
+            settings.entry("relay_upload").or_insert(Value::Bool(true));
+        }
+    }
 }
 
 fn set_default(raw: &mut Value, key: &str, value: Value) {
@@ -184,15 +211,41 @@ mod tests {
 
     #[test]
     fn current_schema_is_an_identity_transformation() {
-        let mut raw = serde_json::to_value(super::super::ConfigFile::default()).unwrap();
+        let mut raw = serde_json::to_value(super::super::ConfigFile::with_test_storage()).unwrap();
         let before = raw.clone();
         assert!(!migrate_config(&mut raw).unwrap());
         assert_eq!(raw, before);
     }
 
     #[test]
+    fn direct_upload_migration_preserves_existing_relay_and_explicit_choices() {
+        let mut raw = serde_json::json!({
+            "schema_version": 14,
+            "storage_instances": [
+                { "backend": { "type": "s3", "settings": {} } },
+                { "backend": { "type": "s3", "settings": { "relay_upload": false } } }
+            ],
+            "pending_storage_instance": { "backend": { "type": "s3", "settings": {} } }
+        });
+        migrate_config(&mut raw).unwrap();
+        assert_eq!(
+            raw["storage_instances"][0]["backend"]["settings"]["relay_upload"],
+            true
+        );
+        assert_eq!(
+            raw["storage_instances"][1]["backend"]["settings"]["relay_upload"],
+            false
+        );
+        assert_eq!(
+            raw["pending_storage_instance"]["backend"]["settings"]["relay_upload"],
+            true
+        );
+        assert!(!migrate_config(&mut raw).unwrap());
+    }
+
+    #[test]
     fn last_schema_step_preserves_existing_configuration_and_is_idempotent() {
-        let mut raw = serde_json::to_value(super::super::ConfigFile::default()).unwrap();
+        let mut raw = serde_json::to_value(super::super::ConfigFile::with_test_storage()).unwrap();
         raw["schema_version"] = Value::from(11);
         let mut expected = raw.clone();
         expected["schema_version"] = Value::from(CONFIG_SCHEMA_VERSION);
@@ -203,8 +256,19 @@ mod tests {
     }
 
     #[test]
+    fn removing_global_default_preserves_existing_storages() {
+        let mut raw = serde_json::to_value(super::super::ConfigFile::with_test_storage()).unwrap();
+        raw["schema_version"] = Value::from(13);
+        raw["default_storage_id"] = Value::from("primary");
+        let before = raw["storage_instances"].clone();
+        migrate_config(&mut raw).unwrap();
+        assert!(raw.get("default_storage_id").is_none());
+        assert_eq!(raw["storage_instances"], before);
+    }
+
+    #[test]
     fn visibility_migration_retains_explicit_choices() {
-        let mut raw = serde_json::to_value(super::super::ConfigFile::default()).unwrap();
+        let mut raw = serde_json::to_value(super::super::ConfigFile::with_test_storage()).unwrap();
         raw["schema_version"] = Value::from(8);
         raw["storage_instances"][0]["enabled"] = Value::Bool(false);
         raw["storage_instances"][0]["allow_guest_access"] = Value::Bool(false);

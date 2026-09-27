@@ -10,8 +10,7 @@ use super::commit::{self, ConfigCommit};
 use super::migration::migrate_config;
 use super::secret_store::SecretStore;
 use super::{
-    default_admin_username, default_storage_id, hash_password, uuid_v4, ConfigFile,
-    InitialCredentials, Share, StorageBackendConfig, StorageInstanceConfig, CONFIG_SCHEMA_VERSION,
+    default_admin_username, hash_password, ConfigFile, InitialCredentials, CONFIG_SCHEMA_VERSION,
     DEFAULT_ADMIN_LOGIN_FAILURES, DEFAULT_LOGIN_BLOCK_SECONDS, DEFAULT_MAX_ARCHIVE_BYTES,
     DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_UPLOAD_BATCH_BYTES, DEFAULT_MAX_UPLOAD_BATCH_ENTRIES,
     DEFAULT_MAX_UPLOAD_BYTES, DEFAULT_SECURITY_LOG_MAX_ENTRIES,
@@ -66,10 +65,7 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
             traffic: crate::traffic::TrafficSettings::default(),
             schema_version: CONFIG_SCHEMA_VERSION,
             domain_binding: None,
-            storage_instances: vec![StorageInstanceConfig::primary(
-                StorageBackendConfig::default(),
-            )],
-            default_storage_id: default_storage_id(),
+            storage_instances: Vec::new(),
             pending_storage_instance: None,
             admin_username: credentials.admin_username.clone(),
             admin_password_hash: hash_password(&credentials.admin_password),
@@ -78,16 +74,7 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
             user_accounts: Vec::new(),
             global_web_password_hash: Some(hash_password(&credentials.web_access_password)),
             folder_locks: Vec::new(),
-            shares: vec![Share {
-                id: uuid_v4(),
-                storage_id: default_storage_id(),
-                name: "Default".into(),
-                path: String::new(),
-                username: Some("admin".into()),
-                webdav_enabled: false,
-                password_hash: None,
-                readonly: false,
-            }],
+            shares: Vec::new(),
             max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
             max_upload_batch_bytes: DEFAULT_MAX_UPLOAD_BATCH_BYTES,
             max_upload_batch_entries: DEFAULT_MAX_UPLOAD_BATCH_ENTRIES,
@@ -607,7 +594,7 @@ mod credential_tests {
     async fn migration_keeps_an_encrypted_exact_recovery_copy() {
         let directory = TestDirectory::new("migration-recovery");
         let path = directory.path().join("config.json");
-        let mut raw = serde_json::to_value(ConfigFile::default()).unwrap();
+        let mut raw = serde_json::to_value(ConfigFile::with_test_storage()).unwrap();
         raw["schema_version"] = serde_json::json!(11);
         let original = serde_json::to_string_pretty(&raw).unwrap();
         tokio::fs::write(&path, &original).await.unwrap();
@@ -633,7 +620,7 @@ mod credential_tests {
     async fn missing_primary_restores_only_a_fully_validated_backup() {
         let directory = TestDirectory::new("validated-recovery");
         let path = directory.path().join("config.json");
-        let config = ConfigFile::default();
+        let config = ConfigFile::with_test_storage();
         save_config_refresh_backup(&path, &config).await.unwrap();
         let backup_before = tokio::fs::read(config_backup_path(&path)).await.unwrap();
         tokio::fs::remove_file(&path).await.unwrap();
@@ -650,7 +637,7 @@ mod credential_tests {
     async fn semantically_invalid_backup_is_not_published() {
         let directory = TestDirectory::new("recovery-validation");
         let path = directory.path().join("config.json");
-        let mut candidate = serde_json::to_value(ConfigFile::default()).unwrap();
+        let mut candidate = serde_json::to_value(ConfigFile::with_test_storage()).unwrap();
         candidate["admin_username"] = serde_json::json!("");
         let original = serde_json::to_vec(&candidate).unwrap();
         tokio::fs::write(config_backup_path(&path), &original)
@@ -668,11 +655,11 @@ mod credential_tests {
     async fn primary_validation_failure_does_not_roll_back_security_settings() {
         let directory = TestDirectory::new("primary-validation");
         let path = directory.path().join("config.json");
-        save_config_refresh_backup(&path, &ConfigFile::default())
+        save_config_refresh_backup(&path, &ConfigFile::with_test_storage())
             .await
             .unwrap();
         let backup = tokio::fs::read(config_backup_path(&path)).await.unwrap();
-        let mut candidate = serde_json::to_value(ConfigFile::default()).unwrap();
+        let mut candidate = serde_json::to_value(ConfigFile::with_test_storage()).unwrap();
         candidate["admin_username"] = serde_json::json!("");
         let original = serde_json::to_vec(&candidate).unwrap();
         tokio::fs::write(&path, &original).await.unwrap();

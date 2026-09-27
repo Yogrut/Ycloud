@@ -54,6 +54,7 @@ pub enum AppError {
         cause: Box<AppError>,
     },
     BadRequest(Cow<'static, str>),
+    UploadBatchExpired,
     Unauthorized,
     Forbidden,
     NotFound,
@@ -124,6 +125,7 @@ impl AppError {
                 CommitState::Unknown => "operation_result_unknown",
             },
             Self::BadRequest(_) => "bad_request",
+            Self::UploadBatchExpired => "upload_batch_expired",
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
@@ -166,6 +168,7 @@ impl AppError {
                 }
             }
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::UploadBatchExpired => StatusCode::GONE,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
@@ -201,6 +204,7 @@ impl AppError {
             | Self::StorageCapability { message, .. }
             | Self::ServiceUnavailable(message) => message.clone(),
             Self::Unauthorized => "Authentication required".into(),
+            Self::UploadBatchExpired => "上传批次已过期，请重新准备未开始的文件".into(),
             Self::Forbidden => "Access denied".into(),
             Self::NotFound => "Resource not found".into(),
             Self::PayloadTooLarge => "Payload exceeds the configured limit".into(),
@@ -232,6 +236,7 @@ impl fmt::Display for AppError {
                 message,
             } => write!(formatter, "storage capability {capability}: {message}"),
             Self::Unauthorized => formatter.write_str("unauthorized"),
+            Self::UploadBatchExpired => formatter.write_str("upload batch expired"),
             Self::Forbidden => formatter.write_str("forbidden"),
             Self::NotFound => formatter.write_str("not found"),
             Self::PayloadTooLarge => formatter.write_str("payload too large"),

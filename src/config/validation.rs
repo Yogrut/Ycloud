@@ -103,17 +103,6 @@ impl ConfigFile {
                 s3_namespaces.push(settings);
             }
         }
-        if self.storage_instances.is_empty() {
-            return Err(AppError::BadRequest("至少需要保留一个存储实例".into()));
-        }
-        let default_storage = self
-            .storage_instances
-            .iter()
-            .find(|storage| storage.id == self.default_storage_id)
-            .ok_or_else(|| AppError::BadRequest("默认存储必须引用已存在的存储实例".into()))?;
-        if !default_storage.enabled {
-            return Err(AppError::Conflict("默认存储必须保持启用".into()));
-        }
         let mut account_ids = HashSet::new();
         let mut account_names = HashSet::new();
         account_names.insert(self.admin_username.trim().to_lowercase());
@@ -458,25 +447,11 @@ pub fn validate_storage_backend(backend: &StorageBackendConfig) -> AppResult<()>
             "S3 Endpoint 必须是长度不超过 2048 字符的完整地址".into(),
         ));
     }
-    let uri: axum::http::Uri = endpoint
+    let normalized = super::normalize_s3_endpoint(endpoint)?;
+    let uri: axum::http::Uri = normalized
         .parse()
         .map_err(|_| AppError::BadRequest("S3 Endpoint 地址无效".into()))?;
-    let scheme = uri
-        .scheme_str()
-        .ok_or_else(|| AppError::BadRequest("S3 Endpoint 必须包含 http:// 或 https://".into()))?;
-    if !matches!(scheme, "http" | "https")
-        || uri.authority().is_none()
-        || !matches!(uri.path(), "" | "/")
-        || uri.query().is_some()
-        || uri
-            .authority()
-            .is_some_and(|authority| authority.as_str().contains('@'))
-    {
-        return Err(AppError::BadRequest(
-            "S3 Endpoint 只能是无凭据、无路径和无查询参数的 HTTP(S) 地址".into(),
-        ));
-    }
-
+    let scheme = uri.scheme_str().expect("normalized HTTP(S) endpoint");
     let host = uri
         .authority()
         .expect("authority checked above")

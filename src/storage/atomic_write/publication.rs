@@ -9,23 +9,32 @@ use crate::{
 
 impl AtomicFileWriter {
     pub async fn commit(self) -> AppResult<AtomicWriteResult> {
-        self.commit_owned(None).await
+        self.commit_owned(None, false).await
     }
 
     pub(crate) async fn commit_with_capacity(
         self,
         reservation: CapacityReservation,
     ) -> AppResult<AtomicWriteResult> {
-        self.commit_owned(Some(reservation)).await
+        self.commit_owned(Some(reservation), false).await
+    }
+
+    pub(crate) async fn commit_new_with_capacity(
+        self,
+        reservation: CapacityReservation,
+    ) -> AppResult<AtomicWriteResult> {
+        self.commit_owned(Some(reservation), true).await
     }
 
     async fn commit_owned(
         self,
         reservation: Option<CapacityReservation>,
+        create_only: bool,
     ) -> AppResult<AtomicWriteResult> {
         // The writer already owns an I/O permit and a bounded staging ticket.
         // One task takes both, plus quota, without an intervening await.
-        let accounting = PublicationAccounting::new(reservation, self.bytes_written);
+        let mut accounting = PublicationAccounting::new(reservation, self.bytes_written);
+        accounting.create_only = create_only;
         tokio::spawn(self.publish(accounting))
             .await
             .map_err(|error| {
@@ -95,6 +104,7 @@ struct PublicationAccounting {
     awaiting_publication: bool,
     was_published: bool,
     ledger_settled: bool,
+    create_only: bool,
 }
 
 impl PublicationAccounting {
@@ -107,6 +117,7 @@ impl PublicationAccounting {
             awaiting_publication: false,
             was_published: false,
             ledger_settled: false,
+            create_only: false,
         }
     }
 
@@ -144,6 +155,9 @@ impl PublicationAccounting {
 }
 
 impl ReplacementObserver for PublicationAccounting {
+    fn must_create_new(&self) -> bool {
+        self.create_only
+    }
     fn prepare(&mut self, previous_size: u64) -> AppResult<()> {
         if let Some(reservation) = &mut self.reservation {
             reservation.rebase_replacement(previous_size, self.size)?;

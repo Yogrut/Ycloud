@@ -70,7 +70,7 @@ describe('UsersView', () => {
     await new Promise(resolve => setTimeout(resolve,0))
     const body = JSON.parse(fetchMock.mock.calls[0]![1].body)
     expect(body.enabled).toBe(false)
-    expect(body.traffic).toEqual({enabled:true,upload:1024,download:2048})
+    expect(body.traffic).toBeUndefined()
     expect(body.permissions[0]).toMatchObject({browse:true,upload:true,download:false})
     app.unmount()
   })
@@ -210,7 +210,7 @@ describe('UsersView', () => {
     const request = fetchMock.mock.calls[0]?.[1] as RequestInit
     const body = JSON.parse(String(request.body)) as Record<string, unknown>
     expect(body.password).toBeUndefined()
-    expect(body.permissions).toEqual(info.user_accounts?.[0]?.permissions)
+    expect(body.permissions).toBeUndefined()
     app.unmount()
   })
 })

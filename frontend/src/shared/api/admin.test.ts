@@ -17,6 +17,27 @@ import {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('admin API', () => {
+  it('reads back a lost settings response without repeating the write', async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError('connection lost'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ max_upload_bytes: 123 }), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(updateTransferLimits({ max_upload_bytes: 123 })).resolves.toEqual({ success: true })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1]![0]).toBe('/api/admin/info')
+    expect(fetchMock.mock.calls[1]![1].method).toBeUndefined()
+  })
+
+  it('keeps an unconfirmed settings result distinct from a rejected write', async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError('connection lost'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ max_upload_bytes: 122 }), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const error = await updateTransferLimits({ max_upload_bytes: 123 }).catch(reason => reason)
+    expect(error.blocksRetry).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
   it('preserves an unauthorized status for the login gate', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
       error: { message: 'Unauthorized' },

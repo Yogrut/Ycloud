@@ -38,11 +38,29 @@ pub(super) fn publish(
     refresh_backup: bool,
     mut checkpoint: impl FnMut(CommitStage) -> std::io::Result<()>,
 ) -> anyhow::Result<ConfigCommit> {
-    let pending = PendingFile::prepare(path, bytes)?;
     let backup = super::persistence::config_backup_path(path);
+    publish_with_backup(
+        path,
+        &backup,
+        bytes,
+        rotate_previous,
+        refresh_backup,
+        &mut checkpoint,
+    )
+}
+
+pub(super) fn publish_with_backup(
+    path: &Path,
+    backup: &Path,
+    bytes: &[u8],
+    rotate_previous: bool,
+    refresh_backup: bool,
+    mut checkpoint: impl FnMut(CommitStage) -> std::io::Result<()>,
+) -> anyhow::Result<ConfigCommit> {
+    let pending = PendingFile::prepare(path, bytes)?;
     if rotate_previous {
         match fs::read(path) {
-            Ok(previous) => PendingFile::prepare(&backup, &previous)?.publish(&backup)?,
+            Ok(previous) => PendingFile::prepare(backup, &previous)?.publish(backup)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("Failed to read previous configuration"),
         }
@@ -62,8 +80,8 @@ pub(super) fn publish(
     let backup_refresh_pending = refresh_backup
         && (|| -> anyhow::Result<()> {
             checkpoint(CommitStage::RefreshBackup)?;
-            PendingFile::prepare(&backup, bytes)?.publish(&backup)?;
-            sync_parent(&backup)?;
+            PendingFile::prepare(backup, bytes)?.publish(backup)?;
+            sync_parent(backup)?;
             Ok(())
         })()
         .is_err();

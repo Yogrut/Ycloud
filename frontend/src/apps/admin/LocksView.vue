@@ -104,7 +104,7 @@ async function submit(): Promise<void> {
   const normalizedPath = normalizePath(path.value)
   try {
     if (editing.value) {
-      const body: UpdateFolderLockRequest = {}
+      const body: UpdateFolderLockRequest = { expected_revision: editing.value.revision }
       if (storageId.value !== editing.value.storage_id) body.storage_id = storageId.value
       if (normalizedPath !== editing.value.path) body.path = normalizedPath
       if (password.value !== MASK) body.password = password.value

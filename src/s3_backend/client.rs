@@ -29,6 +29,18 @@ use crate::{
 };
 
 impl S3Backend {
+    pub(crate) async fn check_health(&self) -> AppResult<()> {
+        let _permit = self.acquire_request().await?;
+        self.client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(&self.prefix)
+            .max_keys(1)
+            .send()
+            .await
+            .map_err(|error| AppError::with_source("S3 连接检查失败", error))?;
+        Ok(())
+    }
     pub fn new(settings: &S3StorageConfig, runtime: &Config) -> AppResult<Self> {
         if runtime.transaction_auth_key == [0; 32] {
             return Err(AppError::ServiceUnavailable(

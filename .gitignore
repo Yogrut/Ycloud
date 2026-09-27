@@ -24,6 +24,7 @@
 /security-state.json
 /security-state.json.bak
 /.ycloud-system/
+/.ycloud-instance.lock
 *.upload
 *.tmp
 

@@ -59,12 +59,12 @@ function requestBody(): UpdateLoginSecuritySettingsRequest {
     || !Number.isInteger(webMinutes) || webMinutes < 5 || webMinutes > 1440) {
     throw new Error(locale.text('封禁时间必须在 5 到 1440 分钟之间', 'Block duration must be between 5 and 1440 minutes'))
   }
-  return {
+  return Object.fromEntries(Object.entries({
     admin_login_failures: adminAttempts,
     web_login_failures: webAttempts,
     admin_login_block_seconds: adminMinutes * 60,
     web_login_block_seconds: webMinutes * 60,
-  }
+  }).filter(([key, value]) => value !== props.info[key as keyof AdminInfo]))
 }
 
 async function submit(): Promise<void> {

@@ -510,7 +510,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let admin_token = state.sessions.create().await;
+        let mut admin_token = state.sessions.create().await;
         let reader_token = state.sessions.create_user("reader".into()).await;
         let gate_token = state.gate_access.create("__gate__".into()).await;
         let app = build_router(state);
@@ -551,6 +551,9 @@ mod tests {
             assert_eq!(result["totp_required"], false);
             if let Some(cookie) = cookie {
                 let session_cookie = cookie.to_str().unwrap().split(';').next().unwrap();
+                if administrator {
+                    admin_token = session_cookie.strip_prefix("session=").unwrap().to_owned();
+                }
                 let me = app
                     .clone()
                     .oneshot(

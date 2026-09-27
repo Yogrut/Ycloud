@@ -16,11 +16,11 @@ export function getTraffic(start?: string, end?: string): Promise<TrafficInfo> {
   if (end) query.set('end', end)
   return adminRequest('/api/admin/traffic?' + query.toString())
 }
-export function saveTraffic(settings: Pick<TrafficSettings, 'total' | 'guest' | 'users_total' | 'cycle'>): Promise<{ success: boolean }> {
+export function saveTraffic(settings: Partial<Pick<TrafficSettings, 'total' | 'guest' | 'users_total' | 'cycle'>>): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/traffic', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) })
 }
 
-import { ApiError, errorMetadata, requestJson } from './client'
+import { ApiError, errorMetadata, requestJson, type OperationOutcome } from './client'
 
 const locale = useLocale()
 
@@ -101,6 +101,7 @@ export interface StoragePermission {
 }
 
 export interface UserAccountView {
+  revision?: string
   id: string
   username: string
   enabled: boolean
@@ -116,6 +117,7 @@ export interface CreateUserAccountRequest {
 }
 
 export interface UpdateUserAccountRequest {
+  expected_revision?: string
   traffic?: TrafficQuota
   username?: string
   password?: string
@@ -124,6 +126,9 @@ export interface UpdateUserAccountRequest {
 }
 
 export interface StorageInstanceView {
+  revision?: string
+  health_ok?: boolean
+  health_checked_at?: number | null
   id: string
   name: string
   enabled?: boolean
@@ -196,6 +201,7 @@ export interface S3CapabilityReport {
 }
 
 export interface WebDavMountView {
+  revision?: string
   id: string
   storage_id: string
   name: string
@@ -217,6 +223,7 @@ export interface CreateWebDavMountRequest {
 }
 
 export interface UpdateWebDavMountRequest {
+  expected_revision?: string
   storage_id?: string
   name?: string
   path?: string
@@ -227,6 +234,7 @@ export interface UpdateWebDavMountRequest {
 }
 
 export interface FolderLockView {
+  revision?: string
   id: string
   storage_id: string
   path: string
@@ -239,6 +247,7 @@ export interface CreateFolderLockRequest {
 }
 
 export interface UpdateFolderLockRequest {
+  expected_revision?: string
   storage_id?: string
   path?: string
   password?: string
@@ -297,13 +306,59 @@ export interface UpdateLoginSecuritySettingsRequest {
 }
 
 export class AdminApiError extends ApiError {
-  constructor(message: string, status: number, code?: string, requestId?: string) {
-    super(message, status, code, requestId)
+  constructor(message: string, status: number, code?: string, requestId?: string, operation?: OperationOutcome) {
+    super(message, status, code, requestId, operation)
     this.name = 'AdminApiError'
   }
 }
 
 async function adminRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
+  try {
+    return await rawAdminRequest<T>(url, options)
+  } catch (error) {
+    if (!(error instanceof ApiError) || !error.blocksRetry) throw error
+    // Never repeat a write after losing its response. Verify observable settings
+    // with a read; secrets and creates cannot be inferred safely from a list.
+    const recovered = await readBackMutation(url, options).catch(() => undefined)
+    if (recovered) return recovered.value as T
+    throw error
+  }
+}
+
+function matchesFields(actual: unknown, desired: unknown): boolean {
+  if (desired === null || typeof desired !== 'object') return actual === desired
+  if (Array.isArray(desired)) return JSON.stringify(actual) === JSON.stringify(desired)
+  if (!actual || typeof actual !== 'object') return false
+  return Object.entries(desired).every(([key, value]) => matchesFields((actual as Record<string, unknown>)[key], value))
+}
+
+async function readBackMutation(url: string, options: RequestInit): Promise<{ value: unknown } | undefined> {
+  const method = options.method?.toUpperCase()
+  if (method === 'PUT' && ['/api/admin/limits', '/api/admin/security/settings', '/api/admin/traffic'].includes(url)) {
+    const desired: unknown = JSON.parse(String(options.body))
+    const actual = url.endsWith('/traffic')
+      ? (await rawAdminRequest<TrafficInfo>('/api/admin/traffic')).settings
+      : await rawAdminRequest<AdminInfo>('/api/admin/info')
+    return matchesFields(actual, desired) ? { value: { success: true } } : undefined
+  }
+  const entity = url.match(/^\/api\/admin\/(users|locks|shares|storage)\/([^/]+)$/)
+  if (!entity || !['PUT', 'DELETE'].includes(method ?? '')) return undefined
+  const info = await rawAdminRequest<AdminInfo>('/api/admin/info')
+  const rows = entity[1] === 'users' ? info.user_accounts : entity[1] === 'locks' ? info.folder_locks : entity[1] === 'shares' ? info.shares : info.storage_instances
+  const current = rows?.find(row => row.id === decodeURIComponent(entity[2]!))
+  if (method === 'DELETE') return !current ? { value: undefined } : undefined
+  const desired = JSON.parse(String(options.body)) as Record<string, unknown>
+  delete desired.expected_revision
+  if ('password' in desired) return undefined
+  if ('traffic' in desired && current && entity[1] === 'users') {
+    const settings = (await rawAdminRequest<TrafficInfo>('/api/admin/traffic')).settings
+    if (!matchesFields(settings.users[current.id], desired.traffic)) return undefined
+    delete desired.traffic
+  }
+  return matchesFields(current, desired) ? { value: current } : undefined
+}
+
+async function rawAdminRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
   const { response, body } = await requestJson<T>(url, options)
   if (response.status === 204) return undefined as T
   if (!response.ok) {
@@ -315,6 +370,7 @@ async function adminRequest<T>(url: string, options: RequestInit = {}): Promise<
       response.status,
       details.code,
       details.requestId,
+      details.operation,
     )
   }
   if (body === undefined) throw new AdminApiError(locale.t('common.invalidResponse'), response.status)
@@ -375,7 +431,7 @@ export function updateAccount(body: UpdateAccountRequest): Promise<UpdateAccount
   })
 }
 
-export function updateTransferLimits(body: UpdateTransferLimitsRequest): Promise<{ success: boolean }> {
+export function updateTransferLimits(body: Partial<UpdateTransferLimitsRequest>): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/limits', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -407,11 +463,11 @@ export function stageS3Storage(name: string, body: TestS3StorageRequest, enabled
   })
 }
 
-export function updateS3Storage(storageId: string, name: string, body: TestS3StorageRequest, enabled: boolean, allowGuestAccess: boolean, allowGuestDownload?: boolean): Promise<{ success: boolean }> {
+export function updateS3Storage(storageId: string, name: string, body: TestS3StorageRequest, enabled: boolean, allowGuestAccess: boolean, allowGuestDownload?: boolean, expectedRevision?: string): Promise<{ success: boolean }> {
   return adminRequest(`/api/admin/storage/s3/${encodeURIComponent(storageId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload, ...body }),
+    body: JSON.stringify({ name, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload, ...body, expected_revision: expectedRevision }),
   })
 }
 
@@ -423,11 +479,11 @@ export function addLocalStorage(path: string, name: string, capacityLimitBytes: 
   })
 }
 
-export function updateLocalStorage(storageId: string, name: string, path: string, capacityLimitBytes: number | null, enabled: boolean, allowGuestAccess: boolean, allowGuestDownload?: boolean): Promise<{ success: boolean }> {
+export function updateLocalStorage(storageId: string, name: string, path: string, capacityLimitBytes: number | null, enabled: boolean, allowGuestAccess: boolean, allowGuestDownload?: boolean, expectedRevision?: string): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/storage/local', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ storage_id: storageId, name, path, capacity_limit_bytes: capacityLimitBytes, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload }),
+    body: JSON.stringify({ storage_id: storageId, name, path, capacity_limit_bytes: capacityLimitBytes, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload, expected_revision: expectedRevision }),
   })
 }
 

@@ -92,7 +92,7 @@ pub async fn enable_admin_totp(
         })
         .await?;
     state.admin_totp_replay.clear().await;
-    state.sessions.clear().await;
+    state.sessions.revoke_administrator().await;
     Ok(Json(TotpEnableResponse {
         success: true,
         recovery_codes,
@@ -136,7 +136,7 @@ pub async fn disable_admin_totp(
         })
         .await?;
     state.admin_totp_replay.clear().await;
-    state.sessions.clear().await;
+    state.sessions.revoke_administrator().await;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 

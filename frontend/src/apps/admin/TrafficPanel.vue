@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { getTraffic, saveTraffic } from '../../shared/api/admin'
-import type { TrafficInfo, TrafficQuota, TrafficUsage } from '../../shared/api/admin'
+import type { TrafficInfo, TrafficQuota, TrafficUsage, TrafficSettings } from '../../shared/api/admin'
 import AppDatePicker from '../../shared/components/AppDatePicker.vue'
 import AppFeedback from '../../shared/components/AppFeedback.vue'
 import AppSelect from '../../shared/components/AppSelect.vue'
@@ -27,6 +27,8 @@ const usersQuota = ref<TrafficQuota>({ enabled: false, upload: 0, download: 0 })
 const unit = ref<'hours' | 'days' | 'months'>('months')
 const every = ref(1)
 const anchor = ref('')
+let originalSettings: TrafficSettings | undefined
+let originalAnchor = ''
 const directions = ['download', 'upload'] as const
 type Direction = typeof directions[number]
 type TrafficMeter = { id: string; label: string; direction: Direction; use: TrafficUsage; quota: TrafficQuota }
@@ -167,10 +169,12 @@ async function openEditor(): Promise<void> {
   guest.value = { ...info.value.settings.guest }
   usersQuota.value = { ...info.value.settings.users_total }
   const cycle = info.value.settings.cycle
+  originalSettings = JSON.parse(JSON.stringify(info.value.settings)) as TrafficSettings
   unit.value = cycle.unit
   every.value = cycle.every
   const date = new Date(cycle.anchor * 1000)
   anchor.value = new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 10)
+  originalAnchor = anchor.value
   editing.value = true
 }
 async function save(): Promise<void> {
@@ -183,17 +187,18 @@ async function save(): Promise<void> {
   }
   saving.value = true
   try {
-    await saveTraffic({
+    const changes = {
       total: total.value,
       guest: guest.value,
       users_total: usersQuota.value,
-      cycle: {
+      cycle: originalSettings && unit.value === originalSettings.cycle.unit && every.value === originalSettings.cycle.every && anchor.value === originalAnchor ? originalSettings.cycle : {
         unit: unit.value,
         every: every.value,
         anchor: Math.floor(timestamp.getTime() / 1000),
         offset_minutes: -timestamp.getTimezoneOffset(),
       },
-    })
+    }
+    await saveTraffic(Object.fromEntries(Object.entries(changes).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(originalSettings?.[key as keyof TrafficSettings]))))
     editing.value = false
     kind.value = 'success'
     message.value = locale.text('流量设置已保存', 'Traffic settings saved')

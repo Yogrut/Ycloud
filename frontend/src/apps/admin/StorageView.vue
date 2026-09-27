@@ -26,6 +26,7 @@ const providers: Array<{ id: StorageOption; zh: string; en: string; protocol: st
 
 const editorOpen = ref(false)
 const editingId = ref('')
+const editingRevision = ref<string>()
 const provider = ref<StorageOption>('local')
 const storageName = ref('')
 const localPath = ref('')
@@ -137,6 +138,7 @@ function capacityLimitBytes(): number | null {
 function resetEditor(): void {
   connectionNotice.value = undefined
   editingId.value = ''
+  editingRevision.value = undefined
   provider.value = 'local'
   storageName.value = ''
   localPath.value = ''
@@ -164,6 +166,7 @@ function selectProvider(value: StorageOption): void {
 function openSettings(instance: StorageInstanceView): void {
   resetEditor()
   editingId.value = instance.id
+  editingRevision.value = instance.revision
   storageName.value = instance.name
   enabled.value = instance.enabled ?? true
   allowGuestAccess.value = instance.allow_guest_access ?? false
@@ -214,8 +217,8 @@ async function testConnection(): Promise<void> {
 async function saveStorage(): Promise<void> {
   await run(async () => {
     if (editingInstance.value) {
-      if (editingInstance.value.backend.type === 'local') await updateLocalStorage(editingInstance.value.id, storageName.value.trim(), localPath.value.trim(), capacityLimitBytes(), enabled.value, allowGuestAccess.value, allowGuestDownload.value)
-      else await updateS3Storage(editingInstance.value.id, storageName.value.trim(), requestBody(), enabled.value, allowGuestAccess.value, allowGuestDownload.value)
+      if (editingInstance.value.backend.type === 'local') await updateLocalStorage(editingInstance.value.id, storageName.value.trim(), localPath.value.trim(), capacityLimitBytes(), enabled.value, allowGuestAccess.value, allowGuestDownload.value, editingRevision.value)
+      else await updateS3Storage(editingInstance.value.id, storageName.value.trim(), requestBody(), enabled.value, allowGuestAccess.value, allowGuestDownload.value, editingRevision.value)
       editorOpen.value = false
       emit('changed', locale.text('存储设置已保存', 'Storage settings saved'))
       return
@@ -258,7 +261,7 @@ async function clearPending(): Promise<void> {
       <div v-if="instances.length" class="storage-instance-list storage-wide">
         <div class="record-table-head"><span>{{ locale.text('名称', 'Name') }}</span><span>{{ locale.text('存储用量', 'Storage used') }}</span><span>{{ locale.text('状态 / 操作', 'Status / Actions') }}</span></div>
         <article v-for="instance in instances" :key="instance.id" class="storage-instance-card storage-source-row">
-          <strong class="admin-record-name">{{ instance.name }}</strong>
+          <strong class="admin-record-name"><span class="storage-health-light" :class="{ healthy: instance.health_ok ?? instance.ready }" :title="`${(instance.health_ok ?? instance.ready) ? locale.text('连接正常', 'Connection healthy') : locale.text('连接异常', 'Connection error')} · ${instance.health_checked_at ? new Date(instance.health_checked_at * 1000).toLocaleString() : locale.text('尚未检查', 'Not checked')}`" />{{ instance.name }}</strong>
           <div class="admin-record-value">
             <span>{{ locale.text('存储用量', 'Storage used') }}</span>
             <strong v-if="instance.capacity_accurate !== false">{{ formatBytes(instance.usage_bytes) }}</strong>

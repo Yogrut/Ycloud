@@ -71,6 +71,7 @@ pub struct LocalMountView {
 
 #[derive(Clone, Serialize)]
 pub struct UserAccountView {
+    pub revision: String,
     pub id: String,
     pub username: String,
     pub enabled: bool,
@@ -80,6 +81,7 @@ pub struct UserAccountView {
 impl From<&UserAccount> for UserAccountView {
     fn from(account: &UserAccount) -> Self {
         Self {
+            revision: crate::config::entity_revision(account),
             id: account.id.clone(),
             username: account.username.clone(),
             enabled: account.enabled,
@@ -88,8 +90,15 @@ impl From<&UserAccount> for UserAccountView {
     }
 }
 
+fn user_account_revision(account: &UserAccount, traffic: Option<&crate::traffic::Quota>) -> String {
+    crate::config::entity_revision(&(account, traffic))
+}
+
 #[derive(Clone, Serialize)]
 pub struct StorageInstanceView {
+    pub revision: String,
+    pub health_ok: bool,
+    pub health_checked_at: Option<i64>,
     pub id: String,
     pub name: String,
     pub enabled: bool,
@@ -171,6 +180,7 @@ impl StorageBackendView {
 /// [安全] Administrative responses expose password presence, never hashes.
 #[derive(Clone, Serialize)]
 pub struct ShareView {
+    pub revision: String,
     pub id: String,
     pub storage_id: String,
     pub name: String,
@@ -184,6 +194,7 @@ pub struct ShareView {
 impl From<&Share> for ShareView {
     fn from(share: &Share) -> Self {
         Self {
+            revision: crate::config::entity_revision(share),
             id: share.id.clone(),
             storage_id: share.storage_id.clone(),
             name: share.name.clone(),
@@ -198,6 +209,7 @@ impl From<&Share> for ShareView {
 
 #[derive(Clone, Serialize)]
 pub struct FolderLockView {
+    pub revision: String,
     pub id: String,
     pub storage_id: String,
     pub path: String,
@@ -206,6 +218,7 @@ pub struct FolderLockView {
 impl From<&FolderLock> for FolderLockView {
     fn from(lock: &FolderLock) -> Self {
         Self {
+            revision: crate::config::entity_revision(lock),
             id: lock.id.clone(),
             storage_id: lock.storage_id.clone(),
             path: lock.path.clone(),
@@ -230,6 +243,7 @@ pub struct CreateShareRequest {
 
 #[derive(Deserialize)]
 pub struct UpdateShareRequest {
+    pub expected_revision: Option<String>,
     pub storage_id: Option<String>,
     pub name: Option<String>,
     pub path: Option<String>,
@@ -301,7 +315,12 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
             config
                 .user_accounts
                 .iter()
-                .map(UserAccountView::from)
+                .map(|account| {
+                    let mut view = UserAccountView::from(account);
+                    view.revision =
+                        user_account_revision(account, config.traffic.users.get(&account.id));
+                    view
+                })
                 .collect(),
         )
     };
@@ -319,6 +338,7 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
         storage_instances.push(storage_instance_view(&state, instance).await);
     }
     let pending_storage_instance = pending_storage_config.map(|instance| StorageInstanceView {
+        revision: crate::config::entity_revision(&instance),
         id: instance.id,
         name: instance.name,
         enabled: instance.enabled,
@@ -327,6 +347,8 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
             && instance.allow_guest_download.unwrap_or(true),
         status: "pending",
         ready: false,
+        health_ok: false,
+        health_checked_at: None,
         backend: StorageBackendView::from_config(&instance.backend, &state.config),
         usage_bytes: 0,
         reserved_bytes: 0,
@@ -403,6 +425,11 @@ async fn storage_instance_view(
     state: &AppState,
     instance: StorageInstanceConfig,
 ) -> StorageInstanceView {
+    let health = state
+        .backends
+        .cached(&instance.id)
+        .await
+        .map(|backend| backend.health_status());
     let backend_view = StorageBackendView::from_config(&instance.backend, &state.config);
     let (
         ready,
@@ -468,6 +495,9 @@ async fn storage_instance_view(
         ),
     };
     StorageInstanceView {
+        revision: crate::config::entity_revision(&instance),
+        health_ok: health.is_some_and(|value| value.0),
+        health_checked_at: health.map(|value| value.1),
         status: if !instance.enabled {
             "disabled"
         } else if ready {
@@ -572,6 +602,7 @@ pub async fn stage_s3_storage(
 
 #[derive(Deserialize)]
 pub struct UpdateS3StorageRequest {
+    pub expected_revision: Option<String>,
     pub name: String,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
@@ -598,6 +629,7 @@ pub async fn update_s3_storage(
                 body.allow_guest_access,
                 body.allow_guest_download,
             )?,
+            body.expected_revision,
         )
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
@@ -605,6 +637,7 @@ pub async fn update_s3_storage(
 
 #[derive(Deserialize)]
 pub struct UpdateLocalStorageRequest {
+    pub expected_revision: Option<String>,
     pub storage_id: String,
     pub name: String,
     pub path: String,
@@ -625,14 +658,17 @@ pub async fn update_local_storage(
     state
         .update_local_storage(
             &settings.storage_id,
-            settings.name,
-            settings.path,
-            settings.capacity_limit_bytes,
-            settings.enabled,
-            crate::config::GuestAccess::checked(
-                settings.allow_guest_access,
-                settings.allow_guest_download,
-            )?,
+            crate::state::LocalStorageEdit {
+                name: settings.name,
+                path: settings.path,
+                capacity_limit_bytes: settings.capacity_limit_bytes,
+                enabled: settings.enabled,
+                guest_access: crate::config::GuestAccess::checked(
+                    settings.allow_guest_access,
+                    settings.allow_guest_download,
+                )?,
+                expected_revision: settings.expected_revision,
+            },
         )
         .await?;
     Ok(Json(serde_json::json!({ "success": true })))
@@ -722,11 +758,11 @@ pub async fn discard_pending_storage(State(state): State<AppState>) -> AppResult
 
 #[derive(Deserialize)]
 pub struct UpdateTransferLimitsRequest {
-    pub max_upload_bytes: u64,
-    pub max_upload_batch_bytes: u64,
-    pub max_upload_batch_entries: usize,
-    pub max_archive_bytes: u64,
-    pub max_archive_entries: usize,
+    pub max_upload_bytes: Option<u64>,
+    pub max_upload_batch_bytes: Option<u64>,
+    pub max_upload_batch_entries: Option<usize>,
+    pub max_archive_bytes: Option<u64>,
+    pub max_archive_entries: Option<usize>,
     #[serde(default)]
     pub upload_rate_bytes_per_sec: Option<u64>,
     #[serde(default)]
@@ -737,50 +773,48 @@ pub async fn update_transfer_limits(
     State(state): State<AppState>,
     Json(body): Json<UpdateTransferLimitsRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    validate_transfer_limits(
-        body.max_upload_bytes,
-        body.max_upload_batch_bytes,
-        body.max_upload_batch_entries,
-        body.max_archive_bytes,
-        body.max_archive_entries,
-    )?;
-    if body.max_upload_bytes > state.config.max_upload_bytes {
-        return Err(AppError::BadRequest(
-            "单文件上传上限超过部署环境允许的绝对上限；请调整 MAX_UPLOAD_BYTES 后重启服务".into(),
-        ));
-    }
-    if body.max_upload_batch_bytes > state.config.max_upload_batch_bytes
-        || body.max_upload_batch_entries > state.config.max_upload_batch_entries
-    {
-        return Err(AppError::BadRequest(
-            "批量上传策略超过部署环境允许的绝对上限；请调整 MAX_UPLOAD_BATCH_BYTES 或 MAX_UPLOAD_BATCH_ENTRIES 后重启服务".into(),
-        ));
-    }
-    if body.max_archive_bytes > state.config.max_archive_bytes
-        || body.max_archive_entries > state.config.max_archive_entries
-    {
-        return Err(AppError::BadRequest(
-            "打包下载策略超过部署环境允许的绝对上限；请调整 MAX_ARCHIVE_BYTES 或 MAX_ARCHIVE_ENTRIES 后重启服务".into(),
-        ));
-    }
-    if let Some(rate) = body.upload_rate_bytes_per_sec {
-        validate_transfer_rate(rate, "上传")?;
-    }
-    if let Some(rate) = body.download_rate_bytes_per_sec {
-        validate_transfer_rate(rate, "下载")?;
-    }
+    let deployment = state.config.clone();
     state
         .update_config(move |config| {
-            config.max_upload_bytes = body.max_upload_bytes;
-            config.max_upload_batch_bytes = body.max_upload_batch_bytes;
-            config.max_upload_batch_entries = body.max_upload_batch_entries;
-            config.max_archive_bytes = body.max_archive_bytes;
-            config.max_archive_entries = body.max_archive_entries;
-            if let Some(rate) = body.upload_rate_bytes_per_sec {
-                config.upload_rate_bytes_per_sec = rate;
+            if let Some(value) = body.max_upload_bytes {
+                config.max_upload_bytes = value;
             }
-            if let Some(rate) = body.download_rate_bytes_per_sec {
-                config.download_rate_bytes_per_sec = rate;
+            if let Some(value) = body.max_upload_batch_bytes {
+                config.max_upload_batch_bytes = value;
+            }
+            if let Some(value) = body.max_upload_batch_entries {
+                config.max_upload_batch_entries = value;
+            }
+            if let Some(value) = body.max_archive_bytes {
+                config.max_archive_bytes = value;
+            }
+            if let Some(value) = body.max_archive_entries {
+                config.max_archive_entries = value;
+            }
+            if let Some(value) = body.upload_rate_bytes_per_sec {
+                config.upload_rate_bytes_per_sec = value;
+            }
+            if let Some(value) = body.download_rate_bytes_per_sec {
+                config.download_rate_bytes_per_sec = value;
+            }
+            validate_transfer_limits(
+                config.max_upload_bytes,
+                config.max_upload_batch_bytes,
+                config.max_upload_batch_entries,
+                config.max_archive_bytes,
+                config.max_archive_entries,
+            )?;
+            validate_transfer_rate(config.upload_rate_bytes_per_sec, "上传")?;
+            validate_transfer_rate(config.download_rate_bytes_per_sec, "下载")?;
+            if config.max_upload_bytes > deployment.max_upload_bytes
+                || config.max_upload_batch_bytes > deployment.max_upload_batch_bytes
+                || config.max_upload_batch_entries > deployment.max_upload_batch_entries
+                || config.max_archive_bytes > deployment.max_archive_bytes
+                || config.max_archive_entries > deployment.max_archive_entries
+            {
+                return Err(AppError::BadRequest(
+                    "传输限制超过部署环境允许的上限，请调整启动参数后重启".into(),
+                ));
             }
             Ok(())
         })
@@ -1022,6 +1056,7 @@ pub async fn update_share(
                 .iter_mut()
                 .find(|share| share.id == id)
                 .ok_or(AppError::NotFound)?;
+            crate::config::verify_entity_revision(share, body.expected_revision.as_deref())?;
             if let Some(storage_id) = body.storage_id {
                 share.storage_id = storage_id;
             }
@@ -1107,7 +1142,7 @@ pub async fn update_admin_account(
         })
         .await?;
     if credentials_changed {
-        state.sessions.clear().await;
+        state.sessions.revoke_administrator().await;
     }
     if gate_changed {
         state.gate_access.clear().await;
@@ -1140,6 +1175,7 @@ pub struct CreateLockRequest {
 
 #[derive(Deserialize)]
 pub struct UpdateLockRequest {
+    pub expected_revision: Option<String>,
     pub storage_id: Option<String>,
     pub path: Option<String>,
     pub password: Option<String>,
@@ -1212,6 +1248,7 @@ pub async fn update_lock(
                 return Err(AppError::Conflict("Folder already has a lock".into()));
             }
             let lock = &mut config.folder_locks[lock_index];
+            crate::config::verify_entity_revision(lock, body.expected_revision.as_deref())?;
             if let Some(storage_id) = body.storage_id {
                 lock.storage_id = storage_id;
             }
@@ -1311,11 +1348,11 @@ mod tests {
         let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
         let config = state.config_file.read().await.clone();
         let request = |upload_rate, download_rate| UpdateTransferLimitsRequest {
-            max_upload_bytes: config.max_upload_bytes,
-            max_upload_batch_bytes: config.max_upload_batch_bytes,
-            max_upload_batch_entries: config.max_upload_batch_entries,
-            max_archive_bytes: config.max_archive_bytes,
-            max_archive_entries: config.max_archive_entries,
+            max_upload_bytes: Some(config.max_upload_bytes),
+            max_upload_batch_bytes: Some(config.max_upload_batch_bytes),
+            max_upload_batch_entries: Some(config.max_upload_batch_entries),
+            max_archive_bytes: Some(config.max_archive_bytes),
+            max_archive_entries: Some(config.max_archive_entries),
             upload_rate_bytes_per_sec: upload_rate,
             download_rate_bytes_per_sec: download_rate,
         };

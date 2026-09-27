@@ -122,7 +122,6 @@ describe('TrafficPanel', () => {
     drawer.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
     await flush()
     expect(saveTraffic).toHaveBeenCalledWith(expect.objectContaining({
-      total: fixture.settings.total, guest: fixture.settings.guest, users_total: fixture.settings.users_total,
       cycle: expect.objectContaining({ every: 2, unit: 'months' }),
     }))
     expect(host.querySelector('.traffic-history')).toBeNull()
@@ -133,5 +132,21 @@ describe('TrafficPanel', () => {
     const drawer = document.querySelector('.settings-drawer')!
     expect(drawer.textContent).not.toContain('账号独立额度')
     expect(drawer.querySelector('.account-quota-row')).toBeNull()
+  })
+  it('does not round an existing non-midnight reset anchor during a quota-only save', async () => {
+    await mount('settings')
+    const changed = structuredClone(fixture)
+    changed.settings.cycle.anchor += 12345
+    changed.settings.cycle.offset_minutes = -300
+    vi.mocked(getTraffic).mockResolvedValue(changed)
+    vi.mocked(saveTraffic).mockResolvedValue({ success: true })
+    await panel!.openEditor(); await flush()
+    const drawer = document.querySelector('.settings-drawer')!
+    drawer.querySelector<HTMLInputElement>('.traffic-quota input[role="switch"]')!.click()
+    drawer.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+    await flush()
+    const submitted = vi.mocked(saveTraffic).mock.calls[0]![0]
+    expect(submitted.cycle).toBeUndefined()
+    expect(submitted.total).toBeDefined()
   })
 })

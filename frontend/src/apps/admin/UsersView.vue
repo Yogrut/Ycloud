@@ -135,13 +135,15 @@ async function save(): Promise<void> {
     }
     let saved: UserAccountView
     if (editing.value) {
-      saved = await updateUserAccount(editing.value.id, { username: username.value.trim(), password: password.value || undefined, enabled: enabled.value, permissions: activePermissions, traffic: trafficQuota.value })
+      const previous = { ...editing.value, traffic: trafficInfo.value?.settings.users[editing.value.id] }
+      const changes = { username: username.value.trim(), password: password.value || undefined, enabled: enabled.value, permissions: activePermissions, traffic: trafficQuota.value }
+      saved = await updateUserAccount(editing.value.id, { ...Object.fromEntries(Object.entries(changes).filter(([key, value]) => value !== undefined && JSON.stringify(value) !== JSON.stringify(previous[key as keyof typeof previous]))), expected_revision: editing.value.revision })
     } else {
       saved = await createUserAccount({ username: username.value.trim(), password: password.value, enabled: enabled.value, permissions: activePermissions, traffic: trafficQuota.value })
     }
     if (trafficInfo.value) trafficInfo.value.settings.users[saved.id] = { ...trafficQuota.value }
     editing.value = undefined
-    emit('changed', locale.text('用户已保存，原会话已撤销', 'User saved and previous sessions were revoked.'))
+    emit('changed', locale.text('用户设置已保存', 'User settings saved.'))
   } catch (reason) { error.value = reason instanceof Error ? reason.message : locale.t('common.requestFailed', { status: '' }) }
   finally { saving.value = false }
 }

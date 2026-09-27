@@ -130,7 +130,7 @@ async function submit(): Promise<void> {
   errorMessage.value = ''
   try {
     if (editing.value) {
-      const body: UpdateWebDavMountRequest = {}
+      const body: UpdateWebDavMountRequest = { expected_revision: editing.value.revision }
       if (storageId.value !== editing.value.storage_id) body.storage_id = storageId.value
       if (normalizedName !== editing.value.name) body.name = normalizedName
       if (normalizedPath !== editing.value.path) body.path = normalizedPath

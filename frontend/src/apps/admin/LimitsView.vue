@@ -171,7 +171,7 @@ async function submit(): Promise<void> {
   saving.value = true
   errorMessage.value = ''
   try {
-    await updateTransferLimits(body)
+    await updateTransferLimits(Object.fromEntries(Object.entries(body).filter(([key, value]) => value !== props.info[key as keyof AdminInfo])))
     baselineUploadBytes.value = body.max_upload_bytes
     baselineUploadBatchBytes.value = body.max_upload_batch_bytes
     baselineArchiveBytes.value = body.max_archive_bytes

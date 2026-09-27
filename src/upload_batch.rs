@@ -37,6 +37,7 @@ pub struct UploadBatchStore {
 }
 
 struct UploadBatch {
+    recovery_backend: Option<crate::storage_backend::StorageBackend>,
     subject: RequestSubject,
     account: String,
     storage_id: String,
@@ -142,8 +143,14 @@ impl UploadBatchStore {
                 batch
                     .items
                     .iter()
-                    .filter(|(_, item)| item.status == UploadStatus::Unknown)
+                    .filter(|(_, item)| {
+                        item.status == UploadStatus::Unknown
+                            || item
+                                .operation
+                                .is_some_and(|outcome| outcome.cleanup != CleanupState::Complete)
+                    })
                     .map(|(path, item)| UnknownUpload {
+                        backend: batch.recovery_backend.clone(),
                         ticket: ticket.clone(),
                         storage_id: batch.storage_id.clone(),
                         path: path.clone(),
@@ -168,7 +175,11 @@ impl UploadBatchStore {
             .items
             .get_mut(&review.path)
             .ok_or(AppError::NotFound)?;
-        if item.status != UploadStatus::Unknown {
+        if item.status != UploadStatus::Unknown
+            && !item
+                .operation
+                .is_some_and(|outcome| outcome.cleanup != CleanupState::Complete)
+        {
             return Err(AppError::Conflict("任务状态已经变化，请刷新".into()));
         }
         item.status = if committed {
@@ -184,6 +195,9 @@ impl UploadBatchStore {
                 .operation()
         };
         batch.expires_at = Instant::now() + self.ttl;
+        if !batch_has_recovery_work(batch) {
+            batch.recovery_backend = None;
+        }
         Ok(())
     }
 
@@ -205,11 +219,26 @@ impl UploadBatchStore {
         Ok(())
     }
 
-    pub async fn invalidate_storage(&self, storage_id: &str) {
-        self.batches
-            .lock()
-            .await
-            .retain(|_, batch| batch.storage_id != storage_id);
+    pub async fn invalidate_storage(
+        &self,
+        storage_id: &str,
+        backend: Option<crate::storage_backend::StorageBackend>,
+    ) {
+        let mut batches = self.batches.lock().await;
+        for batch in batches
+            .values_mut()
+            .filter(|batch| batch.storage_id == storage_id && batch.recovery_backend.is_none())
+        {
+            for item in batch.items.values_mut() {
+                if item.status == UploadStatus::Pending {
+                    item.status = UploadStatus::Cancelled;
+                }
+            }
+            if batch_has_recovery_work(batch) {
+                batch.recovery_backend = backend.clone();
+            }
+            batch.expires_at = Instant::now() + self.ttl;
+        }
     }
     pub fn new(ttl: Duration) -> Self {
         Self {
@@ -288,6 +317,7 @@ impl UploadBatchStore {
         batches.insert(
             token.clone(),
             UploadBatch {
+                recovery_backend: None,
                 subject,
                 account,
                 storage_id,
@@ -466,6 +496,9 @@ impl UploadBatchStore {
         item.status = status;
         item.operation = operation;
         batch.expires_at = Instant::now() + self.ttl;
+        if !batch_has_recovery_work(batch) {
+            batch.recovery_backend = None;
+        }
     }
 
     pub async fn status(
@@ -501,6 +534,8 @@ impl UploadBatchStore {
 
 #[derive(Clone, Serialize)]
 pub(crate) struct UnknownUpload {
+    #[serde(skip)]
+    pub backend: Option<crate::storage_backend::StorageBackend>,
     pub ticket: String,
     pub storage_id: String,
     pub path: String,
@@ -517,13 +552,18 @@ pub(crate) fn operation_id(ticket: &str, path: &str) -> String {
 }
 
 fn batch_is_retained(batch: &UploadBatch, now: Instant) -> bool {
-    batch.expires_at > now
-        || batch.items.values().any(|item| {
-            matches!(
-                item.status,
-                UploadStatus::InProgress | UploadStatus::Unknown
-            )
-        })
+    batch.expires_at > now || batch_has_recovery_work(batch)
+}
+
+fn batch_has_recovery_work(batch: &UploadBatch) -> bool {
+    batch.items.values().any(|item| {
+        matches!(
+            item.status,
+            UploadStatus::InProgress | UploadStatus::Unknown
+        ) || item
+            .operation
+            .is_some_and(|outcome| outcome.cleanup != CleanupState::Complete)
+    })
 }
 
 fn item_is_terminal(item: &UploadItem) -> bool {
@@ -1054,11 +1094,14 @@ mod tests {
         state
             .update_local_storage(
                 "primary",
-                "Rename during upload".into(),
-                path,
-                None,
-                true,
-                false,
+                crate::state::LocalStorageEdit {
+                    name: "Rename during upload".into(),
+                    path,
+                    capacity_limit_bytes: None,
+                    enabled: true,
+                    guest_access: false.into(),
+                    expected_revision: None,
+                },
             )
             .await
             .unwrap();

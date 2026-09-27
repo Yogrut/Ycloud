@@ -199,6 +199,7 @@ struct ActiveStorage {
     editing: AtomicBool,
     transfer: std::sync::Mutex<tokio_util::sync::CancellationToken>,
     leases: std::sync::Mutex<Vec<Weak<AdmissionLease>>>,
+    health: std::sync::Mutex<(bool, i64)>,
 }
 
 pub struct StorageEditGuard {
@@ -277,6 +278,60 @@ impl Drop for ActiveStorage {
 }
 
 impl StorageBackend {
+    pub fn health_status(&self) -> (bool, i64) {
+        *self
+            .active
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn instance_key(&self) -> usize {
+        Arc::as_ptr(&self.active) as usize
+    }
+
+    fn observe_result<T>(&self, result: &AppResult<T>) {
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|error| error.status().is_server_error())
+        {
+            *self
+                .active
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                (result.is_ok(), chrono::Utc::now().timestamp());
+        }
+    }
+
+    pub async fn check_health(&self) {
+        if self.active.editing.load(Ordering::Acquire)
+            || self.active.retired.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let cancellation = self.transfer_token();
+        let check = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            match &self.active.kind {
+                StorageBackendKind::Local(storage) => {
+                    let path = storage.resolve_existing("").await?;
+                    storage.metadata(&path).await.map(|_| ())
+                }
+                StorageBackendKind::S3(storage) => storage.check_health().await,
+            }
+        });
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => return,
+            result = check => result.unwrap_or_else(|_| Err(AppError::ServiceUnavailable("存储连接检查超时".into()))),
+        };
+        *self
+            .active
+            .health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (result.is_ok(), chrono::Utc::now().timestamp());
+    }
     fn admitted(&self) -> AppResult<Self> {
         if self.active.editing.load(Ordering::Acquire) {
             return Err(AppError::Conflict("存储配置正在更新，请重试".into()));
@@ -346,7 +401,19 @@ impl StorageBackend {
     /// Administrator edits stop transfer admission and cancel payload transfer,
     /// rather than requiring clients to voluntarily finish uploading.
     pub(crate) async fn interrupt_for_edit(&self) -> AppResult<StorageEditGuard> {
-        self.active.editing.store(true, Ordering::Release);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.interrupt_for_edit_inner(),
+        )
+        .await
+        .map_err(|_| AppError::Conflict("存储提交未在 5 秒内结束；配置未修改，请稍后重试".into()))?
+    }
+
+    async fn interrupt_for_edit_inner(&self) -> AppResult<StorageEditGuard> {
+        self.active
+            .editing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AppError::Conflict("存储设置正在更新，请稍后重试".into()))?;
         self.transfer_token().cancel();
         let mut guard = StorageEditGuard {
             backend: self.clone(),
@@ -427,7 +494,7 @@ impl StorageBackend {
             }
         }
     }
-    fn set_local_max_upload_bytes(&self, max_upload_bytes: u64) {
+    pub(crate) fn set_local_max_upload_bytes(&self, max_upload_bytes: u64) {
         let active = &self.active;
         if let StorageBackendKind::Local(storage) = &active.kind {
             storage.set_max_upload_bytes(max_upload_bytes);
@@ -444,6 +511,7 @@ impl StorageBackend {
                 editing: AtomicBool::new(false),
                 transfer: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
                 leases: std::sync::Mutex::new(Vec::new()),
+                health: std::sync::Mutex::new((true, chrono::Utc::now().timestamp())),
                 mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
                 kind: StorageBackendKind::Local(storage),
                 capacity: CapacityTracker::new(None, 0),
@@ -472,6 +540,7 @@ impl StorageBackend {
                 editing: AtomicBool::new(false),
                 transfer: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
                 leases: std::sync::Mutex::new(Vec::new()),
+                health: std::sync::Mutex::new((true, chrono::Utc::now().timestamp())),
                 mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
                 kind: StorageBackendKind::Local(storage),
                 capacity,
@@ -507,6 +576,7 @@ impl StorageBackend {
                 editing: AtomicBool::new(false),
                 transfer: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
                 leases: std::sync::Mutex::new(Vec::new()),
+                health: std::sync::Mutex::new((true, chrono::Utc::now().timestamp())),
                 mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
                 kind: StorageBackendKind::S3(storage),
                 capacity: CapacityTracker::new_with_ledger(
@@ -528,6 +598,12 @@ impl StorageBackend {
     }
 
     pub async fn metadata(&self, relative: &str) -> AppResult<BackendMetadata> {
+        let result = self.metadata_inner(relative).await;
+        self.observe_result(&result);
+        result
+    }
+
+    async fn metadata_inner(&self, relative: &str) -> AppResult<BackendMetadata> {
         let active = &self.active;
         match &active.kind {
             StorageBackendKind::Local(storage) => {
@@ -558,6 +634,16 @@ impl StorageBackend {
     }
 
     pub async fn list_directory(
+        &self,
+        relative: &str,
+        max_entries: usize,
+    ) -> AppResult<(Vec<BackendEntry>, bool)> {
+        let result = self.list_directory_inner(relative, max_entries).await;
+        self.observe_result(&result);
+        result
+    }
+
+    async fn list_directory_inner(
         &self,
         relative: &str,
         max_entries: usize,
@@ -601,6 +687,16 @@ impl StorageBackend {
     }
 
     pub async fn list_directory_page(
+        &self,
+        relative: &str,
+        request: DirectoryListRequest,
+    ) -> AppResult<DirectoryPage> {
+        let result = self.list_directory_page_inner(relative, request).await;
+        self.observe_result(&result);
+        result
+    }
+
+    async fn list_directory_page_inner(
         &self,
         relative: &str,
         request: DirectoryListRequest,
@@ -669,8 +765,9 @@ impl StorageBackend {
                 storage.stream_file(&path, headers, mode).await
             }
             StorageBackendKind::S3(storage) => storage.stream_file(relative, headers, mode).await,
-        }?;
-        let (parts, body) = response.into_parts();
+        };
+        self.observe_result(&response);
+        let (parts, body) = response?.into_parts();
         Ok(Response::from_parts(
             parts,
             interruptible_body(body, self.transfer_token()),
@@ -808,7 +905,9 @@ impl StorageBackend {
         tokio::spawn(async move {
             let _permit = permit;
             let _lease = owner.lease.clone();
-            work(owner).await
+            let result = work(owner.clone()).await;
+            owner.observe_result(&result);
+            result
         })
         .await
         .map_err(|error| {

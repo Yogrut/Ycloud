@@ -202,7 +202,8 @@ impl LoginSecurity {
 
     pub async fn is_blocked(&self, entry: LoginEntry, ip: IpAddr) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
-        let mut data = self.data.lock().await;
+        let mut current = self.data.lock().await;
+        let mut data = current.clone();
         let Some(record) = find_mut(&mut data.records, entry, ip) else {
             return Ok(false);
         };
@@ -213,6 +214,7 @@ impl LoginSecurity {
             record.failed_attempts = 0;
             record.last_result = "限制已到期".into();
             persist_state(&self.state_path, &data).await?;
+            *current = data;
         }
         Ok(false)
     }
@@ -226,7 +228,8 @@ impl LoginSecurity {
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
         let event = {
-            let mut data = self.data.lock().await;
+            let mut current = self.data.lock().await;
+            let mut data = current.clone();
             ensure_capacity(&mut data.records, entry, ip, now)?;
             let record = get_or_insert(&mut data.records, entry, ip, now);
             record.failed_attempts = record.failed_attempts.saturating_add(1);
@@ -240,9 +243,11 @@ impl LoginSecurity {
             }
             let event = event_from_record(record, false, now);
             persist_state(&self.state_path, &data).await?;
+            *current = data;
             event
         };
-        self.append_event(event).await
+        self.record_event(event).await;
+        Ok(())
     }
 
     pub async fn record_success(
@@ -253,7 +258,8 @@ impl LoginSecurity {
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
         let event = {
-            let mut data = self.data.lock().await;
+            let mut current = self.data.lock().await;
+            let mut data = current.clone();
             if entry == LoginEntry::WebDav {
                 let recent_clean_success =
                     find_mut(&mut data.records, entry, ip).is_some_and(|record| {
@@ -277,9 +283,11 @@ impl LoginSecurity {
             record.user_agent = sanitize_user_agent(user_agent);
             let event = event_from_record(record, true, now);
             persist_state(&self.state_path, &data).await?;
+            *current = data;
             event
         };
-        self.append_event(event).await
+        self.record_event(event).await;
+        Ok(())
     }
 
     pub async fn query_events(&self, query: EventQuery<'_>) -> LoginEventPage {
@@ -372,14 +380,14 @@ impl LoginSecurity {
         compact_events(&self.events_path, &empty).await?;
         log.events.clear();
         log.disk_entries = 0;
-        compact_events(&self.events_path, &empty).await?;
         Ok(())
     }
 
     pub async fn unblock(&self, entry: LoginEntry, ip: IpAddr) -> anyhow::Result<bool> {
         let now = chrono::Utc::now().timestamp();
         let event = {
-            let mut data = self.data.lock().await;
+            let mut current = self.data.lock().await;
+            let mut data = current.clone();
             let Some(record) = find_mut(&mut data.records, entry, ip) else {
                 return Ok(false);
             };
@@ -389,9 +397,10 @@ impl LoginSecurity {
             record.last_result = "管理员已解除限制".into();
             let event = event_from_record(record, false, now);
             persist_state(&self.state_path, &data).await?;
+            *current = data;
             event
         };
-        self.append_event(event).await?;
+        self.record_event(event).await;
         Ok(true)
     }
 
@@ -403,7 +412,8 @@ impl LoginSecurity {
     ) -> anyhow::Result<()> {
         let now = chrono::Utc::now().timestamp();
         let event = {
-            let mut data = self.data.lock().await;
+            let mut current = self.data.lock().await;
+            let mut data = current.clone();
             ensure_capacity(&mut data.records, entry, ip, now)?;
             let record = get_or_insert(&mut data.records, entry, ip, now);
             record.blocked_until = Some(now + policy.block_seconds);
@@ -411,9 +421,17 @@ impl LoginSecurity {
             record.last_result = "管理员已限制".into();
             let event = event_from_record(record, false, now);
             persist_state(&self.state_path, &data).await?;
+            *current = data;
             event
         };
-        self.append_event(event).await
+        self.record_event(event).await;
+        Ok(())
+    }
+
+    async fn record_event(&self, event: LoginEvent) {
+        if let Err(error) = self.append_event(event).await {
+            tracing::warn!(%error, "login state saved but event log append failed");
+        }
     }
 
     async fn append_event(&self, mut event: LoginEvent) -> anyhow::Result<()> {
@@ -554,36 +572,13 @@ async fn append_json_line(path: &Path, event: &LoginEvent) -> anyhow::Result<()>
 }
 
 async fn compact_events(path: &Path, events: &VecDeque<LoginEvent>) -> anyhow::Result<()> {
-    let temporary = path.with_extension(format!("jsonl.{}.tmp", Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary).await?;
+    let mut bytes = Vec::new();
     for event in events {
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
-        file.write_all(&line).await?;
+        bytes.extend_from_slice(&line);
     }
-    file.sync_all().await?;
-    drop(file);
-    let backup = event_backup_path(path);
-    if tokio::fs::try_exists(&backup).await? {
-        tokio::fs::remove_file(&backup).await?;
-    }
-    if tokio::fs::try_exists(path).await? {
-        tokio::fs::rename(path, &backup).await?;
-    }
-    if let Err(error) = tokio::fs::rename(&temporary, path).await {
-        if tokio::fs::try_exists(&backup).await.unwrap_or(false) {
-            let _ = tokio::fs::rename(&backup, path).await;
-        }
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(error).context("Failed to publish compacted security event log");
-    }
-    secure_permissions(path).await
+    crate::config::publish_private_state(path, event_backup_path(path), bytes, true).await
 }
 
 fn event_backup_path(path: &Path) -> PathBuf {
@@ -699,32 +694,7 @@ async fn read_state(path: &Path) -> anyhow::Result<SecurityData> {
 
 async fn persist_state(path: &Path, data: &SecurityData) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec_pretty(data)?;
-    let temporary = path.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary).await?;
-    file.write_all(&bytes).await?;
-    file.sync_all().await?;
-    drop(file);
-    let backup = backup_path(path);
-    if tokio::fs::try_exists(&backup).await? {
-        tokio::fs::remove_file(&backup).await?;
-    }
-    if tokio::fs::try_exists(path).await? {
-        tokio::fs::rename(path, &backup).await?;
-    }
-    if let Err(error) = tokio::fs::rename(&temporary, path).await {
-        if tokio::fs::try_exists(&backup).await.unwrap_or(false) {
-            let _ = tokio::fs::rename(&backup, path).await;
-        }
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(error).context("Failed to publish login security state");
-    }
-    secure_permissions(path).await
+    crate::config::publish_private_state(path, backup_path(path), bytes, false).await
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -747,6 +717,36 @@ async fn secure_permissions(_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_state_publication_does_not_change_memory() {
+        let root = crate::test_support::TestDirectory::new("security-state-failure");
+        let mut tracker = LoginSecurity::load(&root.path().join("config.json"), 7, 100)
+            .await
+            .unwrap();
+        tracker.state_path = root.path().to_path_buf(); // A directory cannot be replaced by the state file.
+        let ip = "192.0.2.20".parse().unwrap();
+        assert!(tracker
+            .restrict(LoginEntry::Admin, ip, LoginEntry::Admin.fixed_policy())
+            .await
+            .is_err());
+        assert!(!tracker.is_blocked(LoginEntry::Admin, ip).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn event_log_failure_does_not_reject_a_persisted_restriction() {
+        let root = crate::test_support::TestDirectory::new("security-log-failure");
+        let mut tracker = LoginSecurity::load(&root.path().join("config.json"), 7, 100)
+            .await
+            .unwrap();
+        tracker.events_path = root.path().to_path_buf();
+        let ip = "192.0.2.21".parse().unwrap();
+        tracker
+            .restrict(LoginEntry::Admin, ip, LoginEntry::Admin.fixed_policy())
+            .await
+            .unwrap();
+        assert!(tracker.is_blocked(LoginEntry::Admin, ip).await.unwrap());
+    }
 
     #[tokio::test]
     async fn full_capacity_query_counts_and_pages_in_memory() {

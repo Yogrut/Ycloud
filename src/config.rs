@@ -13,6 +13,47 @@ use crate::{
 };
 
 mod commit;
+/// Process-local opaque entity version. A restart invalidates old forms;
+/// keyed hashing prevents a version from exposing secret configuration values.
+pub(crate) fn entity_revision(value: &impl serde::Serialize) -> String {
+    static KEY: std::sync::OnceLock<ring::hmac::Key> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let material = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        ring::hmac::Key::new(ring::hmac::HMAC_SHA256, material.as_bytes())
+    });
+    let bytes = serde_json::to_vec(value).expect("configuration entity is serializable");
+    ring::hmac::sign(key, &bytes)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn verify_entity_revision(
+    value: &impl serde::Serialize,
+    expected: Option<&str>,
+) -> crate::error::AppResult<()> {
+    if expected.is_some_and(|expected| expected != entity_revision(value)) {
+        return Err(crate::error::AppError::Conflict(
+            "该条配置已经变化，请刷新后重新编辑".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn publish_private_state(
+    path: &std::path::Path,
+    backup: std::path::PathBuf,
+    bytes: Vec<u8>,
+    refresh_backup: bool,
+) -> anyhow::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        commit::publish_with_backup(&path, &backup, &bytes, true, refresh_backup, |_| Ok(()))
+            .map(|_| ())
+    })
+    .await?
+}
 pub(crate) fn publish_traffic_snapshot(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     let result = commit::publish(path, bytes, false, false, |_| Ok(()))?;
     anyhow::ensure!(

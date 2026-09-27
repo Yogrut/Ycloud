@@ -70,12 +70,6 @@ describe('LimitsView', () => {
       method: 'PUT',
       body: JSON.stringify({
         max_upload_bytes: 6 * GIB,
-        max_upload_batch_bytes: 20 * GIB,
-        max_upload_batch_entries: 1000,
-        max_archive_bytes: 3 * GIB,
-        max_archive_entries: 1000,
-        upload_rate_bytes_per_sec: 0,
-        download_rate_bytes_per_sec: 0,
       }),
     }))
     expect(host.querySelector('.settings-drawer')).toBeNull()
@@ -123,13 +117,7 @@ describe('LimitsView', () => {
 
     const options = fetchMock.mock.calls[0]?.[1] as RequestInit
     expect(JSON.parse(String(options.body))).toEqual({
-      max_upload_bytes: preciseInfo.max_upload_bytes,
-      max_upload_batch_bytes: preciseInfo.max_upload_batch_bytes,
-      max_upload_batch_entries: preciseInfo.max_upload_batch_entries,
-      max_archive_bytes: preciseInfo.max_archive_bytes,
       max_archive_entries: 999,
-      upload_rate_bytes_per_sec: 0,
-      download_rate_bytes_per_sec: 0,
     })
     app.unmount()
   })

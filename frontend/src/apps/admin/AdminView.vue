@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import AppFeedback from '../../shared/components/AppFeedback.vue'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import type { AdminInfo } from '../../shared/api/admin'
 import { AdminApiError, getAdminInfo, loginAdministrator } from '../../shared/api/admin'
 import AppIcon from '../../shared/components/AppIcon.vue'
@@ -63,12 +63,17 @@ const navigation = computed(() => [
   { id: 'security', label: locale.text('访问日志', 'Access logs'), href: appPath('/admin/security') },
 ] as const)
 
-async function load(): Promise<void> {
-  loading.value = true
+let loadRevision = 0
+async function load(background = false): Promise<void> {
+  const revision = ++loadRevision
+  if (!background) loading.value = true
   try {
-    info.value = await getAdminInfo()
+    const result = await getAdminInfo()
+    if (revision !== loadRevision) return
+    info.value = result
     requiresLogin.value = false
   } catch (error) {
+    if (revision !== loadRevision) return
     if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
       requiresLogin.value = true
       info.value = undefined
@@ -76,7 +81,7 @@ async function load(): Promise<void> {
       loginError.value = error instanceof Error ? error.message : locale.text('管理后台加载失败', 'Unable to load the admin console')
     }
   } finally {
-    loading.value = false
+    if (revision === loadRevision) loading.value = false
   }
 }
 
@@ -127,7 +132,17 @@ function sessionExpired(): void {
   window.setTimeout(() => window.location.replace(appPath('/browse')), 700)
 }
 
-onMounted(load)
+let healthRefresh: ReturnType<typeof setInterval> | undefined
+onMounted(() => {
+  void load()
+  if (activeSection === 'storage') healthRefresh = setInterval(() => {
+    if (!document.hidden && !requiresLogin.value) void load(true)
+  }, 300_000)
+})
+onUnmounted(() => {
+  clearInterval(healthRefresh)
+  loadRevision++
+})
 </script>
 
 <template>

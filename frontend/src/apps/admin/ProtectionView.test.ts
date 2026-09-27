@@ -47,9 +47,6 @@ describe('ProtectionView', () => {
       method: 'PUT',
       body: JSON.stringify({
         admin_login_failures: 4,
-        web_login_failures: 5,
-        admin_login_block_seconds: 3600,
-        web_login_block_seconds: 3600,
       }),
     }))
     app.unmount()

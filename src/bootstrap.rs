@@ -24,6 +24,7 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     let (cleanup_stop, cleanup_signal) = watch::channel(false);
+    let health_task = spawn_health_task(state.clone(), cleanup_signal.clone());
     let cleanup_task = spawn_cleanup_task(state.clone(), cleanup_signal);
     let router = app::build_router(state);
     let address = SocketAddr::new(runtime.bind_address, runtime.port);
@@ -45,8 +46,36 @@ pub async fn run() -> anyhow::Result<()> {
 
     let _ = cleanup_stop.send(true);
     let _ = cleanup_task.await;
+    let _ = health_task.await;
     result?;
     Ok(())
+}
+
+fn spawn_health_task(
+    state: AppState,
+    mut stop: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let ids = state.config_file.read().await.storage_instances.iter()
+                        .map(|storage| storage.id.clone()).collect::<Vec<_>>();
+                    for id in ids {
+                        if let Some(backend) = state.backends.cached(&id).await {
+                            tokio::select! {
+                                _ = backend.check_health() => {},
+                                _ = stop.changed() => return,
+                            }
+                        }
+                    }
+                }
+                _ = stop.changed() => return,
+            }
+        }
+    })
 }
 
 fn spawn_cleanup_task(

@@ -158,6 +158,9 @@ impl SessionStore {
         let now = chrono::Utc::now();
         let mut sessions = self.sessions.write().await;
         sessions.retain(|_, session| now - session.created_at <= SESSION_TTL);
+        if principal == SessionPrincipal::Administrator {
+            sessions.retain(|_, session| session.principal != SessionPrincipal::Administrator);
+        }
         while sessions
             .values()
             .filter(|session| session.principal == principal)
@@ -212,6 +215,12 @@ impl SessionStore {
     }
     pub async fn clear(&self) {
         self.sessions.write().await.clear();
+    }
+    pub async fn revoke_administrator(&self) {
+        self.sessions
+            .write()
+            .await
+            .retain(|_, session| session.principal != SessionPrincipal::Administrator);
     }
     pub async fn revoke_user(&self, user_id: &str) {
         self.sessions.write().await.retain(
@@ -1260,6 +1269,20 @@ mod tests {
             sessions.principal(&second).await,
             Some(super::SessionPrincipal::User("second-user".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn administrator_has_one_session_and_revocation_preserves_users() {
+        let sessions = SessionStore::new();
+        let user = sessions.create_user("ordinary".into()).await;
+        let old_admin = sessions.create().await;
+        let admin = sessions.create().await;
+        assert!(!sessions.validate(&old_admin).await);
+        assert!(sessions.validate(&admin).await);
+        assert!(sessions.validate(&user).await);
+        sessions.revoke_administrator().await;
+        assert!(!sessions.validate(&admin).await);
+        assert!(sessions.validate(&user).await);
     }
 
     #[tokio::test]

@@ -1,4 +1,6 @@
 /* Compact application surfaces; circular icons and status dots retain their shape. */
+.storage-health-light { display: inline-block; width: 8px; height: 8px; margin-right: 9px; border-radius: 50%; background: var(--danger, #ef4444); vertical-align: middle; }
+.storage-health-light.healthy { background: #10b981; }
 :root { --surface-radius: 4px; --control-radius: 4px; }
 /* Short-field forms own their spacing; teleported feedback takes no layout space. */
 .admin-login-form-pane.admin-login-form-pane { gap: 16px; }

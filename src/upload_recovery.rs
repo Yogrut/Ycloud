@@ -5,9 +5,16 @@ pub(crate) async fn recover(state: &AppState) {
     // Bounded by the batch store; process one storage at a time without adding
     // another queue. Active backends cannot be mistaken for abandoned work.
     let mut items = state.upload_batches.unknown_items().await;
-    items.sort_by(|a, b| a.storage_id.cmp(&b.storage_id));
-    for group in items.chunk_by(|a, b| a.storage_id == b.storage_id) {
-        let Some(backend) = state.backends.cached(&group[0].storage_id).await else {
+    for item in &mut items {
+        if item.backend.is_none() {
+            item.backend = state.backends.cached(&item.storage_id).await;
+        }
+    }
+    items.sort_by_key(|item| item.backend.as_ref().map(|backend| backend.instance_key()));
+    for group in items.chunk_by(|a, b| {
+        a.backend.as_ref().map(|v| v.instance_key()) == b.backend.as_ref().map(|v| v.instance_key())
+    }) {
+        let Some(backend) = &group[0].backend else {
             continue;
         };
         let _exclusive = match backend.recover_abandoned_uploads().await {
@@ -42,6 +49,62 @@ mod tests {
         upload_batch::UploadStatus,
     };
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn deleted_storage_keeps_its_original_cleanup_backend() {
+        let directory = TestDirectory::new("removed-storage-recovery");
+        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
+        let subject = RequestSubject::Session("owner".into());
+        let ticket = state
+            .upload_batches
+            .create(
+                subject.clone(),
+                "primary".into(),
+                HashMap::from([("done.txt".into(), ("done.txt".into(), 7))]),
+            )
+            .await
+            .unwrap();
+        state
+            .upload_batches
+            .begin(&ticket, &subject, "primary", "done.txt", 7)
+            .await
+            .unwrap();
+        state
+            .upload_batches
+            .finish_result::<()>(
+                &ticket,
+                "done.txt",
+                &Err(AppError::internal("response lost")
+                    .with_operation(CommitState::Unknown, CleanupState::Unknown)),
+            )
+            .await;
+        tokio::fs::write(state.config.storage_path.join("done.txt"), b"content")
+            .await
+            .unwrap();
+        state.delete_storage("primary").await.unwrap();
+        assert!(state.backends.cached("primary").await.is_none());
+        assert!(state.upload_batches.unknown_items().await[0]
+            .backend
+            .is_some());
+        recover(&state).await;
+        assert!(state.upload_batches.unknown_items().await.is_empty());
+        assert_eq!(
+            state
+                .upload_batches
+                .status(&ticket, &subject, "primary")
+                .await
+                .unwrap()
+                .items[0]
+                .status,
+            UploadStatus::Complete
+        );
+        assert_eq!(
+            tokio::fs::read(state.config.storage_path.join("done.txt"))
+                .await
+                .unwrap(),
+            b"content"
+        );
+    }
 
     #[tokio::test]
     async fn recovery_settles_committed_and_missing_files_without_manual_review() {

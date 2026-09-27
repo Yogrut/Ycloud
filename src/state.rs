@@ -42,7 +42,17 @@ pub struct AppState {
     pub download_limiter: BandwidthLimiter,
     pub traffic: crate::traffic::TrafficStore,
     pub(crate) config_updates: Arc<Mutex<()>>,
+    storage_updates: Arc<Mutex<()>>,
     local_io_gate: Arc<Semaphore>,
+}
+
+pub struct LocalStorageEdit {
+    pub name: String,
+    pub path: String,
+    pub capacity_limit_bytes: Option<u64>,
+    pub enabled: bool,
+    pub guest_access: crate::config::GuestAccess,
+    pub expected_revision: Option<String>,
 }
 
 impl AppState {
@@ -128,6 +138,7 @@ impl AppState {
             upload_limiter: BandwidthLimiter::new(persisted.upload_rate_bytes_per_sec),
             download_limiter: BandwidthLimiter::new(persisted.download_rate_bytes_per_sec),
             config_updates: Arc::new(Mutex::new(())),
+            storage_updates: Arc::new(Mutex::new(())),
             local_io_gate,
         })
     }
@@ -226,6 +237,11 @@ impl AppState {
         enabled: bool,
         allow_guest_access: impl Into<crate::config::GuestAccess>,
     ) -> AppResult<String> {
+        let _storage_guard = self
+            .storage_updates
+            .try_lock()
+            .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
+
         let crate::config::GuestAccess {
             access: allow_guest_access,
             download: allow_guest_download,
@@ -241,7 +257,6 @@ impl AppState {
                     "该路径未通过 STORAGE_PATH 或 LOCAL_STORAGE_MOUNTS 声明".into(),
                 )
             })?;
-        let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
         if next.storage_instances.iter().any(|instance| {
             matches!(
@@ -280,15 +295,10 @@ impl AppState {
         } else {
             None
         };
-        save_config(&self.config.config_path, &next)
-            .await
-            .map_err(|error| AppError::with_source("failed to persist local storage", error))?;
+        self.persist_storage_selection(&next).await?;
         if let Some(prepared) = prepared {
-            self.backends
-                .insert_ready(storage_id.clone(), prepared)
-                .await;
+            self.publish_backend(storage_id.clone(), prepared).await;
         }
-        *self.config_file.write().await = next;
         Ok(storage_id)
     }
 
@@ -300,8 +310,17 @@ impl AppState {
         F: FnOnce(&mut ConfigFile) -> AppResult<T>,
         T: Send + 'static,
     {
-        let update_guard = self.config_updates.clone().lock_owned().await;
+        let update_guard = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.config_updates.clone().lock_owned(),
+        )
+        .await
+        .map_err(|_| AppError::Conflict("配置正在提交，请稍后重试".into()))?;
         let mut next = self.config_file.read().await.clone();
+        let previous_retention = (
+            next.security_log_retention_days,
+            next.security_log_max_entries,
+        );
         let result = update(&mut next)?;
         next.validate()?;
         if next.max_upload_bytes > self.config.max_upload_bytes {
@@ -328,15 +347,26 @@ impl AppState {
             state
                 .download_limiter
                 .set_rate(next.download_rate_bytes_per_sec);
-            if let Err(error) = state
-                .login_security
-                .configure_retention(
+            drop(_update_guard);
+            if previous_retention
+                != (
                     next.security_log_retention_days,
                     next.security_log_max_entries,
                 )
-                .await
             {
-                tracing::warn!(%error, "security event log compaction will be retried later");
+                tokio::spawn(async move {
+                    let latest = state.config_file.read().await.clone();
+                    if let Err(error) = state
+                        .login_security
+                        .configure_retention(
+                            latest.security_log_retention_days,
+                            latest.security_log_max_entries,
+                        )
+                        .await
+                    {
+                        tracing::warn!(%error, "security log maintenance failed");
+                    }
+                });
             }
             Ok(result)
         })
@@ -358,6 +388,11 @@ impl AppState {
         enabled: bool,
         allow_guest_access: impl Into<crate::config::GuestAccess>,
     ) -> AppResult<()> {
+        let _storage_guard = self
+            .storage_updates
+            .try_lock()
+            .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
+
         let crate::config::GuestAccess {
             access: allow_guest_access,
             download: allow_guest_download,
@@ -365,9 +400,10 @@ impl AppState {
         let backend_config = StorageBackendConfig::S3(settings.clone());
         if enabled {
             let backend = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
-            backend.activation_probe().await?;
+            tokio::time::timeout(Duration::from_secs(60), backend.activation_probe())
+                .await
+                .map_err(|_| AppError::ServiceUnavailable("存储连接测试超时".into()))??;
         }
-        let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
         next.pending_storage_instance = Some(StorageInstanceConfig {
             id: format!("storage-{}", uuid::Uuid::new_v4().simple()),
@@ -387,12 +423,17 @@ impl AppState {
         mut settings: crate::config::S3StorageConfig,
         enabled: bool,
         allow_guest_access: impl Into<crate::config::GuestAccess>,
+        expected_revision: Option<String>,
     ) -> AppResult<()> {
+        let _storage_guard = self
+            .storage_updates
+            .try_lock()
+            .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
+
         let crate::config::GuestAccess {
             access: allow_guest_access,
             download: allow_guest_download,
         } = allow_guest_access.into();
-        let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
         let instance = next
             .storage_instances
@@ -402,6 +443,7 @@ impl AppState {
         let StorageBackendConfig::S3(previous) = &instance.backend else {
             return Err(AppError::BadRequest("该存储源不是 S3 存储".into()));
         };
+        crate::config::verify_entity_revision(instance, expected_revision.as_deref())?;
         if settings.access_key_id.is_empty() {
             settings.access_key_id = previous.access_key_id.clone();
         }
@@ -425,19 +467,9 @@ impl AppState {
         candidate_instance.enabled = enabled;
         candidate_instance.name = name.trim().to_string();
         candidate.validate()?;
-        let edit = if interrupt {
-            match &cached {
-                Some(backend) => Some(backend.interrupt_for_edit().await?),
-                None => None,
-            }
-        } else {
-            None
-        };
         let prepared = if reuse {
             cached.clone()
         } else if enabled {
-            let probe = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
-            probe.activation_probe().await?;
             Some(
                 prepare_storage_backend(
                     &self.config,
@@ -451,6 +483,14 @@ impl AppState {
         } else {
             None
         };
+        let edit = if interrupt {
+            match &cached {
+                Some(backend) => Some(backend.interrupt_for_edit().await?),
+                None => None,
+            }
+        } else {
+            None
+        };
         instance.name = name.trim().to_string();
         instance.backend = backend_config;
         instance.enabled = enabled;
@@ -461,10 +501,11 @@ impl AppState {
             Some(false)
         };
         next.validate()?;
-        self.save_storage_selection(&next).await?;
-        *self.config_file.write().await = next;
+        self.persist_storage_selection(&next).await?;
         if interrupt {
-            self.upload_batches.invalidate_storage(storage_id).await;
+            self.upload_batches
+                .invalidate_storage(storage_id, cached.clone())
+                .await;
         }
         if !reuse {
             if let Some(edit) = &edit {
@@ -473,9 +514,7 @@ impl AppState {
         }
         if let Some(prepared) = prepared {
             prepared.set_capacity_limit(settings.capacity_limit_bytes);
-            self.backends
-                .insert_ready(storage_id.to_string(), prepared)
-                .await;
+            self.publish_backend(storage_id.to_string(), prepared).await;
             self.backends.set_enabled(storage_id, enabled).await;
         } else {
             self.backends.remove(storage_id).await;
@@ -487,16 +526,25 @@ impl AppState {
     pub async fn update_local_storage(
         &self,
         storage_id: &str,
-        name: String,
-        path: String,
-        capacity_limit_bytes: Option<u64>,
-        enabled: bool,
-        allow_guest_access: impl Into<crate::config::GuestAccess>,
+        edit: LocalStorageEdit,
     ) -> AppResult<()> {
+        let LocalStorageEdit {
+            name,
+            path,
+            capacity_limit_bytes,
+            enabled,
+            guest_access,
+            expected_revision,
+        } = edit;
+        let _storage_guard = self
+            .storage_updates
+            .try_lock()
+            .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
+
         let crate::config::GuestAccess {
             access: allow_guest_access,
             download: allow_guest_download,
-        } = allow_guest_access.into();
+        } = guest_access;
         let mount_id = self
             .config
             .local_mounts
@@ -508,7 +556,6 @@ impl AppState {
                     "该路径未通过 STORAGE_PATH 或 LOCAL_STORAGE_MOUNTS 声明".into(),
                 )
             })?;
-        let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
         let position = next
             .storage_instances
@@ -518,6 +565,10 @@ impl AppState {
                     && matches!(instance.backend, StorageBackendConfig::Local(_))
             })
             .ok_or(AppError::NotFound)?;
+        crate::config::verify_entity_revision(
+            &next.storage_instances[position],
+            expected_revision.as_deref(),
+        )?;
         if next
             .storage_instances
             .iter()
@@ -546,14 +597,6 @@ impl AppState {
         candidate.storage_instances[position].backend = backend_config.clone();
         candidate.storage_instances[position].enabled = enabled;
         candidate.validate()?;
-        let edit = if interrupt {
-            match &cached {
-                Some(backend) => Some(backend.interrupt_for_edit().await?),
-                None => None,
-            }
-        } else {
-            None
-        };
         let prepared = if reuse {
             cached.clone()
         } else if enabled {
@@ -570,6 +613,14 @@ impl AppState {
         } else {
             None
         };
+        let edit = if interrupt {
+            match &cached {
+                Some(backend) => Some(backend.interrupt_for_edit().await?),
+                None => None,
+            }
+        } else {
+            None
+        };
         next.storage_instances[position].name = name.trim().to_string();
         next.storage_instances[position].backend = backend_config;
         next.storage_instances[position].enabled = enabled;
@@ -580,14 +631,11 @@ impl AppState {
             Some(false)
         };
         next.validate()?;
-        save_config(&self.config.config_path, &next)
-            .await
-            .map_err(|error| {
-                AppError::with_source("failed to persist local storage settings", error)
-            })?;
-        *self.config_file.write().await = next;
+        self.persist_storage_selection(&next).await?;
         if interrupt {
-            self.upload_batches.invalidate_storage(storage_id).await;
+            self.upload_batches
+                .invalidate_storage(storage_id, cached.clone())
+                .await;
         }
         if !reuse {
             if let Some(edit) = &edit {
@@ -596,9 +644,7 @@ impl AppState {
         }
         if let Some(prepared) = prepared {
             prepared.set_capacity_limit(capacity_limit_bytes);
-            self.backends
-                .insert_ready(storage_id.to_string(), prepared)
-                .await;
+            self.publish_backend(storage_id.to_string(), prepared).await;
             self.backends.set_enabled(storage_id, enabled).await;
         } else {
             self.backends.remove(storage_id).await;
@@ -608,7 +654,11 @@ impl AppState {
     }
 
     pub async fn discard_pending_storage(&self) -> AppResult<()> {
-        let _update_guard = self.config_updates.lock().await;
+        let _storage_guard = self
+            .storage_updates
+            .try_lock()
+            .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
+
         let mut next = self.config_file.read().await.clone();
         if next.pending_storage_instance.take().is_none() {
             return Err(AppError::NotFound);
@@ -619,7 +669,11 @@ impl AppState {
     /// Revalidate and recover a staged instance, persist it, then publish it
     /// to the registry. Existing instances and their namespaces are untouched.
     pub async fn activate_pending_storage(&self) -> AppResult<()> {
-        let _update_guard = self.config_updates.lock().await;
+        let _storage_guard = self
+            .storage_updates
+            .try_lock()
+            .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
+
         let mut next = self.config_file.read().await.clone();
         let pending = next
             .pending_storage_instance
@@ -648,15 +702,10 @@ impl AppState {
         next.storage_instances.push(pending.clone());
         next.pending_storage_instance = None;
         next.validate()?;
-        save_config(&self.config.config_path, &next)
-            .await
-            .map_err(|error| AppError::with_source("failed to persist storage instance", error))?;
+        self.persist_storage_selection(&next).await?;
         if let Some(prepared) = prepared {
-            self.backends
-                .insert_ready(pending.id.clone(), prepared)
-                .await;
+            self.publish_backend(pending.id.clone(), prepared).await;
         }
-        *self.config_file.write().await = next;
         tracing::info!(storage_id = %pending.id, "storage instance activation completed");
         Ok(())
     }
@@ -667,11 +716,15 @@ impl AppState {
         enabled: bool,
         allow_guest_access: impl Into<crate::config::GuestAccess>,
     ) -> AppResult<()> {
+        let _storage_guard = self
+            .storage_updates
+            .try_lock()
+            .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
+
         let crate::config::GuestAccess {
             access: allow_guest_access,
             download: allow_guest_download,
         } = allow_guest_access.into();
-        let _update_guard = self.config_updates.lock().await;
         let mut next = self.config_file.read().await.clone();
         let instance = next
             .storage_instances
@@ -688,6 +741,20 @@ impl AppState {
         let backend_config = instance.backend.clone();
         let cached = self.backends.cached(storage_id).await;
         next.validate()?;
+        let prepared = if enabled && cached.is_none() {
+            Some(
+                prepare_storage_backend(
+                    &self.config,
+                    &self.local_io_gate,
+                    next.max_upload_bytes,
+                    storage_id,
+                    &backend_config,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let _edit = if !enabled {
             match &cached {
                 Some(backend) => Some(backend.interrupt_for_edit().await?),
@@ -696,39 +763,16 @@ impl AppState {
         } else {
             None
         };
-        save_config(&self.config.config_path, &next)
-            .await
-            .map_err(|error| {
-                AppError::with_source("failed to persist storage access settings", error)
-            })?;
-        *self.config_file.write().await = next.clone();
+        self.persist_storage_selection(&next).await?;
         if !enabled {
-            self.upload_batches.invalidate_storage(storage_id).await;
+            self.upload_batches
+                .invalidate_storage(storage_id, cached.clone())
+                .await;
         }
         if cached.is_some() {
             self.backends.set_enabled(storage_id, enabled).await;
-        } else if enabled {
-            match prepare_storage_backend(
-                &self.config,
-                &self.local_io_gate,
-                next.max_upload_bytes,
-                storage_id,
-                &backend_config,
-            )
-            .await
-            {
-                Ok(backend) => {
-                    self.backends
-                        .insert_ready(storage_id.to_string(), backend)
-                        .await
-                }
-                Err(error) => {
-                    tracing::warn!(storage_id, %error, "enabled storage remains in abnormal state");
-                    self.backends
-                        .insert_unavailable(storage_id.to_string())
-                        .await;
-                }
-            }
+        } else if let Some(backend) = prepared {
+            self.publish_backend(storage_id.to_string(), backend).await;
         } else {
             self.backends.remove(storage_id).await;
         }
@@ -739,7 +783,11 @@ impl AppState {
     }
 
     pub async fn delete_storage(&self, storage_id: &str) -> AppResult<()> {
-        let _update_guard = self.config_updates.lock().await;
+        let _storage_guard = self
+            .storage_updates
+            .try_lock()
+            .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
+
         let mut next = self.config_file.read().await.clone();
         if next
             .shares
@@ -772,7 +820,9 @@ impl AppState {
             None => None,
         };
         self.persist_storage_selection(&next).await?;
-        self.upload_batches.invalidate_storage(storage_id).await;
+        self.upload_batches
+            .invalidate_storage(storage_id, cached.clone())
+            .await;
         if let Some(edit) = &edit {
             edit.retire();
         }
@@ -783,25 +833,50 @@ impl AppState {
         Ok(())
     }
 
-    /// Save twice so both the primary config and its recovery backup contain
-    /// the current storage credential set. Replacing or discarding a pending
-    /// backend must not leave its superseded secret in `config.json.bak`.
-    async fn persist_storage_selection(&self, next: &ConfigFile) -> AppResult<()> {
-        self.save_storage_selection(next).await?;
-        *self.config_file.write().await = next.clone();
+    /// Merge only storage fields into the latest configuration. Network checks
+    /// and interruption happen before this short serialized publication.
+    async fn persist_storage_selection(&self, candidate: &ConfigFile) -> AppResult<()> {
+        let _update_guard =
+            tokio::time::timeout(Duration::from_secs(5), self.config_updates.lock())
+                .await
+                .map_err(|_| AppError::Conflict("配置正在提交，请稍后重试".into()))?;
+        let mut next = self.config_file.read().await.clone();
+        next.storage_instances = candidate.storage_instances.clone();
+        next.pending_storage_instance = candidate.pending_storage_instance.clone();
+        next.validate()?;
+        save_config_refresh_backup(&self.config.config_path, &next)
+            .await
+            .map_err(|error| AppError::with_source("failed to persist storage settings", error))?;
+        *self.config_file.write().await = next;
         Ok(())
     }
 
-    async fn save_storage_selection(&self, next: &ConfigFile) -> AppResult<()> {
-        next.validate()?;
-        save_config_refresh_backup(&self.config.config_path, next)
-            .await
-            .map_err(|error| AppError::with_source("failed to persist storage settings", error))?;
-        Ok(())
+    async fn publish_backend(&self, id: String, backend: StorageBackend) {
+        // Preparation may have overlapped a transfer-limit change. Publish the
+        // runtime instance under the same lock as those updates, using the
+        // latest accepted limit, without any network work in this section.
+        let _publication = self.config_updates.lock().await;
+        backend.set_local_max_upload_bytes(self.config_file.read().await.max_upload_bytes);
+        self.backends.insert_ready(id, backend).await;
     }
 }
 
 async fn prepare_storage_backend(
+    config: &Config,
+    local_io_gate: &Arc<Semaphore>,
+    max_upload_bytes: u64,
+    storage_id: &str,
+    backend: &StorageBackendConfig,
+) -> AppResult<StorageBackend> {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        prepare_storage_backend_inner(config, local_io_gate, max_upload_bytes, storage_id, backend),
+    )
+    .await
+    .map_err(|_| AppError::ServiceUnavailable("存储初始化超时，配置未生效".into()))?
+}
+
+async fn prepare_storage_backend_inner(
     config: &Config,
     local_io_gate: &Arc<Semaphore>,
     max_upload_bytes: u64,
@@ -874,6 +949,65 @@ mod tests {
     use tokio::sync::RwLock;
 
     #[tokio::test]
+    async fn stale_storage_form_is_rejected_without_interrupting_existing_work() {
+        let directory = crate::test_support::TestDirectory::new("storage-stale-form");
+        let state =
+            crate::test_support::app_state(&directory, ConfigFile::with_test_storage()).await;
+        let old =
+            crate::config::entity_revision(&state.config_file.read().await.storage_instances[0]);
+        state
+            .update_storage_access("primary", true, false)
+            .await
+            .unwrap();
+        let result = state
+            .update_local_storage(
+                "primary",
+                super::LocalStorageEdit {
+                    name: "Old form".into(),
+                    path: state.config.storage_path.to_string_lossy().into_owned(),
+                    capacity_limit_bytes: None,
+                    enabled: true,
+                    guest_access: false.into(),
+                    expected_revision: Some(old),
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(crate::error::AppError::Conflict(_))));
+        assert!(!state.config_file.read().await.storage_instances[0].allow_guest_access);
+        assert!(state.storage_backend("primary").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn storage_publication_merges_unrelated_latest_settings_and_rejects_parallel_edits() {
+        let directory = crate::test_support::TestDirectory::new("storage-merge-latest");
+        let state =
+            crate::test_support::app_state(&directory, ConfigFile::with_test_storage()).await;
+        let mut candidate = state.config_file.read().await.clone();
+        candidate.storage_instances[0].name = "Renamed".into();
+        state
+            .update_config(|config| {
+                config.admin_login_failures = 4;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        state.persist_storage_selection(&candidate).await.unwrap();
+        assert_eq!(state.config_file.read().await.admin_login_failures, 4);
+        assert_eq!(
+            load_config(&state.config.config_path)
+                .await
+                .unwrap()
+                .admin_login_failures,
+            4
+        );
+        let _busy = state.storage_updates.lock().await;
+        assert!(matches!(
+            state.delete_storage("primary").await,
+            Err(crate::error::AppError::Conflict(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn accepted_config_update_finishes_after_the_waiter_is_cancelled() {
         let directory = crate::test_support::TestDirectory::new("config-cancellation");
         let state =
@@ -941,11 +1075,14 @@ mod tests {
         state
             .update_local_storage(
                 "primary",
-                "Renamed".into(),
-                path,
-                Some(4 * 1024 * 1024),
-                true,
-                false,
+                super::LocalStorageEdit {
+                    name: "Renamed".into(),
+                    path,
+                    capacity_limit_bytes: Some(4 * 1024 * 1024),
+                    enabled: true,
+                    guest_access: false.into(),
+                    expected_revision: None,
+                },
             )
             .await
             .unwrap();
@@ -996,11 +1133,14 @@ mod tests {
         state
             .update_local_storage(
                 "primary",
-                "Renamed".into(),
-                state.config.storage_path.to_str().unwrap().into(),
-                None,
-                true,
-                false,
+                super::LocalStorageEdit {
+                    name: "Renamed".into(),
+                    path: state.config.storage_path.to_str().unwrap().into(),
+                    capacity_limit_bytes: None,
+                    enabled: true,
+                    guest_access: false.into(),
+                    expected_revision: None,
+                },
             )
             .await
             .unwrap();
@@ -1344,11 +1484,14 @@ mod tests {
         state
             .update_local_storage(
                 &storage_id,
-                "Backup".into(),
-                backup.to_string_lossy().into_owned(),
-                Some(8 * 1024 * 1024),
-                true,
-                false,
+                super::LocalStorageEdit {
+                    name: "Backup".into(),
+                    path: backup.to_string_lossy().into_owned(),
+                    capacity_limit_bytes: Some(8 * 1024 * 1024),
+                    enabled: true,
+                    guest_access: false.into(),
+                    expected_revision: None,
+                },
             )
             .await
             .unwrap();
@@ -1477,6 +1620,7 @@ mod tests {
                 },
                 false,
                 false,
+                None,
             )
             .await
             .unwrap();

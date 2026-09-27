@@ -20,6 +20,20 @@ const localInstance: StorageInstanceView = {
   reserved_bytes: 0,
 }
 
+describe('storage health', () => {
+  it('shows cached health independently of enabled state without sending probe requests', () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div'); document.body.append(host)
+    const { app } = mountStorage(host, null, [{ ...localInstance, health_ok: false, health_checked_at: 1704067200 }])
+    const light = host.querySelector<HTMLElement>('.storage-health-light')!
+    expect(light.classList.contains('healthy')).toBe(false)
+    expect(light.title).toContain('连接异常')
+    expect(fetchMock).not.toHaveBeenCalled()
+    app.unmount()
+  })
+})
+
 const localMounts: LocalMountView[] = [
   { mount_id: 'primary', name: '主数据盘', path: './storage', storage_id: 'primary', ready: true, total_bytes: 40 * (1024 ** 3), available_bytes: 30 * (1024 ** 3) },
   { mount_id: 'archive', name: '归档盘', path: '/mnt/archive', storage_id: null, ready: true, total_bytes: 100 * (1024 ** 3), available_bytes: 90 * (1024 ** 3) },

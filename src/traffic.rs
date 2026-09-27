@@ -659,11 +659,11 @@ pub async fn info(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateSettings {
-    pub total: Quota,
-    pub guest: Quota,
+    pub total: Option<Quota>,
+    pub guest: Option<Quota>,
     #[serde(default)]
     pub users_total: Option<Quota>,
-    pub cycle: ResetCycle,
+    pub cycle: Option<ResetCycle>,
 }
 pub async fn update(
     State(state): State<AppState>,
@@ -671,12 +671,18 @@ pub async fn update(
 ) -> AppResult<Json<serde_json::Value>> {
     state
         .update_config(move |config| {
-            config.traffic.total = body.total;
-            config.traffic.guest = body.guest;
+            if let Some(quota) = body.total {
+                config.traffic.total = quota;
+            }
+            if let Some(quota) = body.guest {
+                config.traffic.guest = quota;
+            }
             if let Some(quota) = body.users_total {
                 config.traffic.users_total = quota;
             }
-            config.traffic.cycle = body.cycle;
+            if let Some(cycle) = body.cycle {
+                config.traffic.cycle = cycle;
+            }
             Ok(())
         })
         .await?;
@@ -819,6 +825,28 @@ mod tests {
         settings.cycle.every = 1;
         settings.total.upload = u64::MAX;
         assert!(settings.validate().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual durable traffic accounting baseline"]
+    async fn durable_frame_accounting_baseline() {
+        let (_directory, store, _) = fixture(TrafficSettings::default()).await;
+        let started = std::time::Instant::now();
+        for _ in 0..1024 {
+            store
+                .charge("admin".into(), Direction::Upload, 64 * 1024)
+                .await
+                .unwrap();
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "1024 durable 64 KiB charges: {elapsed:?}; accounting ceiling {:.1} MiB/s",
+            64.0 / elapsed.as_secs_f64()
+        );
+        assert_eq!(
+            store.inner.lock().await.ledger.total.upload,
+            64 * 1024 * 1024
+        );
     }
 
     #[test]

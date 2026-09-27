@@ -32,7 +32,7 @@ describe('TrafficPanel', () => {
     expect(host.querySelectorAll('[role="meter"]')).toHaveLength(5)
     expect(host.querySelectorAll('svg[data-chart="traffic-usage"]')).toHaveLength(5)
     expect([...host.querySelectorAll('.traffic-meter h3')].map(el => el.textContent)).toEqual(['总下载', '总上传', '访客下载', '用户下载', '用户上传'])
-    expect(host.querySelector('.traffic-note')?.textContent).toBe('仅统计Ycloud的文件传输')
+    expect(host.querySelector('.traffic-note')?.textContent).toBe('仅统计Ycloud的文件传输，S3直连不计入')
     expect(host.querySelectorAll('.meter-download')).toHaveLength(3)
     expect(host.querySelectorAll('.meter-upload')).toHaveLength(2)
     expect([...host.querySelectorAll('.meter-amount')].map(el => el.textContent)).toEqual(['2 KiB / 8 KiB', '1 KiB / 4 KiB', '1 KiB / ∞', '768 B / 4 KiB', '768 B / 2 KiB'])

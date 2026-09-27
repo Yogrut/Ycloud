@@ -1697,7 +1697,7 @@ fn bad_request_response() -> String {
     "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\nx-amz-request-id: local-test\r\n\r\n".into()
 }
 
-pub(super) fn test_backend(endpoint: &str) -> S3Backend {
+pub(crate) fn test_backend(endpoint: &str) -> S3Backend {
     let settings = S3StorageConfig {
         provider: S3Provider::S3Compatible,
         endpoint: endpoint.into(),

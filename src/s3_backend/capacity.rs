@@ -65,6 +65,17 @@ impl S3Backend {
         exclude_internal: bool,
         max_entries: Option<usize>,
     ) -> AppResult<u64> {
+        self.maintenance
+            .read(self.sum_object_bytes_uninterrupted(prefix, exclude_internal, max_entries))
+            .await
+    }
+
+    async fn sum_object_bytes_uninterrupted(
+        &self,
+        prefix: &str,
+        exclude_internal: bool,
+        max_entries: Option<usize>,
+    ) -> AppResult<u64> {
         let internal_prefix = format!("{}.ycloud-system/", self.prefix);
         let mut continuation_token: Option<String> = None;
         let mut total = 0_u64;

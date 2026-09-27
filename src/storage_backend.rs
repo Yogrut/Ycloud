@@ -225,16 +225,41 @@ impl StorageEditGuard {
 impl Drop for StorageEditGuard {
     fn drop(&mut self) {
         if self.interrupted {
-            *self
-                .backend
-                .active
-                .transfer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                tokio_util::sync::CancellationToken::new();
-            self.backend.active.editing.store(false, Ordering::Release);
+            if self._owners.is_none() {
+                // A timed-out edit must not reopen request admission while an
+                // old queued mutation can still acquire the backend's gate.
+                let backend = self.backend.clone();
+                tokio::spawn(async move {
+                    let owners = backend
+                        .active
+                        .mutation_owners
+                        .clone()
+                        .acquire_many_owned(MAX_MUTATION_OWNERS as u32)
+                        .await;
+                    if let Ok(_owners) = owners {
+                        reopen_after_interruption(&backend);
+                    }
+                });
+            } else {
+                reopen_after_interruption(&self.backend);
+            }
         }
     }
+}
+
+fn reopen_after_interruption(backend: &StorageBackend) {
+    if let StorageBackendKind::S3(storage) = &backend.active.kind {
+        // Retirement blocks user admission separately. Its original
+        // connection must remain usable by deferred owned cleanup.
+        storage.resume_maintenance();
+    }
+    *backend
+        .active
+        .transfer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        tokio_util::sync::CancellationToken::new();
+    backend.active.editing.store(false, Ordering::Release);
 }
 
 /// Cancellation or a task panic must not leave a possibly published S3
@@ -415,6 +440,9 @@ impl StorageBackend {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| AppError::Conflict("存储设置正在更新，请稍后重试".into()))?;
         self.transfer_token().cancel();
+        if let StorageBackendKind::S3(storage) = &self.active.kind {
+            storage.pause_maintenance();
+        }
         let mut guard = StorageEditGuard {
             backend: self.clone(),
             _gate: None,
@@ -1530,6 +1558,109 @@ mod tests {
     use axum::body::Body;
 
     use super::{StorageBackend, StorageRegistry};
+
+    #[tokio::test]
+    async fn interrupted_edit_reopens_only_after_old_mutation_owners_exit() {
+        use std::{sync::atomic::Ordering, time::Duration};
+        let fixture = crate::test_support::TestDirectory::new("edit-reopen-after-owner");
+        let storage =
+            crate::storage::StorageService::new(fixture.path().join("files"), 1024, 1, 100, 0)
+                .await
+                .unwrap();
+        let backend = StorageBackend::local(storage);
+        let owner = backend
+            .active
+            .mutation_owners
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        backend.active.editing.store(true, Ordering::Release);
+        backend.transfer_token().cancel();
+        // Model the guard dropped by the edit timeout before owner draining.
+        drop(super::StorageEditGuard {
+            backend: backend.clone(),
+            _gate: None,
+            _owners: None,
+            interrupted: true,
+            _remote: None,
+        });
+        tokio::task::yield_now().await;
+        assert!(backend.active.editing.load(Ordering::Acquire));
+        assert!(backend.owned_mutation(|_| async { Ok(()) }).await.is_err());
+        drop(owner);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backend.active.editing.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!backend.transfer_token().is_cancelled());
+        backend.owned_mutation(|_| async { Ok(()) }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn administrator_edit_interrupts_slow_s3_capacity_scan() {
+        use axum::{
+            http::{Method, Response},
+            routing::any,
+            Router,
+        };
+        use std::{sync::Arc, time::Duration};
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
+        let router = Router::new().route(
+            "/{*key}",
+            any(move |method: Method| {
+                let signal = signal.clone();
+                async move {
+                    if method == Method::GET {
+                        signal.notify_one();
+                        return std::future::pending::<Response<Body>>().await;
+                    }
+                    Response::builder().status(404).body(Body::empty()).unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = crate::s3_backend::protocol_tests::test_backend(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        ));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let fixture = crate::test_support::TestDirectory::new("admin-s3-scan-interrupt");
+        let backend =
+            StorageBackend::s3_configured(remote.clone(), None, fixture.path().join("ledger.json"))
+                .await
+                .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        let edit = tokio::time::timeout(Duration::from_secs(1), backend.interrupt_for_edit())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(remote.probe().await.is_err());
+        drop(edit);
+        // The cancelled read does not permanently disable request admission.
+        assert!(!remote
+            .upload_committed("missing.txt", 1, "test")
+            .await
+            .unwrap());
+        let edit = backend.interrupt_for_edit().await.unwrap();
+        edit.retire();
+        drop(edit);
+        // The old connection remains available for owned deferred cleanup,
+        // while retirement keeps user mutation admission closed.
+        assert!(!remote
+            .upload_committed("missing.txt", 1, "test")
+            .await
+            .unwrap());
+        assert!(backend.owned_mutation(|_| async { Ok(()) }).await.is_err());
+        server.abort();
+    }
 
     #[tokio::test]
     async fn administrator_interrupt_cancels_download_and_revokes_old_admission() {

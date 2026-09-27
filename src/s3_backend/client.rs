@@ -109,6 +109,7 @@ impl S3Backend {
             orphan_backups: Arc::new(AtomicUsize::new(0)),
             transaction_auth_key: runtime.transaction_auth_key,
             recovery_runtime: Arc::new(super::recovery_runtime::RecoveryRuntime::new()),
+            maintenance: Arc::new(super::maintenance::Maintenance::new()),
         })
     }
 

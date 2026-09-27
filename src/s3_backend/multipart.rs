@@ -414,6 +414,16 @@ impl S3Backend {
         key: &str,
         upload_id: &str,
     ) -> AppResult<S3MultipartAbortOutcome> {
+        self.maintenance
+            .read(self.abort_multipart_operation_uninterrupted(key, upload_id))
+            .await
+    }
+
+    async fn abort_multipart_operation_uninterrupted(
+        &self,
+        key: &str,
+        upload_id: &str,
+    ) -> AppResult<S3MultipartAbortOutcome> {
         let _permit = self.acquire_request().await?;
         let result = self
             .client

@@ -20,6 +20,16 @@ impl S3Backend {
         relative: &str,
         max_entries: usize,
     ) -> AppResult<S3ListResult> {
+        self.maintenance
+            .read(self.list_directory_uninterrupted(relative, max_entries))
+            .await
+    }
+
+    async fn list_directory_uninterrupted(
+        &self,
+        relative: &str,
+        max_entries: usize,
+    ) -> AppResult<S3ListResult> {
         let relative = StorageService::normalize_relative(relative)?;
         let directory_prefix = list_prefix(&self.prefix, &relative)?;
         let limit = max_entries.clamp(1, S3_MAX_LIST_ENTRIES);
@@ -81,7 +91,20 @@ impl S3Backend {
     /// Stream all direct children through a bounded consumer. The caller can
     /// implement exact sorting and cursor pagination without retaining the
     /// complete directory in memory.
-    pub async fn scan_directory_entries<F>(&self, relative: &str, mut consume: F) -> AppResult<()>
+    pub async fn scan_directory_entries<F>(&self, relative: &str, consume: F) -> AppResult<()>
+    where
+        F: FnMut(S3Entry),
+    {
+        self.maintenance
+            .read(self.scan_directory_entries_uninterrupted(relative, consume))
+            .await
+    }
+
+    async fn scan_directory_entries_uninterrupted<F>(
+        &self,
+        relative: &str,
+        mut consume: F,
+    ) -> AppResult<()>
     where
         F: FnMut(S3Entry),
     {

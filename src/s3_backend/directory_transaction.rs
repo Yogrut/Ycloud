@@ -234,6 +234,18 @@ impl S3Backend {
         source: &str,
         destination: Option<&str>,
     ) -> AppResult<Vec<ObjectRecord>> {
+        self.maintenance
+            .read(self.snapshot_objects_uninterrupted(id, operation, source, destination))
+            .await
+    }
+
+    async fn snapshot_objects_uninterrupted(
+        &self,
+        id: &str,
+        operation: Operation,
+        source: &str,
+        destination: Option<&str>,
+    ) -> AppResult<Vec<ObjectRecord>> {
         let source_prefix = list_prefix(&self.prefix, source)?;
         let target_prefix = match operation {
             Operation::Copy | Operation::Move => list_prefix(
@@ -638,6 +650,12 @@ impl S3Backend {
     }
 
     async fn list_directory_transaction_keys(&self) -> AppResult<Vec<String>> {
+        self.maintenance
+            .read(self.list_directory_transaction_keys_uninterrupted())
+            .await
+    }
+
+    async fn list_directory_transaction_keys_uninterrupted(&self) -> AppResult<Vec<String>> {
         let prefix = internal_key(&self.prefix, JOURNAL_CATEGORY, "");
         let mut continuation_token: Option<String> = None;
         let mut keys = Vec::new();
@@ -709,6 +727,15 @@ impl S3Backend {
     }
 
     async fn read_directory_transaction(&self, key: &str) -> AppResult<(Transaction, String)> {
+        self.maintenance
+            .read(self.read_directory_transaction_uninterrupted(key))
+            .await
+    }
+
+    async fn read_directory_transaction_uninterrupted(
+        &self,
+        key: &str,
+    ) -> AppResult<(Transaction, String)> {
         let _permit = self.acquire_request().await?;
         let output = self
             .client

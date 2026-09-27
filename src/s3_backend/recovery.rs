@@ -238,6 +238,15 @@ impl S3Backend {
     }
 
     async fn multipart_upload_ids_for_key(&self, key: &str) -> AppResult<Vec<String>> {
+        self.maintenance
+            .read(self.multipart_upload_ids_for_key_uninterrupted(key))
+            .await
+    }
+
+    async fn multipart_upload_ids_for_key_uninterrupted(
+        &self,
+        key: &str,
+    ) -> AppResult<Vec<String>> {
         let mut key_marker: Option<String> = None;
         let mut upload_id_marker: Option<String> = None;
         let mut matches = Vec::new();

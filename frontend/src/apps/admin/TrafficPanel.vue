@@ -220,7 +220,7 @@ defineExpose({ openEditor })
     <template v-if="mode === 'dashboard'">
       <section class="dashboard-block glass traffic-usage-block" :aria-label="locale.text('流量信息', 'Traffic information')">
         <header class="traffic-usage-heading"><h2>{{ locale.text('流量信息', 'Traffic information') }}</h2></header>
-        <p class="traffic-note">{{ locale.text('仅统计Ycloud的文件传输', 'Only Ycloud file transfers are counted.') }}</p>
+        <p class="traffic-note">{{ locale.text('仅统计Ycloud的文件传输，S3直连不计入', 'Only Ycloud file transfers are counted; direct S3 transfers are excluded.') }}</p>
         <p v-if="!info">{{ loading ? locale.text('正在读取流量统计…', 'Loading traffic…') : locale.text('暂未取得流量统计', 'Traffic statistics unavailable') }}</p>
         <div v-if="info" class="traffic-meters">
           <article v-for="meter in meters" :key="meter.id" class="traffic-meter" :class="`meter-${meter.direction}`">

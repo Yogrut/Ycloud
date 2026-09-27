@@ -55,10 +55,11 @@ mod internal_upload_intent;
 mod journal;
 mod keyspace;
 mod listing;
+mod maintenance;
 mod multipart;
 mod object_read;
 #[cfg(test)]
-mod protocol_tests;
+pub(crate) mod protocol_tests;
 mod recovery;
 mod recovery_runtime;
 mod relay;
@@ -203,6 +204,7 @@ pub struct S3Backend {
     orphan_backups: std::sync::Arc<AtomicUsize>,
     transaction_auth_key: [u8; 32],
     recovery_runtime: std::sync::Arc<recovery_runtime::RecoveryRuntime>,
+    maintenance: std::sync::Arc<maintenance::Maintenance>,
 }
 
 impl S3Backend {
@@ -402,6 +404,12 @@ impl S3Backend {
     }
 
     async fn head_key(&self, key: &str) -> AppResult<Option<RawS3Metadata>> {
+        self.maintenance
+            .read(self.head_key_uninterrupted(key))
+            .await
+    }
+
+    async fn head_key_uninterrupted(&self, key: &str) -> AppResult<Option<RawS3Metadata>> {
         let _permit = self.acquire_request().await?;
         match self
             .client
@@ -541,6 +549,16 @@ impl S3Backend {
     }
 
     async fn delete_key(&self, key: &str, etag: Option<&str>) -> AppResult<()> {
+        if key.starts_with(&format!("{}.ycloud-system/", self.prefix)) {
+            self.maintenance
+                .read(self.delete_key_uninterrupted(key, etag))
+                .await
+        } else {
+            self.delete_key_uninterrupted(key, etag).await
+        }
+    }
+
+    async fn delete_key_uninterrupted(&self, key: &str, etag: Option<&str>) -> AppResult<()> {
         if self.is_alibaba_oss() {
             if let Some(expected_etag) = etag {
                 let current = self.head_key(key).await?;
@@ -613,11 +631,15 @@ impl S3Backend {
     }
 
     async fn acquire_request(&self) -> AppResult<OwnedSemaphorePermit> {
-        self.request_gate
-            .clone()
-            .acquire_owned()
+        self.maintenance
+            .read(async {
+                self.request_gate
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| AppError::ServiceUnavailable("对象存储正在关闭".into()))
+            })
             .await
-            .map_err(|_| AppError::ServiceUnavailable("对象存储正在关闭".into()))
     }
 }
 

@@ -189,6 +189,12 @@ impl S3Backend {
     }
 
     pub(super) async fn list_recovery_journal_keys(&self, area: &str) -> AppResult<Vec<String>> {
+        self.maintenance
+            .read(self.list_recovery_journal_keys_uninterrupted(area))
+            .await
+    }
+
+    async fn list_recovery_journal_keys_uninterrupted(&self, area: &str) -> AppResult<Vec<String>> {
         let prefix = internal_key(&self.prefix, area, "");
         let mut continuation_token: Option<String> = None;
         let mut keys = Vec::new();
@@ -283,6 +289,16 @@ impl S3Backend {
     }
 
     pub(super) async fn read_authenticated_json_journal<T: DeserializeOwned>(
+        &self,
+        key: &str,
+        purpose: &str,
+    ) -> AppResult<(T, String)> {
+        self.maintenance
+            .read(self.read_authenticated_json_journal_uninterrupted(key, purpose))
+            .await
+    }
+
+    async fn read_authenticated_json_journal_uninterrupted<T: DeserializeOwned>(
         &self,
         key: &str,
         purpose: &str,

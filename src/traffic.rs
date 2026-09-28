@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    io::{BufRead, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -257,6 +257,99 @@ struct Runtime {
     records: usize,
     failed: bool,
 }
+const MAX_TRAFFIC_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TRAFFIC_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Offline, read-only inspection. This deliberately does not call `load`:
+/// normal startup may repair an incomplete tail and compact the journal.
+pub fn diagnose_ledger(config_path: &Path) -> anyhow::Result<String> {
+    use anyhow::Context;
+
+    let snapshot_path = config_path.with_file_name("traffic-usage.json");
+    let journal_path = config_path.with_file_name("traffic-usage.jsonl");
+    let snapshot = match std::fs::File::open(&snapshot_path) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("无法读取流量快照"),
+    };
+    let journal = match std::fs::File::open(&journal_path) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("无法读取流量日志"),
+    };
+    let Some(snapshot) = snapshot else {
+        anyhow::ensure!(
+            journal.is_none(),
+            "流量快照缺失，但日志仍存在；保留原件，禁止清零"
+        );
+        return Ok("流量账本尚未建立；未修改任何文件".into());
+    };
+    let bytes = read_bounded(&snapshot, MAX_TRAFFIC_SNAPSHOT_BYTES)
+        .context("流量快照超出限制或读取失败")?;
+    let mut ledger: Ledger = serde_json::from_slice(&bytes).context("流量快照格式损坏")?;
+    anyhow::ensure!(ledger.version == 1, "不支持的流量快照版本");
+    TrafficSettings {
+        cycle: ledger.cycle.clone(),
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|error| anyhow::anyhow!("流量快照重置周期无效: {error}"))?;
+    let journal_bytes = match journal {
+        Some(file) => {
+            read_bounded(&file, MAX_TRAFFIC_JOURNAL_BYTES).context("流量日志超出限制或读取失败")?
+        }
+        None => Vec::new(),
+    };
+    let complete_len = journal_bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let mut records = 0_usize;
+    for (index, line) in journal_bytes[..complete_len]
+        .split_inclusive(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        let record: Record = serde_json::from_slice(line)
+            .with_context(|| format!("流量日志第 {} 条完整记录损坏", index + 1))?;
+        if record.sequence <= ledger.sequence {
+            continue;
+        }
+        anyhow::ensure!(
+            record.sequence == ledger.sequence + 1,
+            "流量日志第 {} 条存在序号缺口",
+            index + 1
+        );
+        TrafficSettings {
+            cycle: record.cycle.clone(),
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|error| anyhow::anyhow!("流量日志第 {} 条重置周期无效: {error}", index + 1))?;
+        anyhow::ensure!(
+            (946_684_800..=7_258_118_400).contains(&record.time),
+            "流量日志第 {} 条时间戳无效",
+            index + 1
+        );
+        ledger.apply(&record);
+        records += 1;
+    }
+    let tail = journal_bytes.len() - complete_len;
+    Ok(format!(
+        "流量账本可回放：序号 {}，新增记录 {} 条，未完成尾部 {} 字节；未修改任何文件",
+        ledger.sequence, records, tail
+    ))
+}
+
+fn read_bounded(file: &std::fs::File, maximum: u64) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        file.metadata()?.len() <= maximum,
+        "Traffic record is too large"
+    );
+    let mut bytes = Vec::new();
+    file.take(maximum + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= maximum, "Traffic record is too large");
+    Ok(bytes)
+}
 #[derive(Clone)]
 pub struct TrafficStore {
     inner: Arc<Mutex<Runtime>>,
@@ -266,7 +359,7 @@ pub struct TrafficStore {
 
 fn failure(error: impl Into<anyhow::Error>) -> AppError {
     AppError::with_source(
-        "Traffic accounting is unavailable; transfers are stopped",
+        "流量账本不可用，传输已停止；保留原件，先备份再运行 ycloud doctor traffic",
         error,
     )
 }
@@ -291,9 +384,9 @@ impl TrafficStore {
         drop(current);
         let snapshot_for_load = snapshot.clone();
         let runtime = tokio::task::spawn_blocking(move || -> anyhow::Result<Runtime> {
-            let mut ledger = match std::fs::read(&snapshot_for_load) {
-                Ok(bytes) => {
-                    anyhow::ensure!(bytes.len() <= 4 * 1024 * 1024, "Traffic snapshot too large");
+            let mut ledger = match std::fs::File::open(&snapshot_for_load) {
+                Ok(file) => {
+                    let bytes = read_bounded(&file, MAX_TRAFFIC_SNAPSHOT_BYTES)?;
                     let ledger: Ledger = serde_json::from_slice(&bytes)?;
                     anyhow::ensure!(ledger.version == 1, "Unknown traffic ledger version");
                     TrafficSettings {
@@ -321,12 +414,16 @@ impl TrafficStore {
                 options.mode(0o600);
             }
             let journal = options.open(&journal_path)?;
-            anyhow::ensure!(
-                journal.metadata()?.len() <= 16 * 1024 * 1024,
-                "Traffic journal requires recovery"
-            );
-            for line in std::io::BufReader::new(&journal).lines() {
-                let record: Record = serde_json::from_str(&line?)?;
+            let bytes = read_bounded(&journal, MAX_TRAFFIC_JOURNAL_BYTES)?;
+            // A record is committed to the journal only with its final newline.
+            // An interrupted append can leave a suffix without that delimiter;
+            // no later valid record can follow it. Keep middle corruption fatal.
+            let complete_len = bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1);
+            for line in bytes[..complete_len].split_inclusive(|byte| *byte == b'\n') {
+                let record: Record = serde_json::from_slice(line)?;
                 if record.sequence <= ledger.sequence {
                     continue;
                 }
@@ -345,6 +442,14 @@ impl TrafficStore {
                     "Invalid traffic timestamp"
                 );
                 ledger.apply(&record);
+            }
+            if complete_len != bytes.len() {
+                tracing::warn!(
+                    discarded_bytes = bytes.len() - complete_len,
+                    "discarded incomplete traffic journal tail"
+                );
+                journal.set_len(complete_len as u64)?;
+                journal.sync_all()?;
             }
             ledger.users.retain(|id, _| active_users.contains(id));
             crate::config::publish_traffic_snapshot(
@@ -997,6 +1102,104 @@ mod tests {
             .preflight("guest", Direction::Upload, 1)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn incomplete_journal_tail_is_discarded_without_losing_confirmed_usage() {
+        let (directory, store, config) = fixture(TrafficSettings::default()).await;
+        store
+            .charge("guest".into(), Direction::Upload, 17)
+            .await
+            .unwrap();
+        drop(store);
+        let config_path = directory.path().join("config.json");
+        let journal_path = config_path.with_file_name("traffic-usage.jsonl");
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        journal.write_all(b"{\"sequence\":2").unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+
+        let restored = TrafficStore::load(&config_path, config).await.unwrap();
+        assert_eq!(restored.inner.lock().await.ledger.total.upload, 17);
+        assert_eq!(std::fs::metadata(journal_path).unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn complete_corrupt_journal_record_keeps_original_and_rejects_replay() {
+        let (directory, store, config) = fixture(TrafficSettings::default()).await;
+        store
+            .charge("guest".into(), Direction::Upload, 17)
+            .await
+            .unwrap();
+        drop(store);
+        let config_path = directory.path().join("config.json");
+        let journal_path = config_path.with_file_name("traffic-usage.jsonl");
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        journal.write_all(b"not-a-record\n").unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+
+        assert!(TrafficStore::load(&config_path, config).await.is_err());
+        assert!(std::fs::read(&journal_path)
+            .unwrap()
+            .ends_with(b"not-a-record\n"));
+    }
+
+    #[tokio::test]
+    async fn offline_diagnosis_reports_replay_without_mutating_ledger() {
+        let (directory, store, _) = fixture(TrafficSettings::default()).await;
+        store
+            .charge("guest".into(), Direction::Upload, 17)
+            .await
+            .unwrap();
+        drop(store);
+        let config_path = directory.path().join("config.json");
+        let snapshot_path = config_path.with_file_name("traffic-usage.json");
+        let journal_path = config_path.with_file_name("traffic-usage.jsonl");
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        journal.write_all(b"{\"sequence\":2").unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        let before_snapshot = std::fs::read(&snapshot_path).unwrap();
+        let before_journal = std::fs::read(&journal_path).unwrap();
+
+        let report = diagnose_ledger(&config_path).unwrap();
+        assert!(report.contains("未完成尾部"));
+        assert_eq!(std::fs::read(snapshot_path).unwrap(), before_snapshot);
+        assert_eq!(std::fs::read(journal_path).unwrap(), before_journal);
+    }
+
+    #[tokio::test]
+    async fn offline_diagnosis_rejects_middle_corruption_without_mutating_ledger() {
+        let (directory, store, _) = fixture(TrafficSettings::default()).await;
+        store
+            .charge("guest".into(), Direction::Upload, 17)
+            .await
+            .unwrap();
+        drop(store);
+        let config_path = directory.path().join("config.json");
+        let journal_path = config_path.with_file_name("traffic-usage.jsonl");
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        journal.write_all(b"not-a-record\n").unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        let before = std::fs::read(&journal_path).unwrap();
+
+        let error = diagnose_ledger(&config_path).unwrap_err();
+        assert!(error.to_string().contains("完整记录损坏"));
+        assert_eq!(std::fs::read(journal_path).unwrap(), before);
     }
 
     #[tokio::test]

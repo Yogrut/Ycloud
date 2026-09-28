@@ -30,12 +30,11 @@ use crate::{
 };
 
 use super::{
-    append_exact_multipart_matches, copy_source, internal_key, is_owned_internal_multipart_key,
-    list_prefix, listing::collect_page_entries, multipart_part_size, multipart_session_matches,
-    object_key, parent_relative, simple_copy_matches, snapshot_matches,
+    copy_source, internal_key, list_prefix, listing::collect_page_entries, multipart_part_size,
+    multipart_session_matches, object_key, parent_relative, simple_copy_matches, snapshot_matches,
     uses_oss_native_write_conditions, valid_transaction_id, validate_multipart_session,
-    validate_upload_transaction, ExactLengthBody, MultipartUpload, RawS3Metadata, S3Backend,
-    S3MultipartPurpose, S3MultipartSession, S3ObjectSnapshot, S3UploadStage, S3UploadTransaction,
+    validate_upload_transaction, ExactLengthBody, RawS3Metadata, S3Backend, S3MultipartPurpose,
+    S3MultipartSession, S3ObjectSnapshot, S3UploadStage, S3UploadTransaction,
     S3_MULTIPART_MAX_PARTS, S3_MULTIPART_MAX_PART_BYTES, S3_MULTIPART_SESSION_SCHEMA_VERSION,
     S3_MULTIPART_THRESHOLD, S3_SINGLE_COPY_LIMIT,
 };
@@ -1105,27 +1104,6 @@ fn multipart_recovery_records_are_confined_to_the_backend_namespace() {
 }
 
 #[test]
-fn multipart_intent_recovery_selects_only_the_exact_recorded_key() {
-    let uploads = [
-        MultipartUpload::builder()
-            .key("tenant/folder/file.bin")
-            .upload_id("ours-a")
-            .build(),
-        MultipartUpload::builder()
-            .key("tenant/folder/file.bin.extra")
-            .upload_id("not-ours")
-            .build(),
-        MultipartUpload::builder()
-            .key("tenant/folder/file.bin")
-            .upload_id("ours-b")
-            .build(),
-    ];
-    let mut matches = Vec::new();
-    append_exact_multipart_matches("tenant/folder/file.bin", &uploads, &mut matches).unwrap();
-    assert_eq!(matches, ["ours-a", "ours-b"]);
-}
-
-#[test]
 fn recovery_snapshots_match_both_size_and_etag() {
     let metadata = RawS3Metadata {
         size: 42,
@@ -1203,10 +1181,4 @@ fn multipart_result_proof_requires_marker_size_and_etag() {
     metadata.size -= 1;
     metadata.etag = None;
     assert!(!multipart_session_matches(&metadata, &session));
-
-    let mut internal = session;
-    internal.key = format!("tenant/.ycloud-system/backups/{id}");
-    assert!(is_owned_internal_multipart_key("tenant/", &internal));
-    internal.key = "tenant/folder/file.bin".into();
-    assert!(!is_owned_internal_multipart_key("tenant/", &internal));
 }

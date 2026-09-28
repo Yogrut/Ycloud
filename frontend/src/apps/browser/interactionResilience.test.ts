@@ -309,7 +309,7 @@ describe('upload queue resilience', () => {
     await settle()
     await vi.runAllTimersAsync()
     expect(getUploadBatchStatus).toHaveBeenCalledTimes(7)
-    expect(queue.uploadTasks.value[0]?.status).toBe('failed')
+    expect(queue.uploadTasks.value[0]?.status).toBe('verifying')
     expect(queue.uploadTasks.value[0]?.retryBlocked).toBe(true)
     expect(vi.getTimerCount()).toBe(0)
     queue.disposeUploads()

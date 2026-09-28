@@ -479,14 +479,10 @@ export function useUploadQueue(context: UploadQueueContext) {
     task.safeToPrepare = status === 'pending' || status === 'failed' || status === 'cancelled'
     if (status === 'complete') {
       task.loaded = task.file.size
-      if (operation) {
-        task.status = 'failed'
-        task.retryBlocked = true
-        task.error = locale.text('文件变更已提交，请勿重复上传；可稍后核对清理状态', 'The file change was committed. Do not upload it again; check cleanup status later.')
-      } else {
-        task.status = 'succeeded'
-        task.error = ''
-      }
+      task.status = 'succeeded'
+      task.error = operation?.cleanup !== 'complete'
+        ? locale.text('上传成功，临时数据仍在后台清理', 'Upload succeeded; temporary data is being cleaned up')
+        : ''
       task.cancelRequested = false
       task.pauseRequested = false
       refreshTaskContext(task)
@@ -527,7 +523,7 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   function markUnconfirmed(task: UploadTask): void {
-    task.status = 'failed'
+    task.status = 'verifying'
     task.retryBlocked = true
     task.error = locale.text('系统正在自动确认上传结果或清理临时数据，请稍后查看', 'The server is checking the upload result or cleaning temporary data; check again shortly')
     context.announce(task.error)

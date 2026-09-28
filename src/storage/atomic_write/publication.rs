@@ -66,12 +66,15 @@ impl AtomicFileWriter {
         let _mutation = self.mutation_gate.lock().await;
         let result = self
             .transactions
-            .commit_file(
+            .commit_file_with_operation(
                 &self.relative,
                 &self.temporary,
                 &self.destination,
                 &mut self.ownership,
                 &mut accounting,
+                self.operation_id
+                    .as_deref()
+                    .map(|id| (id, self.bytes_written)),
             )
             .await
             .map(|previous_size| AtomicWriteResult {

@@ -109,7 +109,13 @@ async fn verify_share_access(
     }
     let failure_key = client_ip.unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
     let _attempt_guard = if headers.contains_key(header::AUTHORIZATION) {
-        Some(state.login_attempts.lock().await)
+        Some(
+            state
+                .login_attempts
+                .for_entry(LoginEntry::WebDav)
+                .lock()
+                .await,
+        )
     } else {
         None
     };

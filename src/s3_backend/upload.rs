@@ -295,6 +295,7 @@ impl S3Backend {
         }
 
         let mut backup_created = false;
+        let mut verified_backup_etag = None;
         if let Some(existing) = existing.as_ref() {
             let backup_etag = self
                 .copy_key(
@@ -313,6 +314,7 @@ impl S3Backend {
                 ));
             }
             backup_created = true;
+            verified_backup_etag = Some(backup_etag);
             transaction.stage = S3UploadStage::BackupCreated;
             journal_etag = self
                 .write_upload_transaction(&journal_key, &transaction, journal_etag.as_deref())
@@ -357,10 +359,7 @@ impl S3Backend {
                     .copy_key(
                         &backup_key,
                         &destination_key,
-                        transaction
-                            .previous
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.etag.as_deref()),
+                        verified_backup_etag.as_deref(),
                         false,
                     )
                     .await
@@ -388,6 +387,15 @@ impl S3Backend {
                         "旧对象恢复结果无法确认，请停止写入并检查存储后端".into(),
                     ));
                 }
+                // A copy need not preserve the old object's ETag. Persist the
+                // verified restored identity before leaving cleanup to recovery.
+                transaction.previous = restored.map(|value| S3ObjectSnapshot {
+                    size: value.size,
+                    etag: value.etag,
+                });
+                journal_etag = self
+                    .write_upload_transaction(&journal_key, &transaction, journal_etag.as_deref())
+                    .await?;
                 let cleanup = self
                     .finish_upload_and_intent(
                         &journal_key,

@@ -14,7 +14,7 @@ pub async fn run() -> anyhow::Result<()> {
     let mut runtime = config::Config::from_env()?;
     // Hold this before configuration bootstrap or any storage recovery can run.
     let _instance_lock = crate::instance_lock::InstanceLock::acquire(&runtime.config_path)?;
-    let config_file = config::load_config(&runtime.config_path).await?;
+    let config_file = config::load_config_for_runtime(&runtime).await?;
     runtime.initialize_transaction_auth_key().await?;
     let config_file = Arc::new(RwLock::new(config_file));
     let state = AppState::new(runtime.clone(), config_file).await?;
@@ -77,6 +77,7 @@ fn spawn_retired_cleanup_task(
                 Some(entry)
             };
             if let Some(entry) = selected {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
                 let current = state.config_file.read().await.clone();
                 let live = current.storage_instances.iter().find(|instance| matches!(&instance.backend,
                     config::StorageBackendConfig::S3(settings) if config::retired_storage_namespace_matches(settings, &entry.settings)));
@@ -106,12 +107,24 @@ fn spawn_retired_cleanup_task(
                 };
                 let result = tokio::select! {
                     _ = stop.changed() => return,
-                    result = tokio::time::timeout(std::time::Duration::from_secs(30), work) => result,
+                    result = tokio::time::timeout_at(deadline, work) => result,
                 };
                 match result {
                     Ok(Ok(true)) => {
-                        if let Err(error) = state.retired_storage.finish(&entry).await {
-                            tracing::warn!(storage_id = %entry.id, %error, "old storage recovery record remains durable");
+                        let settled = tokio::select! {
+                            _ = stop.changed() => return,
+                            result = tokio::time::timeout_at(deadline, settle_retired_uploads(&state, &entry)) => result,
+                        };
+                        match settled {
+                            Ok(true) => {
+                                if let Err(error) = state.retired_storage.finish(&entry).await {
+                                    tracing::warn!(storage_id = %entry.id, %error, "old storage recovery record remains durable");
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(_) => {
+                                tracing::warn!(storage_id = %entry.id, "old upload verification timed out; retaining connection record")
+                            }
                         }
                     }
                     Ok(Ok(false)) => {}
@@ -122,6 +135,64 @@ fn spawn_retired_cleanup_task(
             }
         }
     })
+}
+
+/// A removed S3 connection remains encrypted until upload tickets tied to its
+/// namespace are settled. A positive operation marker proves success; absence
+/// alone does not prove that an earlier success was never overwritten.
+async fn settle_retired_uploads(state: &AppState, entry: &config::RetiredStorageEntry) -> bool {
+    let backend_config = config::StorageBackendConfig::S3(entry.settings.clone());
+    let Ok(namespace) = crate::upload_batch::namespace_id(&state.config, &backend_config) else {
+        return false;
+    };
+    let pending = state
+        .upload_batches
+        .unknown_items()
+        .await
+        .into_iter()
+        .filter(|item| {
+            item.storage_id == entry.id && item.namespace_id.as_deref() == Some(&namespace)
+        })
+        .take(32)
+        .collect::<Vec<_>>();
+    if pending.is_empty() {
+        return !state
+            .upload_batches
+            .has_unsettled_namespace(&entry.id, &namespace)
+            .await;
+    }
+    let detached = if entry.runtime.is_none() {
+        match crate::s3_backend::S3Backend::new(&entry.settings, &state.config) {
+            Ok(backend) => Some(backend),
+            Err(error) => {
+                tracing::warn!(storage_id = %entry.id, %error, "old upload verification connection is unavailable");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    for item in pending {
+        let operation = crate::upload_batch::operation_id(&item.ticket, &item.path);
+        let result = if let Some(runtime) = &entry.runtime {
+            runtime
+                .recovered_upload_committed(&item.path, item.size, &operation)
+                .await
+        } else {
+            detached
+                .as_ref()
+                .expect("detached connection was constructed")
+                .upload_committed(&item.path, item.size, &operation)
+                .await
+        };
+        if matches!(result, Ok(true)) {
+            let _ = state.upload_batches.resolve_unknown(&item, true).await;
+        }
+    }
+    !state
+        .upload_batches
+        .has_unsettled_namespace(&entry.id, &namespace)
+        .await
 }
 
 fn spawn_health_task(
@@ -178,6 +249,7 @@ fn spawn_cleanup_task(
                     state.sessions.cleanup().await;
                     state.gate_access.cleanup().await;
                     state.folder_access.cleanup().await;
+                    state.upload_batches.sweep_expired().await;
                 }
                 _ = capacity_interval.tick() => {
                     state.backends.reconcile_capacities().await;

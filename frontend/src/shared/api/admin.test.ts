@@ -11,6 +11,8 @@ import {
   updateLoginRestriction,
   testS3Storage,
   updateTransferLimits,
+  updateLocalStorage,
+  updateS3Storage,
   updateWebDavMount,
 } from './admin'
 
@@ -36,6 +38,33 @@ describe('admin API', () => {
     const error = await updateTransferLimits({ max_upload_bytes: 123 }).catch(reason => reason)
     expect(error.blocksRetry).toBe(true)
     expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('reads back a local storage edit from the actual administrator route', async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError('connection lost'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ storage_instances: [{
+        id: 'local-1', name: 'Archive', enabled: true, allow_guest_access: false,
+        allow_guest_download: false,
+        backend: { type: 'local', path: '/data/archive', capacity_limit_bytes: null },
+      }] }), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(updateLocalStorage('local-1', 'Archive', '/data/archive', null, true, false, false))
+      .resolves.toEqual({ success: true })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1]![0]).toBe('/api/admin/info')
+  })
+
+  it('does not infer an S3 credential edit from redacted administrator settings', async () => {
+    const fetchMock = vi.fn().mockRejectedValueOnce(new TypeError('connection lost'))
+    vi.stubGlobal('fetch', fetchMock)
+    const result = updateS3Storage('s3-1', 'Objects', {
+      provider: 'minio', endpoint: 'https://s3.example.test', bucket: 'files', region: 'us-east-1',
+      prefix: 'data/', addressing_style: 'path', access_key_id: 'changed', secret_access_key: '',
+      capacity_limit_bytes: null,
+    }, true, false)
+    await expect(result).rejects.toMatchObject({ blocksRetry: true })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it('preserves an unauthorized status for the login gate', async () => {

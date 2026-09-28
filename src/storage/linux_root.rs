@@ -7,8 +7,8 @@ use std::{
 
 use rustix::{
     fs::{
-        fchmod, fstatvfs, fsync, mkdirat, open, openat, openat2, renameat_with, unlinkat, AtFlags,
-        Dir, Mode, OFlags, RenameFlags, ResolveFlags,
+        fchmod, fstatvfs, fsync, linkat, mkdirat, open, openat, openat2, renameat_with, unlinkat,
+        AtFlags, Dir, Mode, OFlags, RenameFlags, ResolveFlags,
     },
     io::Errno,
 };
@@ -203,6 +203,57 @@ impl LinuxRoot {
     }
 
     pub(crate) async fn rename_noreplace(&self, source: &str, destination: &str) -> AppResult<()> {
+        self.rename_with_flags(source, destination, RenameFlags::NOREPLACE)
+            .await
+    }
+
+    pub(crate) async fn hard_link_noreplace(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> AppResult<bool> {
+        let descriptor = self.descriptor.clone();
+        let source = source.to_owned();
+        let destination = destination.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let (source_parent, source_name) = open_parent(&descriptor, &source)?;
+            let (destination_parent, destination_name) = open_parent(&descriptor, &destination)?;
+            match linkat(
+                &source_parent,
+                source_name,
+                &destination_parent,
+                destination_name,
+                AtFlags::empty(),
+            ) {
+                Ok(()) => Ok(true),
+                Err(Errno::OPNOTSUPP | Errno::NOSYS | Errno::PERM) => Ok(false),
+                Err(error) => Err(map_mutation_error("failed to anchor uploaded file", error)),
+            }
+        })
+        .await
+        .map_err(|error| AppError::with_source("local upload anchor task failed", error))?
+    }
+
+    pub(crate) async fn replace_internal_journal(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> AppResult<()> {
+        if !source.starts_with(".ycloud-system/transactions/")
+            || !destination.starts_with(".ycloud-system/transactions/")
+        {
+            return Err(AppError::Forbidden);
+        }
+        self.rename_with_flags(source, destination, RenameFlags::empty())
+            .await
+    }
+
+    async fn rename_with_flags(
+        &self,
+        source: &str,
+        destination: &str,
+        flags: RenameFlags,
+    ) -> AppResult<()> {
         let descriptor = self.descriptor.clone();
         let source = source.to_owned();
         let destination = destination.to_owned();
@@ -214,7 +265,7 @@ impl LinuxRoot {
                 source_name,
                 &destination_parent,
                 destination_name,
-                RenameFlags::NOREPLACE,
+                flags,
             )
             .map_err(|error| map_mutation_error("failed to rename below local storage root", error))
         })
@@ -294,19 +345,14 @@ impl LinuxRoot {
         &self,
         relative: &str,
     ) -> AppResult<Vec<LinuxDirectoryEntry>> {
-        self.read_directory_with_policy(relative, false).await
-    }
-
-    pub(crate) async fn read_directory_with_policy(
-        &self,
-        relative: &str,
-        reject_links: bool,
-    ) -> AppResult<Vec<LinuxDirectoryEntry>> {
-        let descriptor = self.descriptor.clone();
-        let relative = relative.to_owned();
-        tokio::task::spawn_blocking(move || read_directory(&descriptor, &relative, reject_links))
-            .await
-            .map_err(|error| AppError::with_source("local storage listing task failed", error))?
+        let (mut entries, task) = self.scan_directory(relative);
+        let mut result = Vec::new();
+        while let Some(entry) = entries.recv().await {
+            result.push(entry);
+        }
+        task.await
+            .map_err(|error| AppError::with_source("local storage listing task failed", error))??;
+        Ok(result)
     }
 
     pub(crate) fn scan_directory(
@@ -316,11 +362,22 @@ impl LinuxRoot {
         tokio::sync::mpsc::Receiver<LinuxDirectoryEntry>,
         tokio::task::JoinHandle<AppResult<()>>,
     ) {
+        self.scan_directory_with_policy(relative, false)
+    }
+
+    pub(crate) fn scan_directory_with_policy(
+        &self,
+        relative: &str,
+        reject_links: bool,
+    ) -> (
+        tokio::sync::mpsc::Receiver<LinuxDirectoryEntry>,
+        tokio::task::JoinHandle<AppResult<()>>,
+    ) {
         let descriptor = self.descriptor.clone();
         let relative = relative.to_owned();
         let (sender, receiver) = tokio::sync::mpsc::channel(32);
         let task = tokio::task::spawn_blocking(move || {
-            visit_directory(&descriptor, &relative, false, |entry| {
+            visit_directory(&descriptor, &relative, reject_links, |entry| {
                 sender.blocking_send(entry).is_ok()
             })
         });
@@ -337,18 +394,32 @@ impl LinuxRoot {
             return self.copy_file(source, destination).await;
         }
         let mut pending = vec![(source.to_owned(), destination.to_owned())];
+        let mut pending_bytes = source.len() + destination.len();
+        let mut count = 0_usize;
         while let Some((current_source, current_destination)) = pending.pop() {
+            pending_bytes -= current_source.len() + current_destination.len();
             self.create_directory(&current_destination).await?;
-            for entry in self
-                .read_directory_with_policy(&current_source, true)
-                .await?
-            {
+            let (mut entries, task) = self.scan_directory_with_policy(&current_source, true);
+            while let Some(entry) = entries.recv().await {
+                count += 1;
+                if count > 100_000 {
+                    return Err(AppError::Conflict(
+                        "目录复制超过 100000 个条目的上限".into(),
+                    ));
+                }
                 let name = entry.name.to_str().ok_or_else(|| {
                     AppError::Conflict("Local storage entry is not valid UTF-8".into())
                 })?;
                 let source_child = join_relative(&current_source, name);
                 let destination_child = join_relative(&current_destination, name);
                 if entry.metadata.is_dir() {
+                    let bytes = source_child.len() + destination_child.len();
+                    if pending_bytes.saturating_add(bytes) > 4 * 1024 * 1024 {
+                        return Err(AppError::Conflict(
+                            "目录复制待遍历路径超过 4 MiB 预算".into(),
+                        ));
+                    }
+                    pending_bytes += bytes;
                     pending.push((source_child, destination_child));
                 } else if entry.metadata.is_file() {
                     self.copy_file(&source_child, &destination_child).await?;
@@ -356,6 +427,9 @@ impl LinuxRoot {
                     return Err(AppError::Forbidden);
                 }
             }
+            task.await.map_err(|error| {
+                AppError::with_source("local storage listing task failed", error)
+            })??;
         }
         Ok(())
     }
@@ -437,19 +511,6 @@ fn open_parent(descriptor: &OwnedFd, relative: &str) -> AppResult<(OwnedFd, Stri
     )
     .map_err(map_resolution_error)?;
     Ok((parent, name.to_owned()))
-}
-
-fn read_directory(
-    descriptor: &OwnedFd,
-    relative: &str,
-    reject_links: bool,
-) -> AppResult<Vec<LinuxDirectoryEntry>> {
-    let mut result = Vec::new();
-    visit_directory(descriptor, relative, reject_links, |entry| {
-        result.push(entry);
-        true
-    })?;
-    Ok(result)
 }
 
 fn visit_directory(

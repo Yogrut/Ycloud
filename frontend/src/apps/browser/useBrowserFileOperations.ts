@@ -26,11 +26,13 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
   const folderName = ref('')
   const folderError = ref('')
   const creatingFolder = ref(false)
+  let folderContext = { path: '', storageId: '' }
   const showRename = ref(false)
   const renameTarget = ref('')
   const renameName = ref('')
   const renameError = ref('')
   const renaming = ref(false)
+  let renameContext = { path: '', storageId: '' }
   const showDelete = ref(false)
   const pendingDelete = ref<string[]>([])
   const deleteStorageId = ref('')
@@ -57,6 +59,7 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
     if (!context.requireCapability('create_directory')) return
     folderName.value = ''
     folderError.value = ''
+    folderContext = { path: context.path.value, storageId: context.storageId.value }
     showFolder.value = true
   }
 
@@ -66,7 +69,7 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
     creatingFolder.value = true
     folderError.value = ''
     try {
-      await createFolder(context.path.value, name, context.storageId.value)
+      await createFolder(folderContext.path, name, folderContext.storageId)
       showFolder.value = false
       context.announce(locale.text('文件夹已创建', 'Folder created'), 'success')
       await context.refresh()
@@ -123,6 +126,7 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
   function openRenameDialog(entryPath: string): void {
     if (!context.requireCapability('rename')) return
     renameTarget.value = entryPath
+    renameContext = { path: context.path.value, storageId: context.storageId.value }
     renameName.value = entryForPath(entryPath)?.name ?? entryPath.split('/').pop() ?? ''
     renameError.value = ''
     showRename.value = true
@@ -134,7 +138,7 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
     renaming.value = true
     renameError.value = ''
     try {
-      await renameItem(context.path.value, renameTarget.value, name, context.storageId.value)
+      await renameItem(renameContext.path, renameTarget.value, name, renameContext.storageId)
       showRename.value = false
       context.announce(locale.text('重命名成功', 'Renamed'), 'success')
       await context.refresh()

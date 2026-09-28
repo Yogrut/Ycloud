@@ -1,6 +1,6 @@
 use std::{sync::atomic::AtomicUsize, time::Duration};
 
-use aws_sdk_s3::{types::MultipartUpload, Client};
+use aws_sdk_s3::Client;
 use aws_smithy_types::byte_stream::ByteStream;
 use axum::http::HeaderValue;
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,6 @@ const S3_FILE_MOVE_JOURNAL_PURPOSE: &str = "file-move-transaction:v1";
 const S3_INTERNAL_UPLOAD_INTENT_JOURNAL_PURPOSE: &str = "internal-upload-intent:v1";
 const S3_ACTIVATION_PROBE_JOURNAL_PURPOSE: &str = "activation-probe-intent:v1";
 const S3_MAX_PENDING_TRANSACTIONS: usize = 1_000;
-const S3_MAX_MULTIPART_INTENT_MATCHES: usize = 1_000;
 const S3_MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
 const S3_MULTIPART_PART_BYTES: u64 = 64 * 1024 * 1024;
 const S3_MULTIPART_MAX_PARTS: u64 = 10_000;
@@ -154,7 +153,8 @@ struct S3MultipartSession {
     key: String,
     /// Version 1 records always contain the provider ID. Version 2 is first
     /// persisted with `None`, before CreateMultipartUpload is attempted, so a
-    /// lost create response can still be recovered by exact-key enumeration.
+    /// missing ID proves no parts or signed URLs were released. Such an intent
+    /// is discarded without touching remote sessions or destination objects.
     #[serde(default)]
     upload_id: Option<String>,
     #[serde(default)]
@@ -746,17 +746,6 @@ fn is_internal_multipart_backup_key(prefix: &str, key: &str) -> bool {
         .is_some_and(valid_transaction_id)
 }
 
-fn is_owned_internal_multipart_key(prefix: &str, session: &S3MultipartSession) -> bool {
-    match session.purpose {
-        Some(S3MultipartPurpose::Upload) => is_internal_multipart_upload_key(prefix, &session.key),
-        Some(S3MultipartPurpose::Copy) => {
-            is_internal_multipart_backup_key(prefix, &session.key)
-                || directory_trash_transaction_id(prefix, &session.key).is_some()
-        }
-        None => false,
-    }
-}
-
 fn directory_trash_transaction_id<'a>(prefix: &str, key: &'a str) -> Option<&'a str> {
     let relative = key.strip_prefix(&internal_key(prefix, "directory-trash", ""))?;
     let (id, suffix) = relative.split_once('/')?;
@@ -776,36 +765,6 @@ fn multipart_session_matches(metadata: &RawS3Metadata, session: &S3MultipartSess
 
 fn simple_copy_matches(destination: &RawS3Metadata, source: &RawS3Metadata) -> bool {
     source.etag.is_some() && destination.etag == source.etag && destination.size == source.size
-}
-
-fn append_exact_multipart_matches(
-    expected_key: &str,
-    uploads: &[MultipartUpload],
-    matches: &mut Vec<String>,
-) -> AppResult<()> {
-    for upload in uploads {
-        let candidate_key = upload
-            .key()
-            .ok_or_else(|| AppError::ServiceUnavailable("对象存储分片会话缺少键名".into()))?;
-        if candidate_key != expected_key {
-            continue;
-        }
-        let upload_id = upload
-            .upload_id()
-            .ok_or_else(|| AppError::ServiceUnavailable("对象存储分片会话缺少 ID".into()))?;
-        if !valid_multipart_upload_id(upload_id) {
-            return Err(AppError::ServiceUnavailable(
-                "对象存储分片会话 ID 无法安全处理".into(),
-            ));
-        }
-        if matches.len() == S3_MAX_MULTIPART_INTENT_MATCHES {
-            return Err(AppError::ServiceUnavailable(
-                "单个对象的待恢复分片会话超过安全上限".into(),
-            ));
-        }
-        matches.push(upload_id.to_owned());
-    }
-    Ok(())
 }
 
 fn validate_upload_transaction(

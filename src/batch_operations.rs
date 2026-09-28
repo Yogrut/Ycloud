@@ -10,8 +10,8 @@ use crate::{
     error::{AppResult, CommitState},
     file_access::{
         batch_destination_path, ensure_copy_target_outside_source, ensure_non_root,
-        ensure_storage_action, ensure_writable, resolve_share, share_storage_path,
-        validate_batch_size, FileQuery, FolderLockAuthorizer, StorageAction,
+        ensure_storage_action, ensure_writable, share_storage_path, validate_batch_size, FileQuery,
+        FolderLockAuthorizer, StorageAction,
     },
     state::AppState,
 };
@@ -82,7 +82,7 @@ async fn execute(
     body: BatchBody,
     operation: Operation,
 ) -> AppResult<Response> {
-    let share = resolve_share(state, headers, query).await?;
+    let share = crate::file_access::resolve_write_share(state, headers, query).await?;
     let action = match operation {
         Operation::Delete => StorageAction::Delete,
         Operation::Move => StorageAction::Move,

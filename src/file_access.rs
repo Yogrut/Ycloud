@@ -156,6 +156,24 @@ pub async fn resolve_share(
     }
 }
 
+/// Legacy callers may omit the ID only when there is exactly one configured
+/// storage. A write must never silently change its target in a multi-storage site.
+pub async fn resolve_write_share(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &FileQuery,
+) -> AppResult<Share> {
+    let share = resolve_share(state, headers, query).await?;
+    if query.storage_id.is_none() {
+        let config = state.config_file.read().await;
+        if config.storage_instances.len() != 1 || config.storage_instances[0].id != share.storage_id
+        {
+            return Err(AppError::BadRequest("文件写操作必须指定 storage_id".into()));
+        }
+    }
+    Ok(share)
+}
+
 fn root_share(storage_id: &str) -> Share {
     Share {
         id: "root".into(),

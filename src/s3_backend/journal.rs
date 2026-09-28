@@ -284,7 +284,16 @@ impl S3Backend {
             .read_authenticated_json_journal(key, S3_MULTIPART_SESSION_JOURNAL_PURPOSE)
             .await?;
         validate_multipart_session(&self.prefix, key, &session)?;
-        self.validate_directory_multipart_target(&session).await?;
+        // The authenticated child record remains an ownership proof after its
+        // completed parent has been removed. New writes still require a parent.
+        if let Some(id) = super::directory_trash_transaction_id(&self.prefix, &session.key) {
+            let parent_key = internal_key(&self.prefix, "directory-transactions", id);
+            if self.head_key(&parent_key).await?.is_some() {
+                self.validate_directory_multipart_target(&session).await?;
+            }
+        } else {
+            self.validate_directory_multipart_target(&session).await?;
+        }
         Ok((session, etag))
     }
 

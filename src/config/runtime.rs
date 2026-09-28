@@ -100,7 +100,7 @@ fn validate_deployment_envelope(
     archive_bytes: u64,
     archive_entries: usize,
 ) -> anyhow::Result<()> {
-    if upload_bytes == 0 || upload_bytes > HARD_MAX_UPLOAD_BYTES {
+    if !(1024 * 1024..=HARD_MAX_UPLOAD_BYTES).contains(&upload_bytes) {
         anyhow::bail!("MAX_UPLOAD_BYTES is outside the supported format range");
     }
     if batch_bytes < upload_bytes || batch_bytes > HARD_MAX_UPLOAD_BATCH_BYTES {
@@ -109,7 +109,7 @@ fn validate_deployment_envelope(
     if batch_entries == 0 || batch_entries > HARD_MAX_UPLOAD_BATCH_ENTRIES {
         anyhow::bail!("MAX_UPLOAD_BATCH_ENTRIES is outside the supported format range");
     }
-    if archive_bytes == 0 || archive_bytes > HARD_MAX_ARCHIVE_BYTES {
+    if !(1024 * 1024..=HARD_MAX_ARCHIVE_BYTES).contains(&archive_bytes) {
         anyhow::bail!("MAX_ARCHIVE_BYTES is outside the supported format range");
     }
     if archive_entries == 0 || archive_entries > HARD_MAX_ARCHIVE_ENTRIES {

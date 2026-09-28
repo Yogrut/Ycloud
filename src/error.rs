@@ -5,11 +5,11 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub type AppResult<T> = Result<T, AppError>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommitState {
     NotCommitted,
@@ -17,7 +17,7 @@ pub enum CommitState {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupState {
     Complete,
@@ -33,7 +33,7 @@ pub struct OperationOutcome {
 }
 
 impl OperationOutcome {
-    fn new(commit: CommitState, cleanup: CleanupState) -> Self {
+    pub(crate) fn new(commit: CommitState, cleanup: CleanupState) -> Self {
         let retry = match commit {
             CommitState::NotCommitted => "after_correction",
             CommitState::Committed => "do_not_repeat",

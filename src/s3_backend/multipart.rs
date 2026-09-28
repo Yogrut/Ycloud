@@ -40,7 +40,7 @@ impl S3Backend {
             create = create.content_type(content_type);
         }
         create = create.metadata(S3_OPERATION_METADATA_KEY, &session.id);
-        let upload_id = {
+        let upload_id_result = async {
             let _permit = self.acquire_request().await?;
             create
                 .send()
@@ -58,7 +58,19 @@ impl S3Backend {
                         capabilities::MULTIPART_CREATE,
                         "对象存储未返回分片上传 ID",
                     )
-                })?
+                })
+        }
+        .await;
+        let upload_id = match upload_id_result {
+            Ok(upload_id) => upload_id,
+            Err(error) => {
+                // Create can leave an empty remote session, but no payload was
+                // released. Only retire our intent; never guess a provider ID.
+                let cleanup = self
+                    .release_unstarted_multipart_intent(&session_key, session_etag.as_deref())
+                    .await;
+                return Err(error.with_operation(CommitState::NotCommitted, cleanup));
+            }
         };
         session.upload_id = Some(upload_id.clone());
         session_etag = match self
@@ -134,6 +146,24 @@ impl S3Backend {
                 },
                 Err(_) => Err(error.with_operation(CommitState::Unknown, CleanupState::Unknown)),
             },
+        }
+    }
+
+    async fn release_unstarted_multipart_intent(
+        &self,
+        session_key: &str,
+        session_etag: Option<&str>,
+    ) -> CleanupState {
+        // Never wait for a slow remote cleanup before reporting create failure.
+        // The authenticated intent remains recoverable after error or timeout.
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.delete_key_confirmed(session_key, session_etag),
+        )
+        .await
+        {
+            Ok(Ok(())) => CleanupState::Complete,
+            _ => CleanupState::Pending,
         }
     }
 
@@ -237,7 +267,7 @@ impl S3Backend {
                 options.operation_id,
             )
             .await?;
-        let upload_id = {
+        let upload_id_result = async {
             let _permit = self.acquire_request().await?;
             let mut create = self
                 .client
@@ -264,7 +294,17 @@ impl S3Backend {
                         capabilities::MULTIPART_CREATE,
                         "对象存储未返回分片复制 ID",
                     )
-                })?
+                })
+        }
+        .await;
+        let upload_id = match upload_id_result {
+            Ok(upload_id) => upload_id,
+            Err(error) => {
+                let cleanup = self
+                    .release_unstarted_multipart_intent(&session_key, session_etag.as_deref())
+                    .await;
+                return Err(error.with_operation(CommitState::NotCommitted, cleanup));
+            }
         };
         session.upload_id = Some(upload_id.clone());
         session_etag = match self

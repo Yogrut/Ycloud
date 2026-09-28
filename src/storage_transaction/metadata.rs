@@ -58,7 +58,7 @@ impl fmt::Display for TransactionId {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ReplaceJournal {
     // Missing version is the previous two-field format, not an arbitrary format.
@@ -66,6 +66,14 @@ pub(super) struct ReplaceJournal {
     pub version: u32,
     pub id: TransactionId,
     pub destination: String,
+    #[serde(default)]
+    pub published: bool,
+    #[serde(default)]
+    pub operation_id: Option<String>,
+    #[serde(default)]
+    pub operation_size: Option<u64>,
+    #[serde(default)]
+    pub anchored: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -104,18 +112,40 @@ impl DeletionJournal {
 impl ReplaceJournal {
     pub fn new(id: TransactionId, destination: String) -> AppResult<Self> {
         let journal = Self {
-            version: 1,
+            version: 3,
             id,
             destination,
+            published: false,
+            operation_id: None,
+            operation_size: None,
+            anchored: false,
         };
         journal.validate()?;
         Ok(journal)
     }
 
     pub fn validate(&self) -> AppResult<()> {
-        if self.version > 1 {
+        if self.version > 3 || (self.version < 2 && self.published) {
             return Err(AppError::Conflict(
                 "Unsupported transaction journal version; recovery stopped".into(),
+            ));
+        }
+        match (&self.operation_id, self.operation_size) {
+            (None, None) => {}
+            (Some(id), Some(_))
+                if id.len() == 32
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) => {}
+            _ => {
+                return Err(AppError::Conflict(
+                    "Invalid upload operation identity; recovery stopped".into(),
+                ))
+            }
+        }
+        if self.anchored && (self.version < 3 || self.operation_id.is_none()) {
+            return Err(AppError::Conflict(
+                "Invalid upload publication anchor; recovery stopped".into(),
             ));
         }
         if self.destination.is_empty()

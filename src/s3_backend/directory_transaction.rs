@@ -299,7 +299,7 @@ impl S3Backend {
                 let size = non_negative_size(object.size())?;
                 if size > MAX_SINGLE_COPY_BYTES {
                     return Err(AppError::Conflict(
-                        "目录包含超过 5 GB 的对象；当前安全目录事务尚不支持分段复制".into(),
+                        "目录包含超过 5 GB 的对象；当前目录操作上限为单个对象 5 GB".into(),
                     ));
                 }
                 objects.push(ObjectRecord {

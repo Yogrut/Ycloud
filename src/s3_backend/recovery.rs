@@ -1,10 +1,9 @@
 use std::{sync::atomic::Ordering, time::Duration};
 
 use super::{
-    append_exact_multipart_matches, capabilities, is_owned_internal_multipart_key,
-    multipart_session_matches, object_key, snapshot_matches, S3Backend, S3MultipartAbortOutcome,
-    S3MultipartPurpose, S3MultipartSession, S3RecoveryStatus, S3UploadTransaction,
-    S3_MAX_LIST_PAGES, S3_PAGE_SIZE, S3_TRANSACTION_SCHEMA_VERSION,
+    internal_key, multipart_session_matches, object_key, snapshot_matches, S3Backend,
+    S3MultipartAbortOutcome, S3MultipartPurpose, S3MultipartSession, S3RecoveryStatus,
+    S3UploadTransaction, S3_MULTIPART_SESSION_SCHEMA_VERSION, S3_TRANSACTION_SCHEMA_VERSION,
 };
 use crate::error::{AppError, AppResult};
 
@@ -63,11 +62,22 @@ impl S3Backend {
     ) -> AppResult<Option<usize>> {
         let _recovery = self.recovery_gate.write().await;
         let _mutation = self.mutation_gate.lock().await;
-        if self.recovery_worker_stopped() || !self.recovery_runtime.has_pending() {
+        if self.recovery_worker_stopped() {
+            return Ok(None);
+        }
+        if !self.recovery_runtime.has_pending() {
+            // The foreground owner may have settled its own journal while the
+            // worker waited for the exclusive gate. End the in-progress state
+            // without scanning a namespace that no longer needs recovery.
+            self.recovery_runtime.recovery_succeeded();
             return Ok(None);
         }
         capacity.mark_uncertain();
-        self.recover_transactions_locked().await.map(Some)
+        let recovered = self.recover_transactions_locked().await?;
+        // No new journal may enter between this settlement and releasing the
+        // recovery gate. A later operation keeps its own pending record.
+        self.recovery_runtime.recovery_succeeded();
+        Ok(Some(recovered))
     }
 
     pub(crate) async fn recover_quiesced_uploads(&self) -> AppResult<usize> {
@@ -126,10 +136,6 @@ impl S3Backend {
         self.recovery_runtime.recovery_started();
     }
 
-    pub(crate) fn runtime_recovery_succeeded(&self) {
-        self.recovery_runtime.recovery_succeeded();
-    }
-
     pub(crate) fn runtime_recovery_failed(&self, message: &str, retry_after: Duration) {
         self.recovery_runtime.recovery_failed(message, retry_after);
     }
@@ -162,13 +168,35 @@ impl S3Backend {
         journal_etag: &str,
         session: &S3MultipartSession,
     ) -> AppResult<()> {
+        // Authenticated v2 intents cannot send parts or issue signed URLs before
+        // the provider ID is persisted. An absent ID therefore owns no payload.
+        // Do not infer ownership from a key, or touch any destination object.
+        if session.schema_version == S3_MULTIPART_SESSION_SCHEMA_VERSION
+            && session.upload_id.is_none()
+        {
+            self.delete_key_confirmed(journal_key, Some(journal_etag))
+                .await?;
+            tracing::warn!(
+                "S3 pre-transfer intent released; any empty remote multipart session requires bucket lifecycle cleanup"
+            );
+            return Ok(());
+        }
         let object = self.head_key(&session.key).await?;
         if object
             .as_ref()
             .is_some_and(|metadata| multipart_session_matches(metadata, session))
         {
-            if session.purpose == Some(S3MultipartPurpose::Upload) {
-                self.delete_key(
+            let completed_directory_trash = if let Some(id) =
+                super::directory_trash_transaction_id(&self.prefix, &session.key)
+            {
+                self.head_key(&internal_key(&self.prefix, "directory-transactions", id))
+                    .await?
+                    .is_none()
+            } else {
+                false
+            };
+            if session.purpose == Some(S3MultipartPurpose::Upload) || completed_directory_trash {
+                self.delete_key_confirmed(
                     &session.key,
                     object
                         .as_ref()
@@ -209,99 +237,10 @@ impl S3Backend {
                     ));
                 }
             }
-        } else {
-            // A version 2 intent without a provider ID means the process may
-            // have stopped after CreateMultipartUpload reached S3 but before
-            // its response was durably linked. Only exact-key matches inside
-            // the recorded namespace are eligible; a truncated or malformed
-            // listing fails closed and preserves the intent.
-            let upload_ids = self.multipart_upload_ids_for_key(&session.key).await?;
-            if !is_owned_internal_multipart_key(&self.prefix, session) && !upload_ids.is_empty() {
-                return Err(AppError::ServiceUnavailable(
-                    "对象存储分片复制已创建但缺少可验证的会话 ID；已保留恢复意图并拒绝自动终止"
-                        .into(),
-                ));
-            }
-            for upload_id in upload_ids {
-                self.abort_multipart_operation(&session.key, &upload_id)
-                    .await?;
-            }
-            if object.is_some() {
-                return Err(AppError::ServiceUnavailable(
-                    "对象存储分片意图对应的目标对象不匹配；已保留恢复记录并拒绝继续写入".into(),
-                ));
-            }
         }
         self.delete_key_confirmed(journal_key, Some(journal_etag))
             .await?;
         Ok(())
-    }
-
-    async fn multipart_upload_ids_for_key(&self, key: &str) -> AppResult<Vec<String>> {
-        self.maintenance
-            .read(self.multipart_upload_ids_for_key_uninterrupted(key))
-            .await
-    }
-
-    async fn multipart_upload_ids_for_key_uninterrupted(
-        &self,
-        key: &str,
-    ) -> AppResult<Vec<String>> {
-        let mut key_marker: Option<String> = None;
-        let mut upload_id_marker: Option<String> = None;
-        let mut matches = Vec::new();
-        for _ in 0..S3_MAX_LIST_PAGES {
-            let _permit = self.acquire_request().await?;
-            let mut request =
-                self.client
-                    .list_multipart_uploads()
-                    .bucket(&self.bucket)
-                    .prefix(key)
-                    .max_uploads(i32::try_from(S3_PAGE_SIZE).map_err(|_| {
-                        AppError::internal("invalid S3 multipart recovery page size")
-                    })?);
-            if let Some(marker) = key_marker.as_deref() {
-                request = request.key_marker(marker);
-            }
-            if let Some(marker) = upload_id_marker.as_deref() {
-                request = request.upload_id_marker(marker);
-            }
-            let output = request.send().await.map_err(|error| {
-                tracing::warn!(
-                    error_kind = %error.as_service_error().map_or("transport", |_| "service"),
-                    "S3 multipart intent enumeration failed"
-                );
-                AppError::storage_capability(
-                    capabilities::MULTIPART_LIST_EXACT_KEY,
-                    "无法列举对象存储分片会话；已保留恢复意图",
-                )
-            })?;
-            append_exact_multipart_matches(key, output.uploads(), &mut matches)?;
-            if !output.is_truncated().unwrap_or(false) {
-                return Ok(matches);
-            }
-            let next_key = output.next_key_marker().ok_or_else(|| {
-                AppError::storage_capability(
-                    capabilities::MULTIPART_LIST_EXACT_KEY,
-                    "对象存储分片恢复分页结果无效",
-                )
-            })?;
-            let next_upload = output.next_upload_id_marker().map(str::to_owned);
-            if key_marker.as_deref() == Some(next_key)
-                && upload_id_marker.as_deref() == next_upload.as_deref()
-            {
-                return Err(AppError::storage_capability(
-                    capabilities::MULTIPART_LIST_EXACT_KEY,
-                    "对象存储分片恢复分页未前进",
-                ));
-            }
-            key_marker = Some(next_key.to_owned());
-            upload_id_marker = next_upload;
-        }
-        Err(AppError::storage_capability(
-            capabilities::MULTIPART_LIST_EXACT_KEY,
-            "对象存储分片恢复分页超过安全页数上限",
-        ))
     }
 
     async fn recover_upload_transaction(

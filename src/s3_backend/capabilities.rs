@@ -12,7 +12,6 @@ pub(super) const CONFIRMED_DELETE: &str = "confirmed_delete";
 pub(super) const CONDITIONAL_JOURNAL_UPDATE: &str = "conditional_journal_update";
 pub(super) const RANGE_READ: &str = "range_read";
 pub(super) const MULTIPART_CREATE: &str = "multipart_create";
-pub(super) const MULTIPART_LIST_EXACT_KEY: &str = "multipart_list_exact_key";
 pub(super) const MULTIPART_PART_COPY: &str = "multipart_part_copy";
 pub(super) const MULTIPART_ABORT: &str = "multipart_abort";
 
@@ -30,7 +29,6 @@ const FIRST_USE_CAPABILITIES: &[&str] = &[
     CONDITIONAL_JOURNAL_UPDATE,
     RANGE_READ,
     MULTIPART_CREATE,
-    MULTIPART_LIST_EXACT_KEY,
     MULTIPART_PART_COPY,
     MULTIPART_ABORT,
 ];

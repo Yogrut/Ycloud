@@ -235,7 +235,7 @@ pub enum S3AddressingStyle {
     VirtualHosted,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     #[serde(default)]
@@ -288,4 +288,39 @@ pub struct ConfigFile {
     pub security_log_retention_days: u32,
     #[serde(default = "default_security_log_max_entries")]
     pub security_log_max_entries: usize,
+}
+
+impl fmt::Debug for ConfigFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigFile")
+            .field("schema_version", &self.schema_version)
+            .field("storage_instances", &self.storage_instances.len())
+            .field(
+                "pending_storage_instance",
+                &self.pending_storage_instance.is_some(),
+            )
+            .field("user_accounts", &self.user_accounts.len())
+            .field("folder_locks", &self.folder_locks.len())
+            .field("shares", &self.shares.len())
+            .field("max_upload_bytes", &self.max_upload_bytes)
+            .field("max_archive_bytes", &self.max_archive_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    #[test]
+    fn configuration_debug_never_prints_authentication_material() {
+        let config = super::ConfigFile {
+            admin_password_hash: "sensitive-password-hash".into(),
+            admin_totp_secret: Some("sensitive-totp-secret".into()),
+            admin_recovery_code_hashes: vec!["sensitive-recovery-hash".into()],
+            global_web_password_hash: Some("sensitive-web-hash".into()),
+            ..Default::default()
+        };
+        let output = format!("{config:?}");
+        assert!(!output.contains("sensitive-"));
+    }
 }

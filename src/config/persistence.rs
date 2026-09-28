@@ -18,6 +18,17 @@ use super::{
 };
 
 pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
+    load_config_inner(path, None).await
+}
+
+pub async fn load_config_for_runtime(runtime: &super::Config) -> anyhow::Result<ConfigFile> {
+    load_config_inner(&runtime.config_path, Some(runtime)).await
+}
+
+async fn load_config_inner(
+    path: &Path,
+    runtime: Option<&super::Config>,
+) -> anyhow::Result<ConfigFile> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -61,7 +72,7 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
     } else {
         let credentials_path = initial_credentials_path(path);
         let credentials = load_or_create_initial_credentials(&credentials_path).await?;
-        let config = ConfigFile {
+        let mut config = ConfigFile {
             traffic: crate::traffic::TrafficSettings::default(),
             schema_version: CONFIG_SCHEMA_VERSION,
             domain_binding: None,
@@ -89,6 +100,18 @@ pub async fn load_config(path: &Path) -> anyhow::Result<ConfigFile> {
             security_log_retention_days: DEFAULT_SECURITY_LOG_RETENTION_DAYS,
             security_log_max_entries: DEFAULT_SECURITY_LOG_MAX_ENTRIES,
         };
+        if let Some(runtime) = runtime {
+            config.max_upload_bytes = config.max_upload_bytes.min(runtime.max_upload_bytes);
+            config.max_upload_batch_bytes = config
+                .max_upload_batch_bytes
+                .min(runtime.max_upload_batch_bytes);
+            config.max_upload_batch_entries = config
+                .max_upload_batch_entries
+                .min(runtime.max_upload_batch_entries);
+            config.max_archive_bytes = config.max_archive_bytes.min(runtime.max_archive_bytes);
+            config.max_archive_entries =
+                config.max_archive_entries.min(runtime.max_archive_entries);
+        }
         save_config(path, &config).await?;
         tracing::warn!(
             path = %credentials_path.display(),

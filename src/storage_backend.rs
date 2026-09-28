@@ -67,6 +67,19 @@ enum RegisteredStorage {
 }
 
 impl StorageRegistry {
+    pub(crate) async fn cached_backends(&self) -> Vec<(String, StorageBackend)> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .filter_map(|(id, entry)| match entry {
+                RegisteredStorage::Ready(backend) | RegisteredStorage::Disabled(backend) => {
+                    Some((id.clone(), backend.clone()))
+                }
+                RegisteredStorage::Unavailable => None,
+            })
+            .collect()
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -510,17 +523,24 @@ impl StorageBackend {
                 storage.upload_committed(path, size, operation_id).await
             }
             StorageBackendKind::Local(storage) => {
-                // Browser destinations were reserved while absent and remain
-                // reserved until this check; recovery has settled atomic writes.
-                let target = match storage.resolve_existing(path).await {
-                    Ok(target) => target,
-                    Err(AppError::NotFound) => return Ok(false),
-                    Err(error) => return Err(error),
-                };
-                let metadata = storage.metadata(&target).await?;
-                Ok(metadata.is_file() && metadata.len() == size)
+                storage.upload_committed(path, size, operation_id).await
             }
         }
+    }
+    pub(crate) async fn prune_upload_receipts(
+        &self,
+        retained: &std::collections::HashSet<String>,
+    ) -> AppResult<()> {
+        if let StorageBackendKind::Local(storage) = &self.active.kind {
+            storage.prune_upload_receipts(retained).await?;
+        }
+        Ok(())
+    }
+    pub(crate) async fn prune_upload_receipt(&self, operation_id: &str) -> AppResult<()> {
+        if let StorageBackendKind::Local(storage) = &self.active.kind {
+            storage.prune_upload_receipt(operation_id).await?;
+        }
+        Ok(())
     }
     pub(crate) fn set_local_max_upload_bytes(&self, max_upload_bytes: u64) {
         let active = &self.active;
@@ -985,6 +1005,9 @@ impl StorageBackend {
                     }
                     None => storage.begin_atomic_write(relative).await?,
                 };
+                if let Some(operation_id) = &input.operation_id {
+                    writer.set_operation_id(operation_id.clone());
+                }
                 let mut stream = input.body.into_data_stream();
                 let mut received = 0_u64;
                 while let Some(chunk) = stream.next().await {
@@ -1376,12 +1399,20 @@ fn schedule_s3_capacity_reconcile(capacity: CapacityTracker, storage: S3Backend)
         return;
     }
     tokio::spawn(async move {
-        match storage.reconcile_capacity_snapshot(&capacity).await {
-            Ok(()) => {}
-            Err(error) => {
+        let mut retry = Duration::from_secs(1);
+        loop {
+            if storage.recovery_worker_stopped() {
                 capacity.reconciliation_failed();
-                tracing::error!(%error, "failed to reconcile S3 capacity in the background");
+                return;
             }
+            match storage.reconcile_capacity_snapshot(&capacity).await {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(%error, retry_seconds = retry.as_secs(), "S3 capacity reconciliation will retry");
+                }
+            }
+            tokio::time::sleep(retry).await;
+            retry = (retry * 2).min(Duration::from_secs(60));
         }
     });
 }
@@ -1430,7 +1461,6 @@ pub(crate) fn spawn_s3_recovery_reconciler(storage: S3Backend, capacity: Capacit
                 storage.runtime_recovery_started();
                 match storage.recover_runtime_transactions(&capacity).await {
                     Ok(recovered) => {
-                        storage.runtime_recovery_succeeded();
                         if let Some(recovered) = recovered {
                             tracing::info!(recovered, "runtime S3 recovery completed");
                             schedule_s3_capacity_reconcile(capacity.clone(), storage.clone());

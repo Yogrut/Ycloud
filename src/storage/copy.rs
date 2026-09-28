@@ -70,6 +70,7 @@ impl StorageService {
         tokio::spawn(async move {
             let _permit = permit;
             let _mutation = storage.mutation_gate.lock().await;
+            storage.transactions.settle_publication().await?;
             #[cfg(any(not(target_os = "linux"), test))]
             {
                 require_plain_directory(destination.absolute().parent()).await?;

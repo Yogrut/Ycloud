@@ -3,8 +3,8 @@ use crate::{
     auth::{self, RequestSubject},
     error::{AppError, AppResult, CommitState, OperationOutcome},
     file_access::{
-        check_folder_locks, ensure_non_root, ensure_storage_action, ensure_writable, resolve_share,
-        share_storage_path, FileQuery, StorageAction,
+        check_folder_locks, ensure_non_root, ensure_storage_action, ensure_writable,
+        resolve_write_share, share_storage_path, FileQuery, StorageAction,
     },
     s3_backend::{DirectChannel, DirectCommand, DirectDescriptor, SignedPart},
     state::AppState,
@@ -93,7 +93,7 @@ async fn authorize(
     headers: &HeaderMap,
     query: &FileQuery,
 ) -> AppResult<(RequestSubject, String, String)> {
-    let share = resolve_share(state, headers, query).await?;
+    let share = resolve_write_share(state, headers, query).await?;
     ensure_writable(&share)?;
     ensure_storage_action(state, headers, &share.storage_id, StorageAction::Upload).await?;
     let path =

@@ -379,12 +379,15 @@ impl PasswordService {
     }
 
     pub async fn verify(&self, hash: String, password: String) -> bool {
-        let Ok(_permit) = self.gate.acquire().await else {
+        let Ok(permit) = self.gate.clone().acquire_owned().await else {
             return false;
         };
-        tokio::task::spawn_blocking(move || config::verify_password(&hash, &password))
-            .await
-            .unwrap_or(false)
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            config::verify_password(&hash, &password)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub async fn verify_with_timeout(
@@ -393,25 +396,30 @@ impl PasswordService {
         password: String,
         wait: Duration,
     ) -> AppResult<bool> {
-        let permit = tokio::time::timeout(wait, self.gate.acquire())
+        let permit = tokio::time::timeout(wait, self.gate.clone().acquire_owned())
             .await
             .map_err(|_| AppError::ServiceUnavailable("Authentication service is busy".into()))?
             .map_err(|_| AppError::ServiceUnavailable("Authentication is shutting down".into()))?;
-        let result = tokio::task::spawn_blocking(move || config::verify_password(&hash, &password))
-            .await
-            .map_err(|error| AppError::with_source("password verification task failed", error))?;
-        drop(permit);
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            config::verify_password(&hash, &password)
+        })
+        .await
+        .map_err(|error| AppError::with_source("password verification task failed", error))?;
         Ok(result)
     }
 
     pub async fn hash(&self, password: String) -> AppResult<String> {
-        let _permit =
-            self.gate.acquire().await.map_err(|_| {
+        let permit =
+            self.gate.clone().acquire_owned().await.map_err(|_| {
                 AppError::ServiceUnavailable("Authentication is shutting down".into())
             })?;
-        let hash = tokio::task::spawn_blocking(move || config::hash_password(&password))
-            .await
-            .map_err(|error| AppError::with_source("password hashing task failed", error))?;
+        let hash = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            config::hash_password(&password)
+        })
+        .await
+        .map_err(|error| AppError::with_source("password hashing task failed", error))?;
         if hash.starts_with("__hash_error__") {
             Err(AppError::internal("password hashing failed"))
         } else {
@@ -550,7 +558,7 @@ async fn authenticate_account(
     // Serialize the admission check with its success/failure update. Without
     // this guard, parallel requests can all pass `is_blocked` before any of
     // them increments the persistent failure counter.
-    let _attempt_guard = state.login_attempts.lock().await;
+    let _attempt_guard = state.login_attempts.for_entry(entry).lock().await;
     match state.login_security.is_blocked(entry, ip).await {
         Ok(true) => return limited_login_response(policy.block_seconds),
         Ok(false) => {}
@@ -885,7 +893,7 @@ pub async fn gate_handler(
             block_seconds: config.web_login_block_seconds as i64,
         }
     };
-    let _attempt_guard = state.login_attempts.lock().await;
+    let _attempt_guard = state.login_attempts.for_entry(LoginEntry::Web).lock().await;
     match state.login_security.is_blocked(LoginEntry::Web, ip).await {
         Ok(true) => return limited_login_response(web_policy.block_seconds),
         Ok(false) => {}

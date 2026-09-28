@@ -345,6 +345,31 @@ impl StorageService {
         self.transactions.recover(self.root()).await
     }
 
+    pub(crate) async fn upload_committed(
+        &self,
+        path: &str,
+        size: u64,
+        operation_id: &str,
+    ) -> AppResult<bool> {
+        let _mutation = self.mutation_gate.lock().await;
+        self.transactions
+            .receipt_matches(path, size, operation_id)
+            .await
+    }
+
+    pub(crate) async fn prune_upload_receipts(
+        &self,
+        retained: &std::collections::HashSet<String>,
+    ) -> AppResult<()> {
+        let _mutation = self.mutation_gate.lock().await;
+        self.transactions.prune_receipts(retained).await
+    }
+
+    pub(crate) async fn prune_upload_receipt(&self, operation_id: &str) -> AppResult<()> {
+        let _mutation = self.mutation_gate.lock().await;
+        self.transactions.prune_receipt(operation_id).await
+    }
+
     pub async fn remove(&self, path: &ResolvedPath) -> AppResult<u64> {
         self.remove_with_capacity(path, None).await
     }
@@ -405,6 +430,7 @@ impl StorageService {
     pub async fn create_directory(&self, path: &ResolvedPath) -> AppResult<()> {
         let _permit = self.acquire_io().await?;
         let _mutation = self.mutation_gate.lock().await;
+        self.transactions.settle_publication().await?;
         #[cfg(target_os = "linux")]
         {
             self.linux_root.create_directory(path.relative()).await?;
@@ -432,6 +458,7 @@ impl StorageService {
         reject_root_or_descendant(source, destination)?;
         let _permit = self.acquire_io().await?;
         let _mutation = self.mutation_gate.lock().await;
+        self.transactions.settle_publication().await?;
         #[cfg(target_os = "linux")]
         {
             self.linux_root

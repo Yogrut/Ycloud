@@ -16,8 +16,8 @@ use crate::directory_listing::{
 use crate::error::{AppError, AppResult};
 use crate::file_access::{
     check_folder_lock_tree, check_folder_locks, ensure_non_root, ensure_storage_action,
-    ensure_writable, join_request_path, resolve_share, share_storage_path, storage_permission,
-    FileQuery, FolderLockAuthorizer, StorageAction,
+    ensure_writable, join_request_path, resolve_share, resolve_write_share, share_storage_path,
+    storage_permission, FileQuery, FolderLockAuthorizer, StorageAction,
 };
 use crate::security::session_cookie;
 use crate::state::AppState;
@@ -530,7 +530,7 @@ pub async fn create_directory(
     Query(query): Query<FileQuery>,
     Json(body): Json<MkdirBody>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let share = resolve_share(&state, &headers, &query).await?;
+    let share = resolve_write_share(&state, &headers, &query).await?;
     ensure_storage_action(
         &state,
         &headers,
@@ -576,7 +576,7 @@ pub async fn upload_file(
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    let share = resolve_share(&state, &headers, &query).await?;
+    let share = resolve_write_share(&state, &headers, &query).await?;
     ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Upload).await?;
     let backend = state.storage_backend(&share.storage_id).await?;
     ensure_writable(&share)?;
@@ -747,7 +747,7 @@ pub async fn delete_file(
     headers: HeaderMap,
     Query(query): Query<FileQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let share = resolve_share(&state, &headers, &query).await?;
+    let share = resolve_write_share(&state, &headers, &query).await?;
     ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Delete).await?;
     let backend = state.storage_backend(&share.storage_id).await?;
     ensure_writable(&share)?;
@@ -772,7 +772,7 @@ pub async fn rename_file(
     Query(query): Query<FileQuery>,
     Json(body): Json<RenameBody>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let share = resolve_share(&state, &headers, &query).await?;
+    let share = resolve_write_share(&state, &headers, &query).await?;
     ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Rename).await?;
     let backend = state.storage_backend(&share.storage_id).await?;
     ensure_writable(&share)?;

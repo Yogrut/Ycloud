@@ -13,7 +13,7 @@ use crate::{
         StorageBackendConfig, StorageInstanceConfig,
     },
     error::{AppError, AppResult},
-    login_security::LoginSecurity,
+    login_security::{LoginEntry, LoginSecurity},
     storage::StorageService,
     storage_backend::{StorageBackend, StorageRegistry},
     transfer_limit::BandwidthLimiter,
@@ -33,7 +33,7 @@ pub struct AppState {
     pub upload_batches: UploadBatchStore,
     pub(crate) direct_uploads: crate::direct_upload::DirectUploadStore,
     pub(crate) auth_transitions: Arc<Mutex<()>>,
-    pub(crate) login_attempts: Arc<Mutex<()>>,
+    pub(crate) login_attempts: Arc<LoginAttemptGates>,
     pub admin_totp_replay: crate::totp::TotpReplayStore,
     pub webdav_gate: Arc<Semaphore>,
     pub(crate) directory_size_gate: Arc<Semaphore>,
@@ -54,6 +54,28 @@ pub struct LocalStorageEdit {
     pub enabled: bool,
     pub guest_access: crate::config::GuestAccess,
     pub expected_revision: Option<String>,
+}
+
+/// Failure counters are independent by login class. A burst of WebDAV Basic
+/// authentication must not hold the administrator's admission lock through
+/// its password checks.
+#[derive(Default)]
+pub(crate) struct LoginAttemptGates {
+    admin: Mutex<()>,
+    account: Mutex<()>,
+    web: Mutex<()>,
+    webdav: Mutex<()>,
+}
+
+impl LoginAttemptGates {
+    pub(crate) fn for_entry(&self, entry: LoginEntry) -> &Mutex<()> {
+        match entry {
+            LoginEntry::Admin => &self.admin,
+            LoginEntry::Account => &self.account,
+            LoginEntry::Web => &self.web,
+            LoginEntry::WebDav => &self.webdav,
+        }
+    }
 }
 
 impl AppState {
@@ -129,6 +151,10 @@ impl AppState {
             AppError::with_source("failed to load persistent login security state", error)
         })?;
         let upload_batch_ttl = Duration::from_secs(config.upload_timeout_secs);
+        let upload_batches =
+            UploadBatchStore::load_persistent(&config.config_path, upload_batch_ttl).await?;
+        upload_batches.reconcile_receipts(&backends).await?;
+        upload_batches.bind_receipt_registry(backends.clone());
         let traffic =
             crate::traffic::TrafficStore::load(&config.config_path, config_file.clone()).await?;
         Ok(Self {
@@ -142,10 +168,10 @@ impl AppState {
             passwords: PasswordService::new(1),
             backends,
             archive_tickets: ArchiveTicketStore::new(),
-            upload_batches: UploadBatchStore::new(upload_batch_ttl),
+            upload_batches,
             direct_uploads: crate::direct_upload::DirectUploadStore::default(),
             auth_transitions: Arc::new(Mutex::new(())),
-            login_attempts: Arc::new(Mutex::new(())),
+            login_attempts: Arc::new(LoginAttemptGates::default()),
             admin_totp_replay: crate::totp::TotpReplayStore::default(),
             webdav_gate: Arc::new(Semaphore::new(8)),
             directory_size_gate: Arc::new(Semaphore::new(2)),
@@ -491,6 +517,17 @@ impl AppState {
         candidate_instance.enabled = enabled;
         candidate_instance.name = name.trim().to_string();
         candidate.validate()?;
+        // A replacement pointing at the same namespace must not recover the
+        // old generation's live journals. Stop admission and drain the old
+        // owner before any activation probe or recovery touches remote state.
+        let edit = if interrupt {
+            match &cached {
+                Some(backend) => Some(backend.interrupt_for_edit().await?),
+                None => None,
+            }
+        } else {
+            None
+        };
         let prepared = if reuse {
             cached.clone()
         } else if enabled {
@@ -504,14 +541,6 @@ impl AppState {
                 )
                 .await?,
             )
-        } else {
-            None
-        };
-        let edit = if interrupt {
-            match &cached {
-                Some(backend) => Some(backend.interrupt_for_edit().await?),
-                None => None,
-            }
         } else {
             None
         };
@@ -1005,6 +1034,23 @@ fn capacity_ledger_path(config: &Config, storage_id: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::AppState;
+
+    #[tokio::test]
+    async fn webdav_login_pressure_does_not_hold_administrator_admission() {
+        let gates = super::LoginAttemptGates::default();
+        let _dav = gates
+            .for_entry(crate::login_security::LoginEntry::WebDav)
+            .lock()
+            .await;
+        let _admin = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            gates
+                .for_entry(crate::login_security::LoginEntry::Admin)
+                .lock(),
+        )
+        .await
+        .expect("WebDAV authentication blocked administrator admission");
+    }
     use crate::config::{
         load_config, Config, ConfigFile, LocalStorageConfig, S3AddressingStyle, S3Provider,
         S3StorageConfig, Share, StorageBackendConfig, StorageInstanceConfig,

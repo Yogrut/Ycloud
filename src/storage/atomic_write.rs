@@ -122,6 +122,7 @@ impl StorageService {
                     relative: destination.relative,
                     transactions,
                     mutation_gate,
+                    operation_id: None,
                 })
             })
             .await
@@ -150,6 +151,7 @@ impl StorageService {
                     relative: destination.relative,
                     transactions,
                     mutation_gate,
+                    operation_id: None,
                 })
             })
             .await
@@ -210,9 +212,13 @@ pub struct AtomicFileWriter {
     relative: String,
     transactions: Arc<TransactionPaths>,
     mutation_gate: Arc<AsyncMutex<()>>,
+    operation_id: Option<String>,
 }
 
 impl AtomicFileWriter {
+    pub(crate) fn set_operation_id(&mut self, operation_id: String) {
+        self.operation_id = Some(operation_id);
+    }
     pub async fn write_chunk(&mut self, chunk: &Bytes) -> AppResult<()> {
         let new_size = self.bytes_written.saturating_add(chunk.len() as u64);
         if new_size > self.max_bytes {

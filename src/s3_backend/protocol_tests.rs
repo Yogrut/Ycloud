@@ -2058,13 +2058,13 @@ async fn abort_transport_failure_preserves_multipart_recovery_record() {
 }
 
 #[tokio::test]
-async fn non_progressing_multipart_pagination_preserves_intent_without_abort() {
+async fn unstarted_multipart_cleanup_does_not_enumerate_or_abort_remote_sessions() {
     let simulator =
         MultipartRecoveryFaultSimulator::start(MultipartRecoveryFault::PaginationStuck).await;
     let backend = test_backend(&simulator.endpoint);
     let journal_key = format!("tenant/.ycloud-system/multipart-sessions/{INTERNAL_INTENT_ID}");
 
-    let error = backend
+    backend
         .recover_multipart_session(
             &journal_key,
             "\"journal-etag\"",
@@ -2073,14 +2073,15 @@ async fn non_progressing_multipart_pagination_preserves_intent_without_abort() {
         .await
         .unwrap_err();
 
-    assert!(error.to_string().contains("分页未前进"));
-    assert!(simulator.list_attempts.load(Ordering::SeqCst) >= 2);
+    // This simulator cannot HEAD the journal before conditional deletion.
+    // Cleanup fails without consulting or aborting remote sessions.
+    assert_eq!(simulator.list_attempts.load(Ordering::SeqCst), 0);
     assert_eq!(simulator.abort_attempts.load(Ordering::SeqCst), 0);
     assert_eq!(simulator.journal_deletes.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn lost_create_multipart_response_is_recovered_from_precreate_intent() {
+async fn lost_create_response_releases_intent_without_guessing_remote_upload_id() {
     let simulator = MultipartCreateResponseLossSimulator::start().await;
     let backend = test_backend(&simulator.endpoint);
     let upload_size = S3_MULTIPART_THRESHOLD + 1;
@@ -2101,15 +2102,15 @@ async fn lost_create_multipart_response_is_recovered_from_precreate_intent() {
     assert!(simulator.create_attempts.load(Ordering::SeqCst) >= 1);
     assert_eq!(simulator.part_upload_attempts.load(Ordering::SeqCst), 0);
     assert!(!simulator.intent_present.load(Ordering::SeqCst));
-    assert!(simulator.session_present.load(Ordering::SeqCst));
+    assert!(!simulator.session_present.load(Ordering::SeqCst));
     assert!(simulator.provider_session_present.load(Ordering::SeqCst));
 
     let recovered = backend.recover_transactions().await.unwrap();
-    assert_eq!(recovered, 1);
-    assert!(simulator.abort_attempts.load(Ordering::SeqCst) >= 1);
+    assert_eq!(recovered, 0);
+    assert_eq!(simulator.abort_attempts.load(Ordering::SeqCst), 0);
     assert_eq!(simulator.session_deletes.load(Ordering::SeqCst), 1);
     assert!(!simulator.session_present.load(Ordering::SeqCst));
-    assert!(!simulator.provider_session_present.load(Ordering::SeqCst));
+    assert!(simulator.provider_session_present.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

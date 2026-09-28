@@ -341,6 +341,27 @@ async function readBackMutation(url: string, options: RequestInit): Promise<{ va
       : await rawAdminRequest<AdminInfo>('/api/admin/info')
     return matchesFields(actual, desired) ? { value: { success: true } } : undefined
   }
+  if (method === 'PUT' && (url === '/api/admin/storage/local' || /^\/api\/admin\/storage\/s3\/[^/]+$/.test(url))) {
+    const desired = JSON.parse(String(options.body)) as Record<string, unknown>
+    // The administrator view intentionally omits credentials. A changed key
+    // cannot be proven by reading back public storage settings.
+    if (url.includes('/s3/') && (desired.access_key_id || desired.secret_access_key)) return undefined
+    const id = url === '/api/admin/storage/local'
+      ? String(desired.storage_id ?? '')
+      : decodeURIComponent(url.slice('/api/admin/storage/s3/'.length))
+    const info = await rawAdminRequest<AdminInfo>('/api/admin/info')
+    const current = info.storage_instances?.find(instance => instance.id === id)
+    if (!current) return undefined
+    const common = ['name', 'enabled', 'allow_guest_access', 'allow_guest_download'] as const
+    const backend = url === '/api/admin/storage/local'
+      ? ['path', 'capacity_limit_bytes'] as const
+      : ['provider', 'endpoint', 'bucket', 'region', 'prefix', 'addressing_style', 'capacity_limit_bytes', 'relay_upload'] as const
+    const actualType = url === '/api/admin/storage/local' ? 'local' : 's3'
+    if (current.backend.type !== actualType) return undefined
+    const commonMatches = common.every(key => desired[key] === undefined || matchesFields(current[key], desired[key]))
+    const backendMatches = backend.every(key => desired[key] === undefined || matchesFields((current.backend as unknown as Record<string, unknown>)[key], desired[key]))
+    return commonMatches && backendMatches ? { value: { success: true } } : undefined
+  }
   const entity = url.match(/^\/api\/admin\/(users|locks|shares|storage)\/([^/]+)$/)
   if (!entity || !['PUT', 'DELETE'].includes(method ?? '')) return undefined
   const info = await rawAdminRequest<AdminInfo>('/api/admin/info')

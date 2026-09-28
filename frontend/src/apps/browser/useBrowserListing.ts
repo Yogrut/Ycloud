@@ -229,6 +229,8 @@ export function useBrowserListing(context: BrowserListingContext) {
       return
     }
     rememberNextSelection = true
+    entries.value = []
+    capabilities.value = { download: false, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false }
     currentStorageId.value = nextStorageId
     path.value = ''
     query.value = ''

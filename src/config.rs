@@ -70,6 +70,7 @@ mod retired_storage;
 mod runtime;
 mod secret_store;
 pub(crate) use retired_storage::same_namespace as retired_storage_namespace_matches;
+pub(crate) use retired_storage::Entry as RetiredStorageEntry;
 pub(crate) use retired_storage::RetiredStorage;
 mod validation;
 
@@ -80,7 +81,7 @@ pub use model::{
 };
 pub use password::{hash_password, verify_password};
 pub use persistence::{
-    load_config, read_migration_backup, remove_initial_credentials,
+    load_config, load_config_for_runtime, read_migration_backup, remove_initial_credentials,
     remove_initial_credentials_if_rotated, save_config, save_config_refresh_backup,
 };
 pub use runtime::normalize_s3_endpoint;
@@ -986,6 +987,36 @@ mod tests {
         assert!(remove_initial_credentials(&path).await.unwrap());
         assert!(!tokio::fs::try_exists(credentials_path).await.unwrap());
         tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_policy_respects_runtime_envelope_and_survives_reload() {
+        let directory = crate::test_support::TestDirectory::new("initial-policy-envelope");
+        let runtime = super::Config {
+            config_path: directory.path().join("config.json"),
+            max_upload_bytes: 2 * 1024 * 1024,
+            max_upload_batch_bytes: 3 * 1024 * 1024,
+            max_upload_batch_entries: 2,
+            max_archive_bytes: 1024 * 1024,
+            max_archive_entries: 1,
+            ..crate::test_support::runtime_config(directory.path())
+        };
+        let initial = super::load_config_for_runtime(&runtime).await.unwrap();
+        initial.validate().unwrap();
+        assert_eq!(initial.max_upload_bytes, runtime.max_upload_bytes);
+        assert_eq!(
+            initial.max_upload_batch_bytes,
+            runtime.max_upload_batch_bytes
+        );
+        assert_eq!(
+            initial.max_upload_batch_entries,
+            runtime.max_upload_batch_entries
+        );
+        assert_eq!(initial.max_archive_bytes, runtime.max_archive_bytes);
+        assert_eq!(initial.max_archive_entries, runtime.max_archive_entries);
+        let loaded = load_config(&runtime.config_path).await.unwrap();
+        assert_eq!(loaded.max_upload_bytes, initial.max_upload_bytes);
+        assert_eq!(loaded.max_archive_entries, initial.max_archive_entries);
     }
 
     #[tokio::test]

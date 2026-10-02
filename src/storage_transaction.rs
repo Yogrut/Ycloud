@@ -1147,6 +1147,7 @@ fn remove_any_bounded_blocking(
 #[derive(Clone, Copy)]
 enum InventoryKind {
     Journal,
+    Receipt,
     File,
     Tree,
 }
@@ -1191,7 +1192,7 @@ fn validate_inventory_entry(
             "Unexpected transaction resource type; recovery stopped".into(),
         ));
     }
-    if matches!(kind, InventoryKind::Journal) {
+    if matches!(kind, InventoryKind::Journal | InventoryKind::Receipt) {
         if !matches!(
             path.extension().and_then(|ext| ext.to_str()),
             Some("json" | "tmp")
@@ -1200,7 +1201,18 @@ fn validate_inventory_entry(
                 "Unrecognized transaction record; recovery stopped".into(),
             ));
         }
-        resource_id(&path.with_extension(""))?;
+        let identity = path.with_extension("");
+        if matches!(kind, InventoryKind::Receipt) {
+            let valid = identity
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(metadata::valid_operation_id);
+            if !valid {
+                return Err(AppError::Conflict("Invalid upload receipt identity".into()));
+            }
+        } else {
+            resource_id(&identity)?;
+        }
     } else {
         resource_id(path)?;
     }

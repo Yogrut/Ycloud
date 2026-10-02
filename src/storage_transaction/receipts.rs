@@ -4,12 +4,14 @@
 use std::{collections::HashSet, path::PathBuf, sync::atomic::Ordering};
 
 use serde::{Deserialize, Serialize};
-use tokio::{fs, io::AsyncReadExt};
+#[cfg(not(target_os = "linux"))]
+use tokio::fs;
+use tokio::io::AsyncReadExt;
 
-use super::{metadata::MAX_JOURNAL_BYTES, TransactionPaths};
+use super::{metadata::MAX_JOURNAL_BYTES, InventoryKind, TransactionPaths};
 use crate::{
     error::{AppError, AppResult},
-    storage::{is_link_or_reparse_point, StorageService},
+    storage::StorageService,
 };
 
 pub(super) const MAX_UPLOAD_RECEIPTS: usize = 100_000;
@@ -42,42 +44,36 @@ impl TransactionPaths {
     }
 
     pub(super) async fn load_receipt_count(&self) -> AppResult<()> {
-        let mut entries = fs::read_dir(&self.receipts)
-            .await
-            .map_err(|error| AppError::with_source("failed to inspect upload receipts", error))?;
         let mut count = 0_usize;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|error| AppError::with_source("failed to inspect upload receipts", error))?
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(id) = name.strip_suffix(".tmp") {
-                self.receipt_path(id)?;
-                let metadata = fs::symlink_metadata(entry.path()).await.map_err(|error| {
-                    AppError::with_source("failed to inspect upload receipt staging", error)
-                })?;
-                if !metadata.is_file() || is_link_or_reparse_point(&metadata) {
-                    return Err(AppError::Conflict("invalid upload receipt staging".into()));
-                }
-                self.rooted_remove_file(&entry.path()).await?;
-                self.rooted_sync_parent(&entry.path()).await?;
+        for path in self.receipt_inventory().await? {
+            if path.extension().and_then(|extension| extension.to_str()) == Some("tmp") {
+                self.rooted_remove_file(&path).await?;
+                self.rooted_sync_parent(&path).await?;
                 continue;
-            }
-            let id = name
-                .strip_suffix(".json")
-                .ok_or_else(|| AppError::Conflict("unrecognized upload receipt entry".into()))?;
-            self.receipt_path(id)?;
-            let metadata = fs::symlink_metadata(entry.path()).await.map_err(|error| {
-                AppError::with_source("failed to inspect upload receipt", error)
-            })?;
-            if !metadata.is_file() || is_link_or_reparse_point(&metadata) {
-                return Err(AppError::Conflict("invalid upload receipt entry".into()));
             }
             count = count.checked_add(1).ok_or(AppError::TooManyRequests)?;
         }
         self.receipt_count.store(count, Ordering::Relaxed);
         Ok(())
+    }
+
+    async fn receipt_inventory(&self) -> AppResult<Vec<PathBuf>> {
+        // One durable file plus one interrupted staging file per operation.
+        // Use the receipt budget, not the smaller replacement-journal budget.
+        // On Linux this also binds enumeration and metadata to the open root.
+        let (entries, more) = self
+            .inventory_page(
+                &self.receipts,
+                InventoryKind::Receipt,
+                MAX_UPLOAD_RECEIPTS * 2,
+            )
+            .await?;
+        if more {
+            return Err(AppError::Conflict(
+                "Upload receipt inventory exceeds its budget; resources retained".into(),
+            ));
+        }
+        Ok(entries)
     }
 
     async fn read_receipt(&self, operation_id: &str) -> AppResult<Option<UploadReceipt>> {
@@ -168,19 +164,16 @@ impl TransactionPaths {
     }
 
     pub(crate) async fn prune_receipts(&self, retained: &HashSet<String>) -> AppResult<()> {
-        let mut entries = fs::read_dir(&self.receipts)
-            .await
-            .map_err(|error| AppError::with_source("failed to scan upload receipts", error))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|error| AppError::with_source("failed to scan upload receipts", error))?
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let operation_id = name
-                .strip_suffix(".json")
+        for path in self.receipt_inventory().await? {
+            let operation_id = path
+                .file_stem()
+                .and_then(|name| name.to_str())
                 .ok_or_else(|| AppError::Conflict("unrecognized upload receipt entry".into()))?;
-            let path = self.receipt_path(operation_id)?;
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                return Err(AppError::Conflict(
+                    "unrecognized upload receipt entry".into(),
+                ));
+            }
             if retained.contains(operation_id) {
                 continue;
             }
@@ -201,5 +194,51 @@ impl TransactionPaths {
         self.receipt_count.fetch_sub(1, Ordering::Relaxed);
         self.rooted_sync_parent(&path).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransactionPaths;
+    use crate::test_support::TestDirectory;
+    use std::{collections::HashSet, sync::atomic::Ordering};
+
+    #[tokio::test]
+    async fn initialization_counts_durable_receipts_and_pruning_keeps_retained_results() {
+        let root = TestDirectory::new("receipt-inventory");
+        let paths = TransactionPaths::initialize(root.path()).await.unwrap();
+        let retained = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let expired = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        paths
+            .ensure_receipt(retained, "first.txt", 3, true)
+            .await
+            .unwrap();
+        paths
+            .ensure_receipt(expired, "second.txt", 4, true)
+            .await
+            .unwrap();
+        let staging = paths.receipt_path(retained).unwrap().with_extension("tmp");
+        tokio::fs::write(&staging, b"partial").await.unwrap();
+        drop(paths);
+
+        let recovered = TransactionPaths::initialize(root.path()).await.unwrap();
+        assert_eq!(recovered.receipt_count.load(Ordering::Relaxed), 2);
+        assert!(!staging.exists());
+        recovered
+            .prune_receipts(&HashSet::from([retained.into()]))
+            .await
+            .unwrap();
+        assert_eq!(recovered.receipt_count.load(Ordering::Relaxed), 1);
+        assert!(recovered
+            .receipt_matches("first.txt", 3, retained)
+            .await
+            .unwrap());
+        assert!(!recovered
+            .receipt_matches("second.txt", 4, expired)
+            .await
+            .unwrap());
+
+        recovered.prune_receipts(&HashSet::new()).await.unwrap();
+        assert_eq!(recovered.receipt_count.load(Ordering::Relaxed), 0);
     }
 }

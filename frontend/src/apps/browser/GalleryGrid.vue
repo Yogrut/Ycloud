@@ -4,12 +4,12 @@ import type { FileEntry } from '../../shared/api/browser'
 import { previewUrl } from '../../shared/api/browser'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import { useLocale } from '../../shared/i18n'
+import { previewKind } from '../../shared/previewFormats'
 
 const props = defineProps<{ entries: FileEntry[]; storageId: string; selected?: ReadonlySet<string> }>()
 const emit = defineEmits<{ open: [entry: FileEntry]; select: [entry: FileEntry]; contextMenu: [event: MouseEvent, entry: FileEntry] }>()
 const locale = useLocale()
 
-const supportedExtensions = new Set(['jpg', 'jpeg', 'png', 'webp', 'avif', 'gif'])
 const gap = 4
 const targetHeight = 190
 const gallery = ref<HTMLElement | null>(null)
@@ -17,13 +17,7 @@ const galleryWidth = ref(960)
 const ratios = reactive<Record<string, number>>({})
 let resizeObserver: ResizeObserver | undefined
 
-function isSupportedImage(entry: FileEntry): boolean {
-  if (entry.is_dir) return false
-  const extension = entry.name.includes('.') ? entry.name.split('.').pop()?.toLowerCase() ?? '' : ''
-  return supportedExtensions.has(extension)
-}
-
-const images = computed(() => props.entries.filter(isSupportedImage))
+const images = computed(() => props.entries.filter(entry => !entry.is_dir && previewKind(entry.name) === 'image'))
 
 function rememberRatio(path: string, event: Event): void {
   const image = event.currentTarget as HTMLImageElement

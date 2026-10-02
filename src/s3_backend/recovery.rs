@@ -7,6 +7,57 @@ use super::{
 };
 use crate::error::{AppError, AppResult};
 
+// Preserve the namespace recovery order. In particular, upload transactions
+// must settle before their internal-upload intent can release temporary data.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum JournalKind {
+    ActivationProbe,
+    Multipart,
+    FileMove,
+    Upload,
+    Directory,
+    InternalUpload,
+}
+
+impl JournalKind {
+    const ORDERED: [Self; 6] = [
+        Self::ActivationProbe,
+        Self::Multipart,
+        Self::FileMove,
+        Self::Upload,
+        Self::Directory,
+        Self::InternalUpload,
+    ];
+
+    const fn category(self) -> &'static str {
+        match self {
+            Self::ActivationProbe => "activation-probe-intents",
+            Self::Multipart => "multipart-sessions",
+            Self::FileMove => "file-move-transactions",
+            Self::Upload => "transactions",
+            Self::Directory => "directory-transactions",
+            Self::InternalUpload => "internal-upload-intents",
+        }
+    }
+}
+
+fn runtime_journal_kind(prefix: &str, key: &str) -> AppResult<JournalKind> {
+    let reserved = format!("{prefix}.ycloud-system/");
+    let (category, _) = key
+        .strip_prefix(&reserved)
+        .and_then(|relative| relative.split_once('/'))
+        .filter(|(_, id)| super::valid_transaction_id(id))
+        .ok_or_else(invalid_runtime_journal)?;
+    JournalKind::ORDERED
+        .into_iter()
+        .find(|kind| kind.category() == category)
+        .ok_or_else(invalid_runtime_journal)
+}
+
+fn invalid_runtime_journal() -> AppError {
+    AppError::ServiceUnavailable("对象存储待恢复记录不属于当前日志命名空间；已保留记录".into())
+}
+
 impl S3Backend {
     pub(crate) async fn quiesce_after_interrupt(
         &self,
@@ -51,61 +102,133 @@ impl S3Backend {
     /// accepts states that can be proven to be either the old object or the
     /// newly uploaded object. Anything else stops activation for inspection.
     pub async fn recover_transactions(&self) -> AppResult<usize> {
-        let _recovery = self.recovery_gate.write().await;
-        let _mutation = self.mutation_gate.lock().await;
-        self.recover_transactions_locked().await
+        let backend = self.scoped_work(None, None);
+        let _recovery = backend
+            .maintenance
+            .read(async { Ok(backend.recovery_gate.write().await) })
+            .await?;
+        let _mutation = backend
+            .maintenance
+            .read(async { Ok(backend.mutation_gate.lock().await) })
+            .await?;
+        backend.recover_transactions_locked().await
     }
 
     pub(crate) async fn recover_runtime_transactions(
         &self,
         capacity: &crate::capacity::CapacityTracker,
     ) -> AppResult<Option<usize>> {
-        let _recovery = self.recovery_gate.write().await;
-        let _mutation = self.mutation_gate.lock().await;
+        let backend = self.scoped_work(None, None);
+        backend.recover_runtime_transactions_scoped(capacity).await
+    }
+
+    async fn recover_runtime_transactions_scoped(
+        &self,
+        capacity: &crate::capacity::CapacityTracker,
+    ) -> AppResult<Option<usize>> {
+        let _recovery = self
+            .maintenance
+            .read(async { Ok(self.recovery_gate.write().await) })
+            .await?;
+        let _mutation = self
+            .maintenance
+            .read(async { Ok(self.mutation_gate.lock().await) })
+            .await?;
         if self.recovery_worker_stopped() {
+            self.recovery_runtime.recovery_wait_stopped();
             return Ok(None);
         }
-        if !self.recovery_runtime.has_pending() {
+        let mut selected: Option<(JournalKind, String)> = None;
+        // This is a pass-local snapshot, not a second durable work queue. Read
+        // it only after all foreground recovery leases have left the gate.
+        for key in self.recovery_runtime.pending_keys() {
+            let candidate = (runtime_journal_kind(&self.prefix, &key)?, key);
+            if selected.as_ref().is_none_or(|current| candidate < *current) {
+                selected = Some(candidate);
+            }
+        }
+        let Some((kind, key)) = selected else {
             // The foreground owner may have settled its own journal while the
             // worker waited for the exclusive gate. End the in-progress state
             // without scanning a namespace that no longer needs recovery.
-            self.recovery_runtime.recovery_succeeded();
+            self.recovery_runtime.recovery_pass_succeeded();
             return Ok(None);
-        }
+        };
         capacity.mark_uncertain();
-        let recovered = self.recover_transactions_locked().await?;
-        // No new journal may enter between this settlement and releasing the
-        // recovery gate. A later operation keeps its own pending record.
-        self.recovery_runtime.recovery_succeeded();
-        Ok(Some(recovered))
+        if self.head_key(&key).await?.is_none() {
+            // A registered write may have failed before creating its journal.
+            // This retires only the recovery entry, not an upload result.
+            self.recovery_runtime.journal_settled(&key);
+        } else {
+            self.recover_journal(kind, &key).await?;
+        }
+        // Only inspect unclaimed resources after the known journals settle.
+        // Inspection is read-only and remains cancellable by administrator edit.
+        if !self.recovery_runtime.has_pending() {
+            self.inspect_internal_orphans().await?;
+        }
+        self.recovery_runtime.recovery_pass_succeeded();
+        Ok(Some(1))
     }
 
     pub(crate) async fn recover_quiesced_uploads(&self) -> AppResult<usize> {
-        let _mutation = self.mutation_gate.lock().await;
-        self.recover_transactions_locked().await
+        let backend = self.scoped_work(None, None);
+        let _mutation = backend
+            .maintenance
+            .read(async { Ok(backend.mutation_gate.lock().await) })
+            .await?;
+        backend.recover_transactions_locked().await
     }
 
     async fn recover_transactions_locked(&self) -> AppResult<usize> {
-        let mut recovered = self.recover_activation_probe_intents().await?;
-        let multipart_sessions = self.list_multipart_session_keys().await?;
-        recovered = recovered.saturating_add(multipart_sessions.len());
-        for key in multipart_sessions {
-            let (session, journal_etag) = self.read_multipart_session(&key).await?;
-            self.recover_multipart_session(&key, &journal_etag, &session)
-                .await?;
+        let mut recovered = 0_usize;
+        for kind in JournalKind::ORDERED {
+            recovered = recovered.saturating_add(self.recover_journal_category(kind).await?);
         }
-        recovered = recovered.saturating_add(self.recover_file_move_transactions().await?);
-        let transaction_keys = self.list_transaction_keys().await?;
-        recovered = recovered.saturating_add(transaction_keys.len());
-        for key in transaction_keys {
-            let (transaction, journal_etag) = self.read_upload_transaction(&key).await?;
-            self.recover_upload_transaction(&key, &journal_etag, &transaction)
-                .await?;
-        }
-        recovered = recovered.saturating_add(self.recover_directory_transactions().await?);
-        recovered = recovered.saturating_add(self.recover_internal_upload_intents().await?);
         self.inspect_internal_orphans().await?;
         Ok(recovered)
+    }
+
+    /// Recover one bounded category while the caller holds the mutation gate.
+    /// Used by full recovery and the activation probe's own-resource cleanup.
+    pub(super) async fn recover_journal_category(&self, kind: JournalKind) -> AppResult<usize> {
+        let keys = self.list_recovery_journal_keys(kind.category()).await?;
+        for key in &keys {
+            self.recover_journal(kind, key).await?;
+        }
+        Ok(keys.len())
+    }
+
+    // Both activation and online recovery dispatch through this boundary. Each
+    // journal type still owns its authentication and object-identity algorithm.
+    async fn recover_journal(&self, kind: JournalKind, key: &str) -> AppResult<()> {
+        match kind {
+            JournalKind::ActivationProbe => self.recover_activation_probe_intent(key).await,
+            JournalKind::Multipart => {
+                let (session, etag) = self.read_multipart_session(key).await?;
+                self.recover_multipart_session(key, &etag, &session).await
+            }
+            JournalKind::FileMove => self.recover_file_move_transaction(key).await,
+            JournalKind::Upload => {
+                let (transaction, etag) = self.read_upload_transaction(key).await?;
+                self.recover_upload_transaction(key, &etag, &transaction)
+                    .await
+            }
+            JournalKind::Directory => self.recover_directory_transaction(key).await,
+            JournalKind::InternalUpload => {
+                let id = key.rsplit('/').next().expect("validated journal ID");
+                if self
+                    .head_key(&internal_key(&self.prefix, "transactions", id))
+                    .await?
+                    .is_some()
+                {
+                    return Err(AppError::ServiceUnavailable(
+                        "内部上传仍有关联事务待恢复；已保留临时对象和记录".into(),
+                    ));
+                }
+                self.recover_internal_upload_intent(key).await
+            }
+        }
     }
 
     pub(crate) fn recovery_has_pending(&self) -> bool {
@@ -278,3 +401,6 @@ impl S3Backend {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests;

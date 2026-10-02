@@ -3,10 +3,10 @@ use aws_smithy_types::byte_stream::ByteStream;
 use axum::body::Body;
 
 use super::{
-    internal_key, object_key, sanitize_content_type, ExactLengthBody, S3Backend, S3ObjectSnapshot,
-    S3UploadResult, S3UploadStage, S3UploadTransaction, S3_CONNECT_TIMEOUT, S3_MULTIPART_MAX_PARTS,
-    S3_MULTIPART_MAX_PART_BYTES, S3_MULTIPART_THRESHOLD, S3_OPERATION_METADATA_KEY,
-    S3_TRANSACTION_SCHEMA_VERSION,
+    internal_key, object_key, sanitize_content_type, ExactLengthBody, RawS3Metadata, S3Backend,
+    S3ObjectSnapshot, S3UploadResult, S3UploadStage, S3UploadTransaction, S3_CONNECT_TIMEOUT,
+    S3_MULTIPART_MAX_PARTS, S3_MULTIPART_MAX_PART_BYTES, S3_MULTIPART_THRESHOLD,
+    S3_OPERATION_METADATA_KEY, S3_TRANSACTION_SCHEMA_VERSION,
 };
 use crate::{
     error::{AppError, AppResult, CleanupState, CommitState},
@@ -38,6 +38,27 @@ impl S3Backend {
     }
 
     pub(crate) async fn upload_file_mode(
+        &self,
+        relative: &str,
+        input: super::UploadInput,
+        content_length: u64,
+        max_upload_bytes: u64,
+        content_type: Option<&str>,
+        create_only: bool,
+    ) -> AppResult<S3UploadResult> {
+        let backend = self.scoped_work(None, None);
+        Box::pin(backend.upload_file_scoped(
+            relative,
+            input,
+            content_length,
+            max_upload_bytes,
+            content_type,
+            create_only,
+        ))
+        .await
+    }
+
+    async fn upload_file_scoped(
         &self,
         relative: &str,
         mut input: super::UploadInput,
@@ -139,7 +160,10 @@ impl S3Backend {
             _ = cancellation.cancelled() => return Err(cancelled()),
             result = self.head_key(&temporary_key) => result,
         };
-        let temporary = match temporary_probe {
+        let temporary = match temporary_probe
+            .and_then(|metadata| validate_temporary_upload(metadata, content_length))
+        {
+            Ok(metadata) => metadata,
             Err(error) => {
                 return Err(self
                     .finish_uncommitted_internal_upload(
@@ -147,27 +171,6 @@ impl S3Backend {
                         intent_etag.as_deref(),
                         &intent,
                         error,
-                    )
-                    .await);
-            }
-            Ok(Some(metadata)) if metadata.size == content_length => metadata,
-            Ok(Some(_)) => {
-                return Err(self
-                    .finish_uncommitted_internal_upload(
-                        &intent_key,
-                        intent_etag.as_deref(),
-                        &intent,
-                        AppError::ServiceUnavailable("对象存储暂存对象长度校验失败".into()),
-                    )
-                    .await);
-            }
-            Ok(None) => {
-                return Err(self
-                    .finish_uncommitted_internal_upload(
-                        &intent_key,
-                        intent_etag.as_deref(),
-                        &intent,
-                        AppError::ServiceUnavailable("对象存储未保存上传的暂存对象".into()),
                     )
                     .await);
             }
@@ -396,47 +399,31 @@ impl S3Backend {
                 journal_etag = self
                     .write_upload_transaction(&journal_key, &transaction, journal_etag.as_deref())
                     .await?;
-                let cleanup = self
-                    .finish_upload_and_intent(
-                        &journal_key,
-                        journal_etag.as_deref(),
-                        &transaction,
-                        &intent_key,
-                        intent_etag.as_deref(),
-                    )
-                    .await;
-                let cleanup = if cleanup.is_ok() {
-                    CleanupState::Complete
-                } else {
-                    CleanupState::Pending
-                };
-                return Err(
-                    AppError::ServiceUnavailable("对象存储未能确认上传提交结果".into())
-                        .with_operation(CommitState::NotCommitted, cleanup),
-                );
-            } else if self.head_key(&destination_key).await?.is_none() {
-                let cleanup = self
-                    .finish_upload_and_intent(
-                        &journal_key,
-                        journal_etag.as_deref(),
-                        &transaction,
-                        &intent_key,
-                        intent_etag.as_deref(),
-                    )
-                    .await;
-                let cleanup = if cleanup.is_ok() {
-                    CleanupState::Complete
-                } else {
-                    CleanupState::Pending
-                };
-                return Err(
-                    AppError::ServiceUnavailable("对象存储未能确认上传提交结果".into())
-                        .with_operation(CommitState::NotCommitted, cleanup),
-                );
+            } else if self.head_key(&destination_key).await?.is_some() {
+                // An unrecognized formal object is not evidence of a rollback.
+                // Keep its journal; only the verified cases below may clean up.
+                return Err(AppError::ServiceUnavailable(
+                    "对象存储未能确认上传提交结果".into(),
+                ));
             }
-            return Err(AppError::ServiceUnavailable(
-                "对象存储未能确认上传提交结果".into(),
-            ));
+            let cleanup = self
+                .finish_upload_and_intent(
+                    &journal_key,
+                    journal_etag.as_deref(),
+                    &transaction,
+                    &intent_key,
+                    intent_etag.as_deref(),
+                )
+                .await;
+            let cleanup = if cleanup.is_ok() {
+                CleanupState::Complete
+            } else {
+                CleanupState::Pending
+            };
+            return Err(
+                AppError::ServiceUnavailable("对象存储未能确认上传提交结果".into())
+                    .with_operation(CommitState::NotCommitted, cleanup),
+            );
         };
 
         transaction.stage = S3UploadStage::DestinationCommitted;
@@ -504,5 +491,45 @@ impl S3Backend {
             .await
             .map_err(|_| AppError::ServiceUnavailable("对象存储上传失败".into()))?;
         Ok(())
+    }
+}
+
+fn validate_temporary_upload(
+    metadata: Option<RawS3Metadata>,
+    content_length: u64,
+) -> AppResult<RawS3Metadata> {
+    match metadata {
+        Some(metadata) if metadata.size == content_length => Ok(metadata),
+        Some(_) => Err(AppError::ServiceUnavailable(
+            "对象存储暂存对象长度校验失败".into(),
+        )),
+        None => Err(AppError::ServiceUnavailable(
+            "对象存储未保存上传的暂存对象".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temporary_upload_requires_presence_and_exact_size_without_changing_identity() {
+        for size in [0, 42] {
+            let metadata = RawS3Metadata {
+                size,
+                etag: Some("temporary-etag".into()),
+                content_type: Some("text/plain".into()),
+                operation_id: Some("operation-id".into()),
+            };
+            assert_eq!(
+                validate_temporary_upload(Some(metadata.clone()), size).unwrap(),
+                metadata
+            );
+            let error = validate_temporary_upload(Some(metadata), size + 1).unwrap_err();
+            assert!(error.to_string().contains("长度校验失败"));
+        }
+        let error = validate_temporary_upload(None, 0).unwrap_err();
+        assert!(error.to_string().contains("未保存"));
     }
 }

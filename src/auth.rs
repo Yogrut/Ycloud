@@ -9,20 +9,35 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore};
-use uuid::Uuid;
+use std::time::Instant;
+use tokio::sync::RwLock;
+
+mod login;
+mod password;
+mod session;
+
+use login::{AccountLoginKind, AccountLoginSnapshot, GateLoginSnapshot};
+pub use password::PasswordService;
+pub(crate) use password::{
+    valid_password_length, verify_admin_second_factor_proof, AdminSecondFactorProof,
+};
+pub use session::{
+    AccessGrant, AccessTokenStore, RequestSubject, Session, SessionPrincipal, SessionStore,
+    SharedAccessTokenStore, SharedSessionStore,
+};
+use session::{ACCESS_TOKEN_TTL, SESSION_TTL};
 
 pub use crate::state::AppState;
 use crate::{
-    config,
-    error::{AppError, AppResult},
+    error::AppError,
     login_security::LoginEntry,
     security::ClientIp,
     security::{clear_cookie, session_cookie},
 };
 
 // ── Rate limiter ──────────────────────────────────────────────────
+
+const MAX_RATE_LIMIT_KEYS: usize = 10_000;
 
 /// Simple fixed-window rate limiter (per IP).
 pub struct RateLimiter {
@@ -46,9 +61,9 @@ impl RateLimiter {
         let mut map = self.entries.write().await;
         // [稳定 + 性能] Bound attacker-controlled IP cardinality without
         // running a full cleanup scan on every request.
-        if map.len() >= 10_000 {
+        if map.len() >= MAX_RATE_LIMIT_KEYS {
             map.retain(|_, (_, start)| now.duration_since(*start) < self.window);
-            if map.len() >= 10_000 && !map.contains_key(key) {
+            if map.len() >= MAX_RATE_LIMIT_KEYS && !map.contains_key(key) {
                 return false;
             }
         }
@@ -67,24 +82,9 @@ impl RateLimiter {
         }
         true
     }
-
-    pub async fn is_blocked(&self, key: &str) -> bool {
-        let now = Instant::now();
-        self.entries
-            .read()
-            .await
-            .get(key)
-            .is_some_and(|(count, start)| {
-                now.duration_since(*start) < self.window && *count >= self.max_requests
-            })
-    }
-
-    pub async fn record_failure(&self, key: &str) {
-        let _ = self.check(key).await;
-    }
 }
 
-/// Rate-limit middleware: 5 req / 60 s per IP for auth endpoints.
+/// Apply the configured per-IP limit to browser unlock endpoints.
 pub async fn rate_limit_middleware(
     axum::extract::State(limiter): axum::extract::State<Arc<RateLimiter>>,
     Extension(ClientIp(ip)): Extension<ClientIp>,
@@ -95,366 +95,8 @@ pub async fn rate_limit_middleware(
     if limiter.check(&ip).await {
         Ok(next.run(request).await)
     } else {
-        Err(StatusCode::from_u16(429).unwrap_or(StatusCode::TOO_MANY_REQUESTS))
+        Err(StatusCode::TOO_MANY_REQUESTS)
     }
-}
-
-/// Session lifetime: 24 hours for admin sessions, 7 days for share/gate access.
-const SESSION_TTL: chrono::Duration = chrono::Duration::hours(24);
-const ACCESS_TOKEN_TTL: chrono::Duration = chrono::Duration::days(7);
-const MAX_SESSIONS: usize = 4_096;
-const MAX_SESSIONS_PER_PRINCIPAL: usize = 16;
-const MAX_ACCESS_TOKENS: usize = 4_096;
-const MAX_ACCESS_TOKENS_PER_SCOPE: usize = 16;
-
-#[derive(Clone, Debug)]
-pub struct Session {
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub principal: SessionPrincipal,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SessionPrincipal {
-    Administrator,
-    User(String),
-}
-
-/// Exact browser credential that initiated a short-lived server-side task.
-///
-/// Tickets bind to the credential token rather than only the account so a
-/// leaked ticket cannot be consumed from another session of the same account.
-/// The value remains in memory and must never be logged or serialized.
-#[derive(Clone, Eq, PartialEq)]
-pub enum RequestSubject {
-    Session(String),
-    Gate(String),
-}
-
-pub struct SessionStore {
-    sessions: RwLock<HashMap<String, Session>>,
-    max_total: usize,
-    max_per_principal: usize,
-}
-
-impl SessionStore {
-    pub fn new() -> Self {
-        Self::with_limits(MAX_SESSIONS, MAX_SESSIONS_PER_PRINCIPAL)
-    }
-    fn with_limits(max_total: usize, max_per_principal: usize) -> Self {
-        Self {
-            sessions: RwLock::new(HashMap::new()),
-            max_total: max_total.max(1),
-            max_per_principal: max_per_principal.max(1),
-        }
-    }
-    pub async fn create(&self) -> String {
-        self.create_for(SessionPrincipal::Administrator).await
-    }
-    pub async fn create_user(&self, user_id: String) -> String {
-        self.create_for(SessionPrincipal::User(user_id)).await
-    }
-    async fn create_for(&self, principal: SessionPrincipal) -> String {
-        let token = Uuid::new_v4().to_string();
-        let now = chrono::Utc::now();
-        let mut sessions = self.sessions.write().await;
-        sessions.retain(|_, session| now - session.created_at <= SESSION_TTL);
-        if principal == SessionPrincipal::Administrator {
-            sessions.retain(|_, session| session.principal != SessionPrincipal::Administrator);
-        }
-        while sessions
-            .values()
-            .filter(|session| session.principal == principal)
-            .count()
-            >= self.max_per_principal
-        {
-            remove_oldest_where(&mut sessions, |session| session.principal == principal);
-        }
-        while sessions.len() >= self.max_total {
-            remove_oldest_where(&mut sessions, |_| true);
-        }
-        sessions.insert(
-            token.clone(),
-            Session {
-                created_at: now,
-                principal,
-            },
-        );
-        token
-    }
-    pub async fn principal(&self, token: &str) -> Option<SessionPrincipal> {
-        let sessions = self.sessions.read().await;
-        match sessions.get(token) {
-            Some(session) if chrono::Utc::now() - session.created_at <= SESSION_TTL => {
-                Some(session.principal.clone())
-            }
-            Some(_) => {
-                drop(sessions);
-                self.sessions.write().await.remove(token);
-                None
-            }
-            None => None,
-        }
-    }
-    pub async fn validate(&self, token: &str) -> bool {
-        let sessions = self.sessions.read().await;
-        match sessions.get(token) {
-            Some(s) => {
-                if chrono::Utc::now() - s.created_at > SESSION_TTL {
-                    drop(sessions);
-                    self.sessions.write().await.remove(token);
-                    false
-                } else {
-                    true
-                }
-            }
-            None => false,
-        }
-    }
-    pub async fn remove(&self, token: &str) {
-        self.sessions.write().await.remove(token);
-    }
-    pub async fn clear(&self) {
-        self.sessions.write().await.clear();
-    }
-    pub async fn revoke_administrator(&self) {
-        self.sessions
-            .write()
-            .await
-            .retain(|_, session| session.principal != SessionPrincipal::Administrator);
-    }
-    pub async fn revoke_user(&self, user_id: &str) {
-        self.sessions.write().await.retain(
-            |_, session| !matches!(&session.principal, SessionPrincipal::User(id) if id == user_id),
-        );
-    }
-    /// Remove all expired sessions; call periodically from a background task.
-    pub async fn cleanup(&self) {
-        let cutoff = chrono::Utc::now() - SESSION_TTL;
-        self.sessions
-            .write()
-            .await
-            .retain(|_, s| s.created_at > cutoff);
-    }
-}
-
-impl Default for SessionStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-pub type SharedSessionStore = Arc<SessionStore>;
-
-#[derive(Clone, Debug)]
-pub struct AccessGrant {
-    pub scope: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-pub struct AccessTokenStore {
-    accesses: RwLock<HashMap<String, AccessGrant>>,
-    max_total: usize,
-    max_per_scope: usize,
-}
-
-impl AccessTokenStore {
-    pub fn new() -> Self {
-        Self::with_limits(MAX_ACCESS_TOKENS, MAX_ACCESS_TOKENS_PER_SCOPE)
-    }
-    fn with_limits(max_total: usize, max_per_scope: usize) -> Self {
-        Self {
-            accesses: RwLock::new(HashMap::new()),
-            max_total: max_total.max(1),
-            max_per_scope: max_per_scope.max(1),
-        }
-    }
-    pub async fn create(&self, scope: String) -> String {
-        let token = Uuid::new_v4().to_string();
-        let now = chrono::Utc::now();
-        let mut accesses = self.accesses.write().await;
-        accesses.retain(|_, access| now - access.created_at <= ACCESS_TOKEN_TTL);
-        while accesses
-            .values()
-            .filter(|access| access.scope == scope)
-            .count()
-            >= self.max_per_scope
-        {
-            remove_oldest_where(&mut accesses, |access| access.scope == scope);
-        }
-        while accesses.len() >= self.max_total {
-            remove_oldest_where(&mut accesses, |_| true);
-        }
-        accesses.insert(
-            token.clone(),
-            AccessGrant {
-                scope,
-                created_at: now,
-            },
-        );
-        token
-    }
-    pub async fn get_scope(&self, token: &str) -> Option<String> {
-        let accesses = self.accesses.read().await;
-        match accesses.get(token) {
-            Some(a) => {
-                if chrono::Utc::now() - a.created_at > ACCESS_TOKEN_TTL {
-                    drop(accesses);
-                    self.accesses.write().await.remove(token);
-                    None
-                } else {
-                    Some(a.scope.clone())
-                }
-            }
-            None => None,
-        }
-    }
-    pub async fn remove(&self, token: &str) {
-        self.accesses.write().await.remove(token);
-    }
-    pub async fn remove_scope(&self, scope: &str) {
-        self.accesses
-            .write()
-            .await
-            .retain(|_, access| access.scope != scope);
-    }
-    pub async fn clear(&self) {
-        self.accesses.write().await.clear();
-    }
-    /// Remove all expired accesses; call periodically from a background task.
-    pub async fn cleanup(&self) {
-        let cutoff = chrono::Utc::now() - ACCESS_TOKEN_TTL;
-        self.accesses
-            .write()
-            .await
-            .retain(|_, a| a.created_at > cutoff);
-    }
-}
-
-impl Default for AccessTokenStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-pub type SharedAccessTokenStore = Arc<AccessTokenStore>;
-
-fn remove_oldest_where<T>(entries: &mut HashMap<String, T>, matches: impl Fn(&T) -> bool)
-where
-    T: CreatedAt,
-{
-    let oldest = entries
-        .iter()
-        .filter(|(_, value)| matches(value))
-        .min_by_key(|(_, value)| value.created_at())
-        .map(|(token, _)| token.clone());
-    if let Some(token) = oldest {
-        entries.remove(&token);
-    }
-}
-
-trait CreatedAt {
-    fn created_at(&self) -> chrono::DateTime<chrono::Utc>;
-}
-
-impl CreatedAt for Session {
-    fn created_at(&self) -> chrono::DateTime<chrono::Utc> {
-        self.created_at
-    }
-}
-
-impl CreatedAt for AccessGrant {
-    fn created_at(&self) -> chrono::DateTime<chrono::Utc> {
-        self.created_at
-    }
-}
-
-#[derive(Clone)]
-pub struct PasswordService {
-    gate: Arc<Semaphore>,
-}
-
-impl PasswordService {
-    pub fn new(max_parallel_operations: usize) -> Self {
-        Self {
-            gate: Arc::new(Semaphore::new(max_parallel_operations.max(1))),
-        }
-    }
-
-    pub async fn verify(&self, hash: String, password: String) -> bool {
-        let Ok(permit) = self.gate.clone().acquire_owned().await else {
-            return false;
-        };
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            config::verify_password(&hash, &password)
-        })
-        .await
-        .unwrap_or(false)
-    }
-
-    pub async fn verify_with_timeout(
-        &self,
-        hash: String,
-        password: String,
-        wait: Duration,
-    ) -> AppResult<bool> {
-        let permit = tokio::time::timeout(wait, self.gate.clone().acquire_owned())
-            .await
-            .map_err(|_| AppError::ServiceUnavailable("Authentication service is busy".into()))?
-            .map_err(|_| AppError::ServiceUnavailable("Authentication is shutting down".into()))?;
-        let result = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            config::verify_password(&hash, &password)
-        })
-        .await
-        .map_err(|error| AppError::with_source("password verification task failed", error))?;
-        Ok(result)
-    }
-
-    pub async fn hash(&self, password: String) -> AppResult<String> {
-        let permit =
-            self.gate.clone().acquire_owned().await.map_err(|_| {
-                AppError::ServiceUnavailable("Authentication is shutting down".into())
-            })?;
-        let hash = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            config::hash_password(&password)
-        })
-        .await
-        .map_err(|error| AppError::with_source("password hashing task failed", error))?;
-        if hash.starts_with("__hash_error__") {
-            Err(AppError::internal("password hashing failed"))
-        } else {
-            Ok(hash)
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AdminSecondFactorProof {
-    TotpCounter(u64),
-    RecoveryHash(String),
-}
-
-/// Verifies either administrator second-factor credential and preserves the
-/// evidence needed by the caller to consume it atomically with authentication.
-pub(crate) async fn verify_admin_second_factor_proof(
-    passwords: &PasswordService,
-    secret: &str,
-    recovery_hashes: &[String],
-    supplied: &str,
-) -> Option<AdminSecondFactorProof> {
-    if let Some(counter) = crate::totp::verify_now_counter(secret, supplied) {
-        return Some(AdminSecondFactorProof::TotpCounter(counter));
-    }
-    let recovery = crate::totp::normalize_recovery_code(supplied);
-    if recovery.len() != 10 {
-        return None;
-    }
-    for hash in recovery_hashes {
-        if passwords.verify(hash.clone(), recovery.clone()).await {
-            return Some(AdminSecondFactorProof::RecoveryHash(hash.clone()));
-        }
-    }
-    None
 }
 
 // ── Request / response types ──────────────────────────────────────
@@ -490,7 +132,7 @@ pub async fn login_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    authenticate_account(state, ip, headers, body, true).await
+    authenticate_account(state, ip, headers, body, AccountLoginKind::Administrator).await
 }
 
 pub async fn user_login_handler(
@@ -499,7 +141,7 @@ pub async fn user_login_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    authenticate_account(state, ip, headers, body, false).await
+    authenticate_account(state, ip, headers, body, AccountLoginKind::User).await
 }
 
 async fn authenticate_account(
@@ -507,81 +149,32 @@ async fn authenticate_account(
     ip: std::net::IpAddr,
     headers: axum::http::HeaderMap,
     body: LoginRequest,
-    administrator: bool,
+    kind: AccountLoginKind,
 ) -> Response {
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
-    let (
-        admin_policy,
-        admin_username,
-        admin_hash,
-        admin_totp_secret,
-        recovery_hashes,
-        ordinary_candidate,
-    ) = {
+    let snapshot = {
         let config = state.config_file.read().await;
-        let supplied = body.username.as_deref().unwrap_or("");
-        (
-            crate::login_security::LoginPolicy {
-                maximum_failures: config.admin_login_failures,
-                block_seconds: config.admin_login_block_seconds as i64,
-            },
-            config.admin_username.clone(),
-            config.admin_password_hash.clone(),
-            config.admin_totp_secret.clone(),
-            config.admin_recovery_code_hashes.clone(),
-            config
-                .user_accounts
-                .iter()
-                .find(|account| account.username == supplied)
-                .map(|account| {
-                    (
-                        account.id.clone(),
-                        account.password_hash.clone(),
-                        account.enabled,
-                    )
-                }),
-        )
+        AccountLoginSnapshot::capture(&config, body.username.as_deref().unwrap_or(""), kind)
     };
-    let supplied_username = body.username.as_deref().unwrap_or("");
-    let entry = if administrator {
-        LoginEntry::Admin
-    } else {
-        LoginEntry::Account
-    };
-    let policy = if administrator {
-        admin_policy
-    } else {
-        LoginEntry::Account.fixed_policy()
-    };
+    let entry = kind.entry();
+    let administrator = matches!(kind, AccountLoginKind::Administrator);
+    let policy = snapshot.policy;
     // Serialize the admission check with its success/failure update. Without
-    // this guard, parallel requests can all pass `is_blocked` before any of
-    // them increments the persistent failure counter.
+    // this guard, parallel requests can all pass before the failure is recorded.
     let _attempt_guard = state.login_attempts.for_entry(entry).lock().await;
     match state.login_security.is_blocked(entry, ip).await {
         Ok(true) => return limited_login_response(policy.block_seconds),
         Ok(false) => {}
         Err(error) => return login_security_error(error),
     }
-    // Always run Argon2, including for an unknown username, so account
-    // existence is not exposed by a cheap timing distinction.
-    let password_hash = if administrator {
-        admin_hash.clone()
-    } else {
-        ordinary_candidate
-            .as_ref()
-            .map(|(_, hash, _)| hash.clone())
-            .unwrap_or_else(|| admin_hash.clone())
-    };
     let password_matches = valid_password_length(&body.password)
-        && state.passwords.verify(password_hash, body.password).await;
-    let password_valid = password_matches
-        && if administrator {
-            supplied_username == admin_username
-        } else {
-            ordinary_candidate.is_some()
-        };
+        && state
+            .passwords
+            .verify(snapshot.password_hash.clone(), body.password)
+            .await;
+    let password_valid = password_matches && snapshot.principal.is_some();
     let supplied_second_factor = body
         .totp_code
         .as_deref()
@@ -590,7 +183,10 @@ async fn authenticate_account(
     if requires_second_factor_challenge(
         administrator,
         password_valid,
-        admin_totp_secret.as_deref(),
+        snapshot
+            .second_factor
+            .as_ref()
+            .map(|factor| factor.secret.as_str()),
         supplied_second_factor,
     ) {
         return Json(LoginResponse {
@@ -601,96 +197,44 @@ async fn authenticate_account(
         })
         .into_response();
     }
-    let second_factor_proof = if administrator && password_valid {
-        if let Some(secret) = admin_totp_secret.as_deref() {
+    let second_factor_proof = match snapshot.second_factor.as_ref() {
+        Some(factor) if password_valid => {
             verify_admin_second_factor_proof(
                 &state.passwords,
-                secret,
-                &recovery_hashes,
-                body.totp_code.as_deref().unwrap_or("").trim(),
+                &factor.secret,
+                &factor.recovery_hashes,
+                supplied_second_factor.unwrap_or(""),
             )
             .await
-        } else {
-            None
         }
-    } else {
-        None
-    };
-    let second_factor_valid =
-        !administrator || admin_totp_secret.is_none() || second_factor_proof.is_some();
-    let used_totp_counter = match second_factor_proof.as_ref() {
-        Some(AdminSecondFactorProof::TotpCounter(counter)) => Some(*counter),
         _ => None,
     };
-    let used_recovery_hash = match second_factor_proof {
-        Some(AdminSecondFactorProof::RecoveryHash(hash)) => Some(hash),
-        _ => None,
+    let authenticated =
+        password_valid && (snapshot.second_factor.is_none() || second_factor_proof.is_some());
+    let Some(principal) = snapshot.principal.clone().filter(|_| authenticated) else {
+        return failed_login_response(&state, entry, ip, user_agent, policy).await;
     };
-    let authenticated = password_valid
-        && second_factor_valid
-        && (administrator
-            || ordinary_candidate
-                .as_ref()
-                .is_some_and(|(_, _, enabled)| *enabled));
 
-    if authenticated {
-        // Credential verification is intentionally expensive and happens
-        // outside this lock. Before issuing a session, serialize against all
-        // credential changes and prove that the verified snapshot is still
-        // current. This closes the "verify old credential, then revoke, then
-        // issue a new session" race.
-        let auth_guard = state.auth_transitions.lock().await;
-        let snapshot_is_current = {
-            let config = state.config_file.read().await;
-            if administrator {
-                config.admin_username == admin_username
-                    && config.admin_password_hash == admin_hash
-                    && config.admin_totp_secret == admin_totp_secret
-                    && used_recovery_hash.as_ref().is_none_or(|used_hash| {
-                        config.admin_recovery_code_hashes.contains(used_hash)
-                    })
-            } else {
-                ordinary_candidate
-                    .as_ref()
-                    .and_then(|(id, password_hash, _)| {
-                        config
-                            .user_accounts
-                            .iter()
-                            .find(|account| account.id == *id)
-                            .map(|account| {
-                                account.enabled
-                                    && account.username == supplied_username
-                                    && account.password_hash == *password_hash
-                            })
-                    })
-                    .unwrap_or(false)
-            }
-        };
-        if !snapshot_is_current {
-            drop(auth_guard);
-            if let Err(error) = state
-                .login_security
-                .record_failure(entry, ip, user_agent, policy)
-                .await
-            {
-                return login_security_error(error);
-            }
-            return invalid_login_response(entry);
-        }
-        if let Some(counter) = used_totp_counter {
+    // Verification is expensive and runs outside this lock. Recheck the exact
+    // credential snapshot under the same guard used by credential changes,
+    // then keep the guard through proof consumption and session creation.
+    let auth_guard = state.auth_transitions.lock().await;
+    let snapshot_is_current = {
+        let config = state.config_file.read().await;
+        snapshot.is_current(&config, second_factor_proof.as_ref())
+    };
+    if !snapshot_is_current {
+        drop(auth_guard);
+        return failed_login_response(&state, entry, ip, user_agent, policy).await;
+    }
+    match second_factor_proof {
+        Some(AdminSecondFactorProof::TotpCounter(counter)) => {
             if !state.admin_totp_replay.consume(counter).await {
                 drop(auth_guard);
-                if let Err(error) = state
-                    .login_security
-                    .record_failure(entry, ip, user_agent, policy)
-                    .await
-                {
-                    return login_security_error(error);
-                }
-                return invalid_login_response(entry);
+                return failed_login_response(&state, entry, ip, user_agent, policy).await;
             }
         }
-        if let Some(used_hash) = used_recovery_hash {
+        Some(AdminSecondFactorProof::RecoveryHash(used_hash)) => {
             if let Err(error) = state
                 .update_config(move |config| {
                     let index = config
@@ -706,51 +250,34 @@ async fn authenticate_account(
                 return error.into_response();
             }
         }
-        if let Err(error) = state
-            .login_security
-            .record_success(entry, ip, user_agent)
-            .await
-        {
-            return login_security_error(error);
-        }
-        let token = if administrator {
-            state.sessions.create().await
-        } else {
-            state
-                .sessions
-                .create_user(
-                    ordinary_candidate
-                        .as_ref()
-                        .map(|(id, _, _)| id.clone())
-                        .unwrap_or_default(),
-                )
-                .await
-        };
-        drop(auth_guard);
-        json_with_cookie(
-            LoginResponse {
-                success: true,
-                message: "Authenticated".into(),
-                is_admin: administrator,
-                totp_required: false,
-            },
-            session_cookie(
-                "session",
-                &token,
-                SESSION_TTL.num_seconds() as u64,
-                state.config.secure_cookies,
-            ),
-        )
-    } else {
-        if let Err(error) = state
-            .login_security
-            .record_failure(entry, ip, user_agent, policy)
-            .await
-        {
-            return login_security_error(error);
-        }
-        invalid_login_response(entry)
+        None => {}
     }
+    if let Err(error) = state
+        .login_security
+        .record_success(entry, ip, user_agent)
+        .await
+    {
+        return login_security_error(error);
+    }
+    let token = match principal {
+        SessionPrincipal::Administrator => state.sessions.create().await,
+        SessionPrincipal::User(id) => state.sessions.create_user(id).await,
+    };
+    drop(auth_guard);
+    json_with_cookie(
+        LoginResponse {
+            success: true,
+            message: "Authenticated".into(),
+            is_admin: administrator,
+            totp_required: false,
+        },
+        session_cookie(
+            "session",
+            &token,
+            SESSION_TTL.num_seconds() as u64,
+            state.config.secure_cookies,
+        ),
+    )
 }
 
 fn requires_second_factor_challenge(
@@ -818,51 +345,45 @@ pub async fn me_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> impl axum::response::IntoResponse {
-    let mut logged_in = false;
-    let mut is_admin = false;
-    let mut username = None;
-
-    if let Some(token) = extract_session_token(&headers) {
-        if let Some(principal) = state.sessions.principal(&token).await {
-            logged_in = true;
-            match principal {
-                SessionPrincipal::Administrator => {
-                    is_admin = true;
-                    username = Some(state.config_file.read().await.admin_username.clone());
-                }
-                SessionPrincipal::User(id) => {
-                    username = state
-                        .config_file
-                        .read()
-                        .await
-                        .user_accounts
-                        .iter()
-                        .find(|account| account.id == id && account.enabled)
-                        .map(|account| account.username.clone());
-                    logged_in = username.is_some();
-                }
+    let principal = match extract_session_token(&headers) {
+        Some(token) => state.sessions.principal(&token).await,
+        None => None,
+    };
+    let mut response = {
+        let config = state.config_file.read().await;
+        let mut response = MeResponse {
+            logged_in: false,
+            is_admin: false,
+            username: None,
+            web_password_required: config.global_web_password_hash.is_some(),
+        };
+        match principal {
+            Some(SessionPrincipal::Administrator) => {
+                response.logged_in = true;
+                response.is_admin = true;
+                response.username = Some(config.admin_username.clone());
             }
+            Some(SessionPrincipal::User(id)) => {
+                response.username = config
+                    .user_accounts
+                    .iter()
+                    .find(|account| account.id == id && account.enabled)
+                    .map(|account| account.username.clone());
+                response.logged_in = response.username.is_some();
+            }
+            None => {}
         }
-    }
-    if !logged_in {
+        response
+    };
+    if !response.logged_in {
         if let Some(token) = extract_gate_token(&headers) {
             if state.gate_access.get_scope(&token).await.is_some() {
-                logged_in = true;
+                response.logged_in = true;
             }
         }
     }
 
-    Json(MeResponse {
-        logged_in,
-        is_admin,
-        username,
-        web_password_required: state
-            .config_file
-            .read()
-            .await
-            .global_web_password_hash
-            .is_some(),
-    })
+    Json(response)
 }
 
 pub async fn gate_handler(
@@ -871,12 +392,10 @@ pub async fn gate_handler(
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
-    let password_hash = state
-        .config_file
-        .read()
-        .await
-        .global_web_password_hash
-        .clone();
+    let snapshot = {
+        let config = state.config_file.read().await;
+        GateLoginSnapshot::capture(&config)
+    };
     let is_loopback = client_ip
         .map(|Extension(ClientIp(address))| address.is_loopback())
         .unwrap_or(false);
@@ -886,20 +405,14 @@ pub async fn gate_handler(
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
-    let web_policy = {
-        let config = state.config_file.read().await;
-        crate::login_security::LoginPolicy {
-            maximum_failures: config.web_login_failures,
-            block_seconds: config.web_login_block_seconds as i64,
-        }
-    };
+    let web_policy = snapshot.policy;
     let _attempt_guard = state.login_attempts.for_entry(LoginEntry::Web).lock().await;
     match state.login_security.is_blocked(LoginEntry::Web, ip).await {
         Ok(true) => return limited_login_response(web_policy.block_seconds),
         Ok(false) => {}
         Err(error) => return login_security_error(error),
     }
-    let authenticated = match password_hash.as_ref() {
+    let authenticated = match snapshot.password_hash.as_ref() {
         Some(hash) if valid_password_length(&body.password) => {
             state.passwords.verify(hash.clone(), body.password).await
         }
@@ -907,27 +420,13 @@ pub async fn gate_handler(
         None => is_loopback,
     };
     if !authenticated {
-        if let Err(error) = state
-            .login_security
-            .record_failure(LoginEntry::Web, ip, user_agent, web_policy)
-            .await
-        {
-            return login_security_error(error);
-        }
-        return invalid_login_response(LoginEntry::Web);
+        return failed_login_response(&state, LoginEntry::Web, ip, user_agent, web_policy).await;
     }
 
     let auth_guard = state.auth_transitions.lock().await;
-    if state.config_file.read().await.global_web_password_hash != password_hash {
+    if state.config_file.read().await.global_web_password_hash != snapshot.password_hash {
         drop(auth_guard);
-        if let Err(error) = state
-            .login_security
-            .record_failure(LoginEntry::Web, ip, user_agent, web_policy)
-            .await
-        {
-            return login_security_error(error);
-        }
-        return invalid_login_response(LoginEntry::Web);
+        return failed_login_response(&state, LoginEntry::Web, ip, user_agent, web_policy).await;
     }
     if let Err(error) = state
         .login_security
@@ -953,6 +452,23 @@ pub async fn gate_handler(
             state.config.secure_cookies,
         ),
     )
+}
+
+async fn failed_login_response(
+    state: &AppState,
+    entry: LoginEntry,
+    ip: std::net::IpAddr,
+    user_agent: Option<&str>,
+    policy: crate::login_security::LoginPolicy,
+) -> Response {
+    match state
+        .login_security
+        .record_failure(entry, ip, user_agent, policy)
+        .await
+    {
+        Ok(()) => invalid_login_response(entry),
+        Err(error) => login_security_error(error),
+    }
 }
 
 fn invalid_login_response(entry: LoginEntry) -> Response {
@@ -1001,11 +517,6 @@ fn login_security_error(error: anyhow::Error) -> Response {
         }),
     )
         .into_response()
-}
-
-fn valid_password_length(password: &str) -> bool {
-    let characters = password.chars().count();
-    (1..=1_024).contains(&characters) && password.len() <= 4_096
 }
 
 fn json_with_cookie<T: Serialize>(body: T, cookie: String) -> Response {
@@ -1146,12 +657,86 @@ pub async fn auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_basic_auth, invalid_login_response, limited_login_response,
-        requires_second_factor_challenge, verify_admin_second_factor_proof, AccessTokenStore,
-        AdminSecondFactorProof, PasswordService, SessionStore,
+        authenticate_account, extract_basic_auth, invalid_login_response, limited_login_response,
+        requires_second_factor_challenge, AccountLoginKind, LoginRequest,
     };
+    use crate::config::{hash_password, ConfigFile, UserAccount};
     use crate::login_security::LoginEntry;
+    use crate::test_support::{app_state, TestDirectory};
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+
+    #[tokio::test]
+    async fn pending_login_cannot_reissue_a_session_after_password_change() {
+        let directory = TestDirectory::new("login-credential-change");
+        let config = ConfigFile {
+            user_accounts: vec![UserAccount {
+                id: "reader-id".into(),
+                username: "reader".into(),
+                password_hash: hash_password("original-password"),
+                enabled: true,
+                permissions: vec![],
+            }],
+            ..ConfigFile::default()
+        };
+        let state = app_state(&directory, config).await;
+        let previous_session = state.sessions.create_user("reader-id".into()).await;
+        let auth_guard = state.auth_transitions.lock().await;
+        let login_state = state.clone();
+        let pending_login = tokio::spawn(async move {
+            authenticate_account(
+                login_state,
+                [127, 0, 0, 1].into(),
+                HeaderMap::new(),
+                LoginRequest {
+                    username: Some("reader".into()),
+                    password: "original-password".into(),
+                    totp_code: None,
+                },
+                AccountLoginKind::User,
+            )
+            .await
+        });
+        // Admission follows snapshot capture. Hold the credential transition
+        // until this request has captured the original password, without sleeps.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if state
+                    .login_attempts
+                    .for_entry(LoginEntry::Account)
+                    .try_lock()
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("login should capture its credentials before the transition");
+        let replacement_hash = hash_password("replacement-password");
+        state
+            .update_config(move |config| {
+                config.user_accounts[0].password_hash = replacement_hash;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        state.sessions.revoke_user("reader-id").await;
+        drop(auth_guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), pending_login)
+            .await
+            .expect("pending login should finish after the transition")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["success"], false);
+        assert!(state.sessions.principal(&previous_session).await.is_none());
+    }
 
     #[test]
     fn basic_auth_scheme_is_case_insensitive() {
@@ -1211,131 +796,5 @@ mod tests {
             Some("secret"),
             Some("123456")
         ));
-    }
-
-    #[tokio::test]
-    async fn shared_admin_second_factor_verifier_returns_consumable_evidence() {
-        let passwords = PasswordService::new(1);
-        let secret = crate::totp::generate_secret();
-        let code = crate::totp::current_code_for_test(&secret);
-        let proof = verify_admin_second_factor_proof(&passwords, &secret, &[], &code)
-            .await
-            .unwrap();
-        let AdminSecondFactorProof::TotpCounter(counter) = proof else {
-            panic!("current TOTP must produce counter evidence");
-        };
-        let replay = crate::totp::TotpReplayStore::default();
-        assert!(replay.consume(counter).await);
-        assert!(!replay.consume(counter).await);
-
-        let recovery = crate::totp::normalize_recovery_code("ABCDE-23456");
-        let hash = passwords.hash(recovery).await.unwrap();
-        let proof = verify_admin_second_factor_proof(
-            &passwords,
-            &secret,
-            std::slice::from_ref(&hash),
-            "abcde-23456",
-        )
-        .await;
-        assert_eq!(proof, Some(AdminSecondFactorProof::RecoveryHash(hash)));
-    }
-
-    #[tokio::test]
-    async fn credential_change_can_revoke_all_session_classes() {
-        let sessions = SessionStore::new();
-        let accesses = AccessTokenStore::new();
-        let session = sessions.create().await;
-        let gate = accesses.create("__gate__".into()).await;
-        assert!(sessions.validate(&session).await);
-        assert!(accesses.get_scope(&gate).await.is_some());
-
-        sessions.clear().await;
-        accesses.clear().await;
-        assert!(!sessions.validate(&session).await);
-        assert!(accesses.get_scope(&gate).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn ordinary_account_sessions_keep_their_identity_and_can_be_revoked_selectively() {
-        let sessions = SessionStore::new();
-        let administrator = sessions.create().await;
-        let first = sessions.create_user("first-user".into()).await;
-        let second = sessions.create_user("second-user".into()).await;
-
-        assert_eq!(
-            sessions.principal(&first).await,
-            Some(super::SessionPrincipal::User("first-user".into()))
-        );
-        sessions.revoke_user("first-user").await;
-
-        assert!(sessions.principal(&first).await.is_none());
-        assert_eq!(
-            sessions.principal(&administrator).await,
-            Some(super::SessionPrincipal::Administrator)
-        );
-        assert_eq!(
-            sessions.principal(&second).await,
-            Some(super::SessionPrincipal::User("second-user".into()))
-        );
-    }
-
-    #[tokio::test]
-    async fn administrator_has_one_session_and_revocation_preserves_users() {
-        let sessions = SessionStore::new();
-        let user = sessions.create_user("ordinary".into()).await;
-        let old_admin = sessions.create().await;
-        let admin = sessions.create().await;
-        assert!(!sessions.validate(&old_admin).await);
-        assert!(sessions.validate(&admin).await);
-        assert!(sessions.validate(&user).await);
-        sessions.revoke_administrator().await;
-        assert!(!sessions.validate(&admin).await);
-        assert!(sessions.validate(&user).await);
-    }
-
-    #[tokio::test]
-    async fn folder_credential_change_revokes_only_matching_scope() {
-        let accesses = AccessTokenStore::new();
-        let changed = accesses.create("locked/a".into()).await;
-        let other = accesses.create("locked/b".into()).await;
-        accesses.remove_scope("locked/a").await;
-        assert!(accesses.get_scope(&changed).await.is_none());
-        assert_eq!(
-            accesses.get_scope(&other).await.as_deref(),
-            Some("locked/b")
-        );
-    }
-
-    #[tokio::test]
-    async fn sessions_are_bounded_per_principal_and_globally() {
-        let sessions = SessionStore::with_limits(3, 2);
-        let first = sessions.create_user("same-user".into()).await;
-        let second = sessions.create_user("same-user".into()).await;
-        let newest = sessions.create_user("same-user".into()).await;
-        let surviving_same_user = usize::from(sessions.validate(&first).await)
-            + usize::from(sessions.validate(&second).await)
-            + usize::from(sessions.validate(&newest).await);
-        assert_eq!(surviving_same_user, 2);
-        assert!(sessions.validate(&newest).await);
-
-        let administrator = sessions.create().await;
-        let other = sessions.create_user("other-user".into()).await;
-        assert!(sessions.validate(&administrator).await);
-        assert!(sessions.validate(&other).await);
-        assert!(sessions.sessions.read().await.len() <= 3);
-    }
-
-    #[tokio::test]
-    async fn access_tokens_are_bounded_per_scope() {
-        let accesses = AccessTokenStore::with_limits(3, 2);
-        let first = accesses.create("same-scope".into()).await;
-        let second = accesses.create("same-scope".into()).await;
-        let newest = accesses.create("same-scope".into()).await;
-
-        let first_valid = accesses.get_scope(&first).await.is_some();
-        let second_valid = accesses.get_scope(&second).await.is_some();
-        assert_eq!(usize::from(first_valid) + usize::from(second_valid), 1);
-        assert!(accesses.get_scope(&newest).await.is_some());
-        assert!(accesses.accesses.read().await.len() <= 2);
     }
 }

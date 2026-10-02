@@ -1,7 +1,5 @@
-use serde::{Deserialize, Serialize};
-
 use super::{
-    internal_key, object_key, valid_transaction_id, CompletionMode, RawS3Metadata, S3Backend,
+    committed_cleanup::uncertain_transaction, internal_key, object_key, CompletionMode, S3Backend,
     S3_FILE_MOVE_JOURNAL_PURPOSE,
 };
 use crate::{
@@ -9,44 +7,32 @@ use crate::{
     storage::StorageService,
 };
 
-const SCHEMA_VERSION: u32 = 1;
-const JOURNAL_CATEGORY: &str = "file-move-transactions";
+mod record;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Stage {
-    Prepared,
-    DestinationCopied,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ObjectSnapshot {
-    size: u64,
-    etag: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Transaction {
-    schema_version: u32,
-    id: String,
-    source_relative: String,
-    destination_relative: String,
-    stage: Stage,
-    source: ObjectSnapshot,
-    destination: Option<ObjectSnapshot>,
-}
+use record::{
+    prepared_destination_matches, snapshot_matches, validate_transaction, ObjectSnapshot, Stage,
+    Transaction, JOURNAL_CATEGORY, SCHEMA_VERSION,
+};
 
 impl S3Backend {
+    /// Verify a copied destination before deleting the matching source.
+    /// S3 moves are not atomic; unresolved journaled work remains recoverable.
     pub async fn move_file(&self, source: &str, destination: &str) -> AppResult<()> {
+        let backend = self.scoped_work(None, None);
+        Box::pin(backend.move_file_scoped(source, destination)).await
+    }
+
+    async fn move_file_scoped(&self, source: &str, destination: &str) -> AppResult<()> {
         let source = StorageService::normalize_relative(source)?;
         let destination = StorageService::normalize_relative(destination)?;
         if source.is_empty() || destination.is_empty() || source == destination {
             return Err(AppError::BadRequest("无效的文件移动路径".into()));
         }
 
-        let _mutation = self.mutation_gate.lock().await;
+        let _mutation = self
+            .maintenance
+            .read(async { Ok(self.mutation_gate.lock().await) })
+            .await?;
         let source_metadata = self.metadata(&source).await?;
         if source_metadata.is_dir {
             return Err(AppError::Conflict("当前操作只接受普通文件".into()));
@@ -86,23 +72,18 @@ impl S3Backend {
             CompletionMode::Foreground,
         )
         .await
-        .map_err(super::committed_cleanup::uncertain_transaction)
+        .map_err(uncertain_transaction)
     }
 
-    pub(super) async fn recover_file_move_transactions(&self) -> AppResult<usize> {
-        let keys = self.list_recovery_journal_keys(JOURNAL_CATEGORY).await?;
-        let recovered = keys.len();
-        for key in keys {
-            let (mut transaction, journal_etag) = self.read_file_move_transaction(&key).await?;
-            self.execute_file_move_transaction(
-                &key,
-                Some(journal_etag),
-                &mut transaction,
-                CompletionMode::Recovery,
-            )
-            .await?;
-        }
-        Ok(recovered)
+    pub(super) async fn recover_file_move_transaction(&self, key: &str) -> AppResult<()> {
+        let (mut transaction, journal_etag) = self.read_file_move_transaction(key).await?;
+        self.execute_file_move_transaction(
+            key,
+            Some(journal_etag),
+            &mut transaction,
+            CompletionMode::Recovery,
+        )
+        .await
     }
 
     async fn execute_file_move_transaction(
@@ -115,10 +96,8 @@ impl S3Backend {
         validate_transaction(&self.prefix, journal_key, transaction)?;
         let source_key = object_key(&self.prefix, &transaction.source_relative)?;
         let destination_key = object_key(&self.prefix, &transaction.destination_relative)?;
-        let mut source = self.head_key(&source_key).await?;
-        let mut destination = self.head_key(&destination_key).await?;
-
         if transaction.stage == Stage::Prepared {
+            let source = self.head_key(&source_key).await?;
             if !source
                 .as_ref()
                 .is_some_and(|metadata| snapshot_matches(metadata, &transaction.source))
@@ -128,6 +107,7 @@ impl S3Backend {
                 ));
             }
 
+            let destination = self.head_key(&destination_key).await?;
             let destination_etag = match destination.as_ref() {
                 None => {
                     self.copy_key_with_operation(
@@ -149,7 +129,7 @@ impl S3Backend {
                     ));
                 }
             };
-            destination = self.head_key(&destination_key).await?;
+            let destination = self.head_key(&destination_key).await?;
             let destination_metadata = destination.as_ref().ok_or_else(|| {
                 AppError::ServiceUnavailable("对象存储移动目标在复制后不可见".into())
             })?;
@@ -177,7 +157,7 @@ impl S3Backend {
             .destination
             .as_ref()
             .ok_or_else(|| AppError::ServiceUnavailable("对象存储移动事务缺少目标快照".into()))?;
-        destination = self.head_key(&destination_key).await?;
+        let destination = self.head_key(&destination_key).await?;
         if !destination
             .as_ref()
             .is_some_and(|metadata| snapshot_matches(metadata, recorded_destination))
@@ -187,25 +167,13 @@ impl S3Backend {
             ));
         }
 
-        source = self.head_key(&source_key).await?;
+        let source = self.head_key(&source_key).await?;
         match source.as_ref() {
             None => {}
             Some(metadata) if snapshot_matches(metadata, &transaction.source) => {
-                if let Err(error) = self
-                    .delete_key(&source_key, Some(&transaction.source.etag))
+                self.delete_key_after_identity_check(&source_key, Some(&transaction.source.etag))
                     .await
-                {
-                    if !matches!(self.head_key(&source_key).await, Ok(None)) {
-                        return Err(
-                            error.with_operation(CommitState::Unknown, CleanupState::Pending)
-                        );
-                    }
-                }
-                if self.head_key(&source_key).await?.is_some() {
-                    return Err(ambiguous_move(
-                        "对象存储未能确认移动源已经删除；已保留事务供恢复核对",
-                    ));
-                }
+                    .map_err(uncertain_transaction)?;
             }
             Some(_) => {
                 return Err(ambiguous_move(
@@ -244,112 +212,10 @@ impl S3Backend {
     }
 }
 
-fn snapshot_matches(metadata: &RawS3Metadata, snapshot: &ObjectSnapshot) -> bool {
-    metadata.size == snapshot.size && metadata.etag.as_deref() == Some(snapshot.etag.as_str())
-}
-
-fn prepared_destination_matches(metadata: &RawS3Metadata, transaction: &Transaction) -> bool {
-    metadata.size == transaction.source.size
-        && metadata.etag.is_some()
-        && (metadata.etag.as_deref() == Some(transaction.source.etag.as_str())
-            || metadata.operation_id.as_deref() == Some(transaction.id.as_str()))
-}
-
-fn validate_transaction(
-    prefix: &str,
-    journal_key: &str,
-    transaction: &Transaction,
-) -> AppResult<()> {
-    let source = StorageService::normalize_relative(&transaction.source_relative)?;
-    let destination = StorageService::normalize_relative(&transaction.destination_relative)?;
-    let valid_destination = match transaction.stage {
-        Stage::Prepared => transaction.destination.is_none(),
-        Stage::DestinationCopied => transaction.destination.as_ref().is_some_and(valid_snapshot),
-    };
-    if transaction.schema_version != SCHEMA_VERSION
-        || !valid_transaction_id(&transaction.id)
-        || journal_key != internal_key(prefix, JOURNAL_CATEGORY, &transaction.id)
-        || source.is_empty()
-        || destination.is_empty()
-        || source != transaction.source_relative
-        || destination != transaction.destination_relative
-        || source == destination
-        || !valid_snapshot(&transaction.source)
-        || !valid_destination
-    {
-        return Err(AppError::ServiceUnavailable(
-            "对象存储单文件移动记录无法安全处理".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn valid_snapshot(snapshot: &ObjectSnapshot) -> bool {
-    !snapshot.etag.is_empty()
-        && snapshot.etag.len() <= 4_096
-        && !snapshot.etag.chars().any(char::is_control)
-}
-
 fn ambiguous_move(message: &'static str) -> AppError {
     AppError::ServiceUnavailable(message.into())
         .with_operation(CommitState::Unknown, CleanupState::Pending)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn transaction(stage: Stage) -> Transaction {
-        Transaction {
-            schema_version: SCHEMA_VERSION,
-            id: "0123456789abcdef0123456789abcdef".into(),
-            source_relative: "source.bin".into(),
-            destination_relative: "folder/destination.bin".into(),
-            stage,
-            source: ObjectSnapshot {
-                size: 42,
-                etag: "source-etag".into(),
-            },
-            destination: None,
-        }
-    }
-
-    #[test]
-    fn move_records_require_exact_stage_snapshots_and_namespace() {
-        let mut value = transaction(Stage::Prepared);
-        let key = internal_key("tenant/", JOURNAL_CATEGORY, &value.id);
-        assert!(validate_transaction("tenant/", &key, &value).is_ok());
-
-        value.stage = Stage::DestinationCopied;
-        assert!(validate_transaction("tenant/", &key, &value).is_err());
-        value.destination = Some(ObjectSnapshot {
-            size: 42,
-            etag: "destination-etag".into(),
-        });
-        assert!(validate_transaction("tenant/", &key, &value).is_ok());
-
-        value.source_relative = "../outside".into();
-        assert!(validate_transaction("tenant/", &key, &value).is_err());
-        value.source_relative = "source.bin".into();
-        assert!(validate_transaction("tenant/", "other/key", &value).is_err());
-    }
-
-    #[test]
-    fn prepared_move_accepts_only_source_etag_or_operation_marker() {
-        let value = transaction(Stage::Prepared);
-        let mut metadata = RawS3Metadata {
-            size: 42,
-            etag: Some("source-etag".into()),
-            content_type: None,
-            operation_id: None,
-        };
-        assert!(prepared_destination_matches(&metadata, &value));
-
-        metadata.etag = Some("multipart-etag".into());
-        assert!(!prepared_destination_matches(&metadata, &value));
-        metadata.operation_id = Some(value.id.clone());
-        assert!(prepared_destination_matches(&metadata, &value));
-        metadata.size = 41;
-        assert!(!prepared_destination_matches(&metadata, &value));
-    }
-}
+mod tests;

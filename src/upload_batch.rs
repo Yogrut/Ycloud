@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -13,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+mod item;
 mod persistence;
+use item::{classify_upload_result, UploadItem};
+pub use item::{UploadBegin, UploadStatus};
 use persistence::BatchPersistence;
 
 use crate::{
@@ -28,6 +34,7 @@ use crate::{
 };
 
 const MAX_ACTIVE_BATCHES: usize = 32;
+const MAX_ACTIVE_BATCHES_PER_ACCOUNT: usize = 4;
 const MAX_ACTIVE_BATCH_ITEMS: usize = 20_000;
 const MAX_RETAINED_BATCHES: usize = 128;
 const MAX_RETAINED_BATCH_ITEMS: usize = 40_000;
@@ -38,6 +45,9 @@ pub struct UploadBatchStore {
     ttl: Duration,
     result_ttl: Duration,
     prepare_gate: Arc<Mutex<()>>,
+    // Fences directory planning across administrator storage edits without
+    // making those edits wait for a slow local or S3 directory listing.
+    invalidation_epoch: Arc<AtomicU64>,
     persistence: Option<Arc<BatchPersistence>>,
     receipt_registry: Arc<std::sync::OnceLock<crate::storage_backend::StorageRegistry>>,
 }
@@ -53,28 +63,57 @@ struct UploadBatch {
     items: HashMap<String, UploadItem>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UploadStatus {
-    Pending,
-    InProgress,
-    Complete,
-    Failed,
-    Unknown,
-    Cancelled,
+/// Request-local counts derived while the batch map is locked. They are never
+/// stored beside the map, so later cancellation or completion cannot stale them.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct BatchUsage {
+    retained_batches: usize,
+    retained_items: usize,
+    active_batches: usize,
+    account_batches: usize,
+    active_items: usize,
 }
 
-struct UploadItem {
-    request_path: String,
-    size: u64,
-    status: UploadStatus,
-    operation: Option<OperationOutcome>,
+impl BatchUsage {
+    fn from_batches(batches: &HashMap<String, UploadBatch>, account: &str) -> Self {
+        let mut usage = Self {
+            retained_batches: batches.len(),
+            ..Self::default()
+        };
+        for batch in batches.values() {
+            let active_items = batch
+                .items
+                .values()
+                .filter(|item| !item.status.is_terminal())
+                .count();
+            usage.retained_items = usage.retained_items.saturating_add(batch.items.len());
+            usage.active_items = usage.active_items.saturating_add(active_items);
+            if active_items > 0 {
+                usage.active_batches += 1;
+                if batch.account == account {
+                    usage.account_batches += 1;
+                }
+            }
+        }
+        usage
+    }
+
+    fn requires_retirement(&self, incoming_items: usize) -> bool {
+        self.retained_batches >= MAX_RETAINED_BATCHES
+            || self.retained_items.saturating_add(incoming_items) > MAX_RETAINED_BATCH_ITEMS
+    }
+
+    fn can_admit(&self, incoming_items: usize) -> bool {
+        !self.requires_retirement(incoming_items)
+            && self.active_batches < MAX_ACTIVE_BATCHES
+            && self.account_batches < MAX_ACTIVE_BATCHES_PER_ACCOUNT
+            && self.active_items.saturating_add(incoming_items) <= MAX_ACTIVE_BATCH_ITEMS
+    }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UploadBegin {
-    Start,
-    AlreadyComplete(Option<OperationOutcome>),
+struct UploadPlanningFence {
+    epoch: u64,
+    guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 /// The execution owner, not the HTTP waiter, settles the ticket. If that
@@ -186,7 +225,7 @@ impl UploadBatchStore {
     }
     pub(crate) async fn sweep_expired(&self) {
         let mut batches = self.batches.lock().await;
-        let _ = self.prune_expired(&mut batches).await;
+        self.prune_expired(&mut batches);
     }
     pub(crate) async fn reconcile_receipts(
         &self,
@@ -210,7 +249,9 @@ impl UploadBatchStore {
         }
         Ok(())
     }
-    async fn prune_expired(&self, batches: &mut HashMap<String, UploadBatch>) -> AppResult<()> {
+    // Removing a registry entry only schedules durable index/receipt cleanup;
+    // it neither waits for that cleanup nor reports it as completed.
+    fn prune_expired(&self, batches: &mut HashMap<String, UploadBatch>) {
         let now = Instant::now();
         let expired = batches
             .iter()
@@ -222,7 +263,6 @@ impl UploadBatchStore {
                 self.retire_batch(token, batch);
             }
         }
-        Ok(())
     }
     pub(crate) async fn unknown_items(&self) -> Vec<UnknownUpload> {
         let batches = self.batches.lock().await;
@@ -254,11 +294,7 @@ impl UploadBatchStore {
         })
     }
 
-    pub(crate) async fn resolve_unknown(
-        &self,
-        review: &UnknownUpload,
-        committed: bool,
-    ) -> AppResult<()> {
+    pub(crate) async fn confirm_unknown_committed(&self, review: &UnknownUpload) -> AppResult<()> {
         let mut batches = self.batches.lock().await;
         let batch = batches.get_mut(&review.ticket).ok_or(AppError::NotFound)?;
         if batch.storage_id != review.storage_id {
@@ -271,32 +307,20 @@ impl UploadBatchStore {
         if item.status != UploadStatus::Unknown {
             return Err(AppError::Conflict("任务状态已经变化，请刷新".into()));
         }
-        let status = if committed {
-            UploadStatus::Complete
-        } else {
-            UploadStatus::Failed
-        };
-        let operation = if committed {
-            None
-        } else {
-            AppError::ClientClosedRequest
-                .with_operation(CommitState::NotCommitted, CleanupState::Complete)
-                .operation()
-        };
         let expires_unix = batch_expires_unix(self.result_ttl);
         if let Some(persistence) = &self.persistence {
             persistence
                 .update(
                     &review.ticket,
                     &review.path,
-                    status,
-                    operation,
+                    UploadStatus::Complete,
+                    None,
                     expires_unix,
                 )
                 .await?;
         }
-        item.status = status;
-        item.operation = operation;
+        item.status = UploadStatus::Complete;
+        item.operation = None;
         batch.expires_at = Instant::now() + self.result_ttl;
         batch.expires_unix = expires_unix;
         if !batch_has_recovery_work(batch) {
@@ -307,15 +331,13 @@ impl UploadBatchStore {
 
     #[cfg(test)]
     pub async fn ensure_storage_idle(&self, storage_id: &str) -> AppResult<()> {
-        if self.batches.lock().await.values().any(|batch| {
-            batch.storage_id == storage_id
-                && batch.items.values().any(|item| {
-                    matches!(
-                        item.status,
-                        UploadStatus::InProgress | UploadStatus::Unknown
-                    )
-                })
-        }) {
+        if self
+            .batches
+            .lock()
+            .await
+            .values()
+            .any(|batch| batch.storage_id == storage_id && batch_has_recovery_work(batch))
+        {
             return Err(AppError::Conflict(
                 "存储仍有正在执行或后台自动恢复的上传，请稍后重试".into(),
             ));
@@ -329,6 +351,7 @@ impl UploadBatchStore {
         backend: Option<crate::storage_backend::StorageBackend>,
     ) {
         let mut batches = self.batches.lock().await;
+        self.invalidation_epoch.fetch_add(1, Ordering::AcqRel);
         for batch in batches
             .values_mut()
             .filter(|batch| batch.storage_id == storage_id && batch.recovery_backend.is_none())
@@ -350,6 +373,7 @@ impl UploadBatchStore {
             ttl,
             result_ttl: ttl,
             prepare_gate: Arc::new(Mutex::new(())),
+            invalidation_epoch: Arc::new(AtomicU64::new(0)),
             persistence: None,
             receipt_registry: Arc::new(std::sync::OnceLock::new()),
         }
@@ -362,11 +386,13 @@ impl UploadBatchStore {
             ttl,
             result_ttl: Duration::from_secs(24 * 60 * 60),
             prepare_gate: Arc::new(Mutex::new(())),
+            invalidation_epoch: Arc::new(AtomicU64::new(0)),
             persistence: Some(Arc::new(persistence)),
             receipt_registry: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
+    #[cfg(test)]
     pub async fn create(
         &self,
         subject: RequestSubject,
@@ -380,6 +406,7 @@ impl UploadBatchStore {
             .await
     }
 
+    #[cfg(test)]
     async fn create_for_account(
         &self,
         subject: RequestSubject,
@@ -391,6 +418,7 @@ impl UploadBatchStore {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn create_for_account_with_namespace(
         &self,
         subject: RequestSubject,
@@ -399,51 +427,87 @@ impl UploadBatchStore {
         items: HashMap<String, (String, u64)>,
         namespace_id: Option<String>,
     ) -> AppResult<String> {
+        let expected_epoch = self.invalidation_epoch.load(Ordering::Acquire);
+        self.create_for_account_with_namespace_owned(
+            subject,
+            account,
+            storage_id,
+            items,
+            namespace_id,
+            expected_epoch,
+        )
+        .await
+    }
+
+    async fn create_for_account_with_namespace_planned(
+        &self,
+        subject: RequestSubject,
+        account: String,
+        storage_id: String,
+        items: HashMap<String, (String, u64)>,
+        namespace_id: Option<String>,
+        planning: UploadPlanningFence,
+    ) -> AppResult<String> {
+        // Once creation starts, its disk manifest and in-memory reservation
+        // must settle together even if the HTTP waiter disconnects. Retain
+        // the planning gate so another request cannot queue behind an orphan.
+        let store = self.clone();
+        tokio::spawn(async move {
+            let _planning_guard = planning.guard;
+            store
+                .create_for_account_with_namespace_owned(
+                    subject,
+                    account,
+                    storage_id,
+                    items,
+                    namespace_id,
+                    planning.epoch,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| AppError::with_source("upload batch creation task failed", error))?
+    }
+
+    async fn create_for_account_with_namespace_owned(
+        &self,
+        subject: RequestSubject,
+        account: String,
+        storage_id: String,
+        items: HashMap<String, (String, u64)>,
+        namespace_id: Option<String>,
+        expected_epoch: u64,
+    ) -> AppResult<String> {
         let mut batches = self.batches.lock().await;
+        if self.invalidation_epoch.load(Ordering::Acquire) != expected_epoch {
+            return Err(AppError::Conflict(
+                "存储设置在上传准备期间已变化，请重新选择文件".into(),
+            ));
+        }
         let now = Instant::now();
-        self.prune_expired(&mut batches).await?;
-        while batches.len() >= MAX_RETAINED_BATCHES
-            || retained_item_count(&batches).saturating_add(items.len()) > MAX_RETAINED_BATCH_ITEMS
-        {
-            let Some(expired_first) = batches
+        self.prune_expired(&mut batches);
+        let mut usage = BatchUsage::from_batches(&batches, &account);
+        if usage.requires_retirement(items.len()) {
+            // Snapshot only when space is needed. All candidates are terminal,
+            // so retiring them cannot change active/account admission counts.
+            let mut completed = batches
                 .iter()
                 .filter(|(_, batch)| batch_is_terminal(batch))
-                .min_by_key(|(_, batch)| batch.expires_at)
-                .map(|(token, _)| token.clone())
-            else {
-                break;
-            };
-            if let Some(batch) = batches.remove(&expired_first) {
-                self.retire_batch(expired_first, batch);
+                .map(|(token, batch)| (token.clone(), batch.expires_at))
+                .collect::<Vec<_>>();
+            completed.sort_by_key(|(_, expires_at)| *expires_at);
+            for (token, _) in completed {
+                if !usage.requires_retirement(items.len()) {
+                    break;
+                }
+                if let Some(batch) = batches.remove(&token) {
+                    usage.retained_batches -= 1;
+                    usage.retained_items -= batch.items.len();
+                    self.retire_batch(token, batch);
+                }
             }
         }
-        if batches.len() >= MAX_RETAINED_BATCHES
-            || retained_item_count(&batches).saturating_add(items.len()) > MAX_RETAINED_BATCH_ITEMS
-        {
-            return Err(AppError::TooManyRequests);
-        }
-        let active_batches = batches
-            .values()
-            .filter(|batch| !batch_is_terminal(batch))
-            .count();
-        if active_batches >= MAX_ACTIVE_BATCHES {
-            return Err(AppError::TooManyRequests);
-        }
-        if batches
-            .values()
-            .filter(|batch| batch.account == account && !batch_is_terminal(batch))
-            .count()
-            >= 4
-        {
-            return Err(AppError::TooManyRequests);
-        }
-        let active_items = batches
-            .values()
-            .flat_map(|batch| batch.items.values())
-            .filter(|item| !item_is_terminal(item))
-            .try_fold(0_usize, |total, _| total.checked_add(1))
-            .ok_or(AppError::TooManyRequests)?;
-        if active_items.saturating_add(items.len()) > MAX_ACTIVE_BATCH_ITEMS {
+        if !usage.can_admit(items.len()) {
             return Err(AppError::TooManyRequests);
         }
         let token = Uuid::new_v4().to_string();
@@ -488,12 +552,7 @@ impl UploadBatchStore {
                 batch
                     .items
                     .iter()
-                    .filter(|(_, item)| {
-                        !matches!(
-                            item.status,
-                            UploadStatus::Complete | UploadStatus::Cancelled | UploadStatus::Failed
-                        )
-                    })
+                    .filter(|(_, item)| !item.status.is_terminal())
                     .map(|(path, _)| path.clone())
             })
             .collect()
@@ -509,7 +568,7 @@ impl UploadBatchStore {
     ) -> AppResult<UploadBegin> {
         let mut batches = self.batches.lock().await;
         let now = Instant::now();
-        self.prune_expired(&mut batches).await?;
+        self.prune_expired(&mut batches);
         let batch = batches.get_mut(token).ok_or(AppError::UploadBatchExpired)?;
         if batch.subject.as_ref() != Some(subject) || batch.storage_id != storage_id {
             return Err(AppError::Forbidden);
@@ -521,25 +580,9 @@ impl UploadBatchStore {
         if item.size != size {
             return Err(AppError::BadRequest("上传文件大小与批次声明不一致".into()));
         }
-        match item.status {
-            UploadStatus::Pending | UploadStatus::Failed => {}
-            UploadStatus::Complete => return Ok(UploadBegin::AlreadyComplete(item.operation)),
-            UploadStatus::InProgress => {
-                return Err(AppError::Conflict("上传目标正在执行".into()));
-            }
-            UploadStatus::Unknown => {
-                let outcome = item.operation;
-                return Err(AppError::Conflict(
-                    "上传结果尚未确认，请先查询任务状态，不要直接重试".into(),
-                )
-                .with_operation(
-                    outcome.map_or(CommitState::Unknown, |value| value.commit),
-                    outcome.map_or(CleanupState::Unknown, |value| value.cleanup),
-                ));
-            }
-            UploadStatus::Cancelled => {
-                return Err(AppError::Conflict("上传目标已取消".into()));
-            }
+        match item.begin_decision()? {
+            UploadBegin::Start => {}
+            completed @ UploadBegin::AlreadyComplete(_) => return Ok(completed),
         }
         let expires_unix = batch_expires_unix(self.ttl);
         if let Some(persistence) = &self.persistence {
@@ -563,7 +606,7 @@ impl UploadBatchStore {
     ) -> AppResult<()> {
         let mut batches = self.batches.lock().await;
         let now = Instant::now();
-        self.prune_expired(&mut batches).await?;
+        self.prune_expired(&mut batches);
         let Some(batch) = batches.get_mut(token) else {
             return Ok(());
         };
@@ -579,7 +622,7 @@ impl UploadBatchStore {
             if paths.is_some_and(|paths| !paths.contains(path)) {
                 continue;
             }
-            if matches!(item.status, UploadStatus::Pending | UploadStatus::Failed) {
+            if item.status.can_cancel() {
                 if let Some(persistence) = &self.persistence {
                     persistence
                         .update(
@@ -606,26 +649,13 @@ impl UploadBatchStore {
     }
 
     pub async fn finish_result<T>(&self, token: &str, path: &str, result: &AppResult<T>) {
-        let (status, operation) = match result {
-            Ok(_) => (UploadStatus::Complete, None),
-            Err(error) => match error.operation() {
-                Some(outcome) if outcome.commit == CommitState::Committed => {
-                    (UploadStatus::Complete, Some(outcome))
-                }
-                Some(outcome) if outcome.commit == CommitState::Unknown => {
-                    (UploadStatus::Unknown, Some(outcome))
-                }
-                Some(outcome) if outcome.cleanup != CleanupState::Complete => {
-                    (UploadStatus::Unknown, Some(outcome))
-                }
-                outcome => (UploadStatus::Failed, outcome),
-            },
-        };
+        let (status, operation) = classify_upload_result(result);
         self.finish_with_status(token, path, status, operation)
             .await;
     }
 
-    pub async fn finish(&self, token: &str, path: &str, succeeded: bool) {
+    #[cfg(test)]
+    async fn finish(&self, token: &str, path: &str, succeeded: bool) {
         self.finish_with_status(
             token,
             path,
@@ -653,11 +683,8 @@ impl UploadBatchStore {
         let terminal = batch
             .items
             .iter()
-            .all(|(key, value)| key == path || item_is_terminal(value))
-            && matches!(
-                status,
-                UploadStatus::Complete | UploadStatus::Failed | UploadStatus::Cancelled
-            );
+            .all(|(key, value)| key == path || value.status.is_terminal())
+            && status.is_terminal();
         let Some(item) = batch.items.get_mut(path) else {
             return;
         };
@@ -709,7 +736,7 @@ impl UploadBatchStore {
         storage_id: &str,
     ) -> AppResult<UploadBatchStatusResponse> {
         let mut batches = self.batches.lock().await;
-        self.prune_expired(&mut batches).await?;
+        self.prune_expired(&mut batches);
         let batch = batches.get(token).ok_or(AppError::UploadBatchExpired)?;
         if batch.storage_id != storage_id
             || (batch.subject.as_ref() != Some(subject) && account != Some(batch.account.as_str()))
@@ -797,29 +824,14 @@ fn batch_is_retained(batch: &UploadBatch, now: Instant) -> bool {
 }
 
 fn batch_has_recovery_work(batch: &UploadBatch) -> bool {
-    batch.items.values().any(|item| {
-        matches!(
-            item.status,
-            UploadStatus::InProgress | UploadStatus::Unknown
-        )
-    })
-}
-
-fn item_is_terminal(item: &UploadItem) -> bool {
-    matches!(
-        item.status,
-        UploadStatus::Complete | UploadStatus::Cancelled | UploadStatus::Failed
-    )
+    batch
+        .items
+        .values()
+        .any(|item| item.status.needs_recovery())
 }
 
 fn batch_is_terminal(batch: &UploadBatch) -> bool {
-    batch.items.values().all(item_is_terminal)
-}
-
-fn retained_item_count(batches: &HashMap<String, UploadBatch>) -> usize {
-    batches.values().fold(0_usize, |total, batch| {
-        total.saturating_add(batch.items.len())
-    })
+    batch.items.values().all(|item| item.status.is_terminal())
 }
 
 #[derive(Deserialize)]
@@ -894,6 +906,10 @@ pub async fn prepare_upload_batch(
     Query(query): Query<FileQuery>,
     Json(body): Json<PrepareUploadBatchRequest>,
 ) -> AppResult<Json<PrepareUploadBatchResponse>> {
+    let expected_epoch = state
+        .upload_batches
+        .invalidation_epoch
+        .load(Ordering::Acquire);
     let share = crate::file_access::resolve_write_share(&state, &headers, &query).await?;
     ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Upload).await?;
     let subject = auth::current_request_subject(&state, &headers)
@@ -908,7 +924,7 @@ pub async fn prepare_upload_batch(
         return Err(AppError::PayloadTooLarge);
     }
     // Serialize only name planning, never the upload body. Pending names belong to tickets.
-    let _planning = state.upload_batches.prepare_gate.lock().await;
+    let planning_guard = state.upload_batches.prepare_gate.clone().lock_owned().await;
     let backend = state.storage_backend(&share.storage_id).await?;
     let mut reserved = state.upload_batches.reserved_paths(&share.storage_id).await;
     let mut directory_names: HashMap<String, HashSet<String>> = HashMap::new();
@@ -998,7 +1014,7 @@ pub async fn prepare_upload_batch(
     }
     let ticket = state
         .upload_batches
-        .create_for_account_with_namespace(
+        .create_for_account_with_namespace_planned(
             subject,
             crate::traffic::browser_subject(&state, &headers).await,
             share.storage_id.clone(),
@@ -1012,6 +1028,10 @@ pub async fn prepare_upload_batch(
                     .ok_or(AppError::NotFound)?
                     .backend,
             )?),
+            UploadPlanningFence {
+                epoch: expected_epoch,
+                guard: planning_guard,
+            },
         )
         .await?;
     Ok(Json(PrepareUploadBatchResponse {
@@ -1083,6 +1103,594 @@ pub async fn upload_batch_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admission_batch(
+        account: &str,
+        count: usize,
+        status: UploadStatus,
+        expires_at: Instant,
+    ) -> UploadBatch {
+        UploadBatch {
+            recovery_backend: None,
+            subject: Some(subject("owner")),
+            account: account.into(),
+            storage_id: "local".into(),
+            namespace_id: None,
+            expires_at,
+            expires_unix: batch_expires_unix(Duration::from_secs(3600)),
+            items: (0..count)
+                .map(|index| {
+                    let path = format!("{index}.txt");
+                    (
+                        path.clone(),
+                        UploadItem {
+                            request_path: path,
+                            size: 4,
+                            status,
+                            operation: operation_for_status(status),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn active_item_budget_excludes_ended_items_and_reopens_after_a_failure() {
+        let store = UploadBatchStore::new(Duration::from_secs(60));
+        let owner = subject("owner");
+        let ticket = store
+            .create(
+                owner.clone(),
+                "local".into(),
+                (0..MAX_ACTIVE_BATCH_ITEMS)
+                    .map(|index| (format!("{index}.txt"), (format!("{index}.txt"), 4)))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let incoming = || HashMap::from([("next.txt".into(), ("next.txt".into(), 4))]);
+        assert!(matches!(
+            store
+                .create(owner.clone(), "local".into(), incoming())
+                .await,
+            Err(AppError::TooManyRequests)
+        ));
+        store.finish(&ticket, "0.txt", false).await;
+        store
+            .create(owner, "local".into(), incoming())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retained_item_pressure_retires_only_the_oldest_terminal_batch() {
+        let store = UploadBatchStore::new(Duration::from_secs(60));
+        let now = Instant::now();
+        let mut unknown = admission_batch(
+            "other",
+            10_000,
+            UploadStatus::Complete,
+            now + Duration::from_secs(100),
+        );
+        unknown.items.get_mut("0.txt").unwrap().status = UploadStatus::Unknown;
+        let mut pending = admission_batch(
+            "other",
+            10_000,
+            UploadStatus::Failed,
+            now + Duration::from_secs(200),
+        );
+        pending.items.get_mut("0.txt").unwrap().status = UploadStatus::Pending;
+        store.batches.lock().await.extend([
+            ("unknown".into(), unknown),
+            ("pending".into(), pending),
+            (
+                "oldest".into(),
+                admission_batch(
+                    "other",
+                    10_000,
+                    UploadStatus::Complete,
+                    now + Duration::from_secs(300),
+                ),
+            ),
+            (
+                "newer".into(),
+                admission_batch(
+                    "other",
+                    10_000,
+                    UploadStatus::Cancelled,
+                    now + Duration::from_secs(400),
+                ),
+            ),
+        ]);
+        let ticket = store
+            .create(subject("owner"), "local".into(), items())
+            .await
+            .unwrap();
+        let batches = store.batches.lock().await;
+        assert!(!batches.contains_key("oldest"));
+        for retained in ["unknown", "pending", "newer", &ticket] {
+            assert!(batches.contains_key(retained));
+        }
+        assert_eq!(batches.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn retained_batch_pressure_keeps_live_work_and_retires_the_oldest_result() {
+        let store = UploadBatchStore::new(Duration::from_secs(60));
+        let now = Instant::now();
+        {
+            let mut batches = store.batches.lock().await;
+            batches.insert(
+                "unknown".into(),
+                admission_batch(
+                    "other",
+                    1,
+                    UploadStatus::Unknown,
+                    now + Duration::from_secs(100),
+                ),
+            );
+            batches.insert(
+                "pending".into(),
+                admission_batch(
+                    "other",
+                    1,
+                    UploadStatus::Pending,
+                    now + Duration::from_secs(200),
+                ),
+            );
+            for index in 0..MAX_RETAINED_BATCHES - 2 {
+                batches.insert(
+                    format!("result-{index}"),
+                    admission_batch(
+                        "other",
+                        1,
+                        UploadStatus::Complete,
+                        now + Duration::from_secs(300 + index as u64),
+                    ),
+                );
+            }
+        }
+        let ticket = store
+            .create(subject("owner"), "local".into(), items())
+            .await
+            .unwrap();
+        let batches = store.batches.lock().await;
+        assert!(!batches.contains_key("result-0"));
+        assert!(batches.contains_key("result-1"));
+        assert!(batches.contains_key("unknown"));
+        assert!(batches.contains_key("pending"));
+        assert!(batches.contains_key(&ticket));
+        assert_eq!(batches.len(), MAX_RETAINED_BATCHES);
+    }
+
+    #[tokio::test]
+    async fn result_retirement_still_precedes_active_limit_rejection() {
+        let store = UploadBatchStore::new(Duration::from_secs(60));
+        let now = Instant::now();
+        let mut unknown = admission_batch(
+            "other",
+            MAX_ACTIVE_BATCH_ITEMS,
+            UploadStatus::Complete,
+            now + Duration::from_secs(100),
+        );
+        unknown.items.get_mut("0.txt").unwrap().status = UploadStatus::Unknown;
+        store.batches.lock().await.extend([
+            ("unknown".into(), unknown),
+            (
+                "oldest".into(),
+                admission_batch(
+                    "other",
+                    10_000,
+                    UploadStatus::Complete,
+                    now + Duration::from_secs(200),
+                ),
+            ),
+            (
+                "newer".into(),
+                admission_batch(
+                    "other",
+                    10_000,
+                    UploadStatus::Cancelled,
+                    now + Duration::from_secs(300),
+                ),
+            ),
+        ]);
+        let incoming = (0..MAX_ACTIVE_BATCH_ITEMS)
+            .map(|index| (format!("new-{index}.txt"), (format!("new-{index}.txt"), 4)))
+            .collect();
+        assert!(matches!(
+            store
+                .create(subject("owner"), "local".into(), incoming)
+                .await,
+            Err(AppError::TooManyRequests)
+        ));
+        let batches = store.batches.lock().await;
+        assert!(!batches.contains_key("oldest"));
+        assert!(!batches.contains_key("newer"));
+        assert!(batches.contains_key("unknown"));
+        assert_eq!(batches.len(), 1);
+    }
+
+    fn operation_for_status(status: UploadStatus) -> Option<OperationOutcome> {
+        let (commit, cleanup) = match status {
+            UploadStatus::Complete => (CommitState::Committed, CleanupState::Pending),
+            UploadStatus::Failed => (CommitState::NotCommitted, CleanupState::Complete),
+            UploadStatus::Unknown => (CommitState::Unknown, CleanupState::Pending),
+            _ => return None,
+        };
+        Some(OperationOutcome::new(commit, cleanup))
+    }
+
+    #[test]
+    fn admission_counts_all_states_but_scopes_active_batches_to_the_account() {
+        let expires_at = Instant::now() + Duration::from_secs(60);
+        let mut mixed = admission_batch("first", 6, UploadStatus::Complete, expires_at);
+        for (index, status) in [
+            UploadStatus::Pending,
+            UploadStatus::InProgress,
+            UploadStatus::Complete,
+            UploadStatus::Failed,
+            UploadStatus::Unknown,
+            UploadStatus::Cancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mixed.items.get_mut(&format!("{index}.txt")).unwrap().status = status;
+        }
+        let batches = HashMap::from([
+            ("mixed".into(), mixed),
+            (
+                "ended".into(),
+                admission_batch("first", 3, UploadStatus::Failed, expires_at),
+            ),
+            (
+                "other".into(),
+                admission_batch("second", 1, UploadStatus::Unknown, expires_at),
+            ),
+            (
+                "empty".into(),
+                admission_batch("first", 0, UploadStatus::Pending, expires_at),
+            ),
+        ]);
+        assert_eq!(
+            BatchUsage::from_batches(&batches, "first"),
+            BatchUsage {
+                retained_batches: 4,
+                retained_items: 10,
+                active_batches: 2,
+                account_batches: 1,
+                active_items: 4,
+            }
+        );
+        assert_eq!(
+            BatchUsage::from_batches(&batches, "absent").account_batches,
+            0
+        );
+    }
+
+    #[test]
+    fn admission_snapshot_is_recomputed_after_task_and_membership_changes() {
+        let expires_at = Instant::now() + Duration::from_secs(60);
+        let mut batches = HashMap::from([(
+            "ticket".into(),
+            admission_batch("first", 1, UploadStatus::Pending, expires_at),
+        )]);
+        let before = BatchUsage::from_batches(&batches, "first");
+        batches
+            .get_mut("ticket")
+            .unwrap()
+            .items
+            .get_mut("0.txt")
+            .unwrap()
+            .status = UploadStatus::Complete;
+        let after = BatchUsage::from_batches(&batches, "first");
+        assert_eq!(before.active_items, 1);
+        assert_eq!(
+            after,
+            BatchUsage {
+                retained_batches: 1,
+                retained_items: 1,
+                ..BatchUsage::default()
+            }
+        );
+        batches.clear();
+        assert_eq!(
+            BatchUsage::from_batches(&batches, "first"),
+            BatchUsage::default()
+        );
+    }
+
+    #[test]
+    fn admission_keeps_each_batch_and_item_limit_at_its_existing_boundary() {
+        let near = BatchUsage {
+            retained_batches: MAX_RETAINED_BATCHES - 1,
+            retained_items: MAX_RETAINED_BATCH_ITEMS - 1,
+            active_batches: MAX_ACTIVE_BATCHES - 1,
+            account_batches: MAX_ACTIVE_BATCHES_PER_ACCOUNT - 1,
+            active_items: MAX_ACTIVE_BATCH_ITEMS - 1,
+        };
+        assert!(near.can_admit(1));
+        for full in [
+            BatchUsage {
+                retained_batches: MAX_RETAINED_BATCHES,
+                ..BatchUsage::default()
+            },
+            BatchUsage {
+                retained_items: MAX_RETAINED_BATCH_ITEMS,
+                ..BatchUsage::default()
+            },
+            BatchUsage {
+                active_batches: MAX_ACTIVE_BATCHES,
+                ..BatchUsage::default()
+            },
+            BatchUsage {
+                account_batches: MAX_ACTIVE_BATCHES_PER_ACCOUNT,
+                ..BatchUsage::default()
+            },
+            BatchUsage {
+                active_items: MAX_ACTIVE_BATCH_ITEMS,
+                ..BatchUsage::default()
+            },
+        ] {
+            assert!(!full.can_admit(1), "{full:?}");
+        }
+        let exact_items = BatchUsage {
+            retained_items: MAX_RETAINED_BATCH_ITEMS,
+            active_items: MAX_ACTIVE_BATCH_ITEMS,
+            ..BatchUsage::default()
+        };
+        assert!(exact_items.can_admit(0));
+        assert!(BatchUsage::default().can_admit(MAX_ACTIVE_BATCH_ITEMS));
+        assert!(!BatchUsage::default().can_admit(MAX_ACTIVE_BATCH_ITEMS + 1));
+    }
+
+    #[test]
+    fn admission_item_totals_cannot_wrap_into_available_room() {
+        assert!(BatchUsage::default().requires_retirement(usize::MAX));
+        assert!(!BatchUsage::default().can_admit(usize::MAX));
+        let retained = BatchUsage {
+            retained_items: usize::MAX,
+            ..BatchUsage::default()
+        };
+        assert!(retained.requires_retirement(1));
+        let active = BatchUsage {
+            active_items: usize::MAX,
+            ..BatchUsage::default()
+        };
+        assert!(!active.can_admit(1));
+    }
+
+    #[tokio::test]
+    async fn mixed_status_reservations_and_cancellation_keep_uncertain_results() {
+        let store = UploadBatchStore::new(Duration::from_secs(60));
+        let owner = subject("owner");
+        let statuses = [
+            UploadStatus::Pending,
+            UploadStatus::InProgress,
+            UploadStatus::Complete,
+            UploadStatus::Failed,
+            UploadStatus::Unknown,
+            UploadStatus::Cancelled,
+        ];
+        let ticket = store
+            .create(
+                owner.clone(),
+                "local".into(),
+                statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| (format!("{index}.txt"), (format!("{index}.txt"), 4)))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        for (index, status) in statuses.into_iter().enumerate() {
+            store
+                .finish_with_status(
+                    &ticket,
+                    &format!("{index}.txt"),
+                    status,
+                    operation_for_status(status),
+                )
+                .await;
+        }
+        assert_eq!(
+            store.reserved_paths("local").await,
+            HashSet::from(["0.txt".into(), "1.txt".into(), "4.txt".into()])
+        );
+        assert!(store.reserved_paths("other").await.is_empty());
+        store.cancel(&ticket, &owner, "local", None).await.unwrap();
+        let result = store.status(&ticket, &owner, "local").await.unwrap();
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .map(|item| item.status)
+                .collect::<Vec<_>>(),
+            vec![
+                UploadStatus::Cancelled,
+                UploadStatus::InProgress,
+                UploadStatus::Complete,
+                UploadStatus::Cancelled,
+                UploadStatus::Unknown,
+                UploadStatus::Cancelled,
+            ]
+        );
+        for (item, before) in result.items.iter().zip(statuses) {
+            assert_eq!(
+                item.operation,
+                if item.path == "0.txt" || item.path == "3.txt" {
+                    None
+                } else {
+                    operation_for_status(before)
+                }
+            );
+        }
+        assert_eq!(
+            store.reserved_paths("local").await,
+            HashSet::from(["1.txt".into(), "4.txt".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_restart_preserves_all_status_evidence_without_reopening_uploads() {
+        let directory = crate::test_support::TestDirectory::new("upload-status-matrix-restart");
+        let config_path = directory.path().join("config.json");
+        let store = UploadBatchStore::load_persistent(&config_path, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let owner = subject("owner");
+        let statuses = [
+            UploadStatus::Pending,
+            UploadStatus::InProgress,
+            UploadStatus::Complete,
+            UploadStatus::Failed,
+            UploadStatus::Unknown,
+            UploadStatus::Cancelled,
+        ];
+        let ticket = store
+            .create_for_account(
+                owner,
+                "user:1".into(),
+                "local".into(),
+                statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| (format!("{index}.txt"), (format!("{index}.txt"), 4)))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        for (index, status) in statuses.into_iter().enumerate() {
+            // Leave the first item without a sidecar, as an unstarted ticket.
+            if index != 0 {
+                store
+                    .finish_with_status(
+                        &ticket,
+                        &format!("{index}.txt"),
+                        status,
+                        operation_for_status(status),
+                    )
+                    .await;
+            }
+        }
+        drop(store);
+        let restored = UploadBatchStore::load_persistent(&config_path, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let result = restored
+            .status_for_account(&ticket, &subject("new-session"), "user:1", "local")
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .map(|item| item.status)
+                .collect::<Vec<_>>(),
+            vec![
+                UploadStatus::Cancelled,
+                UploadStatus::Unknown,
+                UploadStatus::Complete,
+                UploadStatus::Failed,
+                UploadStatus::Unknown,
+                UploadStatus::Cancelled,
+            ]
+        );
+        for (item, before) in result.items.iter().zip(statuses) {
+            assert_eq!(item.operation, operation_for_status(before));
+        }
+        assert_eq!(
+            restored.reserved_paths("local").await,
+            HashSet::from(["1.txt".into(), "4.txt".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_edit_invalidates_a_plan_before_it_creates_a_ticket() {
+        let store = UploadBatchStore::new(Duration::from_secs(60));
+        let planning_epoch = store.invalidation_epoch.load(Ordering::Acquire);
+        store.invalidate_storage("local", None).await;
+
+        let result = store
+            .create_for_account_with_namespace_planned(
+                subject("session"),
+                "user:1".into(),
+                "local".into(),
+                items(),
+                None,
+                UploadPlanningFence {
+                    epoch: planning_epoch,
+                    guard: store.prepare_gate.clone().lock_owned().await,
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(AppError::Conflict(_))));
+        assert!(store.batches.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnected_waiter_does_not_orphan_a_persisted_ticket() {
+        let directory = crate::test_support::TestDirectory::new("upload-ticket-owner");
+        let store = UploadBatchStore::load_persistent(
+            &directory.path().join("config.json"),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let locked_batches = store.batches.lock().await;
+        let planning_guard = store.prepare_gate.clone().lock_owned().await;
+        let waiter_store = store.clone();
+        let initial_owners = Arc::strong_count(&store.batches);
+        let waiter = tokio::spawn(async move {
+            waiter_store
+                .create_for_account_with_namespace_planned(
+                    subject("session"),
+                    "user:1".into(),
+                    "local".into(),
+                    items(),
+                    None,
+                    UploadPlanningFence {
+                        epoch: 0,
+                        guard: planning_guard,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&store.batches) == initial_owners {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        waiter.abort();
+        assert!(store.prepare_gate.try_lock().is_err());
+        drop(locked_batches);
+
+        let ticket = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(ticket) = store.batches.lock().await.keys().next().cloned() {
+                    break ticket;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(directory
+            .path()
+            .join(".ycloud-system/upload-results")
+            .join(ticket)
+            .join("manifest.json")
+            .exists());
+        let _planning = tokio::time::timeout(Duration::from_secs(2), store.prepare_gate.lock())
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn persistent_ticket_survives_restart_but_requires_same_account() {
@@ -1510,7 +2118,7 @@ mod tests {
                     path,
                     capacity_limit_bytes: None,
                     enabled: true,
-                    guest_access: false.into(),
+                    guest_access: true.into(),
                     expected_revision: None,
                 },
             )
@@ -1944,7 +2552,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatically_resolved_upload_releases_the_old_reservation() {
+    async fn confirmed_upload_releases_the_old_reservation() {
         let store = UploadBatchStore::new(Duration::from_secs(60));
         let owner = subject("owner");
         let ticket = store
@@ -1964,15 +2572,15 @@ mod tests {
             )
             .await;
         let review = store.unknown_items().await.pop().unwrap();
-        store.resolve_unknown(&review, false).await.unwrap();
+        store.confirm_unknown_committed(&review).await.unwrap();
         let status = store.status(&ticket, &owner, "local").await.unwrap();
         let item = status
             .items
             .iter()
             .find(|item| item.path == "folder/one.txt")
             .unwrap();
-        assert_eq!(item.status, UploadStatus::Failed);
-        assert_eq!(item.operation.unwrap().commit, CommitState::NotCommitted);
+        assert_eq!(item.status, UploadStatus::Complete);
+        assert!(item.operation.is_none());
         store.ensure_storage_idle("local").await.unwrap();
     }
 }

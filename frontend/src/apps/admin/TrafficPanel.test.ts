@@ -1,6 +1,7 @@
 import { createApp, nextTick } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { getTraffic, saveTraffic } from '../../shared/api/admin'
+import type { TrafficInfo } from '../../shared/api/admin'
 import TrafficPanel from './TrafficPanel.vue'
 
 vi.mock('../../shared/api/admin', () => ({ getTraffic: vi.fn(), saveTraffic: vi.fn() }))
@@ -13,8 +14,8 @@ const fixture = {
 }
 const apps: ReturnType<typeof createApp>[] = []
 let panel: { openEditor: () => Promise<void> } | undefined
-async function mount(mode: 'dashboard' | 'settings' = 'dashboard') {
-  vi.mocked(getTraffic).mockResolvedValue(structuredClone(fixture))
+async function mount(mode: 'dashboard' | 'settings' = 'dashboard', traffic: TrafficInfo = fixture) {
+  vi.mocked(getTraffic).mockResolvedValue(structuredClone(traffic))
   const host = document.createElement('div')
   document.body.append(host)
   const app = createApp(TrafficPanel, { mode }); apps.push(app); panel = app.mount(host) as unknown as typeof panel
@@ -25,6 +26,30 @@ async function flush() { await new Promise(resolve => setTimeout(resolve, 0)); a
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); document.body.replaceChildren(); vi.resetAllMocks() })
 
 describe('TrafficPanel', () => {
+  it('defaults to the last seven calendar days without changing quotas', async () => {
+    const host = await mount()
+    const end = new Date()
+    const start = new Date(end)
+    start.setDate(start.getDate() - 6)
+    const iso = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+    expect(getTraffic).toHaveBeenCalledExactlyOnceWith(iso(start), iso(end))
+    expect(host.querySelector('.range-presets .active')?.textContent).toBe('近 7 天')
+    expect(saveTraffic).not.toHaveBeenCalled()
+  })
+
+  it('gives only nonzero bars a visibility floor without changing proportions or tooltip values', async () => {
+    const traffic = structuredClone(fixture)
+    traffic.days['2026-09-01'] = { upload: 1_000_000, download: 1 }
+    const host = await mount('dashboard', traffic)
+    const bars = [...host.querySelectorAll<HTMLElement>('.day-bars span')]
+    expect(bars.map(bar => bar.classList.contains('has-traffic'))).toEqual([true, true, false, false])
+    expect(Number.parseFloat(bars[0]!.style.height)).toBeCloseTo(0.0001, 8)
+    expect(bars.slice(1).map(bar => bar.style.height)).toEqual(['100%', '0%', '0%'])
+    host.querySelector<HTMLButtonElement>('.day-bars')!.focus()
+    await nextTick()
+    expect(host.querySelector('.day-tooltip .download-key b')?.textContent).toBe('1 B')
+  })
+
   it('shows five independent traffic meters and grouped daily bars', async () => {
     const host = await mount()
     expect(host.querySelectorAll('.traffic-card')).toHaveLength(0)
@@ -98,6 +123,8 @@ describe('TrafficPanel', () => {
   })
   it('queries a date range without writing quota settings', async () => {
     const host = await mount()
+    ;[...host.querySelectorAll<HTMLButtonElement>('.range-presets button')].find(button => button.textContent?.includes('近 30 天'))!.click()
+    await flush()
     ;[...host.querySelectorAll<HTMLButtonElement>('.range-presets button')].find(button => button.textContent?.includes('自定义'))!.click()
     await nextTick()
     host.querySelector<HTMLButtonElement>('.traffic-range .date-picker-trigger')!.click()
@@ -148,5 +175,49 @@ describe('TrafficPanel', () => {
     const submitted = vi.mocked(saveTraffic).mock.calls[0]![0]
     expect(submitted.cycle).toBeUndefined()
     expect(submitted.total).toBeDefined()
+  })
+
+  it('ignores late date-range responses without changing displayed statistics', async () => {
+    const host = await mount()
+    let finishOld!: (value: TrafficInfo) => void
+    let finishLatest!: (value: TrafficInfo) => void
+    vi.mocked(getTraffic)
+      .mockReturnValueOnce(new Promise(resolve => { finishOld = resolve }))
+      .mockReturnValueOnce(new Promise(resolve => { finishLatest = resolve }))
+    const presets = [...host.querySelectorAll<HTMLButtonElement>('.range-presets button')]
+    presets.find(button => button.textContent?.includes('近 7 天'))!.click()
+    presets.find(button => button.textContent?.includes('今日'))!.click()
+    const latest = structuredClone(fixture)
+    latest.total.download = 3072
+    finishLatest(latest)
+    await flush()
+    const old = structuredClone(fixture)
+    old.total.download = 4096
+    finishOld(old)
+    await flush()
+    expect(host.querySelector('.meter-download [role="meter"]')?.getAttribute('aria-valuetext')).toBe('3 KiB')
+    expect(presets.find(button => button.classList.contains('active'))?.textContent).toBe('今日')
+    expect(saveTraffic).not.toHaveBeenCalled()
+  })
+
+  it('keeps the settings drawer open on save failure and permits a corrected retry', async () => {
+    await mount('settings')
+    vi.mocked(saveTraffic).mockRejectedValueOnce(new Error('保存失败')).mockResolvedValueOnce({ success: true })
+    await panel!.openEditor()
+    await flush()
+    const drawer = document.querySelector('.settings-drawer')!
+    const form = drawer.querySelector('form')!
+    form.dispatchEvent(new Event('submit', { cancelable: true }))
+    await flush()
+    expect(document.querySelector('.settings-drawer')).not.toBeNull()
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('保存失败')
+    const every = drawer.querySelector<HTMLInputElement>('.cycle-fields input[type="number"]')!
+    every.value = '2'
+    every.dispatchEvent(new Event('input'))
+    form.dispatchEvent(new Event('submit', { cancelable: true }))
+    await flush()
+    expect(saveTraffic).toHaveBeenCalledTimes(2)
+    expect(saveTraffic).toHaveBeenLastCalledWith({ cycle: expect.objectContaining({ every: 2 }) })
+    expect(document.querySelector('.settings-drawer')).toBeNull()
   })
 })

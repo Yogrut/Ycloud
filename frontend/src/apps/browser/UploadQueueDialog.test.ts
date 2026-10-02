@@ -30,6 +30,50 @@ function mountUploadDialog(host: HTMLElement, props: Record<string, unknown>) {
 }
 
 describe('UploadQueueDialog', () => {
+  it('updates toolbar eligibility and counters when the same task changes status', async () => {
+    const host = document.createElement('div')
+    document.body.append(host)
+    const files = reactive([task(1, 'verifying')])
+    const app = mountUploadDialog(host, { tasks: files })
+    const enabledActions = () => [...host.querySelectorAll<HTMLButtonElement>('.upload-batch-actions button')]
+      .filter(button => !button.disabled).map(button => button.getAttribute('aria-label'))
+    try {
+      await nextTick()
+      expect(enabledActions()).toEqual([])
+      files[0]!.status = 'failed'
+      files[0]!.retryBlocked = true
+      await nextTick()
+      expect(enabledActions()).toEqual(['删除当前筛选任务记录'])
+      expect(host.querySelector('[aria-label="重试该文件"]')).toBeNull()
+      expect(host.querySelector('.upload-overall-meta')?.textContent).toContain('1 个未成功')
+      files[0]!.status = 'paused'
+      await nextTick()
+      expect(enabledActions()).toEqual(['继续当前筛选任务', '终止当前筛选任务'])
+      files[0]!.status = 'queued'
+      await nextTick()
+      expect(enabledActions()).toEqual(['暂停当前筛选任务', '终止当前筛选任务'])
+      files[0]!.status = 'succeeded'
+      await nextTick()
+      expect(enabledActions()).toEqual(['删除当前筛选任务记录'])
+      expect(host.querySelector('.upload-overall-meta')?.textContent).toContain('全部上传成功')
+      expect(host.querySelector('.upload-overall-percent')?.textContent).toBe('100%')
+    } finally { app.unmount() }
+  })
+
+  it('disables termination when all visible tasks are only awaiting result confirmation', async () => {
+    const host = document.createElement('div')
+    document.body.append(host)
+    const terminate = vi.fn()
+    const app = mountUploadDialog(host, { tasks: [task(1, 'verifying')], onTerminate: terminate })
+    try {
+      await nextTick()
+      const button = host.querySelector<HTMLButtonElement>('[aria-label="终止当前筛选任务"]')!
+      expect(button.disabled).toBe(true)
+      button.click()
+      expect(terminate).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
   it('samples live upload speed and resets on stalls, pause, retry and completion', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
     const host = document.createElement('div')

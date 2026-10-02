@@ -268,3 +268,55 @@ describe('file size formatting', () => {
     expect(formatSize(1024 ** 3)).toBe('1.0 GB')
   })
 })
+
+describe('cancellable preview and download checks', () => {
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
+
+  it.each([
+    ['download', checkDownload],
+    ['preview', isPreviewTrafficExhausted],
+  ] as const)('cancels the %s HEAD request and clears its deadline', async (_name, action) => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn().mockImplementation(() => new Promise(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const source = new AbortController()
+    const request = action('/api/check', source.signal)
+    source.abort()
+    if (action === checkDownload) await expect(request).rejects.toMatchObject({ name: 'AbortError' })
+    else expect(await request).toBe(false)
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ method: 'HEAD', cache: 'no-store' })
+    expect(fetchMock.mock.calls[0]?.[1].signal.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each([
+    ['download', checkDownload],
+    ['preview', isPreviewTrafficExhausted],
+  ] as const)('does not send an already cancelled %s check', async (_name, action) => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const source = new AbortController()
+    source.abort()
+    const request = action('/api/check', source.signal)
+    if (action === checkDownload) await expect(request).rejects.toMatchObject({ name: 'AbortError' })
+    else expect(await request).toBe(false)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['download', checkDownload],
+    ['preview', isPreviewTrafficExhausted],
+  ] as const)('retains the shared timeout for an unresponsive %s endpoint', async (_name, action) => {
+    vi.useFakeTimers()
+    const fetchMock = vi.fn().mockImplementation(() => new Promise(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const request = action('/api/check')
+    const observed = action === checkDownload
+      ? expect(request).rejects.toMatchObject({ code: 'request_timeout' })
+      : expect(request).resolves.toBe(false)
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS)
+    await observed
+    expect(fetchMock.mock.calls[0]?.[1].signal.aborted).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+})

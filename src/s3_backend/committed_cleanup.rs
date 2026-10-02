@@ -29,6 +29,12 @@ impl CompletionMode {
     ) -> AppResult<()> {
         match self {
             Self::Recovery => cleanup.await.map_err(|error| {
+                // The nested outcome describes cleanup, not the formal change
+                // that this caller has already verified as committed.
+                let error = match error {
+                    AppError::Operation { cause, .. } => *cause,
+                    other => other,
+                };
                 error.with_operation(CommitState::Committed, CleanupState::Pending)
             }),
             Self::Foreground => {
@@ -64,6 +70,32 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.operation().unwrap().commit, CommitState::Committed);
         assert_eq!(error.operation().unwrap().cleanup, CleanupState::Pending);
+    }
+
+    #[tokio::test]
+    async fn cleanup_substep_outcomes_cannot_reclassify_a_verified_formal_commit() {
+        for commit in [
+            CommitState::NotCommitted,
+            CommitState::Unknown,
+            CommitState::Committed,
+        ] {
+            let error = CompletionMode::Recovery
+                .finish(async {
+                    Err(
+                        AppError::ServiceUnavailable("owned trash still exists".into())
+                            .with_operation(commit, CleanupState::Pending),
+                    )
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.operation().unwrap().commit, CommitState::Committed);
+            assert_eq!(error.operation().unwrap().cleanup, CleanupState::Pending);
+            assert!(error.blocks_retry());
+            let AppError::Operation { cause, .. } = error else {
+                panic!("cleanup error must carry the verified operation outcome");
+            };
+            assert_eq!(cause.to_string(), "owned trash still exists");
+        }
     }
 
     #[tokio::test]

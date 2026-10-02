@@ -2,13 +2,14 @@
 import AppFeedback from '../../shared/components/AppFeedback.vue'
 import SettingsDrawer from '../../shared/components/SettingsDrawer.vue'
 import ConfirmDialog from '../../shared/components/ConfirmDialog.vue'
-import { computed, nextTick, ref } from 'vue'
-import type { FolderLockView, StorageInstanceView, UpdateFolderLockRequest } from '../../shared/api/admin'
+import { computed, ref } from 'vue'
+import type { FolderLockView, StorageInstanceView } from '../../shared/api/admin'
 import { createFolderLock, deleteFolderLock, updateFolderLock } from '../../shared/api/admin'
 import AppSelect from '../../shared/components/AppSelect.vue'
 import { useLocale } from '../../shared/i18n'
+import { STORED_PASSWORD_MASK as MASK, selectStoredPassword as selectMask } from '../../shared/passwordInput'
+import { createFolderLockRequest, displayStoragePath as displayPath, folderLockChanges, normalizeStoragePath as normalizePath, type FolderLockDraft } from './storageAccessForm'
 
-const MASK = '••••••'
 const { locks, storages } = defineProps<{
   locks: FolderLockView[]
   storages: StorageInstanceView[]
@@ -32,25 +33,16 @@ const storageOptions = computed(() => storages.map(storage => ({
   disabled: !storage.ready,
 })))
 
-function normalizePath(value: string): string {
-  return value.replace(/\\/g, '/').split('/').filter(Boolean).join('/')
-}
-
-function displayPath(value: string): string {
-  const normalized = normalizePath(value)
-  return normalized ? `/${normalized}` : '/'
-}
-
 function storageName(id: string): string {
   return storages.find((storage) => storage.id === id)?.name ?? id
 }
 
+const draft = computed<FolderLockDraft>(() => ({ storageId: storageId.value, path: path.value, password: password.value }))
+const editorChanges = computed(() => editing.value ? folderLockChanges(editing.value, draft.value) : {})
 const hasChanges = computed(() => {
   if (!showEditor.value) return false
   if (!editing.value) return Boolean(path.value.trim() || password.value)
-  return storageId.value !== editing.value.storage_id
-    || normalizePath(path.value) !== editing.value.path
-    || password.value !== MASK
+  return Object.keys(editorChanges.value).length > 0
 })
 
 function openCreate(): void {
@@ -78,11 +70,6 @@ function closeEditor(): void {
   errorMessage.value = ''
 }
 
-function selectMask(event: FocusEvent): void {
-  const input = event.target as HTMLInputElement
-  if (input.value === MASK) nextTick(() => input.select())
-}
-
 function validate(): string | undefined {
   if (!storageId.value) return locale.text('请选择存储', 'Select a storage')
   if (!normalizePath(path.value)) return locale.text('不能给存储根目录加锁，请填写具体文件夹路径', 'The storage root cannot be locked. Enter a specific folder path')
@@ -104,15 +91,12 @@ async function submit(): Promise<void> {
   const normalizedPath = normalizePath(path.value)
   try {
     if (editing.value) {
-      const body: UpdateFolderLockRequest = { expected_revision: editing.value.revision }
-      if (storageId.value !== editing.value.storage_id) body.storage_id = storageId.value
-      if (normalizedPath !== editing.value.path) body.path = normalizedPath
-      if (password.value !== MASK) body.password = password.value
+      const body = { expected_revision: editing.value.revision, ...editorChanges.value }
       await updateFolderLock(editing.value.id, body)
       showEditor.value = false
       emit('changed', locale.text(`文件夹锁 ${displayPath(normalizedPath)} 已更新`, `Folder lock ${displayPath(normalizedPath)} updated`))
     } else {
-      await createFolderLock({ storage_id: storageId.value, path: normalizedPath, password: password.value })
+      await createFolderLock(createFolderLockRequest(draft.value))
       showEditor.value = false
       emit('changed', locale.text(`文件夹锁 ${displayPath(normalizedPath)} 已创建`, `Folder lock ${displayPath(normalizedPath)} created`))
     }

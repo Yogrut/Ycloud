@@ -1,37 +1,38 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { getTraffic, saveTraffic } from '../../shared/api/admin'
-import type { TrafficInfo, TrafficQuota, TrafficUsage, TrafficSettings } from '../../shared/api/admin'
+import { getTraffic } from '../../shared/api/admin'
+import type { TrafficInfo, TrafficQuota, TrafficUsage } from '../../shared/api/admin'
 import AppDatePicker from '../../shared/components/AppDatePicker.vue'
 import AppFeedback from '../../shared/components/AppFeedback.vue'
 import AppSelect from '../../shared/components/AppSelect.vue'
 import SettingsDrawer from '../../shared/components/SettingsDrawer.vue'
 import TrafficQuotaFields from '../../shared/components/TrafficQuotaFields.vue'
 import { useLocale } from '../../shared/i18n'
+import { useTrafficSettings } from './useTrafficSettings'
 
 const props = withDefaults(defineProps<{ mode?: 'dashboard' | 'settings' }>(), { mode: 'dashboard' })
 const emit = defineEmits<{ saved: [message: string] }>()
 const locale = useLocale()
 const info = ref<TrafficInfo>()
 const loading = ref(false)
-const saving = ref(false)
-const editing = ref(false)
 const message = ref('')
 const kind = ref<'error' | 'success'>('error')
 const revision = ref(0)
 const start = ref('')
 const end = ref('')
-const total = ref<TrafficQuota>({ enabled: false, upload: 0, download: 0 })
-const guest = ref<TrafficQuota>({ enabled: false, upload: 0, download: 0 })
-const usersQuota = ref<TrafficQuota>({ enabled: false, upload: 0, download: 0 })
-const unit = ref<'hours' | 'days' | 'months'>('months')
-const every = ref(1)
-const anchor = ref('')
-let originalSettings: TrafficSettings | undefined
-let originalAnchor = ''
-const directions = ['download', 'upload'] as const
-type Direction = typeof directions[number]
+type Direction = keyof TrafficUsage
 type TrafficMeter = { id: string; label: string; direction: Direction; use: TrafficUsage; quota: TrafficQuota }
+const { total, guest, usersQuota, unit, every, anchor, editing, saving, openEditor, save } = useTrafficSettings({
+  info,
+  refresh,
+  feedback,
+  onSaved() {
+    kind.value = 'success'
+    message.value = locale.text('流量设置已保存', 'Traffic settings saved')
+    emit('saved', message.value)
+    revision.value++
+  },
+})
 
 function bytes(value: number): string {
   if (!value) return '0 B'
@@ -73,7 +74,7 @@ const dayTooltipTop = ref(0)
 const dayTooltipWidth = ref(174)
 const selectedShare = ref<Direction>()
 const shareTooltipLeft = ref(80)
-const rangeMode = ref<'today' | '7' | '30' | 'custom'>('30')
+const rangeMode = ref<'today' | '7' | '30' | 'custom'>('7')
 const downloadShare = computed(() => historyTotal.value ? sum.value.download / historyTotal.value * 100 : 0)
 const uploadShare = computed(() => 100 - downloadShare.value)
 const today = computed(() => {
@@ -162,56 +163,7 @@ async function refresh(): Promise<void> {
     if (id === requestId) loading.value = false
   }
 }
-async function openEditor(): Promise<void> {
-  if (!info.value) await refresh()
-  if (!info.value) return
-  total.value = { ...info.value.settings.total }
-  guest.value = { ...info.value.settings.guest }
-  usersQuota.value = { ...info.value.settings.users_total }
-  const cycle = info.value.settings.cycle
-  originalSettings = JSON.parse(JSON.stringify(info.value.settings)) as TrafficSettings
-  unit.value = cycle.unit
-  every.value = cycle.every
-  const date = new Date(cycle.anchor * 1000)
-  anchor.value = new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 10)
-  originalAnchor = anchor.value
-  editing.value = true
-}
-async function save(): Promise<void> {
-  if (saving.value) return
-  const timestamp = new Date(`${anchor.value}T00:00:00`)
-  if (!Number.isFinite(timestamp.getTime()) || !Number.isInteger(every.value) || every.value < 1 || every.value > 120
-    || [total.value, guest.value, usersQuota.value].some(quota => directions.some(direction => !Number.isSafeInteger(quota[direction]) || quota[direction] < 0))) {
-    feedback(new Error(locale.text('请填写有效的额度、周期和起始日期', 'Enter a valid allowance, interval and start date')))
-    return
-  }
-  saving.value = true
-  try {
-    const changes = {
-      total: total.value,
-      guest: guest.value,
-      users_total: usersQuota.value,
-      cycle: originalSettings && unit.value === originalSettings.cycle.unit && every.value === originalSettings.cycle.every && anchor.value === originalAnchor ? originalSettings.cycle : {
-        unit: unit.value,
-        every: every.value,
-        anchor: Math.floor(timestamp.getTime() / 1000),
-        offset_minutes: -timestamp.getTimezoneOffset(),
-      },
-    }
-    await saveTraffic(Object.fromEntries(Object.entries(changes).filter(([key, value]) => JSON.stringify(value) !== JSON.stringify(originalSettings?.[key as keyof TrafficSettings]))))
-    editing.value = false
-    kind.value = 'success'
-    message.value = locale.text('流量设置已保存', 'Traffic settings saved')
-    emit('saved', message.value)
-    revision.value++
-    await refresh()
-  } catch (error) {
-    feedback(error)
-  } finally {
-    saving.value = false
-  }
-}
-onMounted(() => { void (props.mode === 'dashboard' ? selectRange('30') : refresh()) })
+onMounted(() => { void (props.mode === 'dashboard' ? selectRange(rangeMode.value) : refresh()) })
 defineExpose({ openEditor })
 </script>
 
@@ -263,8 +215,8 @@ defineExpose({ openEditor })
               <div class="chart-days">
                 <div v-for="(day, index) in days" :key="day.date" class="chart-day">
                   <button type="button" class="day-bars" :class="{ selected: selected === day.date }" :aria-label="day.date + ' ' + directionLabel('upload') + ' ' + bytes(day.upload) + ', ' + directionLabel('download') + ' ' + bytes(day.download)" @mouseenter="selectDay(day.date, $event)" @mousemove="selectDay(day.date, $event)" @mouseleave="selected = undefined" @focus="selectDay(day.date, $event)" @blur="selected = undefined" @click="selectDay(day.date, $event)">
-                    <span class="download" :style="{ height: (day.download / maximum * 100) + '%' }" />
-                    <span class="upload" :style="{ height: (day.upload / maximum * 100) + '%' }" />
+                    <span class="download" :class="{ 'has-traffic': day.download > 0 }" :style="{ height: (day.download / maximum * 100) + '%' }" />
+                    <span class="upload" :class="{ 'has-traffic': day.upload > 0 }" :style="{ height: (day.upload / maximum * 100) + '%' }" />
                   </button>
                   <small>{{ index % Math.max(1, Math.ceil(days.length / 7)) === 0 ? day.date.slice(5) : '' }}</small>
                 </div>
@@ -348,7 +300,9 @@ defineExpose({ openEditor })
 .chart-days { flex: 1; display: flex; min-width: 0; border-bottom: 1px solid var(--line); background: repeating-linear-gradient(to top,transparent,transparent calc(50% - 1px),var(--line) 50%); }
 .chart-day { position: relative; flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .day-bars { display: flex; flex: 1; align-items: end; justify-content: center; gap: 3px; min-width: 0; padding: 0 2px; background: transparent; border: 0; border-radius: 0; cursor: pointer; }
-.day-bars span { width: 34%; max-width: 16px; border-radius: 3px 3px 0 0; }
+/* Keep tiny nonzero bars visible; vertical radii must fit their own height. */
+.day-bars span { width: 34%; max-width: 16px; border-radius: 3px 3px 0 0 / min(3px, 50%) min(3px, 50%) 0 0; }
+.day-bars .has-traffic { min-height: 2px; }
 .day-bars .download { background: var(--download-used); }
 .day-bars .upload { background: var(--upload-used); }
 .day-bars:hover,.day-bars:focus-visible,.day-bars.selected { background: rgb(128 128 128 / .12); }

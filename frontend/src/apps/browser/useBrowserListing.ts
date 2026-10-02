@@ -1,8 +1,9 @@
 import { computed, ref } from 'vue'
-import type { BrowserCapabilities, BrowserStorage, FileEntry } from '../../shared/api/browser'
+import type { BrowserCapabilities, BrowserStorage, FileEntry, FileListResponse } from '../../shared/api/browser'
 import { calculateDirectorySize, listFiles, listStorages } from '../../shared/api/browser'
 import { ApiError } from '../../shared/api/client'
 import { useLocale } from '../../shared/i18n'
+import { isStorageUsable, rememberedStorage, rememberStorage, shouldForgetStorage } from './storageSelection'
 
 type SortKey = 'name' | 'time' | 'size'
 type PageSize = 10 | 20 | 50 | 100
@@ -15,6 +16,19 @@ interface BrowserListingContext {
 }
 
 const PAGE_SIZES: PageSize[] = [10, 20, 50, 100]
+const SEARCH_DELAY_MS = 250
+
+function emptyCapabilities(): BrowserCapabilities {
+  return {
+    download: false,
+    upload: false,
+    create_directory: false,
+    rename: false,
+    move_items: false,
+    copy: false,
+    delete: false,
+  }
+}
 
 export function useBrowserListing(context: BrowserListingContext) {
   const locale = useLocale()
@@ -38,11 +52,8 @@ export function useBrowserListing(context: BrowserListingContext) {
   let selectionScope = ''
   let restoreSelection = true
   let rememberNextSelection = false
-  const usable = (storage: BrowserStorage): boolean => !storage.requires_login && storage.enabled !== false && storage.ready !== false
-  function remembered(scope: string): string { try { return localStorage.getItem(`ycloud:storage:${scope}`) ?? '' } catch { return '' } }
-  function remember(scope: string, id: string): void { try { if (id) localStorage.setItem(`ycloud:storage:${scope}`, id); else localStorage.removeItem(`ycloud:storage:${scope}`) } catch { /* Storage can be unavailable in private browsing. */ } }
   const isAdministrator = ref(false)
-  const capabilities = ref<BrowserCapabilities>({ download: false, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false })
+  const capabilities = ref<BrowserCapabilities>(emptyCapabilities())
   const maxUploadBytes = ref(0)
   const maxUploadBatchBytes = ref(0)
   const maxUploadBatchEntries = ref(0)
@@ -59,7 +70,7 @@ export function useBrowserListing(context: BrowserListingContext) {
   const storageOptions = computed(() => storages.value.filter(storage => !storage.requires_login).map(storage => ({
     value: storage.id,
     label: `${storage.name}${storage.enabled === false ? locale.text('（停用）', ' (disabled)') : storage.ready === false ? locale.text('（异常）', ' (unavailable)') : ''}`,
-    disabled: !usable(storage),
+    disabled: !isStorageUsable(storage),
   })))
   const pageSizeOptions = PAGE_SIZES.map(size => ({ value: size, label: String(size) }))
   const crumbs = computed(() => {
@@ -82,6 +93,36 @@ export function useBrowserListing(context: BrowserListingContext) {
     currentCursor.value = undefined
     nextCursor.value = null
     cursorHistory.value = []
+    context.resetSelection()
+  }
+
+  function clearListingEntries(): void {
+    entries.value = []
+    capabilities.value = emptyCapabilities()
+  }
+
+  function applyListing(data: FileListResponse): void {
+    emptyReason.value = data.empty_reason ?? null
+    currentStorageId.value = data.storage_id
+    storages.value = data.storages ?? []
+    path.value = data.current_path.replace(/^\/+|\/+$/g, '')
+    entries.value = data.entries
+    nextCursor.value = data.next_cursor ?? null
+    isAdministrator.value = Boolean(data.is_admin)
+    capabilities.value = data.capabilities ?? {
+      download: true,
+      upload: data.can_write,
+      create_directory: data.can_write,
+      rename: data.can_write,
+      move_items: data.can_write,
+      copy: data.can_write,
+      delete: data.can_write,
+    }
+    maxUploadBytes.value = data.max_upload_bytes
+    maxUploadBatchBytes.value = data.max_upload_batch_bytes ?? data.max_upload_bytes
+    maxUploadBatchEntries.value = data.max_upload_batch_entries ?? 1
+    maxArchiveBytes.value = data.max_archive_bytes
+    maxArchiveEntries.value = data.max_archive_entries
     context.resetSelection()
   }
 
@@ -108,10 +149,10 @@ export function useBrowserListing(context: BrowserListingContext) {
       if (restoreSelection || scope !== selectionScope) {
         restoreSelection = false
         selectionScope = scope
-        const saved = scope ? remembered(scope) : ''
-        const target = available.find(storage => storage.id === saved && usable(storage))
+        const saved = scope ? rememberedStorage(scope) : ''
+        const target = available.find(storage => storage.id === saved && isStorageUsable(storage))
         const savedStorage = available.find(storage => storage.id === saved)
-        if (saved && (!savedStorage || savedStorage.enabled === false || savedStorage.requires_login)) remember(scope, '')
+        if (saved && shouldForgetStorage(savedStorage)) rememberStorage(scope, '')
         if (target && target.id !== data.storage_id) {
           currentStorageId.value = target.id
           path.value = ''
@@ -120,34 +161,15 @@ export function useBrowserListing(context: BrowserListingContext) {
           return
         }
       }
-      if (rememberNextSelection) { if (scope) remember(scope, data.storage_id); rememberNextSelection = false }
-      emptyReason.value = data.empty_reason ?? null
-      currentStorageId.value = data.storage_id
-      storages.value = data.storages ?? []
-      path.value = data.current_path.replace(/^\/+|\/+$/g, '')
-      entries.value = data.entries
-      nextCursor.value = data.next_cursor ?? null
-      isAdministrator.value = Boolean(data.is_admin)
-      capabilities.value = data.capabilities ?? {
-        download: true,
-        upload: data.can_write,
-        create_directory: data.can_write,
-        rename: data.can_write,
-        move_items: data.can_write,
-        copy: data.can_write,
-        delete: data.can_write,
+      if (rememberNextSelection) {
+        if (scope) rememberStorage(scope, data.storage_id)
+        rememberNextSelection = false
       }
-      maxUploadBytes.value = data.max_upload_bytes
-      maxUploadBatchBytes.value = data.max_upload_batch_bytes ?? data.max_upload_bytes
-      maxUploadBatchEntries.value = data.max_upload_batch_entries ?? 1
-      maxArchiveBytes.value = data.max_archive_bytes
-      maxArchiveEntries.value = data.max_archive_entries
-      context.resetSelection()
+      applyListing(data)
     } catch (error) {
       if (sequence !== refreshSequence) return
       if (error instanceof ApiError && [401, 403, 404, 503].includes(error.status)) {
-        entries.value = []
-        capabilities.value = { download: false, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false }
+        clearListingEntries()
         context.resetSelection()
       }
       if (!storages.value.length || error instanceof ApiError && (error.status === 403 || error.status === 404 || error.status === 503)) {
@@ -156,13 +178,13 @@ export function useBrowserListing(context: BrowserListingContext) {
           if (sequence !== refreshSequence) return
           storages.value = available
           const current = available.find(storage => storage.id === currentStorageId.value)
-          if (currentStorageId.value && !usable(current ?? { id: '', name: '', requires_login: true })) {
+          if (currentStorageId.value && !isStorageUsable(current)) {
             entries.value = []
             currentStorageId.value = ''
             path.value = ''
             resetPagination()
             rememberNextSelection = false
-            if ((!current || current.enabled === false || current.requires_login) && selectionScope) remember(selectionScope, '')
+            if (shouldForgetStorage(current) && selectionScope) rememberStorage(selectionScope, '')
             await refresh()
             return
           }
@@ -180,7 +202,10 @@ export function useBrowserListing(context: BrowserListingContext) {
 
   async function calculateSize(entry: FileEntry): Promise<void> {
     if (!entry.is_dir || calculatingDirectory.value !== null || loading.value) return
-    if (entry.locked) { context.openLockedEntry(entry); return }
+    if (entry.locked) {
+      context.openLockedEntry(entry)
+      return
+    }
     directorySizes.value.delete(entry.path)
     const sequence = ++directorySizeSequence
     const controller = new AbortController()
@@ -208,7 +233,7 @@ export function useBrowserListing(context: BrowserListingContext) {
       appliedQuery.value = query.value.trim()
       resetPagination()
       void refresh()
-    }, 250)
+    }, SEARCH_DELAY_MS)
   }
 
   async function navigate(destination: string): Promise<void> {
@@ -223,14 +248,13 @@ export function useBrowserListing(context: BrowserListingContext) {
   async function switchStorage(value: string | number): Promise<void> {
     const nextStorageId = String(value)
     const nextStorage = storages.value.find(storage => storage.id === nextStorageId)
-    if (nextStorage && !usable(nextStorage) && !nextStorage.requires_login) return
+    if (nextStorage && !isStorageUsable(nextStorage) && !nextStorage.requires_login) return
     if (!nextStorage || nextStorage.requires_login) {
       context.requestStorageLogin(nextStorageId)
       return
     }
     rememberNextSelection = true
-    entries.value = []
-    capabilities.value = { download: false, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false }
+    clearListingEntries()
     currentStorageId.value = nextStorageId
     path.value = ''
     query.value = ''
@@ -286,8 +310,7 @@ export function useBrowserListing(context: BrowserListingContext) {
     const controller = new AbortController()
     listingRequest = controller
     if (searchTimer !== undefined) window.clearTimeout(searchTimer)
-    entries.value = []
-    capabilities.value = { download: false, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false }
+    clearListingEntries()
     isAdministrator.value = false
     const available = await listStorages(controller.signal).catch(() => [])
     if (sequence !== refreshSequence) return
@@ -296,7 +319,7 @@ export function useBrowserListing(context: BrowserListingContext) {
     restoreSelection = true
     selectionScope = ''
     rememberNextSelection = false
-    currentStorageId.value = requested && usable(requested) ? requested.id : ''
+    currentStorageId.value = requested && isStorageUsable(requested) ? requested.id : ''
     path.value = ''
     query.value = ''
     appliedQuery.value = ''

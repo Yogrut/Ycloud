@@ -12,7 +12,15 @@ it('keeps compact sizing on one-field dialogs without shrinking login forms', ()
   expect(css).not.toMatch(/\.user-login-form \.input\.input|\.admin-login-form-pane \.input,/)
   expect(css).toContain('.modal.short-field-dialog { width: min(360px, 100%);')
   const view = readFileSync('src/apps/browser/BrowserView.vue', 'utf8')
-  for (const action of ['submitFolder', 'submitRename', 'submitUnlock']) {
+  for (const action of ['submitEntry', 'submitUnlock']) {
     expect(view).toContain(`<form class="modal short-field-dialog" @submit.prevent="${action}">`)
   }
+})
+it('stacks WebDAV switches in one column at every drawer width', () => {
+  expect(css).toMatch(/\.settings-drawer \.webdav-options\s*\{[^}]*display:\s*grid;[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/)
+})
+it('keeps tiny traffic bars visible without letting top corners consume their height', () => {
+  const view = readFileSync('src/apps/admin/TrafficPanel.vue', 'utf8')
+  expect(view).toContain('border-radius: 3px 3px 0 0 / min(3px, 50%) min(3px, 50%) 0 0;')
+  expect(view).toContain('.day-bars .has-traffic { min-height: 2px; }')
 })

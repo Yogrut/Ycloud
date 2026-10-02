@@ -91,17 +91,19 @@ pub struct BindingView {
     pub source: &'static str,
 }
 
-pub async fn view(state: &AppState) -> BindingView {
-    let persisted = state.config_file.read().await.domain_binding.clone();
-    let source = if persisted.is_some() {
-        "settings"
-    } else {
-        "none"
-    };
-    BindingView {
-        binding: persisted,
-        source,
+impl BindingView {
+    pub(crate) fn from_binding(binding: Option<DomainBinding>) -> Self {
+        let source = if binding.is_some() {
+            "settings"
+        } else {
+            "none"
+        };
+        Self { binding, source }
     }
+}
+
+pub async fn view(state: &AppState) -> BindingView {
+    BindingView::from_binding(state.config_file.read().await.domain_binding.clone())
 }
 
 /// Read the committed policy from memory; no disk IO and no old-address fallback.

@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
 };
 
 mod metadata;
+mod receipts;
+mod recovery;
 pub use metadata::TransactionId;
 use metadata::{
     resource_id, DeletionJournal, ReplaceJournal, MAX_JOURNAL_BYTES, MAX_RECOVERY_ENTRIES,
@@ -71,18 +73,6 @@ pub struct TransactionPaths {
     pub anchors: PathBuf,
 }
 
-const MAX_UPLOAD_RECEIPTS: usize = 100_000;
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UploadReceipt {
-    version: u32,
-    operation_id: String,
-    destination: String,
-    size: u64,
-    confirmed: bool,
-}
-
 #[derive(Clone)]
 pub(crate) struct StagedDeletion {
     pub path: PathBuf,
@@ -97,191 +87,6 @@ pub(crate) struct RemovalProgress {
 }
 
 impl TransactionPaths {
-    fn receipt_path(&self, operation_id: &str) -> AppResult<PathBuf> {
-        if operation_id.len() != 32
-            || !operation_id
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        {
-            return Err(AppError::BadRequest("invalid upload operation ID".into()));
-        }
-        Ok(self.receipts.join(format!("{operation_id}.json")))
-    }
-
-    async fn load_receipt_count(&self) -> AppResult<()> {
-        let mut entries = fs::read_dir(&self.receipts)
-            .await
-            .map_err(|error| AppError::with_source("failed to inspect upload receipts", error))?;
-        let mut count = 0_usize;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|error| AppError::with_source("failed to inspect upload receipts", error))?
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(id) = name.strip_suffix(".tmp") {
-                self.receipt_path(id)?;
-                let metadata = fs::symlink_metadata(entry.path()).await.map_err(|error| {
-                    AppError::with_source("failed to inspect upload receipt staging", error)
-                })?;
-                if !metadata.is_file() || is_link_or_reparse_point(&metadata) {
-                    return Err(AppError::Conflict("invalid upload receipt staging".into()));
-                }
-                self.rooted_remove_file(&entry.path()).await?;
-                self.rooted_sync_parent(&entry.path()).await?;
-                continue;
-            }
-            let id = name
-                .strip_suffix(".json")
-                .ok_or_else(|| AppError::Conflict("unrecognized upload receipt entry".into()))?;
-            self.receipt_path(id)?;
-            let metadata = fs::symlink_metadata(entry.path()).await.map_err(|error| {
-                AppError::with_source("failed to inspect upload receipt", error)
-            })?;
-            if !metadata.is_file() || is_link_or_reparse_point(&metadata) {
-                return Err(AppError::Conflict("invalid upload receipt entry".into()));
-            }
-            count = count.checked_add(1).ok_or(AppError::TooManyRequests)?;
-        }
-        self.receipt_count
-            .store(count, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    async fn read_receipt(&self, operation_id: &str) -> AppResult<Option<UploadReceipt>> {
-        let path = self.receipt_path(operation_id)?;
-        let Some(metadata) = self.rooted_metadata(&path).await? else {
-            return Ok(None);
-        };
-        if !metadata.is_file() || metadata.len() > MAX_JOURNAL_BYTES {
-            return Err(AppError::Conflict("invalid upload receipt".into()));
-        }
-        #[cfg(target_os = "linux")]
-        let file = self
-            .linux_root
-            .open_file_for_read(&self.rooted_relative(&path)?)
-            .await?;
-        #[cfg(not(target_os = "linux"))]
-        let file = fs::File::open(&path)
-            .await
-            .map_err(|error| AppError::with_source("failed to read upload receipt", error))?;
-        let mut bytes = Vec::new();
-        file.take(MAX_JOURNAL_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|error| AppError::with_source("failed to read upload receipt", error))?;
-        if bytes.len() as u64 > MAX_JOURNAL_BYTES {
-            return Err(AppError::Conflict("invalid upload receipt".into()));
-        }
-        let receipt: UploadReceipt = serde_json::from_slice(&bytes)
-            .map_err(|error| AppError::with_source("invalid upload receipt", error))?;
-        if receipt.version != 1
-            || receipt.operation_id != operation_id
-            || crate::storage::StorageService::normalize_relative(&receipt.destination)?
-                != receipt.destination
-        {
-            return Err(AppError::Conflict("invalid upload receipt identity".into()));
-        }
-        Ok(Some(receipt))
-    }
-
-    async fn ensure_receipt(
-        &self,
-        operation_id: &str,
-        destination: &str,
-        size: u64,
-        confirmed: bool,
-    ) -> AppResult<()> {
-        if let Some(existing) = self.read_receipt(operation_id).await? {
-            if existing.destination == destination
-                && existing.size == size
-                && existing.confirmed == confirmed
-            {
-                return Ok(());
-            }
-            return Err(AppError::Conflict(
-                "upload receipt identity collision".into(),
-            ));
-        }
-        if self
-            .receipt_count
-            .load(std::sync::atomic::Ordering::Relaxed)
-            >= MAX_UPLOAD_RECEIPTS
-        {
-            return Err(AppError::TooManyRequests);
-        }
-        let receipt = UploadReceipt {
-            version: 1,
-            operation_id: operation_id.into(),
-            destination: destination.into(),
-            size,
-            confirmed,
-        };
-        let path = self.receipt_path(operation_id)?;
-        self.rooted_remove_file_idempotent(&path.with_extension("tmp"))
-            .await?;
-        self.write_json_atomic(&path, &receipt).await?;
-        self.receipt_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub(crate) async fn receipt_matches(
-        &self,
-        destination: &str,
-        size: u64,
-        operation_id: &str,
-    ) -> AppResult<bool> {
-        match self.read_receipt(operation_id).await? {
-            Some(receipt) if !receipt.confirmed => {
-                Err(AppError::Conflict("上传发布结果未确认，保留待核查".into()))
-            }
-            Some(receipt) => Ok(receipt.destination == destination && receipt.size == size),
-            None => Ok(false),
-        }
-    }
-
-    pub(crate) async fn prune_receipts(
-        &self,
-        retained: &std::collections::HashSet<String>,
-    ) -> AppResult<()> {
-        let mut entries = fs::read_dir(&self.receipts)
-            .await
-            .map_err(|error| AppError::with_source("failed to scan upload receipts", error))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|error| AppError::with_source("failed to scan upload receipts", error))?
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let operation_id = name
-                .strip_suffix(".json")
-                .ok_or_else(|| AppError::Conflict("unrecognized upload receipt entry".into()))?;
-            let path = self.receipt_path(operation_id)?;
-            if retained.contains(operation_id) {
-                continue;
-            }
-            self.read_receipt(operation_id).await?;
-            self.rooted_remove_file(&path).await?;
-            self.receipt_count
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            self.rooted_sync_parent(&path).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn prune_receipt(&self, operation_id: &str) -> AppResult<()> {
-        let path = self.receipt_path(operation_id)?;
-        if self.read_receipt(operation_id).await?.is_none() {
-            return Ok(());
-        }
-        self.rooted_remove_file(&path).await?;
-        self.receipt_count
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        self.rooted_sync_parent(&path).await?;
-        Ok(())
-    }
-
     pub async fn initialize(root: &Path) -> AppResult<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -841,19 +646,6 @@ impl TransactionPaths {
         }
     }
 
-    async fn read_journal(&self, path: &Path) -> AppResult<ReplaceJournal> {
-        #[cfg(target_os = "linux")]
-        let file = self
-            .linux_root
-            .open_file_for_read(&self.rooted_relative(path)?)
-            .await?;
-        #[cfg(not(target_os = "linux"))]
-        let file = fs::File::open(path)
-            .await
-            .map_err(|error| AppError::with_source("failed to open transaction journal", error))?;
-        decode_replace_journal(path, file).await
-    }
-
     async fn read_deletion_journal(&self, path: &Path) -> AppResult<DeletionJournal> {
         #[cfg(target_os = "linux")]
         let file = self
@@ -865,226 +657,6 @@ impl TransactionPaths {
             .await
             .map_err(|error| AppError::with_source("failed to open deletion debt record", error))?;
         decode_deletion_journal(path, file).await
-    }
-
-    pub(crate) async fn recover(&self, root: &Path) -> AppResult<()> {
-        self.settle_publication().await?;
-        // Inspect the entire bounded recovery set before performing any rename
-        // or removal. A bad/unrecognized entry must not leave a half-cleaned set.
-        let journal_files = self
-            .inventory(&self.journals, InventoryKind::Journal)
-            .await?;
-        let uploads = self.inventory(&self.uploads, InventoryKind::File).await?;
-        let copies = self.inventory(&self.copies, InventoryKind::Tree).await?;
-        let trash = self.inventory(&self.trash, InventoryKind::Tree).await?;
-        let backups = self.inventory(&self.backups, InventoryKind::File).await?;
-        let anchors = self.inventory(&self.anchors, InventoryKind::File).await?;
-        let deletion_files = self
-            .inventory(&self.deletions, InventoryKind::Journal)
-            .await?;
-        let mut journals = Vec::new();
-        let mut pending_files = Vec::new();
-        let mut ids = std::collections::HashSet::new();
-        let mut destinations = std::collections::HashSet::new();
-        let mut deletion_records = std::collections::HashMap::new();
-        let mut pending_deletion_records = Vec::new();
-        for path in journal_files {
-            if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
-                pending_files.push(path);
-                continue;
-            }
-            let journal = self.read_journal(&path).await.inspect_err(|_| {
-                // Inventory has already validated this filename; do not log
-                // journal contents or user destination paths.
-                if let Ok(id) = resource_id(&path.with_extension("")) {
-                    tracing::warn!(transaction_id = %id, "journal validation failed; recovery stopped with resources retained");
-                }
-            })?;
-            if !journal.published {
-                self.validate_destination(&journal.destination).await?;
-            }
-            if !ids.insert(journal.id.clone())
-                || (!journal.published && !destinations.insert(journal.destination.clone()))
-            {
-                return Err(AppError::Conflict(
-                    "Ambiguous transaction journals; recovery stopped".into(),
-                ));
-            }
-            journals.push((path, journal));
-        }
-        for path in deletion_files {
-            if path.extension().and_then(|ext| ext.to_str()) == Some("tmp") {
-                pending_deletion_records.push(path);
-                continue;
-            }
-            let record = self.read_deletion_journal(&path).await?;
-            if deletion_records
-                .insert(record.id.clone(), (path, record))
-                .is_some()
-            {
-                return Err(AppError::Conflict(
-                    "Ambiguous deletion debt records; recovery stopped".into(),
-                ));
-            }
-        }
-        for path in &backups {
-            if !ids.contains(&resource_id(path)?) {
-                return Err(AppError::Conflict(
-                    "Unclaimed replacement backup; recovery stopped".into(),
-                ));
-            }
-        }
-        for path in &anchors {
-            let id = resource_id(path)?;
-            if ids.contains(&id)
-                && !journals
-                    .iter()
-                    .any(|(_, journal)| journal.id == id && journal.anchored)
-            {
-                return Err(AppError::Conflict(
-                    "Unclaimed upload anchor; recovery stopped".into(),
-                ));
-            }
-        }
-
-        for (path, journal) in journals {
-            let destination = root.join(&journal.destination);
-            let backup = self.backups.join(&journal.id);
-            let upload = self.upload_path(&journal.id);
-            let anchor = self.anchors.join(&journal.id);
-            // Never convert inspection failures into "the destination is absent".
-            let destination_exists = if journal.published {
-                false
-            } else {
-                self.rooted_exists(&destination).await?
-            };
-            let backup_exists = self.rooted_exists(&backup).await?;
-            let upload_exists = self.rooted_exists(&upload).await?;
-            if !journal.published && upload_exists && backup_exists && destination_exists {
-                return Err(AppError::Conflict(
-                    "Unexpected destination during upload recovery; original backup retained"
-                        .into(),
-                ));
-            }
-            #[cfg(target_os = "linux")]
-            let anchor_exists = self.rooted_exists(&anchor).await?;
-            #[cfg(target_os = "linux")]
-            let anchored_publication = if journal.anchored
-                && !journal.published
-                && anchor_exists
-                && destination_exists
-                && !upload_exists
-            {
-                use std::os::unix::fs::MetadataExt;
-                let anchored = self.rooted_metadata(&anchor).await?.ok_or_else(|| {
-                    AppError::Conflict("Upload anchor disappeared during recovery".into())
-                })?;
-                let destination = self.rooted_metadata(&destination).await?.ok_or_else(|| {
-                    AppError::Conflict("Upload destination disappeared during recovery".into())
-                })?;
-                anchored.dev() == destination.dev() && anchored.ino() == destination.ino()
-            } else {
-                false
-            };
-            #[cfg(not(target_os = "linux"))]
-            let anchored_publication = false;
-            if journal.anchored
-                && !journal.published
-                && destination_exists
-                && !upload_exists
-                && !anchored_publication
-            {
-                return Err(AppError::Conflict(
-                    "Upload publication identity cannot be verified; resources retained".into(),
-                ));
-            }
-            let was_committed = journal.published || (destination_exists && !upload_exists);
-            if was_committed {
-                if let (Some(operation_id), Some(size)) =
-                    (&journal.operation_id, journal.operation_size)
-                {
-                    self.rooted_sync_parent(&destination).await?;
-                    self.ensure_receipt(
-                        operation_id,
-                        &journal.destination,
-                        size,
-                        journal.published || anchored_publication,
-                    )
-                    .await?;
-                }
-            }
-            if journal.version < 2
-                && !destination_exists
-                && backup_exists
-                && !self.rooted_exists(&upload).await?
-            {
-                return Err(AppError::Conflict(
-                    "旧版替换记录缺少发布证明；已保留备份，不自动恢复旧文件".into(),
-                ));
-            }
-            if !destination_exists && backup_exists && !journal.published {
-                self.rooted_rename_noreplace(&backup, &destination).await?;
-                self.rooted_sync_parent(&destination).await?;
-                self.rooted_sync_parent(&backup).await?;
-            } else if backup_exists {
-                self.rooted_remove_file_idempotent(&backup).await?;
-                self.rooted_sync_parent(&backup).await?;
-            }
-            // The journal remains the recovery owner until cleanup really succeeds.
-            self.rooted_remove_file_idempotent(&upload).await?;
-            self.rooted_sync_parent(&upload).await?;
-            if journal.anchored {
-                self.rooted_remove_file_idempotent(&anchor).await?;
-                self.rooted_sync_parent(&anchor).await?;
-            }
-            self.rooted_remove_file_idempotent(&path).await?;
-            self.rooted_sync_parent(&path).await?;
-        }
-        for path in pending_files.into_iter().chain(uploads) {
-            self.rooted_remove_file_idempotent(&path).await?;
-            self.rooted_sync_parent(&path).await?;
-        }
-        for path in anchors {
-            if !self.rooted_exists(&path).await? {
-                continue;
-            }
-            self.rooted_remove_file(&path).await?;
-            self.rooted_sync_parent(&path).await?;
-        }
-        for path in copies {
-            loop {
-                let progress = self.remove_bounded(&path, DELETION_NODES_PER_PASS).await?;
-                if progress.complete {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            self.rooted_sync_parent(&path).await?;
-        }
-        for path in trash {
-            let id = resource_id(&path)?;
-            loop {
-                let progress = self.remove_bounded(&path, DELETION_NODES_PER_PASS).await?;
-                if progress.complete {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            self.rooted_sync_parent(&path).await?;
-            if let Some((record_path, _)) = deletion_records.remove(&id) {
-                self.rooted_remove_file_idempotent(&record_path).await?;
-                self.rooted_sync_parent(&record_path).await?;
-            }
-        }
-        for (record_path, _) in deletion_records.into_values() {
-            self.rooted_remove_file_idempotent(&record_path).await?;
-            self.rooted_sync_parent(&record_path).await?;
-        }
-        for path in pending_deletion_records {
-            self.rooted_remove_file_idempotent(&path).await?;
-            self.rooted_sync_parent(&path).await?;
-        }
-        Ok(())
     }
 
     pub fn upload_path(&self, id: &TransactionId) -> PathBuf {
@@ -1220,14 +792,7 @@ impl TransactionPaths {
             journal.operation_id = Some(operation_id.to_owned());
             journal.operation_size = Some(size);
             journal.validate()?;
-            if self.read_receipt(operation_id).await?.is_none()
-                && self
-                    .receipt_count
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    >= MAX_UPLOAD_RECEIPTS
-            {
-                return Err(AppError::TooManyRequests);
-            }
+            self.check_receipt_capacity(operation_id).await?;
         }
         let previous_size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
         observer.prepare(previous_size)?;
@@ -1642,29 +1207,6 @@ fn validate_inventory_entry(
     Ok(())
 }
 
-async fn decode_replace_journal(path: &Path, file: fs::File) -> AppResult<ReplaceJournal> {
-    let mut bytes = Vec::new();
-    file.take(MAX_JOURNAL_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|error| AppError::with_source("failed to read transaction journal", error))?;
-    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
-        return Err(AppError::Conflict(
-            "Transaction journal exceeds its size limit; recovery stopped".into(),
-        ));
-    }
-    let journal: ReplaceJournal = serde_json::from_slice(&bytes).map_err(|error| {
-        AppError::with_source("invalid transaction journal; recovery stopped", error)
-    })?;
-    journal.validate()?;
-    if journal.id != resource_id(&path.with_extension(""))? {
-        return Err(AppError::Conflict(
-            "Transaction filename and identifier disagree; recovery stopped".into(),
-        ));
-    }
-    Ok(journal)
-}
-
 async fn decode_deletion_journal(path: &Path, file: fs::File) -> AppResult<DeletionJournal> {
     let mut bytes = Vec::new();
     file.take(MAX_JOURNAL_BYTES + 1)
@@ -1920,6 +1462,120 @@ mod tests {
         assert!(anchor.exists());
         assert!(record.exists());
         assert_eq!(tokio::fs::read(backup).await.unwrap(), b"old");
+    }
+
+    #[tokio::test]
+    async fn unclaimed_anchor_preserves_the_recovery_set() {
+        let root = TestDirectory::new("recovery-unclaimed-anchor");
+        let paths = TransactionPaths::initialize(root.path()).await.unwrap();
+        let id = TransactionId::new();
+        let journal = ReplaceJournal::new(id.clone(), "report.txt".into()).unwrap();
+        let journal_path = paths.journals.join(format!("{id}.json"));
+        let upload = paths.upload_path(&id);
+        let backup = paths.backups.join(&id);
+        let anchor = paths.anchors.join(&id);
+        let copy = paths.copy_path(&TransactionId::new());
+        let trash = paths.trash.join(TransactionId::new());
+        let pending_journal = paths.journals.join(format!("{}.tmp", TransactionId::new()));
+        for (path, bytes) in [
+            (&upload, b"pending".as_slice()),
+            (&backup, b"original".as_slice()),
+            (&anchor, b"anchor".as_slice()),
+            (&pending_journal, b"partial".as_slice()),
+        ] {
+            tokio::fs::write(path, bytes).await.unwrap();
+        }
+        tokio::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap())
+            .await
+            .unwrap();
+        for path in [&copy, &trash] {
+            tokio::fs::create_dir(path).await.unwrap();
+            tokio::fs::write(path.join("child.txt"), b"staged")
+                .await
+                .unwrap();
+        }
+        drop(paths);
+
+        let error = TransactionPaths::initialize(root.path())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, crate::error::AppError::Conflict(ref message)
+            if message == "Unclaimed upload anchor; recovery stopped")
+        );
+        for (path, bytes) in [
+            (&upload, b"pending".as_slice()),
+            (&backup, b"original".as_slice()),
+            (&anchor, b"anchor".as_slice()),
+            (&pending_journal, b"partial".as_slice()),
+        ] {
+            assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+        }
+        assert!(journal_path.exists());
+        for path in [&copy, &trash] {
+            assert_eq!(
+                tokio::fs::read(path.join("child.txt")).await.unwrap(),
+                b"staged"
+            );
+        }
+        assert!(!root.path().join("report.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn orphan_anchor_is_reclaimed_without_touching_formal_files() {
+        let root = TestDirectory::new("recovery-orphan-anchor");
+        let paths = TransactionPaths::initialize(root.path()).await.unwrap();
+        let anchor = paths.anchors.join(TransactionId::new());
+        let destination = root.path().join("report.txt");
+        tokio::fs::write(&anchor, b"staged").await.unwrap();
+        tokio::fs::write(&destination, b"formal").await.unwrap();
+        drop(paths);
+
+        for _ in 0..2 {
+            let recovered = TransactionPaths::initialize(root.path()).await.unwrap();
+            assert!(!anchor.exists());
+            assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"formal");
+            drop(recovered);
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_anchor_does_not_turn_rollback_into_a_success_receipt() {
+        let root = TestDirectory::new("recovery-anchored-rollback");
+        let paths = TransactionPaths::initialize(root.path()).await.unwrap();
+        let id = TransactionId::new();
+        let operation = "abababababababababababababababab";
+        let mut journal = ReplaceJournal::new(id.clone(), "report.txt".into()).unwrap();
+        journal.anchored = true;
+        journal.operation_id = Some(operation.into());
+        journal.operation_size = Some(7);
+        let journal_path = paths.journals.join(format!("{id}.json"));
+        let upload = paths.upload_path(&id);
+        let backup = paths.backups.join(&id);
+        let anchor = paths.anchors.join(&id);
+        tokio::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&upload, b"pending").await.unwrap();
+        tokio::fs::write(&backup, b"original").await.unwrap();
+        tokio::fs::write(&anchor, b"pending").await.unwrap();
+        drop(paths);
+
+        let recovered = TransactionPaths::initialize(root.path()).await.unwrap();
+        assert_eq!(
+            tokio::fs::read(root.path().join("report.txt"))
+                .await
+                .unwrap(),
+            b"original"
+        );
+        for path in [&journal_path, &upload, &backup, &anchor] {
+            assert!(!path.exists());
+        }
+        assert!(!recovered
+            .receipt_matches("report.txt", 7, operation)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

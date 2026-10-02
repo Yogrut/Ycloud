@@ -6,7 +6,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Weak,
 };
-use std::time::Duration;
 
 use tokio::{sync::Notify, sync::RwLock};
 
@@ -26,9 +25,17 @@ use crate::{
 
 pub use crate::directory_listing::BackendEntry;
 
-// Detached HTTP waiters must not admit an unbounded number of mutation owners.
-const MAX_MUTATION_OWNERS: usize = 32;
-type AdmissionLease = std::sync::Mutex<Option<tokio::sync::OwnedRwLockReadGuard<()>>>;
+mod lifecycle;
+pub use lifecycle::StorageEditGuard;
+use lifecycle::{interruptible_body, AdmissionLease, MAX_MUTATION_OWNERS};
+#[cfg(test)]
+mod copy_tests;
+mod maintenance;
+pub(crate) use maintenance::spawn_s3_recovery_reconciler;
+use maintenance::{
+    reconcile_local_capacity, schedule_s3_capacity_reconcile, spawn_local_capacity_reconciler,
+    RETRY_MIN,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendMetadata {
@@ -50,10 +57,8 @@ pub struct StorageBackend {
 
 /// Routes every storage operation through an immutable storage identity.
 ///
-/// The first migration stage registers only `primary`. Keeping the registry
-/// separate from persisted configuration prevents a partially migrated
-/// configuration from exposing two names that still point at one mutable
-/// backend.
+/// Persisted configuration and live instances are separate: replacing a
+/// registration does not rebind handles retained by existing operations.
 #[derive(Clone, Default)]
 pub struct StorageRegistry {
     entries: Arc<RwLock<HashMap<String, RegisteredStorage>>>,
@@ -66,17 +71,25 @@ enum RegisteredStorage {
     Unavailable,
 }
 
+impl RegisteredStorage {
+    fn cached_backend(&self) -> Option<&StorageBackend> {
+        match self {
+            Self::Ready(backend) | Self::Disabled(backend) => Some(backend),
+            Self::Unavailable => None,
+        }
+    }
+}
+
 impl StorageRegistry {
     pub(crate) async fn cached_backends(&self) -> Vec<(String, StorageBackend)> {
         self.entries
             .read()
             .await
             .iter()
-            .filter_map(|(id, entry)| match entry {
-                RegisteredStorage::Ready(backend) | RegisteredStorage::Disabled(backend) => {
-                    Some((id.clone(), backend.clone()))
-                }
-                RegisteredStorage::Unavailable => None,
+            .filter_map(|(id, entry)| {
+                entry
+                    .cached_backend()
+                    .map(|backend| (id.clone(), backend.clone()))
             })
             .collect()
     }
@@ -122,20 +135,21 @@ impl StorageRegistry {
     }
 
     pub async fn cached(&self, storage_id: &str) -> Option<StorageBackend> {
-        match self.entries.read().await.get(storage_id) {
-            Some(RegisteredStorage::Ready(backend) | RegisteredStorage::Disabled(backend)) => {
-                Some(backend.clone())
-            }
-            _ => None,
-        }
+        self.entries
+            .read()
+            .await
+            .get(storage_id)
+            .and_then(RegisteredStorage::cached_backend)
+            .cloned()
     }
 
     pub async fn set_enabled(&self, storage_id: &str, enabled: bool) {
         let mut entries = self.entries.write().await;
-        if let Some(RegisteredStorage::Ready(backend) | RegisteredStorage::Disabled(backend)) =
-            entries.get(storage_id)
+        if let Some(backend) = entries
+            .get(storage_id)
+            .and_then(RegisteredStorage::cached_backend)
+            .cloned()
         {
-            let backend = backend.clone();
             entries.insert(
                 storage_id.to_owned(),
                 if enabled {
@@ -154,7 +168,8 @@ impl StorageRegistry {
     pub async fn is_ready(&self, storage_id: &str) -> bool {
         matches!(
             self.entries.read().await.get(storage_id),
-            Some(RegisteredStorage::Ready(_))
+            Some(RegisteredStorage::Ready(backend))
+                if !backend.interruption_pending() && !backend.active.retired.load(Ordering::Acquire)
         )
     }
 
@@ -164,12 +179,8 @@ impl StorageRegistry {
             .read()
             .await
             .values()
-            .filter_map(|entry| match entry {
-                RegisteredStorage::Ready(backend) | RegisteredStorage::Disabled(backend) => {
-                    Some(backend.clone())
-                }
-                RegisteredStorage::Unavailable => None,
-            })
+            .filter_map(RegisteredStorage::cached_backend)
+            .cloned()
             .collect::<Vec<_>>();
         for backend in backends {
             backend.set_local_max_upload_bytes(max_upload_bytes);
@@ -182,12 +193,8 @@ impl StorageRegistry {
             .read()
             .await
             .values()
-            .filter_map(|entry| match entry {
-                RegisteredStorage::Ready(backend) | RegisteredStorage::Disabled(backend) => {
-                    Some(backend.clone())
-                }
-                RegisteredStorage::Unavailable => None,
-            })
+            .filter_map(RegisteredStorage::cached_backend)
+            .cloned()
             .collect::<Vec<_>>();
         for backend in backends {
             backend.reconcile_capacity().await;
@@ -215,64 +222,26 @@ struct ActiveStorage {
     health: std::sync::Mutex<(bool, i64)>,
 }
 
-pub struct StorageEditGuard {
-    backend: StorageBackend,
-    _gate: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
-    _owners: Option<tokio::sync::OwnedSemaphorePermit>,
-    interrupted: bool,
-    _remote: Option<(
-        tokio::sync::OwnedRwLockWriteGuard<()>,
-        tokio::sync::OwnedMutexGuard<()>,
-    )>,
-}
-
-impl StorageEditGuard {
-    pub fn retire(&self) {
-        self.backend.active.retired.store(true, Ordering::Release);
-        if let StorageBackendKind::S3(storage) = &self.backend.active.kind {
-            storage.stop_recovery_worker();
+impl ActiveStorage {
+    fn new(
+        kind: StorageBackendKind,
+        capacity: CapacityTracker,
+        local_reconcile_wake: Option<Arc<Notify>>,
+    ) -> Self {
+        Self {
+            kind,
+            capacity,
+            local_reconcile_wake,
+            directory_snapshots: DirectorySnapshotStore::new(),
+            lifecycle: Arc::new(RwLock::new(())),
+            retired: AtomicBool::new(false),
+            mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
+            editing: AtomicBool::new(false),
+            transfer: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
+            leases: std::sync::Mutex::new(Vec::new()),
+            health: std::sync::Mutex::new((true, chrono::Utc::now().timestamp())),
         }
     }
-}
-
-impl Drop for StorageEditGuard {
-    fn drop(&mut self) {
-        if self.interrupted {
-            if self._owners.is_none() {
-                // A timed-out edit must not reopen request admission while an
-                // old queued mutation can still acquire the backend's gate.
-                let backend = self.backend.clone();
-                tokio::spawn(async move {
-                    let owners = backend
-                        .active
-                        .mutation_owners
-                        .clone()
-                        .acquire_many_owned(MAX_MUTATION_OWNERS as u32)
-                        .await;
-                    if let Ok(_owners) = owners {
-                        reopen_after_interruption(&backend);
-                    }
-                });
-            } else {
-                reopen_after_interruption(&self.backend);
-            }
-        }
-    }
-}
-
-fn reopen_after_interruption(backend: &StorageBackend) {
-    if let StorageBackendKind::S3(storage) = &backend.active.kind {
-        // Retirement blocks user admission separately. Its original
-        // connection must remain usable by deferred owned cleanup.
-        storage.resume_maintenance();
-    }
-    *backend
-        .active
-        .transfer
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-        tokio_util::sync::CancellationToken::new();
-    backend.active.editing.store(false, Ordering::Release);
 }
 
 /// Cancellation or a task panic must not leave a possibly published S3
@@ -370,138 +339,24 @@ impl StorageBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             (result.is_ok(), chrono::Utc::now().timestamp());
     }
-    fn admitted(&self) -> AppResult<Self> {
-        if self.active.editing.load(Ordering::Acquire) {
-            return Err(AppError::Conflict("存储配置正在更新，请重试".into()));
-        }
-        let gate = self
-            .active
-            .lifecycle
-            .clone()
-            .try_read_owned()
-            .map_err(|_| AppError::Conflict("存储连接正在调整，请稍后重试".into()))?;
-        if self.active.retired.load(Ordering::Acquire) {
-            return Err(AppError::Conflict("存储连接已更新，请重试".into()));
-        }
-        let mut leases = self
-            .active
-            .leases
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.active.editing.load(Ordering::Acquire) {
-            return Err(AppError::Conflict("存储配置正在更新，请重试".into()));
-        }
-        leases.retain(|lease| lease.strong_count() > 0);
-        let lease = Arc::new(std::sync::Mutex::new(Some(gate)));
-        leases.push(Arc::downgrade(&lease));
-        Ok(Self {
-            active: self.active.clone(),
-            lease: Some(lease),
-            transfer: Some(self.transfer_token()),
-        })
-    }
-
-    pub async fn edit_guard(&self) -> AppResult<StorageEditGuard> {
-        if self.active.editing.load(Ordering::Acquire) {
-            return Err(AppError::Conflict("存储配置正在更新".into()));
-        }
-        let gate = self
-            .active
-            .lifecycle
-            .clone()
-            .try_write_owned()
-            .map_err(|_| {
-                AppError::Conflict("存储仍有进行中的操作，请完成后再修改连接或删除".into())
-            })?;
-        let remote = match &self.active.kind {
-            StorageBackendKind::S3(storage) => Some(storage.quiesce_for_edit().await?),
-            StorageBackendKind::Local(_) => None,
-        };
-        Ok(StorageEditGuard {
-            backend: self.clone(),
-            _gate: Some(gate),
-            _owners: None,
-            interrupted: false,
-            _remote: remote,
-        })
-    }
-
-    fn transfer_token(&self) -> tokio_util::sync::CancellationToken {
-        self.transfer.clone().unwrap_or_else(|| {
-            self.active
-                .transfer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        })
-    }
-
-    /// Administrator edits stop transfer admission and cancel payload transfer,
-    /// rather than requiring clients to voluntarily finish uploading.
-    pub(crate) async fn interrupt_for_edit(&self) -> AppResult<StorageEditGuard> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.interrupt_for_edit_inner(),
-        )
-        .await
-        .map_err(|_| AppError::Conflict("存储提交未在 5 秒内结束；配置未修改，请稍后重试".into()))?
-    }
-
-    async fn interrupt_for_edit_inner(&self) -> AppResult<StorageEditGuard> {
-        self.active
-            .editing
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| AppError::Conflict("存储设置正在更新，请稍后重试".into()))?;
-        self.transfer_token().cancel();
-        if let StorageBackendKind::S3(storage) = &self.active.kind {
-            storage.pause_maintenance();
-        }
-        let mut guard = StorageEditGuard {
-            backend: self.clone(),
-            _gate: None,
-            _owners: None,
-            interrupted: true,
-            _remote: None,
-        };
-        guard._owners = Some(
-            self.active
-                .mutation_owners
-                .clone()
-                .acquire_many_owned(MAX_MUTATION_OWNERS as u32)
-                .await
-                .map_err(|_| AppError::ServiceUnavailable("存储操作已关闭".into()))?,
-        );
-        {
-            let mut leases = self
-                .active
-                .leases
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for lease in leases.drain(..).filter_map(|lease| lease.upgrade()) {
-                lease
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-            }
-        }
-        guard._gate = Some(self.active.lifecycle.clone().write_owned().await);
-        if let StorageBackendKind::S3(storage) = &self.active.kind {
-            guard._remote = Some(storage.quiesce_after_interrupt().await);
-        }
-        Ok(guard)
-    }
-
     pub fn set_capacity_limit(&self, limit: Option<u64>) {
         self.active.capacity.set_limit(limit);
     }
 
     /// Hold exclusive admission while settling abandoned uploads.
     /// No live upload may be adopted as abandoned recovery work.
-    pub(crate) async fn recover_abandoned_uploads(&self) -> AppResult<StorageEditGuard> {
+    pub(crate) async fn recover_abandoned_uploads_before(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        stop: Option<tokio_util::sync::CancellationToken>,
+    ) -> AppResult<StorageEditGuard> {
         let guard = self.edit_guard().await?;
         match &self.active.kind {
             StorageBackendKind::S3(storage) => {
-                storage.recover_quiesced_uploads().await?;
+                storage
+                    .scoped_work(deadline, stop)
+                    .recover_quiesced_uploads()
+                    .await?;
                 self.active.capacity.mark_uncertain();
             }
             StorageBackendKind::Local(storage) => {
@@ -553,19 +408,11 @@ impl StorageBackend {
         Self {
             lease: None,
             transfer: None,
-            active: Arc::new(ActiveStorage {
-                lifecycle: Arc::new(RwLock::new(())),
-                retired: AtomicBool::new(false),
-                editing: AtomicBool::new(false),
-                transfer: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
-                leases: std::sync::Mutex::new(Vec::new()),
-                health: std::sync::Mutex::new((true, chrono::Utc::now().timestamp())),
-                mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
-                kind: StorageBackendKind::Local(storage),
-                capacity: CapacityTracker::new(None, 0),
-                local_reconcile_wake: None,
-                directory_snapshots: DirectorySnapshotStore::new(),
-            }),
+            active: Arc::new(ActiveStorage::new(
+                StorageBackendKind::Local(storage),
+                CapacityTracker::new(None, 0),
+                None,
+            )),
         }
     }
 
@@ -582,24 +429,16 @@ impl StorageBackend {
         let backend = Self {
             lease: None,
             transfer: None,
-            active: Arc::new(ActiveStorage {
-                lifecycle: Arc::new(RwLock::new(())),
-                retired: AtomicBool::new(false),
-                editing: AtomicBool::new(false),
-                transfer: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
-                leases: std::sync::Mutex::new(Vec::new()),
-                health: std::sync::Mutex::new((true, chrono::Utc::now().timestamp())),
-                mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
-                kind: StorageBackendKind::Local(storage),
+            active: Arc::new(ActiveStorage::new(
+                StorageBackendKind::Local(storage),
                 capacity,
-                local_reconcile_wake: Some(reconcile_wake.clone()),
-                directory_snapshots: DirectorySnapshotStore::new(),
-            }),
+                Some(reconcile_wake.clone()),
+            )),
         };
-        spawn_local_capacity_reconciler(
+        let _worker = spawn_local_capacity_reconciler(
             Arc::downgrade(&backend.active),
             reconcile_wake,
-            Duration::from_secs(1),
+            RETRY_MIN,
         );
         persist_capacity(&backend.active.capacity).await;
         Ok(backend)
@@ -618,24 +457,11 @@ impl StorageBackend {
         let backend = Self {
             lease: None,
             transfer: None,
-            active: Arc::new(ActiveStorage {
-                lifecycle: Arc::new(RwLock::new(())),
-                retired: AtomicBool::new(false),
-                editing: AtomicBool::new(false),
-                transfer: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
-                leases: std::sync::Mutex::new(Vec::new()),
-                health: std::sync::Mutex::new((true, chrono::Utc::now().timestamp())),
-                mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
-                kind: StorageBackendKind::S3(storage),
-                capacity: CapacityTracker::new_with_ledger(
-                    capacity_limit,
-                    used,
-                    false,
-                    Some(ledger_path),
-                ),
-                local_reconcile_wake: None,
-                directory_snapshots: DirectorySnapshotStore::new(),
-            }),
+            active: Arc::new(ActiveStorage::new(
+                StorageBackendKind::S3(storage),
+                CapacityTracker::new_with_ledger(capacity_limit, used, false, Some(ledger_path)),
+                None,
+            )),
         };
         let active = &backend.active;
         if let StorageBackendKind::S3(storage) = &active.kind {
@@ -930,42 +756,6 @@ impl StorageBackend {
         .await
     }
 
-    async fn owned_mutation<T: Send + 'static, F, Fut>(&self, work: F) -> AppResult<T>
-    where
-        F: FnOnce(Self) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = AppResult<T>> + Send + 'static,
-    {
-        let owner = self.clone();
-        let permit = owner
-            .active
-            .mutation_owners
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| AppError::TooManyRequests)?;
-        if owner.active.editing.load(Ordering::Acquire)
-            || owner.active.retired.load(Ordering::Acquire)
-            || owner.transfer_token().is_cancelled()
-        {
-            return Err(AppError::Conflict(
-                "存储配置已变更，传输已中断，请重试".into(),
-            ));
-        }
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _lease = owner.lease.clone();
-            let result = work(owner.clone()).await;
-            owner.observe_result(&result);
-            result
-        })
-        .await
-        .map_err(|error| {
-            AppError::with_source("storage mutation owner failed", error).with_operation(
-                crate::error::CommitState::Unknown,
-                crate::error::CleanupState::Unknown,
-            )
-        })?
-    }
-
     async fn upload_file_mode_inner(
         &self,
         relative: &str,
@@ -1238,47 +1028,24 @@ impl StorageBackend {
             StorageBackendKind::S3(storage) => {
                 let copied_size = storage.path_size(source).await?;
                 let reservation = capacity.reserve_replacement(0, copied_size)?;
-                let storage = storage.clone();
-                let source = source.to_owned();
-                let destination = destination.to_owned();
-                let failure_capacity = capacity.clone();
-                let failure_storage = storage.clone();
-                let snapshots = active.directory_snapshots.clone();
-                tokio::spawn(async move {
-                    let _snapshot_invalidation = snapshots.invalidate_on_drop();
-                    let _accounting = storage.acquire_capacity_mutation().await;
-                    let mut accounting = S3CapacityAccounting::new(&capacity, &storage);
-                    let result: AppResult<()> = async {
-                        if storage.metadata(&source).await?.is_dir {
-                            storage
-                                .copy_directory_with_expected_size(
-                                    &source,
-                                    &destination,
-                                    copied_size,
-                                )
-                                .await
-                        } else {
-                            storage
-                                .copy_file_with_expected_size(&source, &destination, copied_size)
-                                .await
-                        }
-                    }
-                    .await;
-                    if let Err(error) = result {
-                        drop(reservation);
-                        schedule_s3_capacity_reconcile(capacity, storage);
-                        return Err(error);
-                    }
-                    reservation.commit(0, copied_size);
-                    persist_capacity(&capacity).await;
-                    accounting.settled = true;
-                    Ok(())
-                })
-                .await
-                .map_err(|error| {
-                    schedule_s3_capacity_reconcile(failure_capacity, failure_storage);
-                    AppError::with_source("S3 copy execution task failed", error)
-                })?
+                // `copy_path` already owns independent execution and snapshot
+                // invalidation. Keep quota and remote I/O in that same owner;
+                // the accounting guard reconciles errors or panic on exit.
+                let _accounting = storage.acquire_capacity_mutation().await;
+                let mut accounting = S3CapacityAccounting::new(&capacity, storage);
+                if storage.metadata(source).await?.is_dir {
+                    storage
+                        .copy_directory_with_expected_size(source, destination, copied_size)
+                        .await?;
+                } else {
+                    storage
+                        .copy_file_with_expected_size(source, destination, copied_size)
+                        .await?;
+                }
+                reservation.commit(0, copied_size);
+                persist_capacity(&capacity).await;
+                accounting.settled = true;
+                Ok(())
             }
         }
     }
@@ -1334,178 +1101,6 @@ impl StorageBackend {
             }
         }
     }
-}
-
-async fn reconcile_local_capacity(
-    capacity: &CapacityTracker,
-    storage: &StorageService,
-) -> AppResult<()> {
-    if !capacity.begin_reconciliation() {
-        return Ok(());
-    }
-    match storage.reconcile_capacity_snapshot(capacity).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            capacity.reconciliation_failed();
-            tracing::error!(%error, "failed to reconcile local capacity after a storage mutation error");
-            Err(error)
-        }
-    }
-}
-
-fn spawn_local_capacity_reconciler(
-    active: Weak<ActiveStorage>,
-    wake: Arc<Notify>,
-    retry_min: Duration,
-) {
-    tokio::spawn(async move {
-        loop {
-            wake.notified().await;
-            let mut retry = retry_min;
-            loop {
-                let Some(current) = active.upgrade() else {
-                    return;
-                };
-                if current.retired.load(Ordering::Acquire) {
-                    return;
-                }
-                let lease = current.lifecycle.clone().try_read_owned();
-                let Ok(_lease) = lease else {
-                    drop(current);
-                    tokio::time::sleep(retry).await;
-                    continue;
-                };
-                let result = match &current.kind {
-                    StorageBackendKind::Local(storage) => {
-                        reconcile_local_capacity(&current.capacity, storage).await
-                    }
-                    StorageBackendKind::S3(_) => return,
-                };
-                drop(_lease);
-                drop(current);
-                if result.is_ok() {
-                    break;
-                }
-                tokio::time::sleep(retry).await;
-                retry = (retry * 2).min(Duration::from_secs(60));
-            }
-        }
-    });
-}
-
-fn schedule_s3_capacity_reconcile(capacity: CapacityTracker, storage: S3Backend) {
-    capacity.mark_uncertain();
-    if !capacity.begin_reconciliation() {
-        return;
-    }
-    tokio::spawn(async move {
-        let mut retry = Duration::from_secs(1);
-        loop {
-            if storage.recovery_worker_stopped() {
-                capacity.reconciliation_failed();
-                return;
-            }
-            match storage.reconcile_capacity_snapshot(&capacity).await {
-                Ok(()) => return,
-                Err(error) => {
-                    tracing::warn!(%error, retry_seconds = retry.as_secs(), "S3 capacity reconciliation will retry");
-                }
-            }
-            tokio::time::sleep(retry).await;
-            retry = (retry * 2).min(Duration::from_secs(60));
-        }
-    });
-}
-
-pub(crate) fn spawn_s3_recovery_reconciler(storage: S3Backend, capacity: CapacityTracker) {
-    const QUIET_PERIOD: Duration = Duration::from_secs(1);
-    const RETRY_MIN: Duration = Duration::from_secs(1);
-    const RETRY_MAX: Duration = Duration::from_secs(60);
-
-    if !storage.begin_recovery_worker() {
-        tracing::warn!("refused to start a duplicate S3 recovery worker");
-        return;
-    }
-    tokio::spawn(async move {
-        loop {
-            if storage.recovery_worker_stopped() {
-                return;
-            }
-            tokio::select! {
-                _ = storage.wait_for_recovery_work() => {}
-                _ = storage.wait_for_recovery_shutdown() => return,
-            }
-            if storage.recovery_worker_stopped() {
-                return;
-            }
-
-            // A normal mutation usually creates and settles its journal while
-            // holding the shared mutation gate. Give it a short quiet period
-            // so successful requests do not trigger an eight-category scan.
-            tokio::select! {
-                _ = tokio::time::sleep(QUIET_PERIOD) => {}
-                _ = storage.wait_for_recovery_shutdown() => return,
-            }
-            if !storage.recovery_has_pending() {
-                continue;
-            }
-
-            let mut retry = RETRY_MIN;
-            loop {
-                if storage.recovery_worker_stopped() {
-                    return;
-                }
-                if !storage.recovery_has_pending() {
-                    break;
-                }
-                storage.runtime_recovery_started();
-                match storage.recover_runtime_transactions(&capacity).await {
-                    Ok(recovered) => {
-                        if let Some(recovered) = recovered {
-                            tracing::info!(recovered, "runtime S3 recovery completed");
-                            schedule_s3_capacity_reconcile(capacity.clone(), storage.clone());
-                        }
-                        break;
-                    }
-                    Err(error) => {
-                        storage.runtime_recovery_failed(error.public_message().as_ref(), retry);
-                        tracing::warn!(
-                            %error,
-                            retry_seconds = retry.as_secs(),
-                            "runtime S3 recovery remains pending"
-                        );
-                    }
-                }
-                if storage.recovery_worker_stopped() {
-                    return;
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(retry) => {}
-                    _ = storage.wait_for_recovery_shutdown() => return,
-                }
-                retry = (retry * 2).min(RETRY_MAX);
-            }
-        }
-    });
-}
-
-fn interruptible_body(body: Body, cancellation: tokio_util::sync::CancellationToken) -> Body {
-    Body::from_stream(futures_util::stream::try_unfold(
-        (body.into_data_stream(), cancellation),
-        |(mut stream, cancellation)| async move {
-            let chunk = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted, "存储配置已变更，传输已中断，请重试")),
-                chunk = stream.next() => chunk,
-            };
-            match chunk {
-                Some(Ok(chunk)) => Ok(Some((chunk, (stream, cancellation)))),
-                Some(Err(error)) => Err(std::io::Error::other(error)),
-                None => Ok(None),
-            }
-        },
-    ))
 }
 
 async fn persist_capacity(capacity: &CapacityTracker) {
@@ -1589,207 +1184,55 @@ mod tests {
 
     use super::{StorageBackend, StorageRegistry};
 
-    #[tokio::test]
-    async fn interrupted_edit_reopens_only_after_old_mutation_owners_exit() {
-        use std::{sync::atomic::Ordering, time::Duration};
-        let fixture = crate::test_support::TestDirectory::new("edit-reopen-after-owner");
-        let storage =
-            crate::storage::StorageService::new(fixture.path().join("files"), 1024, 1, 100, 0)
-                .await
-                .unwrap();
-        let backend = StorageBackend::local(storage);
-        let owner = backend
-            .active
-            .mutation_owners
-            .clone()
-            .try_acquire_owned()
-            .unwrap();
-        backend.active.editing.store(true, Ordering::Release);
-        backend.transfer_token().cancel();
-        // Model the guard dropped by the edit timeout before owner draining.
-        drop(super::StorageEditGuard {
-            backend: backend.clone(),
-            _gate: None,
-            _owners: None,
-            interrupted: true,
-            _remote: None,
-        });
-        tokio::task::yield_now().await;
-        assert!(backend.active.editing.load(Ordering::Acquire));
-        assert!(backend.owned_mutation(|_| async { Ok(()) }).await.is_err());
-        drop(owner);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while backend.active.editing.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(!backend.transfer_token().is_cancelled());
-        backend.owned_mutation(|_| async { Ok(()) }).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn administrator_edit_interrupts_slow_s3_capacity_scan() {
-        use axum::{
-            http::{Method, Response},
-            routing::any,
-            Router,
-        };
-        use std::{sync::Arc, time::Duration};
-        let started = Arc::new(tokio::sync::Notify::new());
-        let signal = started.clone();
-        let router = Router::new().route(
-            "/{*key}",
-            any(move |method: Method| {
-                let signal = signal.clone();
-                async move {
-                    if method == Method::GET {
-                        signal.notify_one();
-                        return std::future::pending::<Response<Body>>().await;
-                    }
-                    Response::builder().status(404).body(Body::empty()).unwrap()
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let remote = crate::s3_backend::protocol_tests::test_backend(&format!(
-            "http://{}",
-            listener.local_addr().unwrap()
-        ));
-        let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        let fixture = crate::test_support::TestDirectory::new("admin-s3-scan-interrupt");
-        let backend =
-            StorageBackend::s3_configured(remote.clone(), None, fixture.path().join("ledger.json"))
-                .await
-                .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), started.notified())
-            .await
-            .unwrap();
-        let edit = tokio::time::timeout(Duration::from_secs(1), backend.interrupt_for_edit())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(remote.probe().await.is_err());
-        drop(edit);
-        // The cancelled read does not permanently disable request admission.
-        assert!(!remote
-            .upload_committed("missing.txt", 1, "test")
-            .await
-            .unwrap());
-        let edit = backend.interrupt_for_edit().await.unwrap();
-        edit.retire();
-        drop(edit);
-        // The old connection remains available for owned deferred cleanup,
-        // while retirement keeps user mutation admission closed.
-        assert!(!remote
-            .upload_committed("missing.txt", 1, "test")
-            .await
-            .unwrap());
-        assert!(backend.owned_mutation(|_| async { Ok(()) }).await.is_err());
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn administrator_interrupt_cancels_download_and_revokes_old_admission() {
-        use futures_util::StreamExt;
-        let fixture = crate::test_support::TestDirectory::new("admin-download-interrupt");
-        let path = fixture.path().join("files");
-        let storage = crate::storage::StorageService::new(path.clone(), 1024, 1, 100, 0)
-            .await
-            .unwrap();
-        tokio::fs::write(path.join("saved.bin"), b"saved")
-            .await
-            .unwrap();
-        let registry = StorageRegistry::single("primary", StorageBackend::local(storage)).await;
-        let admitted = registry.get("primary").await.unwrap();
-        let response = admitted
-            .stream_file(
-                "saved.bin",
-                &axum::http::HeaderMap::new(),
-                crate::storage::FileResponseMode::Attachment,
-            )
-            .await
-            .unwrap();
-        let cached = registry.cached("primary").await.unwrap();
-        let edit = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            cached.interrupt_for_edit(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(registry.get("primary").await.is_err());
-        assert!(response
-            .into_body()
-            .into_data_stream()
-            .next()
-            .await
-            .unwrap()
-            .is_err());
-        assert_eq!(
-            tokio::fs::read(path.join("saved.bin")).await.unwrap(),
-            b"saved"
-        );
-        drop(edit);
-        let fresh = registry.get("primary").await.unwrap();
-        assert!(!fresh.transfer_token().is_cancelled());
-        assert!(admitted.transfer_token().is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn lifecycle_admission_survives_disable_and_an_abandoned_mutation_waiter() {
-        let fixture = crate::test_support::TestDirectory::new("backend-lifecycle");
-        let storage =
-            crate::storage::StorageService::new(fixture.path().join("files"), 1024, 1, 100, 0)
-                .await
-                .unwrap();
-        let registry = StorageRegistry::single("primary", StorageBackend::local(storage)).await;
-        let cached = registry.cached("primary").await.unwrap();
-        let admitted = registry.get("primary").await.unwrap();
-        let (started, entered) = tokio::sync::oneshot::channel();
-        let (finish, finishing) = tokio::sync::oneshot::channel();
-        let waiter = tokio::spawn(async move {
-            admitted
-                .owned_mutation(move |_backend| async move {
-                    started.send(()).unwrap();
-                    finishing.await.unwrap();
-                    Ok(())
-                })
-                .await
-        });
-        entered.await.unwrap();
-        waiter.abort();
-        waiter.await.unwrap_err();
-        assert!(cached.edit_guard().await.is_err());
-        registry.set_enabled("primary", false).await;
-        assert!(registry.get("primary").await.is_err());
-        registry.set_enabled("primary", true).await;
-        assert!(cached.edit_guard().await.is_err());
-        finish.send(()).unwrap();
-        let edit = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Ok(edit) = cached.edit_guard().await {
-                    break edit;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(registry.get("primary").await.is_err());
-        edit.retire();
-        drop(edit);
-        assert!(registry.get("primary").await.is_err());
-    }
     use crate::capacity::load_capacity_ledger;
     use crate::directory_listing::{
         DirectoryEntryFilter, DirectoryListRequest, DirectorySort, SortDirection,
     };
     use crate::storage::StorageService;
     use crate::test_support::TestDirectory;
+
+    #[tokio::test]
+    async fn fresh_instances_do_not_share_lifecycle_or_capacity_state() {
+        let fixture = TestDirectory::new("backend-instance-state");
+        let storage = StorageService::new(fixture.path().join("files"), 1024, 1, 100, 0)
+            .await
+            .unwrap();
+        let first = StorageBackend::local(storage.clone());
+        let second = StorageBackend::local(storage);
+        assert_ne!(first.instance_key(), second.instance_key());
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.active.lifecycle,
+            &second.active.lifecycle,
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.active.mutation_owners,
+            &second.active.mutation_owners,
+        ));
+        assert_eq!(
+            second.active.mutation_owners.available_permits(),
+            super::MAX_MUTATION_OWNERS
+        );
+        assert!(second.active.local_reconcile_wake.is_none());
+        assert!(second.active.leases.lock().unwrap().is_empty());
+        assert!(!second.transfer_token().is_cancelled());
+
+        first.set_capacity_limit(Some(2));
+        first.active.capacity.mark_uncertain();
+        let edit = first.interrupt_for_edit().await.unwrap();
+        edit.retire();
+        drop(edit);
+        assert!(first.admitted().is_err());
+        assert!(second.active.capacity.status().accurate);
+        assert!(second.active.capacity.status().limit.is_none());
+        assert_eq!(second.active.capacity.status().used, 0);
+        assert!(!second.transfer_token().is_cancelled());
+        second
+            .admitted()
+            .unwrap()
+            .owned_mutation(|_| async { Ok(()) })
+            .await
+            .unwrap();
+    }
 
     fn directory_request(limit: usize) -> DirectoryListRequest {
         DirectoryListRequest {
@@ -1963,6 +1406,19 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.status(), axum::http::StatusCode::NOT_FOUND);
+
+        registry.insert_unavailable("unavailable").await;
+        assert!(registry.cached("unavailable").await.is_none());
+        registry.set_enabled("primary", false).await;
+        assert!(!registry.is_ready("primary").await);
+        assert!(registry.cached("primary").await.is_some());
+        assert_eq!(registry.cached_backends().await.len(), 1);
+        assert_eq!(
+            registry.get("primary").await.err().unwrap().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+        registry.set_enabled("primary", true).await;
+        assert!(registry.is_ready("primary").await);
 
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

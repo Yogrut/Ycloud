@@ -20,6 +20,8 @@ use crate::{
     upload_batch::UploadBatchStore,
 };
 
+const STORAGE_INITIALIZATION_BUDGET: Duration = Duration::from_secs(60);
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
@@ -108,27 +110,23 @@ impl AppState {
             .map_err(|error| {
                 AppError::with_source("failed to load old storage recovery responsibility", error)
             })?;
-        let startup_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let startup_deadline = tokio::time::Instant::now() + STORAGE_INITIALIZATION_BUDGET;
         for instance in &persisted.storage_instances {
             if !instance.enabled {
                 continue;
             }
-            match tokio::time::timeout_at(
+            // Share the startup admission deadline without dropping an issued
+            // recovery write when the whole startup budget expires.
+            match prepare_storage_backend_before(
+                &config,
+                &local_io_gate,
+                max_upload_bytes,
+                &instance.id,
+                &instance.backend,
                 startup_deadline,
-                prepare_storage_backend(
-                    &config,
-                    &local_io_gate,
-                    max_upload_bytes,
-                    &instance.id,
-                    &instance.backend,
-                ),
             )
             .await
-            .unwrap_or_else(|_| {
-                Err(AppError::ServiceUnavailable(
-                    "存储启动初始化总时限已到，请在后台重试".into(),
-                ))
-            }) {
+            {
                 Ok(backend) => backends.insert_ready(instance.id.clone(), backend).await,
                 Err(error) => {
                     tracing::error!(
@@ -450,9 +448,13 @@ impl AppState {
         }
         if enabled {
             let backend = crate::s3_backend::S3Backend::new(&settings, &self.config)?;
-            tokio::time::timeout(Duration::from_secs(60), backend.activation_probe())
-                .await
-                .map_err(|_| AppError::ServiceUnavailable("存储连接测试超时".into()))??;
+            backend
+                .scoped_work(
+                    Some(tokio::time::Instant::now() + STORAGE_INITIALIZATION_BUDGET),
+                    None,
+                )
+                .activation_probe()
+                .await?;
         }
         let mut next = self.config_file.read().await.clone();
         next.pending_storage_instance = Some(StorageInstanceConfig {
@@ -480,20 +482,19 @@ impl AppState {
             .try_lock()
             .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
 
-        let crate::config::GuestAccess {
-            access: allow_guest_access,
-            download: allow_guest_download,
-        } = allow_guest_access.into();
+        let guest_access = allow_guest_access.into();
         let mut next = self.config_file.read().await.clone();
         let instance = next
             .storage_instances
-            .iter_mut()
+            .iter()
             .find(|instance| instance.id == storage_id)
             .ok_or(AppError::NotFound)?;
         let StorageBackendConfig::S3(previous) = &instance.backend else {
             return Err(AppError::BadRequest("该存储源不是 S3 存储".into()));
         };
         crate::config::verify_entity_revision(instance, expected_revision.as_deref())?;
+        let previous_instance = instance.clone();
+        let previous = previous.clone();
         if settings.access_key_id.is_empty() {
             settings.access_key_id = previous.access_key_id.clone();
         }
@@ -504,25 +505,38 @@ impl AppState {
         connection.capacity_limit_bytes = previous.capacity_limit_bytes;
         connection.relay_upload = previous.relay_upload;
         let cached = self.backends.cached(storage_id).await;
-        let reuse = connection == *previous && cached.is_some();
-        let interrupt = !reuse || !enabled || settings.relay_upload != previous.relay_upload;
+        let reuse = connection == previous && cached.is_some();
         let backend_config = StorageBackendConfig::S3(settings.clone());
-        let mut candidate = self.config_file.read().await.clone();
-        let candidate_instance = candidate
+        let candidate_instance = next
             .storage_instances
             .iter_mut()
             .find(|storage| storage.id == storage_id)
             .ok_or(AppError::NotFound)?;
+        candidate_instance.name = name.trim().to_string();
         candidate_instance.backend = backend_config.clone();
         candidate_instance.enabled = enabled;
-        candidate_instance.name = name.trim().to_string();
-        candidate.validate()?;
+        candidate_instance.update_guest_access(guest_access);
+        let interrupt = !reuse
+            || !enabled
+            || settings.relay_upload != previous.relay_upload
+            || guest_access_restricted(&previous_instance, candidate_instance);
+        let reenable = enabled && !previous_instance.enabled;
+        next.validate()?;
         // A replacement pointing at the same namespace must not recover the
         // old generation's live journals. Stop admission and drain the old
         // owner before any activation probe or recovery touches remote state.
-        let edit = if interrupt {
+        let _edit = if reenable && reuse {
+            Some(
+                cached
+                    .as_ref()
+                    .expect("reused backend")
+                    .reenable_guard()
+                    .await?,
+            )
+        } else if interrupt {
             match &cached {
-                Some(backend) => Some(backend.interrupt_for_edit().await?),
+                Some(backend) if !reuse => Some(backend.interrupt_for_edit().await?),
+                Some(backend) => backend.interrupt_for_policy(),
                 None => None,
             }
         } else {
@@ -544,16 +558,6 @@ impl AppState {
         } else {
             None
         };
-        instance.name = name.trim().to_string();
-        instance.backend = backend_config;
-        instance.enabled = enabled;
-        instance.allow_guest_access = allow_guest_access;
-        instance.allow_guest_download = if allow_guest_access {
-            allow_guest_download.or(instance.allow_guest_download)
-        } else {
-            Some(false)
-        };
-        next.validate()?;
         self.persist_storage_selection(&next).await?;
         if interrupt {
             self.upload_batches
@@ -561,8 +565,8 @@ impl AppState {
                 .await;
         }
         if !reuse {
-            if let Some(edit) = &edit {
-                edit.retire();
+            if let Some(backend) = &cached {
+                backend.retire();
             }
         }
         if let Some(prepared) = prepared {
@@ -594,10 +598,6 @@ impl AppState {
             .try_lock()
             .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
 
-        let crate::config::GuestAccess {
-            access: allow_guest_access,
-            download: allow_guest_download,
-        } = guest_access;
         let mount_id = self
             .config
             .local_mounts
@@ -622,6 +622,7 @@ impl AppState {
             &next.storage_instances[position],
             expected_revision.as_deref(),
         )?;
+        let previous_instance = next.storage_instances[position].clone();
         if next
             .storage_instances
             .iter()
@@ -644,12 +645,33 @@ impl AppState {
         let reuse = matches!((&next.storage_instances[position].backend, &backend_config),
             (StorageBackendConfig::Local(old), StorageBackendConfig::Local(new)) if old.mount_id == new.mount_id)
             && cached.is_some();
-        let interrupt = !reuse || !enabled;
-        let mut candidate = next.clone();
-        candidate.storage_instances[position].name = name.trim().to_string();
-        candidate.storage_instances[position].backend = backend_config.clone();
-        candidate.storage_instances[position].enabled = enabled;
-        candidate.validate()?;
+        next.storage_instances[position].name = name.trim().to_string();
+        next.storage_instances[position].backend = backend_config.clone();
+        next.storage_instances[position].enabled = enabled;
+        next.storage_instances[position].update_guest_access(guest_access);
+        let interrupt = !reuse
+            || !enabled
+            || guest_access_restricted(&previous_instance, &next.storage_instances[position]);
+        next.validate()?;
+        let _edit = if enabled && !previous_instance.enabled && reuse {
+            Some(
+                cached
+                    .as_ref()
+                    .expect("reused backend")
+                    .reenable_guard()
+                    .await?,
+            )
+        } else if interrupt {
+            match &cached {
+                Some(backend) if !reuse => Some(backend.interrupt_for_edit().await?),
+                Some(backend) => backend.interrupt_for_policy(),
+                None => None,
+            }
+        } else {
+            None
+        };
+        // A replacement shares the capacity-ledger identity. Prepare it only
+        // after old mutation owners have stopped updating that ledger.
         let prepared = if reuse {
             cached.clone()
         } else if enabled {
@@ -666,24 +688,6 @@ impl AppState {
         } else {
             None
         };
-        let edit = if interrupt {
-            match &cached {
-                Some(backend) => Some(backend.interrupt_for_edit().await?),
-                None => None,
-            }
-        } else {
-            None
-        };
-        next.storage_instances[position].name = name.trim().to_string();
-        next.storage_instances[position].backend = backend_config;
-        next.storage_instances[position].enabled = enabled;
-        next.storage_instances[position].allow_guest_access = allow_guest_access;
-        next.storage_instances[position].allow_guest_download = if allow_guest_access {
-            allow_guest_download.or(next.storage_instances[position].allow_guest_download)
-        } else {
-            Some(false)
-        };
-        next.validate()?;
         self.persist_storage_selection(&next).await?;
         if interrupt {
             self.upload_batches
@@ -691,8 +695,8 @@ impl AppState {
                 .await;
         }
         if !reuse {
-            if let Some(edit) = &edit {
-                edit.retire();
+            if let Some(backend) = &cached {
+                backend.retire();
             }
         }
         if let Some(prepared) = prepared {
@@ -774,23 +778,17 @@ impl AppState {
             .try_lock()
             .map_err(|_| AppError::Conflict("另一个存储设置正在处理，请稍后重试".into()))?;
 
-        let crate::config::GuestAccess {
-            access: allow_guest_access,
-            download: allow_guest_download,
-        } = allow_guest_access.into();
+        let guest_access = allow_guest_access.into();
         let mut next = self.config_file.read().await.clone();
         let instance = next
             .storage_instances
             .iter_mut()
             .find(|instance| instance.id == storage_id)
             .ok_or(AppError::NotFound)?;
+        let previous_instance = instance.clone();
         instance.enabled = enabled;
-        instance.allow_guest_access = allow_guest_access;
-        instance.allow_guest_download = if allow_guest_access {
-            allow_guest_download.or(instance.allow_guest_download)
-        } else {
-            Some(false)
-        };
+        instance.update_guest_access(guest_access);
+        let interrupt = !enabled || guest_access_restricted(&previous_instance, instance);
         let backend_config = instance.backend.clone();
         let cached = self.backends.cached(storage_id).await;
         next.validate()?;
@@ -808,16 +806,21 @@ impl AppState {
         } else {
             None
         };
-        let _edit = if !enabled {
+        let _edit = if enabled && !previous_instance.enabled {
             match &cached {
-                Some(backend) => Some(backend.interrupt_for_edit().await?),
+                Some(backend) => Some(backend.reenable_guard().await?),
+                None => None,
+            }
+        } else if interrupt {
+            match &cached {
+                Some(backend) => backend.interrupt_for_policy(),
                 None => None,
             }
         } else {
             None
         };
         self.persist_storage_selection(&next).await?;
-        if !enabled {
+        if interrupt {
             self.upload_batches
                 .invalidate_storage(storage_id, cached.clone())
                 .await;
@@ -868,16 +871,15 @@ impl AppState {
         }
         next.validate()?;
         let cached = self.backends.cached(storage_id).await;
-        let edit = match &cached {
-            Some(backend) => Some(backend.interrupt_for_edit().await?),
-            None => None,
-        };
+        let _edit = cached
+            .as_ref()
+            .and_then(StorageBackend::interrupt_for_policy);
         self.persist_storage_selection(&next).await?;
         self.upload_batches
             .invalidate_storage(storage_id, cached.clone())
             .await;
-        if let Some(edit) = &edit {
-            edit.retire();
+        if let Some(backend) = &cached {
+            backend.retire();
         }
         self.backends.remove(storage_id).await;
         self.gate_access.clear().await;
@@ -893,12 +895,13 @@ impl AppState {
             tokio::time::timeout(Duration::from_secs(5), self.config_updates.lock())
                 .await
                 .map_err(|_| AppError::Conflict("配置正在提交，请稍后重试".into()))?;
-        let mut next = self.config_file.read().await.clone();
+        let current = self.config_file.read().await.clone();
+        let mut next = current.clone();
         next.storage_instances = candidate.storage_instances.clone();
         next.pending_storage_instance = candidate.pending_storage_instance.clone();
         next.validate()?;
         self.retired_storage
-            .remember_removed(&*self.config_file.read().await, &next)
+            .remember_removed(&current, &next)
             .await
             .map_err(|error| {
                 AppError::with_source(
@@ -907,7 +910,6 @@ impl AppState {
                 )
             })?;
         for entry in self.retired_storage.snapshot().await {
-            let current = self.config_file.read().await.clone();
             if let Some(instance) = current
                 .storage_instances
                 .iter()
@@ -939,6 +941,15 @@ impl AppState {
     }
 }
 
+fn guest_access_restricted(previous: &StorageInstanceConfig, next: &StorageInstanceConfig) -> bool {
+    if !previous.allow_guest_access {
+        return false;
+    }
+    !next.allow_guest_access
+        || (previous.allow_guest_download.unwrap_or(true)
+            && !next.allow_guest_download.unwrap_or(true))
+}
+
 async fn prepare_storage_backend(
     config: &Config,
     local_io_gate: &Arc<Semaphore>,
@@ -946,6 +957,30 @@ async fn prepare_storage_backend(
     storage_id: &str,
     backend: &StorageBackendConfig,
 ) -> AppResult<StorageBackend> {
+    prepare_storage_backend_before(
+        config,
+        local_io_gate,
+        max_upload_bytes,
+        storage_id,
+        backend,
+        tokio::time::Instant::now() + STORAGE_INITIALIZATION_BUDGET,
+    )
+    .await
+}
+
+async fn prepare_storage_backend_before(
+    config: &Config,
+    local_io_gate: &Arc<Semaphore>,
+    max_upload_bytes: u64,
+    storage_id: &str,
+    backend: &StorageBackendConfig,
+    deadline: tokio::time::Instant,
+) -> AppResult<StorageBackend> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(AppError::ServiceUnavailable(
+            "存储初始化时限已到，请在后台重试".into(),
+        ));
+    }
     if let StorageBackendConfig::S3(settings) = backend {
         let retired = crate::config::RetiredStorage::load(&config.config_path)
             .await
@@ -963,12 +998,23 @@ async fn prepare_storage_backend(
             ));
         }
     }
-    tokio::time::timeout(
-        Duration::from_secs(60),
-        prepare_storage_backend_inner(config, local_io_gate, max_upload_bytes, storage_id, backend),
-    )
-    .await
-    .map_err(|_| AppError::ServiceUnavailable("存储初始化超时，配置未生效".into()))?
+    // Keep initialization's SDK/recovery state out of every administrator
+    // future's by-value layout (also required by release layout computation).
+    let prepared = Box::pin(prepare_storage_backend_inner(
+        config,
+        local_io_gate,
+        max_upload_bytes,
+        storage_id,
+        backend,
+        deadline,
+    ))
+    .await?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(AppError::ServiceUnavailable(
+            "存储初始化超时，配置未生效".into(),
+        ));
+    }
+    Ok(prepared)
 }
 
 async fn prepare_storage_backend_inner(
@@ -977,6 +1023,7 @@ async fn prepare_storage_backend_inner(
     max_upload_bytes: u64,
     storage_id: &str,
     backend: &StorageBackendConfig,
+    deadline: tokio::time::Instant,
 ) -> AppResult<StorageBackend> {
     let ledger_path = capacity_ledger_path(config, storage_id);
     match backend {
@@ -1011,10 +1058,17 @@ async fn prepare_storage_backend_inner(
         }
         StorageBackendConfig::S3(settings) => {
             let backend = crate::s3_backend::S3Backend::new(settings, config)?;
-            backend.activation_probe().await?;
-            let recovered = backend.recover_transactions().await?;
+            let initializing = backend.scoped_work(Some(deadline), None);
+            initializing.activation_probe().await?;
+            let recovered = initializing.recover_transactions().await?;
             if recovered > 0 {
                 tracing::warn!(recovered, "recovered pending S3 storage transactions");
+            }
+            // The ready instance must not inherit the initialization deadline.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AppError::ServiceUnavailable(
+                    "存储初始化超时，配置未生效".into(),
+                ));
             }
             StorageBackend::s3_configured(backend, settings.capacity_limit_bytes, ledger_path).await
         }
@@ -1036,6 +1090,27 @@ mod tests {
     use super::AppState;
 
     #[tokio::test]
+    async fn expired_initialization_budget_does_not_start_the_next_storage() {
+        let directory = crate::test_support::TestDirectory::new("expired-storage-startup");
+        let runtime = crate::test_support::runtime_config(directory.path());
+        let config = ConfigFile::with_test_storage();
+        let result = super::prepare_storage_backend_before(
+            &runtime,
+            &std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            runtime.max_upload_bytes,
+            "primary",
+            &config.storage_instances[0].backend,
+            tokio::time::Instant::now() - std::time::Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(crate::error::AppError::ServiceUnavailable(_))
+        ));
+        assert!(!runtime.storage_path.join(".ycloud-system").exists());
+    }
+
+    #[tokio::test]
     async fn webdav_login_pressure_does_not_hold_administrator_admission() {
         let gates = super::LoginAttemptGates::default();
         let _dav = gates
@@ -1052,8 +1127,8 @@ mod tests {
         .expect("WebDAV authentication blocked administrator admission");
     }
     use crate::config::{
-        load_config, Config, ConfigFile, LocalStorageConfig, S3AddressingStyle, S3Provider,
-        S3StorageConfig, Share, StorageBackendConfig, StorageInstanceConfig,
+        load_config, Config, ConfigFile, GuestAccess, LocalStorageConfig, S3AddressingStyle,
+        S3Provider, S3StorageConfig, Share, StorageBackendConfig, StorageInstanceConfig,
     };
     use crate::storage_catalog::{DeploymentLocalMount, LocalMountCatalog};
     use axum::body::Body;
@@ -1071,6 +1146,8 @@ mod tests {
             .update_storage_access("primary", true, false)
             .await
             .unwrap();
+        let cached = state.backends.cached("primary").await.unwrap();
+        crate::test_support::wait_storage_settled(&cached).await;
         let result = state
             .update_local_storage(
                 "primary",
@@ -1087,6 +1164,40 @@ mod tests {
         assert!(matches!(result, Err(crate::error::AppError::Conflict(_))));
         assert!(!state.config_file.read().await.storage_instances[0].allow_guest_access);
         assert!(state.storage_backend("primary").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn storage_edits_keep_the_guest_download_choice() {
+        let directory = crate::test_support::TestDirectory::new("storage-guest-download-edit");
+        let state =
+            crate::test_support::app_state(&directory, ConfigFile::with_test_storage()).await;
+        state
+            .update_local_storage(
+                "primary",
+                super::LocalStorageEdit {
+                    name: "Local".into(),
+                    path: state.config.storage_path.to_string_lossy().into_owned(),
+                    capacity_limit_bytes: None,
+                    enabled: true,
+                    guest_access: GuestAccess {
+                        access: true,
+                        download: Some(false),
+                    },
+                    expected_revision: None,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .update_storage_access("primary", true, true)
+            .await
+            .unwrap();
+        let stored = load_config(&state.config.config_path).await.unwrap();
+        assert!(stored.storage_instances[0].allow_guest_access);
+        assert_eq!(
+            stored.storage_instances[0].allow_guest_download,
+            Some(false)
+        );
     }
 
     #[tokio::test]
@@ -1192,7 +1303,7 @@ mod tests {
                     path,
                     capacity_limit_bytes: Some(4 * 1024 * 1024),
                     enabled: true,
-                    guest_access: false.into(),
+                    guest_access: true.into(),
                     expected_revision: None,
                 },
             )
@@ -1204,6 +1315,7 @@ mod tests {
             .await
             .unwrap();
         assert!(state.storage_backend("primary").await.is_err());
+        crate::test_support::wait_storage_settled(&backend).await;
         state
             .update_storage_access("primary", true, false)
             .await
@@ -1250,7 +1362,7 @@ mod tests {
                     path: state.config.storage_path.to_str().unwrap().into(),
                     capacity_limit_bytes: None,
                     enabled: true,
-                    guest_access: false.into(),
+                    guest_access: true.into(),
                     expected_revision: None,
                 },
             )
@@ -1268,6 +1380,8 @@ mod tests {
         assert!(error.to_string().contains("存储配置已变更"));
         assert!(stale.metadata("interrupted.bin").await.is_err());
         assert!(state.storage_backend("primary").await.is_err());
+        crate::test_support::wait_storage_settled(&state.backends.cached("primary").await.unwrap())
+            .await;
         state
             .update_storage_access("primary", true, false)
             .await

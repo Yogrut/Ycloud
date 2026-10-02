@@ -259,6 +259,57 @@ struct Runtime {
 }
 const MAX_TRAFFIC_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TRAFFIC_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+const MIN_TRAFFIC_RECORD_TIME: i64 = 946_684_800; // 2000-01-01 UTC
+const MAX_TRAFFIC_RECORD_TIME: i64 = 7_258_118_400; // 2200-01-01 UTC
+
+struct JournalReplay {
+    complete_len: usize,
+    applied_records: usize,
+}
+
+/// Replaying complete records is read-only with respect to disk. Startup may
+/// truncate an incomplete tail only after this validation has succeeded.
+fn replay_complete_records(ledger: &mut Ledger, bytes: &[u8]) -> anyhow::Result<JournalReplay> {
+    use anyhow::Context;
+
+    let complete_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let mut applied_records = 0;
+    for (index, line) in bytes[..complete_len]
+        .split_inclusive(|byte| *byte == b'\n')
+        .enumerate()
+    {
+        let record: Record = serde_json::from_slice(line)
+            .with_context(|| format!("流量日志第 {} 条完整记录损坏", index + 1))?;
+        if record.sequence <= ledger.sequence {
+            continue;
+        }
+        anyhow::ensure!(
+            record.sequence == ledger.sequence + 1,
+            "流量日志第 {} 条存在序号缺口",
+            index + 1
+        );
+        TrafficSettings {
+            cycle: record.cycle.clone(),
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|error| anyhow::anyhow!("流量日志第 {} 条重置周期无效: {error}", index + 1))?;
+        anyhow::ensure!(
+            (MIN_TRAFFIC_RECORD_TIME..=MAX_TRAFFIC_RECORD_TIME).contains(&record.time),
+            "流量日志第 {} 条时间戳无效",
+            index + 1
+        );
+        ledger.apply(&record);
+        applied_records += 1;
+    }
+    Ok(JournalReplay {
+        complete_len,
+        applied_records,
+    })
+}
 
 /// Offline, read-only inspection. This deliberately does not call `load`:
 /// normal startup may repair an incomplete tail and compact the journal.
@@ -300,43 +351,11 @@ pub fn diagnose_ledger(config_path: &Path) -> anyhow::Result<String> {
         }
         None => Vec::new(),
     };
-    let complete_len = journal_bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    let mut records = 0_usize;
-    for (index, line) in journal_bytes[..complete_len]
-        .split_inclusive(|byte| *byte == b'\n')
-        .enumerate()
-    {
-        let record: Record = serde_json::from_slice(line)
-            .with_context(|| format!("流量日志第 {} 条完整记录损坏", index + 1))?;
-        if record.sequence <= ledger.sequence {
-            continue;
-        }
-        anyhow::ensure!(
-            record.sequence == ledger.sequence + 1,
-            "流量日志第 {} 条存在序号缺口",
-            index + 1
-        );
-        TrafficSettings {
-            cycle: record.cycle.clone(),
-            ..Default::default()
-        }
-        .validate()
-        .map_err(|error| anyhow::anyhow!("流量日志第 {} 条重置周期无效: {error}", index + 1))?;
-        anyhow::ensure!(
-            (946_684_800..=7_258_118_400).contains(&record.time),
-            "流量日志第 {} 条时间戳无效",
-            index + 1
-        );
-        ledger.apply(&record);
-        records += 1;
-    }
-    let tail = journal_bytes.len() - complete_len;
+    let replay = replay_complete_records(&mut ledger, &journal_bytes)?;
+    let tail = journal_bytes.len() - replay.complete_len;
     Ok(format!(
         "流量账本可回放：序号 {}，新增记录 {} 条，未完成尾部 {} 字节；未修改任何文件",
-        ledger.sequence, records, tail
+        ledger.sequence, replay.applied_records, tail
     ))
 }
 
@@ -418,37 +437,13 @@ impl TrafficStore {
             // A record is committed to the journal only with its final newline.
             // An interrupted append can leave a suffix without that delimiter;
             // no later valid record can follow it. Keep middle corruption fatal.
-            let complete_len = bytes
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map_or(0, |index| index + 1);
-            for line in bytes[..complete_len].split_inclusive(|byte| *byte == b'\n') {
-                let record: Record = serde_json::from_slice(line)?;
-                if record.sequence <= ledger.sequence {
-                    continue;
-                }
-                anyhow::ensure!(
-                    record.sequence == ledger.sequence + 1,
-                    "Traffic journal sequence gap"
-                );
-                TrafficSettings {
-                    cycle: record.cycle.clone(),
-                    ..Default::default()
-                }
-                .validate()
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                anyhow::ensure!(
-                    (946_684_800..=7_258_118_400).contains(&record.time),
-                    "Invalid traffic timestamp"
-                );
-                ledger.apply(&record);
-            }
-            if complete_len != bytes.len() {
+            let replay = replay_complete_records(&mut ledger, &bytes)?;
+            if replay.complete_len != bytes.len() {
                 tracing::warn!(
-                    discarded_bytes = bytes.len() - complete_len,
+                    discarded_bytes = bytes.len() - replay.complete_len,
                     "discarded incomplete traffic journal tail"
                 );
-                journal.set_len(complete_len as u64)?;
+                journal.set_len(replay.complete_len as u64)?;
                 journal.sync_all()?;
             }
             ledger.users.retain(|id, _| active_users.contains(id));
@@ -1149,6 +1144,42 @@ mod tests {
         assert!(std::fs::read(&journal_path)
             .unwrap()
             .ends_with(b"not-a-record\n"));
+    }
+
+    #[tokio::test]
+    async fn diagnosis_and_startup_reject_sequence_gap_without_modifying_journal() {
+        let (directory, store, config) = fixture(TrafficSettings::default()).await;
+        store
+            .charge("guest".into(), Direction::Upload, 17)
+            .await
+            .unwrap();
+        drop(store);
+        let config_path = directory.path().join("config.json");
+        let journal_path = config_path.with_file_name("traffic-usage.jsonl");
+        let record = Record {
+            sequence: 3,
+            time: Utc::now().timestamp(),
+            subject: "guest".into(),
+            direction: Direction::Upload,
+            bytes: 1,
+            cycle: ResetCycle::default(),
+        };
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        serde_json::to_writer(&mut journal, &record).unwrap();
+        journal.write_all(b"\n").unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        let before = std::fs::read(&journal_path).unwrap();
+
+        assert!(diagnose_ledger(&config_path)
+            .unwrap_err()
+            .to_string()
+            .contains("序号缺口"));
+        assert!(TrafficStore::load(&config_path, config).await.is_err());
+        assert_eq!(std::fs::read(journal_path).unwrap(), before);
     }
 
     #[tokio::test]

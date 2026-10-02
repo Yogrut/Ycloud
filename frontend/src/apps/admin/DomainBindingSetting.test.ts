@@ -17,6 +17,117 @@ function mount(initial = empty) {
 }
 
 describe('DomainBindingSetting', () => {
+  it('disables confirmation while reading and aborts only that read when unmounted', async () => {
+    const fetch = vi.fn().mockImplementation(() => new Promise<Response>(() => {}))
+    vi.stubGlobal('fetch', fetch)
+    const { app, host } = mount()
+    let mounted = true
+    try {
+      host.querySelector<HTMLButtonElement>('.setting-row button')!.click()
+      await nextTick()
+      expect([...host.querySelectorAll<HTMLButtonElement>('.modal-actions button')].every(button => button.disabled)).toBe(true)
+      expect(host.querySelector<HTMLButtonElement>('.drawer-close')!.disabled).toBe(true)
+      host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+      expect(fetch).toHaveBeenCalledTimes(1)
+      const signal = fetch.mock.calls[0]![1].signal as AbortSignal
+      expect(signal.aborted).toBe(false)
+      app.unmount()
+      mounted = false
+      await settle()
+      expect(signal.aborted).toBe(true)
+      expect(document.querySelector('.app-toast')).toBeNull()
+    } finally { if (mounted) app.unmount() }
+  })
+
+  it.each([
+    { operation: 'save', outcome: 'success' },
+    { operation: 'save', outcome: 'failure' },
+    { operation: 'remove', outcome: 'success' },
+    { operation: 'remove', outcome: 'failure' },
+  ] as const)('does not cancel an accepted $operation or show a late $outcome after unmounting', async ({ operation, outcome }) => {
+    let finish!: (value: Response) => void
+    const fetch = vi.fn().mockResolvedValueOnce(response({ binding, source: 'settings' })).mockImplementationOnce(() => new Promise<Response>(resolve => { finish = resolve }))
+    vi.stubGlobal('fetch', fetch)
+    const { app, host } = mount({ binding, source: 'settings' })
+    let mounted = true
+    try {
+      host.querySelector<HTMLButtonElement>('.setting-row button')!.click()
+      await settle()
+      if (operation === 'remove') {
+        host.querySelector<HTMLButtonElement>('.domain-remove')!.click()
+        await nextTick()
+      } else {
+        const input = host.querySelector<HTMLInputElement>('input[type="url"]')!
+        input.value = 'https://other.example.com'
+        input.dispatchEvent(new Event('input'))
+      }
+      const form = host.querySelector('form')!
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      await nextTick()
+      expect(fetch).toHaveBeenCalledTimes(2)
+      expect(fetch.mock.calls[1]![1].method).toBe(operation === 'save' ? 'PUT' : 'DELETE')
+      expect([...host.querySelectorAll<HTMLButtonElement>('.modal-actions button')].every(button => button.disabled)).toBe(true)
+      if (operation === 'save') expect(host.querySelector<HTMLButtonElement>('.domain-remove')!.disabled).toBe(true)
+      const signal = fetch.mock.calls[1]![1].signal as AbortSignal
+      app.unmount()
+      mounted = false
+      expect(signal.aborted).toBe(false)
+      finish(outcome === 'success' ? response(operation === 'save' ? { binding, source: 'settings' } : empty)
+        : new Response(JSON.stringify({ error: { message: 'Persistence failed' } }), { status: 400, headers: { 'Content-Type': 'application/json' } }))
+      await settle()
+      expect(signal.aborted).toBe(false)
+      expect(fetch).toHaveBeenCalledTimes(2)
+      expect(document.querySelector('.app-toast')).toBeNull()
+    } finally { if (mounted) app.unmount() }
+  })
+
+  it('keeps a rejected URL draft for explicit retry and displays the confirmed normalized binding', async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(response(empty))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'Persistence rejected' } }), { status: 400, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(response({ binding, source: 'settings' }))
+    vi.stubGlobal('fetch', fetch)
+    const { app, host } = mount()
+    try {
+      host.querySelector<HTMLButtonElement>('.setting-row button')!.click()
+      await settle()
+      const input = host.querySelector<HTMLInputElement>('input[type="url"]')!
+      input.value = '  https://CLOUD.example.com:443/  '
+      input.dispatchEvent(new Event('input'))
+      const form = host.querySelector('form')!
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      await settle()
+      expect(input.value).toBe('https://CLOUD.example.com:443/')
+      expect(fetch).toHaveBeenCalledTimes(2)
+      expect(document.querySelector('.app-toast.error')?.textContent).toContain('Persistence rejected')
+      expect(host.querySelector('.domain-open-link')).toBeNull()
+      expect(host.querySelector<HTMLButtonElement>('.modal-actions .btn:not(.secondary)')!.disabled).toBe(false)
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      await settle()
+      expect(fetch).toHaveBeenCalledTimes(3)
+      expect(fetch).toHaveBeenLastCalledWith('/api/admin/domain-binding', expect.objectContaining({ method: 'PUT', body: JSON.stringify({ public_url: 'https://CLOUD.example.com:443/' }) }))
+      expect(input.value).toBe(binding.public_url)
+      expect(host.querySelector('.setting-row')?.textContent).toContain(binding.public_url)
+      expect(host.querySelector<HTMLAnchorElement>('.domain-open-link')?.href).toBe(`${binding.public_url}/admin/account`)
+    } finally { app.unmount() }
+  })
+
+  it('opens one read even when the edit action is clicked twice before rendering', async () => {
+    let finish!: (value: Response) => void
+    const fetch = vi.fn().mockImplementation(() => new Promise<Response>(resolve => { finish = resolve }))
+    vi.stubGlobal('fetch', fetch)
+    const { app, host } = mount()
+    try {
+      const edit = host.querySelector<HTMLButtonElement>('.setting-row button')!
+      edit.click()
+      edit.click()
+      expect(fetch).toHaveBeenCalledTimes(1)
+      finish(response(empty))
+      await settle()
+      expect(host.querySelector<HTMLInputElement>('input[type="url"]')?.value).toBe('')
+    } finally { app.unmount() }
+  })
+
   it('saves an HTTPS domain immediately with one confirmation', async () => {
     const saved: DomainBindingView = { binding, source: 'settings' }
     const fetch = vi.fn().mockResolvedValueOnce(response(empty)).mockResolvedValueOnce(response(saved))

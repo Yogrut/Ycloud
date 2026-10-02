@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { isPreviewTrafficExhausted, previewUrl, type BrowserCapabilities, type FileEntry } from '../../shared/api/browser'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import type { BrowserCapabilities, FileEntry } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import AppFeedback from '../../shared/components/AppFeedback.vue'
@@ -22,10 +22,12 @@ import UploadQueueDialog from './UploadQueueDialog.vue'
 import { useUploadQueue } from './useUploadQueue'
 import { useBrowserSelection } from './useBrowserSelection'
 import { useBrowserFileOperations } from './useBrowserFileOperations'
+import { useBrowserEntryEditor } from './useBrowserEntryEditor'
+import { useBrowserDownloads } from './useBrowserDownloads'
 import { useBrowserListing } from './useBrowserListing'
 import { useBrowserAccess } from './useBrowserAccess'
-import { batchSummary } from './operationFeedback'
-import { previewKind } from '../../shared/previewFormats'
+import { useBrowserPreviews } from './useBrowserPreviews'
+import { formatBatchSummary } from './operationFeedback'
 import FilePreviewDialog from './FilePreviewDialog.vue'
 import MediaPlayer from '../../shared/components/MediaPlayer.vue'
 
@@ -34,9 +36,6 @@ const locale = useLocale()
 const notice = ref('')
 const noticeKind = ref<'error' | 'success'>('error')
 const noticeRevision = ref(0)
-const previewEntry = ref<FileEntry | null>(null)
-const pendingDownload = ref<FileEntry | null>(null)
-const audioPlayback = ref<{ entry: FileEntry; storageId: string; queue: FileEntry[] } | null>(null)
 const audioNav = ref<HTMLDetailsElement | null>(null)
 const userAccountMenu = ref<InstanceType<typeof UserAccountMenu>>()
 let resetListingSelection = (): void => undefined
@@ -97,60 +96,12 @@ const {
   requestStorageLogin: storageId => openRestrictedStorage(storageId),
 })
 
-const galleryExtensions = new Set(['jpg', 'jpeg', 'png', 'webp', 'avif', 'gif'])
-const galleryImages = computed(() => visibleEntries.value.filter(entry => {
-  if (entry.is_dir || !entry.name.includes('.')) return false
-  return galleryExtensions.has(entry.name.split('.').pop()?.toLowerCase() ?? '')
-}))
-const activeGalleryPath = ref('')
-const activeGalleryIndex = computed(() => galleryImages.value.findIndex(entry => entry.path === activeGalleryPath.value))
-const activeGalleryEntry = computed(() => galleryImages.value[activeGalleryIndex.value] ?? null)
-const audioIndex = computed(() => audioPlayback.value?.queue.findIndex(entry => entry.path === audioPlayback.value?.entry.path) ?? -1)
-const audioSource = computed(() => audioPlayback.value ? previewUrl(audioPlayback.value.entry.path, audioPlayback.value.storageId) : '')
-
-function playAudio(entry: FileEntry): void {
-  const queue = visibleEntries.value.filter(item => !item.is_dir && previewKind(item.name) === 'audio')
-  audioPlayback.value = { entry, storageId: currentStorageId.value, queue: queue.length ? queue : [entry] }
-}
-
-function moveAudio(offset: number): void {
-  const playback = audioPlayback.value
-  if (!playback) return
-  const entry = playback.queue[audioIndex.value + offset]
-  if (entry) audioPlayback.value = { ...playback, entry }
-}
-
-async function onAudioError(): Promise<void> {
-  const playback = audioPlayback.value
-  const entry = playback?.entry
-  audioPlayback.value = null
-  if (!entry || !playback) return
-  const trafficExhausted = await isPreviewTrafficExhausted(previewUrl(entry.path, playback.storageId))
-  if (audioPlayback.value) return
-  if (trafficExhausted) {
-    announce(locale.text('下载流量已用尽或剩余流量不足，请等待重置或联系管理员', 'Download allowance is exhausted or insufficient. Wait for the reset or contact the administrator.'))
-    return
-  }
-  pendingDownload.value = entry
-}
-
-watch(currentStorageId, storageId => {
-  if (audioPlayback.value && audioPlayback.value.storageId !== storageId) audioPlayback.value = null
-})
-
-function openGalleryEntry(entry: FileEntry): void {
-  activeGalleryPath.value = entry.path
-}
-
-function closeGalleryEntry(): void {
-  activeGalleryPath.value = ''
-}
-
-function moveGalleryEntry(offset: number): void {
-  const next = activeGalleryIndex.value + offset
-  const entry = galleryImages.value[next]
-  if (entry) activeGalleryPath.value = entry.path
-}
+const {
+  filePreview, pendingDownload, audioPlayback, audioIndex, audioSource,
+  galleryImages, activeGalleryIndex, activeGalleryEntry, galleryStorageId,
+  openPreviewImage, openPreviewFile, moveAudio, onAudioError, closeAudio,
+  moveGalleryEntry, closeGalleryEntry, closeFilePreview, closePendingDownload,
+} = useBrowserPreviews({ storageId: currentStorageId, visibleEntries, announce })
 
 function changeGalleryMode(): void {
   closeGalleryEntry()
@@ -184,20 +135,8 @@ const {
   isAdministrator,
   navigate,
   resetAfterSignIn,
-  openPreviewImage: entry => {
-    if (!galleryImages.value.some(image => image.path === entry.path)) return false
-    openGalleryEntry(entry)
-    return true
-  },
-  openPreviewFile: entry => {
-    const kind = previewKind(entry.name)
-    if (kind === 'audio') playAudio(entry)
-    else if (kind === 'unsupported') pendingDownload.value = entry
-    else {
-      if (kind === 'video') audioPlayback.value = null
-      previewEntry.value = entry
-    }
-  },
+  openPreviewImage,
+  openPreviewFile,
   openAccountMenu: () => userAccountMenu.value?.open(),
   disposeListing,
 })
@@ -273,14 +212,9 @@ resetListingSelection = () => { selected.value = new Set() }
 
 const {
   batchResult,
+  closeBatchDialog,
   confirmDelete,
   confirmTransfer,
-  creatingFolder,
-  entryForPath,
-  folderError,
-  folderName,
-  openFolderDialog,
-  openRenameDialog,
   operationBusy,
   operationError,
   operationRetryBlocked,
@@ -288,34 +222,44 @@ const {
   pickerOperation,
   pickerStorageId,
   pickerTitle,
-  renameError,
-  renameName,
-  renaming,
   requestDelete,
   requestTransfer,
   showDelete,
-  showFolder,
-  showRename,
-  startArchive,
-  startDownload,
-  submitFolder,
-  submitRename,
 } = useBrowserFileOperations({
-  path,
   storageId: currentStorageId,
-  entries,
-  capabilities,
-  maxArchiveBytes,
-  maxArchiveEntries,
   selected,
   requireCapability,
   announce,
   refresh,
 })
 
+const {
+  editorKind, entryName, entryError, entrySaving, entryRetryBlocked,
+  openFolderDialog, openRenameDialog, closeEntryEditor, submitEntry,
+} = useBrowserEntryEditor({ path, storageId: currentStorageId, entries, requireCapability, announce, refresh })
+
+const entryTitle = computed(() => editorKind.value === 'folder'
+  ? locale.text('新建文件夹', 'New folder') : locale.text('重命名', 'Rename'))
+const entryNameLabel = computed(() => editorKind.value === 'folder'
+  ? locale.text('名称', 'Name') : locale.text('新名称', 'New name'))
+const entrySubmitLabel = computed(() => {
+  if (editorKind.value === 'folder') return entrySaving.value ? locale.text('创建中…', 'Creating…') : locale.t('common.create')
+  return entrySaving.value ? locale.t('common.saving') : locale.t('common.save')
+})
+
+const { startArchive, startDownload } = useBrowserDownloads({
+  storageId: currentStorageId, capabilities, maxArchiveBytes, maxArchiveEntries, announce,
+})
+
+function confirmPreviewDownload(): void {
+  const target = pendingDownload.value
+  closePendingDownload()
+  if (target) void startDownload(target.entry.path, target.storageId)
+}
+
 function handleMenuAction(action: BrowserAction): void {
   const paths = [...selected.value]
-  const entry = contextEntry.value ?? (paths.length === 1 ? entryForPath(paths[0] ?? '') ?? null : null)
+  const entry = contextEntry.value ?? (paths.length === 1 ? entries.value.find(entry => entry.path === paths[0]) ?? null : null)
   closeContextMenu()
   switch (action) {
     case 'open':
@@ -454,7 +398,7 @@ onBeforeUnmount(() => {
         <div v-else-if="emptyReason" class="empty file-list-body">{{ emptyReason === 'unconfigured' ? locale.text('尚未配置存储，请管理员在后台添加存储。', 'No storage configured. Ask an administrator to add one.') : emptyReason === 'forbidden' ? locale.text('当前账号没有可访问的存储。', 'No storage is accessible to this account.') : locale.text('存储暂不可用，请稍后重试。', 'Storage is temporarily unavailable. Please try again later.') }}</div>
         <div v-else-if="!(galleryMode ? galleryImages.length : visibleEntries.length)" class="empty file-list-body">{{ appliedQuery ? locale.text('没有匹配的文件', 'No matching files') : galleryMode ? locale.text('此文件夹没有可展示的图片', 'No supported images in this folder') : locale.text('此文件夹为空', 'This folder is empty') }}</div>
         <div v-else-if="galleryMode" class="file-list-body gallery-list-body">
-          <GalleryGrid :entries="visibleEntries" :storage-id="currentStorageId" :selected="selected" @open="openGalleryEntry" @select="toggleSelection($event.path)" @context-menu="openRowMenu" />
+          <GalleryGrid :entries="visibleEntries" :storage-id="currentStorageId" :selected="selected" @open="openEntry" @select="toggleSelection($event.path)" @context-menu="openRowMenu" />
         </div>
         <div v-else class="file-list-body">
           <div
@@ -521,7 +465,7 @@ onBeforeUnmount(() => {
         :autoplay="true"
         @previous="moveAudio(-1)"
         @next="moveAudio(1)"
-        @close="audioPlayback = null"
+        @close="closeAudio"
         @error="onAudioError"
       />
     </div>
@@ -530,7 +474,7 @@ onBeforeUnmount(() => {
   <GalleryLightbox
     v-if="activeGalleryEntry"
     :entry="activeGalleryEntry"
-    :storage-id="currentStorageId"
+    :storage-id="galleryStorageId"
     :index="activeGalleryIndex"
     :total="galleryImages.length"
     @close="closeGalleryEntry"
@@ -538,16 +482,16 @@ onBeforeUnmount(() => {
     @next="moveGalleryEntry(1)"
   />
 
-  <FilePreviewDialog v-if="previewEntry" :entry="previewEntry" :storage-id="currentStorageId" @close="previewEntry = null" />
+  <FilePreviewDialog v-if="filePreview" :key="`${filePreview.storageId}:${filePreview.entry.path}`" :entry="filePreview.entry" :storage-id="filePreview.storageId" @close="closeFilePreview" />
 
   <ConfirmDialog
     v-if="pendingDownload"
     :title="locale.text('下载文件', 'Download file')"
     :message="locale.text('浏览器无法预览此文件，是否下载？', 'This file cannot be previewed in the browser. Download it?')"
-    :target="pendingDownload.name"
+    :target="pendingDownload.entry.name"
     :confirm-label="locale.text('下载', 'Download')"
-    @close="pendingDownload = null"
-    @confirm="startDownload(pendingDownload.path); pendingDownload = null"
+    @close="closePendingDownload"
+    @confirm="confirmPreviewDownload"
   />
 
   <BrowserContextMenu
@@ -587,12 +531,15 @@ onBeforeUnmount(() => {
     />
   </div>
 
-  <div v-if="showFolder" class="overlay active" @click.self="showFolder = false">
-    <form class="modal short-field-dialog" @submit.prevent="submitFolder">
-      <h2>{{ locale.text('新建文件夹', 'New folder') }}</h2>
-      <label>{{ locale.text('名称', 'Name') }}<input v-model="folderName" class="input" autocomplete="off" autofocus></label>
-      <AppFeedback :message="folderError" />
-      <div class="modal-actions"><button class="btn secondary" type="button" :disabled="creatingFolder" @click="showFolder = false">{{ locale.t('common.cancel') }}</button><button class="btn" type="submit" :disabled="creatingFolder">{{ creatingFolder ? locale.text('创建中…', 'Creating…') : locale.t('common.create') }}</button></div>
+  <div v-if="editorKind" class="overlay active" @click.self="closeEntryEditor">
+    <form class="modal short-field-dialog" @submit.prevent="submitEntry">
+      <h2>{{ entryTitle }}</h2>
+      <label>{{ entryNameLabel }}<input v-model="entryName" class="input" autocomplete="off" autofocus></label>
+      <AppFeedback :message="entryError" />
+      <div class="modal-actions">
+        <button class="btn secondary" type="button" :disabled="entrySaving" @click="closeEntryEditor">{{ locale.t('common.cancel') }}</button>
+        <button class="btn" type="submit" :disabled="entrySaving || entryRetryBlocked">{{ entrySubmitLabel }}</button>
+      </div>
     </form>
   </div>
 
@@ -611,30 +558,21 @@ onBeforeUnmount(() => {
     @remove-failed="removeFailedUpload"
   />
 
-  <div v-if="showRename" class="overlay active" @click.self="showRename = false">
-    <form class="modal short-field-dialog" @submit.prevent="submitRename">
-      <h2>{{ locale.text('重命名', 'Rename') }}</h2>
-      <label>{{ locale.text('新名称', 'New name') }}<input v-model="renameName" class="input" autocomplete="off" autofocus></label>
-      <AppFeedback :message="renameError" />
-      <div class="modal-actions"><button class="btn secondary" type="button" :disabled="renaming" @click="showRename = false">{{ locale.t('common.cancel') }}</button><button class="btn" type="submit" :disabled="renaming">{{ renaming ? locale.t('common.saving') : locale.t('common.save') }}</button></div>
-    </form>
-  </div>
-
-  <FolderPicker v-if="pickerOperation" :title="pickerTitle" :storage-id="pickerStorageId" @close="pickerOperation = null" @confirm="confirmTransfer" />
+  <FolderPicker v-if="pickerOperation" :title="pickerTitle" :storage-id="pickerStorageId" @close="closeBatchDialog" @confirm="confirmTransfer" />
 
   <ConfirmDialog
     v-if="showDelete"
     :title="locale.text('确认永久删除', 'Confirm permanent deletion')"
     :message="locale.text(`将永久删除 ${pendingDelete.length} 个项目，此操作无法撤销。`, `${pendingDelete.length} item(s) will be permanently deleted. This cannot be undone.`)"
-    :busy="operationBusy" :error="operationError" :confirm-disabled="operationRetryBlocked" @close="showDelete = false" @confirm="confirmDelete"
+    :busy="operationBusy" :error="operationError" :confirm-disabled="operationRetryBlocked" @close="closeBatchDialog" @confirm="confirmDelete"
   />
 
   <div v-if="batchResult" class="overlay active" @click.self="batchResult = null">
     <section class="modal result-modal" aria-labelledby="result-title">
       <h2 id="result-title">{{ locale.text('部分项目未完成', 'Some items were not completed') }}</h2>
-      <p>{{ locale.text(batchSummary(batchResult), batchSummary(batchResult, true)) }}</p>
+      <p>{{ locale.text(formatBatchSummary(batchResult), formatBatchSummary(batchResult, true)) }}</p>
       <div class="result-list">
-        <div v-for="item in batchResult.results.filter(result => result.status >= 400)" :key="item.path" class="result-row">
+        <div v-for="item in batchResult.attentionItems" :key="item.path" class="result-row">
           <strong>{{ item.path }}</strong><span>{{ item.message }} ({{ item.code }})</span>
         </div>
       </div>

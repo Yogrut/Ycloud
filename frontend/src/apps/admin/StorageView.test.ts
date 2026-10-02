@@ -21,6 +21,18 @@ const localInstance: StorageInstanceView = {
 }
 
 describe('storage health', () => {
+  it('shows settling separately from cached connection health without probing', () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div'); document.body.append(host)
+    const { app } = mountStorage(host, null, [{ ...localInstance, status: 'pending', ready: false, health_ok: true }])
+    try {
+      expect(host.textContent).toContain('处理中')
+      expect(host.querySelector('.storage-health-light')?.classList.contains('healthy')).toBe(true)
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
   it('shows cached health independently of enabled state without sending probe requests', () => {
     const fetchMock = vi.fn()
     vi.stubGlobal('fetch', fetchMock)
@@ -412,5 +424,80 @@ describe('StorageView', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/activate', expect.objectContaining({ method: 'POST' }))
     expect(changed).toHaveBeenCalledWith(expect.stringContaining('存储源已添加'))
     app.unmount()
+  })
+
+  it('edits S3 with its captured revision and blank keys, without staging or activating', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response())
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div'); document.body.append(host)
+    const { app, changed } = mountStorage(host, null, [{
+      ...localInstance, id: 'objects', revision: 'revision-one', name: 'RustFS',
+      backend: {
+        type: 's3', provider: 'minio', endpoint: 'https://s3.example.com', bucket: 'bucket',
+        region: 'us-east-1', prefix: 'files/', addressing_style: 'path', relay_upload: true,
+        has_access_key_id: true, has_secret_access_key: true, capacity_limit_bytes: null,
+      },
+    }])
+    try {
+      host.querySelector<HTMLButtonElement>('[aria-label="编辑存储"]')!.click()
+      await nextTick()
+      setLabeledInput(host, '存储名称', 'New name')
+      button(host, '确认')!.click()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(fetchMock).toHaveBeenCalledWith('/api/admin/storage/s3/objects', expect.objectContaining({ method: 'PUT' }))
+      expect(JSON.parse(String(fetchMock.mock.calls[0]![1].body))).toEqual({
+        name: 'New name', enabled: true, allow_guest_access: true, allow_guest_download: true,
+        provider: 'minio', endpoint: 'https://s3.example.com', bucket: 'bucket', region: 'us-east-1',
+        prefix: 'files/', addressing_style: 'path', relay_upload: true,
+        access_key_id: '', secret_access_key: '', capacity_limit_bytes: null, expected_revision: 'revision-one',
+      })
+      expect(changed).toHaveBeenCalledExactlyOnceWith('存储设置已保存')
+    } finally { app.unmount() }
+  })
+
+  it('suppresses duplicate connection probes and discards their result after the form changes', async () => {
+    let finish!: (value: Response) => void
+    const fetchMock = vi.fn().mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+      .mockResolvedValue(response())
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div'); document.body.append(host)
+    const { app, changed } = mountStorage(host)
+    try {
+      button(host, '新建存储')!.click(); await nextTick()
+      button(host, 'MinIO / RustFS')!.click(); await nextTick()
+      setLabeledInput(host, 'Endpoint', 'https://old.example.com')
+      button(host, '测试连接')!.click()
+      button(host, '测试连接')!.click()
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      setLabeledInput(host, 'Endpoint', 'https://new.example.com')
+      finish(response())
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(document.querySelector('.app-toast')).toBeNull()
+      expect(changed).not.toHaveBeenCalled()
+      button(host, '测试连接')!.click()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(JSON.parse(String(fetchMock.mock.calls[1]![1].body))).toMatchObject({ endpoint: 'https://new.example.com' })
+      expect(document.querySelector('.app-toast.success')?.textContent).toContain('测试成功')
+    } finally { app.unmount() }
+  })
+
+  it('keeps the editor open and does not report success when activation is rejected', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(response()).mockResolvedValueOnce(response({ error: { code: 'access_denied', message: 'Activation denied' } }, 403))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div'); document.body.append(host)
+    const { app, changed } = mountStorage(host)
+    try {
+      button(host, '新建存储')!.click(); await nextTick()
+      button(host, 'MinIO / RustFS')!.click(); await nextTick()
+      setLabeledInput(host, '存储名称', 'RustFS')
+      button(host, '确认')!.click()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(fetchMock.mock.calls.map(call => call[0])).toEqual(['/api/admin/storage/pending', '/api/admin/storage/activate'])
+      expect(changed).not.toHaveBeenCalled()
+      expect(host.querySelector('.settings-drawer')).not.toBeNull()
+      expect(document.querySelector('.app-toast.error[role="alert"]')?.textContent).toContain('Activation denied')
+    } finally { app.unmount() }
   })
 })

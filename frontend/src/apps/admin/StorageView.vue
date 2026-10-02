@@ -4,17 +4,17 @@ import SettingsDrawer from '../../shared/components/SettingsDrawer.vue'
 import AppSwitch from '../../shared/components/AppSwitch.vue'
 import ConfirmDialog from '../../shared/components/ConfirmDialog.vue'
 import { computed, ref, watch } from 'vue'
-import type { LocalMountView, S3AddressingStyle, S3Provider, StorageInstanceView, TestS3StorageRequest } from '../../shared/api/admin'
+import type { LocalMountView, StorageInstanceView } from '../../shared/api/admin'
 import { activatePendingStorage, addLocalStorage, deleteStorage, discardPendingStorage, stageS3Storage, testLocalStorage, testS3Storage, updateLocalStorage, updateS3Storage } from '../../shared/api/admin'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import AppSelect from '../../shared/components/AppSelect.vue'
 import { useLocale } from '../../shared/i18n'
+import { MAX_STORAGE_CAPACITY_GIB, useStorageForm, type StorageOption } from './useStorageForm'
 
 const props = defineProps<{ instances: StorageInstanceView[]; pendingInstance: StorageInstanceView | null; localMounts: LocalMountView[] }>()
 const emit = defineEmits<{ changed: [message: string] }>()
 const locale = useLocale()
 const feedbackRevision = ref(0)
-type StorageOption = 'local' | S3Provider
 
 const providers: Array<{ id: StorageOption; zh: string; en: string; protocol: string }> = [
   { id: 'local', zh: '本地存储', en: 'Local storage', protocol: 'Filesystem' },
@@ -27,22 +27,12 @@ const providers: Array<{ id: StorageOption; zh: string; en: string; protocol: st
 const editorOpen = ref(false)
 const editingId = ref('')
 const editingRevision = ref<string>()
-const provider = ref<StorageOption>('local')
-const storageName = ref('')
-const localPath = ref('')
-const endpoint = ref('')
-const bucket = ref('')
-const region = ref('us-east-1')
-const prefix = ref('')
-const addressingStyle = ref<S3AddressingStyle>('path')
-const relayUpload = ref(false)
-const accessKeyId = ref('')
-const secretAccessKey = ref('')
-const capacityLimitGiB = ref(0)
-const enabled = ref(true)
-const allowGuestAccess = ref(false)
-const allowGuestDownload = ref(false)
-watch(allowGuestAccess, value => { if (!value) allowGuestDownload.value = false }, { flush: 'sync' })
+const {
+  provider, storageName, localPath, endpoint, bucket, region, prefix, addressingStyle,
+  relayUpload, accessKeyId, secretAccessKey, capacityLimitGiB, enabled, allowGuestAccess,
+  allowGuestDownload, isS3, isOfficialCloud, reset: resetForm, loadInstance,
+  selectProvider: selectFormProvider, capacityLimitBytes, s3RequestBody: requestBody,
+} = useStorageForm()
 const busy = ref(false)
 const errorMessage = ref('')
 const connectionNotice = ref<{ message: string; kind: 'success' | 'error' }>()
@@ -62,14 +52,11 @@ const localMountOptions = computed(() => props.localMounts
     label: `${mount.name} · ${mount.path}${mount.ready ? '' : locale.text('（不可用）', ' (unavailable)')}`,
     disabled: !mount.ready,
   })))
-const isS3 = computed(() => provider.value !== 'local')
-const isOfficialCloud = computed(() => provider.value === 'alibaba_oss' || provider.value === 'tencent_cos')
 const addressingOptions = [
   { value: 'path', label: 'Path Style' },
   { value: 'virtual_hosted', label: 'Virtual Hosted' },
 ]
 
-function bytesToGiB(value: number | null): number { return value ? value / (1024 ** 3) : 0 }
 function formatBytes(value: number): string {
   if (value >= 1024 ** 4) return `${(value / (1024 ** 4)).toFixed(2)} TiB`
   if (value >= 1024 ** 3) return `${(value / (1024 ** 3)).toFixed(2)} GiB`
@@ -78,6 +65,7 @@ function formatBytes(value: number): string {
   return `${value} B`
 }
 function statusLabel(instance: StorageInstanceView): string {
+  if (instance.status === 'pending') return locale.text('处理中', 'Settling')
   if (instance.status === 'disabled') return locale.text('停用', 'Disabled')
   if (instance.status === 'abnormal') return locale.text('异常', 'Abnormal')
   return locale.text('启用', 'Enabled')
@@ -127,39 +115,20 @@ function s3RecoveryLabel(instance: StorageInstanceView): string {
     : ''
   return `${state}${ageText}${retryText}${errorText}`
 }
-function capacityLimitBytes(): number | null {
-  const value = Number(capacityLimitGiB.value)
-  if (!Number.isFinite(value) || value < 0 || value > 4_194_304) throw new Error(locale.text('容量上限必须在 0 到 4194304 GiB 之间', 'Capacity must be from 0 to 4194304 GiB'))
-  if (value === 0) return null
-  const bytes = Math.round(value * (1024 ** 3))
-  if (bytes < 1024 ** 2) throw new Error(locale.text('容量上限不能小于 1 MiB', 'Capacity cannot be less than 1 MiB'))
-  return bytes
-}
 function resetEditor(): void {
   connectionNotice.value = undefined
   editingId.value = ''
   editingRevision.value = undefined
-  provider.value = 'local'
-  storageName.value = ''
-  localPath.value = ''
-  endpoint.value = ''
-  bucket.value = ''
-  region.value = 'us-east-1'
-  prefix.value = ''
-  addressingStyle.value = 'path'
-  relayUpload.value = false
-  accessKeyId.value = ''
-  secretAccessKey.value = ''
-  capacityLimitGiB.value = 0
-  enabled.value = true
-  allowGuestAccess.value = false
-  allowGuestDownload.value = false
+  resetForm()
   errorMessage.value = ''
 }
-function openNew(): void { resetEditor(); localPath.value = String(localMountOptions.value[0]?.value ?? ''); editorOpen.value = true }
+function openNew(): void {
+  resetEditor()
+  localPath.value = String(localMountOptions.value[0]?.value ?? '')
+  editorOpen.value = true
+}
 function selectProvider(value: StorageOption): void {
-  provider.value = value
-  addressingStyle.value = value === 'alibaba_oss' || value === 'tencent_cos' ? 'virtual_hosted' : 'path'
+  selectFormProvider(value)
   if (value === 'local' && !localPath.value) localPath.value = String(localMountOptions.value[0]?.value ?? '')
   errorMessage.value = ''
 }
@@ -167,28 +136,8 @@ function openSettings(instance: StorageInstanceView): void {
   resetEditor()
   editingId.value = instance.id
   editingRevision.value = instance.revision
-  storageName.value = instance.name
-  enabled.value = instance.enabled ?? true
-  allowGuestAccess.value = instance.allow_guest_access ?? false
-  allowGuestDownload.value = allowGuestAccess.value && (instance.allow_guest_download ?? true)
-  provider.value = instance.backend.type === 'local' ? 'local' : instance.backend.provider
-  if (instance.backend.type === 'local') {
-    localPath.value = instance.backend.path
-    capacityLimitGiB.value = bytesToGiB(instance.backend.capacity_limit_bytes)
-  } else {
-    endpoint.value = instance.backend.endpoint
-    bucket.value = instance.backend.bucket
-    region.value = instance.backend.region
-    prefix.value = instance.backend.prefix
-    addressingStyle.value = instance.backend.addressing_style
-    relayUpload.value = instance.backend.relay_upload ?? false
-    capacityLimitGiB.value = bytesToGiB(instance.backend.capacity_limit_bytes)
-  }
+  loadInstance(instance)
   editorOpen.value = true
-}
-function requestBody(): TestS3StorageRequest {
-  if (provider.value === 'local') throw new Error('local storage does not use S3 credentials')
-  return { provider: provider.value, endpoint: endpoint.value.trim(), bucket: bucket.value.trim(), region: region.value.trim(), prefix: prefix.value.trim(), addressing_style: addressingStyle.value, access_key_id: accessKeyId.value, secret_access_key: secretAccessKey.value, capacity_limit_bytes: capacityLimitBytes(), relay_upload: relayUpload.value }
 }
 async function run(action: () => Promise<void>, fallback: string): Promise<void> {
   if (busy.value) return
@@ -196,7 +145,13 @@ async function run(action: () => Promise<void>, fallback: string): Promise<void>
   busy.value = true
   errorMessage.value = ''
   connectionNotice.value = undefined
-  try { await action() } catch (error) { errorMessage.value = error instanceof Error ? error.message : fallback } finally { busy.value = false }
+  try {
+    await action()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : fallback
+  } finally {
+    busy.value = false
+  }
 }
 async function testConnection(): Promise<void> {
   if (busy.value) return
@@ -293,9 +248,9 @@ async function clearPending(): Promise<void> {
       <div class="storage-form">
         <label :class="{ 'storage-wide': provider === 'local' }">{{ locale.text('存储名称', 'Storage name') }}<input v-model="storageName" aria-required="true" class="input local-storage-name" maxlength="64"></label>
         <label v-if="provider === 'local'" class="required-field">{{ locale.text('本地存储挂载', 'Local storage mount') }}<AppSelect v-model="localPath" class="local-storage-path" :options="localMountOptions" :label="locale.text('本地存储挂载', 'Local storage mount')" /><small>{{ locale.text('这里只显示启动参数中已声明且尚未使用的挂载点。', 'Only declared and unused deployment mounts are shown.') }}</small></label>
-        <label v-if="provider === 'local'">{{ locale.text('容量上限（GiB）', 'Capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input local-capacity-input" type="number" min="0" max="4194304" step="0.001"><small>{{ locale.text('0 表示不设置逻辑上限，最小 1 MiB。', '0 disables the logical limit; minimum 1 MiB.') }}</small></label>
+        <label v-if="provider === 'local'">{{ locale.text('容量上限（GiB）', 'Capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input local-capacity-input" type="number" min="0" :max="MAX_STORAGE_CAPACITY_GIB" step="0.001"><small>{{ locale.text('0 表示不设置逻辑上限，最小 1 MiB。', '0 disables the logical limit; minimum 1 MiB.') }}</small></label>
         <template v-if="isS3">
-          <label class="storage-wide">{{ locale.text('Endpoint 完整地址', 'Full endpoint URL') }}<input v-model="endpoint" aria-required="true" class="input" type="url" maxlength="2048" placeholder="https://s3.example.com"><small>{{ locale.text('填写对象存储的 HTTP(S) 接口地址，不包含桶名、账号或密码。', 'Enter the object storage HTTP(S) endpoint without a bucket name or credentials.') }}</small></label><label>Bucket<input v-model="bucket" aria-required="true" class="input" maxlength="63"></label><label>Region<input v-model="region" aria-required="true" class="input" maxlength="64"></label><label class="storage-wide">Prefix<input v-model="prefix" class="input" maxlength="1024" placeholder="ycloud/"></label><label>Access Key ID<input v-model="accessKeyId" :aria-required="!editingInstance" class="input" maxlength="256" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>Secret Access Key<input v-model="secretAccessKey" :aria-required="!editingInstance" class="input" type="password" maxlength="4096" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>{{ locale.text('寻址方式', 'Addressing style') }}<AppSelect v-model="addressingStyle" :options="addressingOptions" :label="locale.text('寻址方式', 'Addressing style')" :disabled="isOfficialCloud" /></label><label>{{ locale.text('容量上限（GiB）', 'Capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input" type="number" min="0" max="4194304" step="0.001"></label>
+          <label class="storage-wide">{{ locale.text('Endpoint 完整地址', 'Full endpoint URL') }}<input v-model="endpoint" aria-required="true" class="input" type="url" maxlength="2048" placeholder="https://s3.example.com"><small>{{ locale.text('填写对象存储的 HTTP(S) 接口地址，不包含桶名、账号或密码。', 'Enter the object storage HTTP(S) endpoint without a bucket name or credentials.') }}</small></label><label>Bucket<input v-model="bucket" aria-required="true" class="input" maxlength="63"></label><label>Region<input v-model="region" aria-required="true" class="input" maxlength="64"></label><label class="storage-wide">Prefix<input v-model="prefix" class="input" maxlength="1024" placeholder="ycloud/"></label><label>Access Key ID<input v-model="accessKeyId" :aria-required="!editingInstance" class="input" maxlength="256" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>Secret Access Key<input v-model="secretAccessKey" :aria-required="!editingInstance" class="input" type="password" maxlength="4096" :placeholder="editingInstance ? locale.text('留空则保留原密钥', 'Leave blank to keep the current key') : ''"></label><label>{{ locale.text('寻址方式', 'Addressing style') }}<AppSelect v-model="addressingStyle" :options="addressingOptions" :label="locale.text('寻址方式', 'Addressing style')" :disabled="isOfficialCloud" /></label><label>{{ locale.text('容量上限（GiB）', 'Capacity limit (GiB)') }}<input v-model.number="capacityLimitGiB" class="input" type="number" min="0" :max="MAX_STORAGE_CAPACITY_GIB" step="0.001"></label>
         </template>
         <div class="storage-access-options storage-wide">
           <AppSwitch v-model="enabled" :label="locale.text('启动', 'Enabled')" :description="locale.text('停用后不会出现在文件页切换器中。', 'Disabled storage is hidden from the file browser.')" :disabled="busy" />

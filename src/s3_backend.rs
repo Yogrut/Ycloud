@@ -3,7 +3,6 @@ use std::{sync::atomic::AtomicUsize, time::Duration};
 use aws_sdk_s3::Client;
 use aws_smithy_types::byte_stream::ByteStream;
 use axum::http::HeaderValue;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::{
@@ -23,8 +22,6 @@ const S3_PAGE_SIZE: usize = 1_000;
 const S3_MAX_LIST_ENTRIES: usize = 10_000;
 const S3_MAX_LIST_PAGES: usize = 16;
 const S3_MAX_CAPACITY_SCAN_PAGES: usize = 10_000;
-const S3_TRANSACTION_SCHEMA_VERSION: u32 = 1;
-const S3_MULTIPART_SESSION_SCHEMA_VERSION: u32 = 2;
 const S3_OPERATION_METADATA_KEY: &str = "ycloud-operation";
 const S3_UPLOAD_TRANSACTION_JOURNAL_PURPOSE: &str = "upload-transaction:v1";
 const S3_MULTIPART_SESSION_JOURNAL_PURPOSE: &str = "multipart-session:v1";
@@ -47,6 +44,8 @@ mod capabilities;
 mod capacity;
 mod client;
 mod committed_cleanup;
+mod copy;
+mod deletion;
 mod direct;
 mod directory_transaction;
 mod file_move_transaction;
@@ -62,6 +61,7 @@ pub(crate) mod protocol_tests;
 mod recovery;
 mod recovery_runtime;
 mod relay;
+mod transaction_record;
 mod upload;
 
 pub use capabilities::S3CapabilityReport;
@@ -71,6 +71,12 @@ pub(crate) use direct::{DirectChannel, DirectCommand, DirectDescriptor, SignedPa
 use body::{range_not_satisfiable, ExactLengthBody, PermitStream};
 use keyspace::{
     copy_source, internal_key, list_prefix, object_key, parent_relative, valid_transaction_id,
+};
+
+use transaction_record::{
+    directory_trash_transaction_id, validate_multipart_session, validate_upload_transaction,
+    S3MultipartPurpose, S3MultipartSession, S3ObjectSnapshot, S3UploadStage, S3UploadTransaction,
+    S3_MULTIPART_SESSION_SCHEMA_VERSION, S3_TRANSACTION_SCHEMA_VERSION,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,57 +123,6 @@ pub struct S3RecoveryStatus {
     pub last_failure_unix: Option<i64>,
     pub next_retry_unix: Option<i64>,
     pub recovering: bool,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum S3UploadStage {
-    Prepared,
-    BackupCreated,
-    DestinationCommitted,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct S3ObjectSnapshot {
-    size: u64,
-    etag: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct S3UploadTransaction {
-    schema_version: u32,
-    id: String,
-    relative: String,
-    stage: S3UploadStage,
-    temporary: S3ObjectSnapshot,
-    previous: Option<S3ObjectSnapshot>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct S3MultipartSession {
-    schema_version: u32,
-    id: String,
-    key: String,
-    /// Version 1 records always contain the provider ID. Version 2 is first
-    /// persisted with `None`, before CreateMultipartUpload is attempted, so a
-    /// missing ID proves no parts or signed URLs were released. Such an intent
-    /// is discarded without touching remote sessions or destination objects.
-    #[serde(default)]
-    upload_id: Option<String>,
-    #[serde(default)]
-    purpose: Option<S3MultipartPurpose>,
-    #[serde(default)]
-    expected_size: Option<u64>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum S3MultipartPurpose {
-    Upload,
-    Copy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -270,127 +225,25 @@ impl S3Backend {
         Ok(())
     }
 
-    pub async fn copy_file(&self, source: &str, destination: &str) -> AppResult<()> {
-        self.copy_file_internal(source, destination, None).await
-    }
-
-    pub async fn copy_file_with_expected_size(
-        &self,
-        source: &str,
-        destination: &str,
-        expected_size: u64,
-    ) -> AppResult<()> {
-        self.copy_file_internal(source, destination, Some(expected_size))
-            .await
-    }
-
-    async fn copy_file_internal(
-        &self,
-        source: &str,
-        destination: &str,
-        expected_size: Option<u64>,
-    ) -> AppResult<()> {
-        let source = StorageService::normalize_relative(source)?;
-        let destination = StorageService::normalize_relative(destination)?;
-        if source.is_empty() || destination.is_empty() || source == destination {
-            return Err(AppError::BadRequest("无效的文件复制路径".into()));
-        }
-        let _mutation = self.mutation_gate.lock().await;
-        self.copy_file_locked(&source, &destination, expected_size)
-            .await
-            .map(|_| ())
-    }
-
     pub async fn delete_file(&self, relative: &str) -> AppResult<u64> {
         let relative = StorageService::normalize_relative(relative)?;
         if relative.is_empty() {
             return Err(AppError::BadRequest("不能删除存储根目录".into()));
         }
-        let _mutation = self.mutation_gate.lock().await;
-        let metadata = self.metadata(&relative).await?;
+        let backend = self.scoped_work(None, None);
+        let _mutation = backend
+            .maintenance
+            .read(async { Ok(backend.mutation_gate.lock().await) })
+            .await?;
+        let metadata = backend.metadata(&relative).await?;
         if metadata.is_dir {
             return Err(AppError::Conflict("目标是目录而不是文件".into()));
         }
-        let key = object_key(&self.prefix, &relative)?;
-        self.delete_key_confirmed(&key, metadata.etag.as_deref())
+        let key = object_key(&backend.prefix, &relative)?;
+        backend
+            .delete_key_confirmed(&key, metadata.etag.as_deref())
             .await?;
         Ok(metadata.size)
-    }
-
-    /// Delete only an empty directory marker. Recursive directory deletion is
-    /// deliberately separate because S3 cannot make a whole prefix disappear
-    /// atomically.
-    pub async fn delete_empty_directory(&self, relative: &str) -> AppResult<()> {
-        let relative = StorageService::normalize_relative(relative)?;
-        if relative.is_empty() {
-            return Err(AppError::BadRequest("不能删除存储根目录".into()));
-        }
-        let _mutation = self.mutation_gate.lock().await;
-        let metadata = self.metadata(&relative).await?;
-        if !metadata.is_dir {
-            return Err(AppError::Conflict("目标不是目录".into()));
-        }
-        if !self.list_directory(&relative, 1).await?.entries.is_empty() {
-            return Err(AppError::Conflict("目录不为空".into()));
-        }
-        let marker = list_prefix(&self.prefix, &relative)?;
-        let marker_metadata = self.head_key(&marker).await?;
-        let Some(marker_metadata) = marker_metadata else {
-            return Err(AppError::Conflict(
-                "隐式目录没有可安全删除的目录标记".into(),
-            ));
-        };
-        self.delete_key_confirmed(&marker, marker_metadata.etag.as_deref())
-            .await
-    }
-
-    async fn copy_file_locked(
-        &self,
-        source: &str,
-        destination: &str,
-        expected_size: Option<u64>,
-    ) -> AppResult<S3Metadata> {
-        let source_metadata = self.metadata(source).await?;
-        if source_metadata.is_dir {
-            return Err(AppError::Conflict("当前操作只接受普通文件".into()));
-        }
-        if expected_size.is_some_and(|size| size != source_metadata.size) {
-            return Err(AppError::Conflict(
-                "Source changed while preparing the copy".into(),
-            ));
-        }
-        self.ensure_parent_directory(destination).await?;
-        match self.metadata(destination).await {
-            Ok(_) => return Err(AppError::Conflict("目标路径已经存在".into())),
-            Err(AppError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-
-        let source_key = object_key(&self.prefix, source)?;
-        let destination_key = object_key(&self.prefix, destination)?;
-        let copied_etag = self
-            .copy_key(
-                &source_key,
-                &destination_key,
-                source_metadata.etag.as_deref(),
-                true,
-            )
-            .await?;
-        let destination_metadata = self.metadata(destination).await?;
-        let is_our_copy = destination_metadata.etag.as_ref() == Some(&copied_etag);
-        if destination_metadata.is_dir
-            || destination_metadata.size != source_metadata.size
-            || !is_our_copy
-        {
-            if is_our_copy {
-                self.delete_key(&destination_key, destination_metadata.etag.as_deref())
-                    .await?;
-            }
-            return Err(AppError::ServiceUnavailable(
-                "对象存储复制结果校验失败".into(),
-            ));
-        }
-        Ok(source_metadata)
     }
 
     async fn ensure_parent_directory(&self, relative: &str) -> AppResult<()> {
@@ -548,88 +401,6 @@ impl S3Backend {
         }
     }
 
-    async fn delete_key(&self, key: &str, etag: Option<&str>) -> AppResult<()> {
-        if key.starts_with(&format!("{}.ycloud-system/", self.prefix)) {
-            self.maintenance
-                .read(self.delete_key_uninterrupted(key, etag))
-                .await
-        } else {
-            self.delete_key_uninterrupted(key, etag).await
-        }
-    }
-
-    async fn delete_key_uninterrupted(&self, key: &str, etag: Option<&str>) -> AppResult<()> {
-        if self.is_alibaba_oss() {
-            if let Some(expected_etag) = etag {
-                let current = self.head_key(key).await?;
-                if current
-                    .as_ref()
-                    .and_then(|metadata| metadata.etag.as_deref())
-                    != Some(expected_etag)
-                {
-                    return Err(AppError::Conflict(
-                        "对象在删除前已经发生变化，请刷新后重试".into(),
-                    ));
-                }
-            }
-        }
-        let _permit = self.acquire_request().await?;
-        let mut request = self.client.delete_object().bucket(&self.bucket).key(key);
-        if !self.is_alibaba_oss() {
-            if let Some(etag) = etag {
-                request = request.if_match(etag);
-            }
-        }
-        request.send().await.map_err(|error| {
-            tracing::warn!(
-                error_kind = %error.as_service_error().map_or("transport", |_| "service"),
-                "S3 object deletion failed"
-            );
-            AppError::ServiceUnavailable("对象存储删除失败".into())
-        })?;
-        Ok(())
-    }
-
-    async fn delete_key_confirmed(&self, key: &str, etag: Option<&str>) -> AppResult<()> {
-        let current = self.head_key(key).await?;
-        let Some(current) = current else {
-            self.recovery_runtime.journal_settled(key);
-            return Ok(());
-        };
-        if etag.is_some() && current.etag.as_deref() != etag {
-            return Err(AppError::ServiceUnavailable(
-                "对象存储待删除对象已发生变化，本次未删除".into(),
-            ));
-        }
-        if let Err(error) = self.delete_key(key, etag).await {
-            if let Some(current) = self.head_key(key).await.map_err(|error| {
-                error.with_operation(CommitState::Unknown, CleanupState::Pending)
-            })? {
-                let commit = if etag.is_some() && current.etag.as_deref() == etag {
-                    CommitState::NotCommitted
-                } else {
-                    CommitState::Unknown
-                };
-                return Err(error.with_operation(commit, CleanupState::Pending));
-            }
-            self.recovery_runtime.journal_settled(key);
-            return Ok(());
-        }
-        if self
-            .head_key(key)
-            .await
-            .map_err(|error| error.with_operation(CommitState::Unknown, CleanupState::Pending))?
-            .is_some()
-        {
-            return Err(
-                AppError::ServiceUnavailable("对象存储未能确认对象已经删除".into())
-                    .with_operation(CommitState::Unknown, CleanupState::Pending),
-            );
-        }
-        self.recovery_runtime.journal_settled(key);
-        Ok(())
-    }
-
     async fn acquire_request(&self) -> AppResult<OwnedSemaphorePermit> {
         self.maintenance
             .read(async {
@@ -672,90 +443,6 @@ fn non_negative_size(size: Option<i64>) -> AppResult<u64> {
         .map_err(|_| AppError::ServiceUnavailable("对象存储返回了无效的内容长度".into()))
 }
 
-fn validate_multipart_session(
-    prefix: &str,
-    journal_key: &str,
-    session: &S3MultipartSession,
-) -> AppResult<()> {
-    let internal_upload = is_internal_multipart_upload_key(prefix, &session.key);
-    let internal_backup = is_internal_multipart_backup_key(prefix, &session.key);
-    let regular_object = session.key.strip_prefix(prefix).is_some_and(|relative| {
-        !relative.is_empty()
-            && !relative.starts_with(".ycloud-system/")
-            && StorageService::normalize_relative(relative)
-                .is_ok_and(|normalized| normalized == relative)
-    });
-    let upload_id_valid = session
-        .upload_id
-        .as_deref()
-        .is_none_or(valid_multipart_upload_id);
-    let valid_state = match session.schema_version {
-        // Read-only compatibility for records written before pre-create
-        // intents were introduced.
-        S3_TRANSACTION_SCHEMA_VERSION => {
-            session.upload_id.is_some()
-                && upload_id_valid
-                && session.purpose.is_none()
-                && session.expected_size.is_none()
-                && (internal_upload || regular_object)
-        }
-        S3_MULTIPART_SESSION_SCHEMA_VERSION => {
-            let expected_size = session.expected_size.unwrap_or(0);
-            let within_provider_limit =
-                expected_size <= S3_MULTIPART_MAX_PART_BYTES.saturating_mul(S3_MULTIPART_MAX_PARTS);
-            upload_id_valid
-                && within_provider_limit
-                && match session.purpose {
-                    Some(S3MultipartPurpose::Upload) => {
-                        // Direct uploads use multipart even below the relay threshold.
-                        internal_upload && session.expected_size.is_some()
-                    }
-                    Some(S3MultipartPurpose::Copy) => {
-                        (regular_object
-                            || internal_backup
-                            || directory_trash_transaction_id(prefix, &session.key).is_some())
-                            && expected_size > S3_SINGLE_COPY_LIMIT
-                    }
-                    None => false,
-                }
-        }
-        _ => false,
-    };
-    if !valid_state
-        || !valid_transaction_id(&session.id)
-        || journal_key != internal_key(prefix, "multipart-sessions", &session.id)
-    {
-        return Err(AppError::ServiceUnavailable(
-            "对象存储分片恢复记录无法安全处理".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn valid_multipart_upload_id(upload_id: &str) -> bool {
-    !upload_id.is_empty() && upload_id.len() <= 4_096 && !upload_id.chars().any(char::is_control)
-}
-
-fn is_internal_multipart_upload_key(prefix: &str, key: &str) -> bool {
-    key.strip_prefix(&internal_key(prefix, "uploads", ""))
-        .is_some_and(valid_transaction_id)
-}
-
-fn is_internal_multipart_backup_key(prefix: &str, key: &str) -> bool {
-    key.strip_prefix(&internal_key(prefix, "backups", ""))
-        .is_some_and(valid_transaction_id)
-}
-
-fn directory_trash_transaction_id<'a>(prefix: &str, key: &'a str) -> Option<&'a str> {
-    let relative = key.strip_prefix(&internal_key(prefix, "directory-trash", ""))?;
-    let (id, suffix) = relative.split_once('/')?;
-    (valid_transaction_id(id)
-        && (suffix.is_empty()
-            || StorageService::normalize_relative(suffix)
-                .is_ok_and(|normalized| normalized == suffix.trim_end_matches('/'))))
-    .then_some(id)
-}
-
 fn multipart_session_matches(metadata: &RawS3Metadata, session: &S3MultipartSession) -> bool {
     session.schema_version == S3_MULTIPART_SESSION_SCHEMA_VERSION
         && session.expected_size == Some(metadata.size)
@@ -765,33 +452,6 @@ fn multipart_session_matches(metadata: &RawS3Metadata, session: &S3MultipartSess
 
 fn simple_copy_matches(destination: &RawS3Metadata, source: &RawS3Metadata) -> bool {
     source.etag.is_some() && destination.etag == source.etag && destination.size == source.size
-}
-
-fn validate_upload_transaction(
-    prefix: &str,
-    journal_key: &str,
-    transaction: &S3UploadTransaction,
-) -> AppResult<()> {
-    if transaction.schema_version != S3_TRANSACTION_SCHEMA_VERSION
-        || !valid_transaction_id(&transaction.id)
-        || journal_key != internal_key(prefix, "transactions", &transaction.id)
-        || transaction.temporary.etag.is_none()
-        || transaction
-            .previous
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.etag.is_none())
-    {
-        return Err(AppError::ServiceUnavailable(
-            "对象存储事务记录无法安全恢复".into(),
-        ));
-    }
-    let relative = StorageService::normalize_relative(&transaction.relative)?;
-    if relative.is_empty() || relative != transaction.relative {
-        return Err(AppError::ServiceUnavailable(
-            "对象存储事务记录包含无效目标路径".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn snapshot_matches(metadata: &RawS3Metadata, snapshot: &S3ObjectSnapshot) -> bool {

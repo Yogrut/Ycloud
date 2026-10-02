@@ -1,15 +1,15 @@
 <script setup lang="ts">
 import AppFeedback from '../../shared/components/AppFeedback.vue'
 import ConfirmDialog from '../../shared/components/ConfirmDialog.vue'
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import type { AdminInfo, LoginEntry, LoginEvent, UpdateLoginSecuritySettingsRequest } from '../../shared/api/admin'
-import { AdminApiError, clearLoginEvents, getLoginEvents, updateLoginRestriction, updateLoginSecuritySettings } from '../../shared/api/admin'
+import { AdminApiError, clearLoginEvents, updateLoginRestriction, updateLoginSecuritySettings } from '../../shared/api/admin'
 import AppSelect from '../../shared/components/AppSelect.vue'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import SettingsDrawer from '../../shared/components/SettingsDrawer.vue'
 import { useLocale } from '../../shared/i18n'
+import { LOG_PAGE_SIZES, LOG_REFRESH_SECONDS, useSecurityLogs } from './useSecurityLogs'
 
-type RecordKind = '' | 'normal' | 'error'
 type RestrictionAction = 'block' | 'unblock'
 
 const props = defineProps<{ info: AdminInfo }>()
@@ -17,24 +17,10 @@ const emit = defineEmits<{ changed: [message: string] }>()
 const locale = useLocale()
 const feedbackRevision = ref(0)
 
-const kind = ref<RecordKind>('')
-const entry = ref<LoginEntry | ''>('')
-const ip = ref('')
-const queryText = ref('')
-const events = ref<LoginEvent[]>([])
-const loading = ref(false)
-const loadError = ref('')
-const pageNumber = ref(1)
-const pageSize = ref(20)
-const total = ref(0)
-const jumpPage = ref<string | number>(1)
-const refreshSeconds = ref(0)
 const retentionOpen = ref(false)
 const clearOpen = ref(false)
 const clearing = ref(false)
 const clearError = ref('')
-let requestVersion = 0
-let timer: ReturnType<typeof setInterval> | undefined
 const pending = ref<{ action: RestrictionAction; event: LoginEvent }>()
 const submitting = ref(false)
 const actionError = ref('')
@@ -43,18 +29,18 @@ const maxEntries = ref<string | number>(props.info.security_log_max_entries)
 const savingRetention = ref(false)
 const retentionError = ref('')
 
-const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
-const pageOptions = computed(() => [20, 50, 100].map(value => ({ value, label: locale.text(`${value}条/页`, `${value}/page`) })))
+const logs = useSecurityLogs(() => !clearOpen.value && !retentionOpen.value && !pending.value)
+const {
+  kind, entry, ip, events, loading, loadError, pageNumber, pageSize, total, jumpPage,
+  refreshSeconds, totalPages, visiblePages, load, resetAndLoad, goToPage,
+} = logs
+const pageOptions = computed(() => LOG_PAGE_SIZES.map(value => ({ value, label: locale.text(`${value}条/页`, `${value}/page`) })))
 const statusOptions = computed(() => [
   { value: '', label: locale.text('全部状态', 'All statuses') },
   { value: 'normal', label: locale.text('成功', 'Successful') },
   { value: 'error', label: locale.text('失败', 'Failed') },
 ])
-const refreshOptions = computed(() => [0, 30, 60, 300].map(value => ({ value, label: value ? `${value}s` : locale.text('不刷新', 'No auto-refresh') })))
-const visiblePages = computed(() => {
-  const pages = [...new Set([1, ...Array.from({ length: 5 }, (_, i) => pageNumber.value - 2 + i), totalPages.value])].filter(p => p >= 1 && p <= totalPages.value).sort((a, b) => a - b)
-  return pages.flatMap((p, i) => i && p - pages[i - 1]! > 1 ? ['…', p] : [p])
-})
+const refreshOptions = computed(() => LOG_REFRESH_SECONDS.map(value => ({ value, label: value ? `${value}s` : locale.text('不刷新', 'No auto-refresh') })))
 const entryOptions = computed(() => [
   { value: '', label: locale.text('全部入口', 'All entries') },
   { value: 'admin', label: locale.text('管理员', 'Administrator') },
@@ -93,35 +79,6 @@ function formatTime(timestamp: number | null): string {
   }).format(new Date(timestamp * 1000))
 }
 
-async function load(page = pageNumber.value): Promise<void> {
-  const version = ++requestVersion
-  loading.value = true
-  loadError.value = ''
-  try {
-    const result = await getLoginEvents({
-      success: kind.value ? kind.value === 'normal' : undefined,
-      entry: entry.value || undefined,
-      search: queryText.value,
-      page,
-      limit: pageSize.value,
-    })
-    if (version !== requestVersion) return
-    events.value = result.events
-    total.value = result.total
-    pageNumber.value = result.page
-    jumpPage.value = result.page
-  } catch (error) {
-    if (version === requestVersion) loadError.value = error instanceof Error ? error.message : locale.text('登录日志加载失败', 'Unable to load sign-in logs')
-  } finally {
-    if (version === requestVersion) loading.value = false
-  }
-}
-
-function resetAndLoad(): void {
-  queryText.value = ip.value.trim()
-  void load(1)
-}
-
 function openRetention(): void {
   retentionDays.value = props.info.security_log_retention_days
   maxEntries.value = props.info.security_log_max_entries
@@ -129,23 +86,20 @@ function openRetention(): void {
   retentionOpen.value = true
 }
 
-function goToPage(page: number): void {
-  if (loading.value || !Number.isInteger(page) || page < 1 || page > totalPages.value) return
-  void load(page)
-}
-
 async function clearLogs(): Promise<void> {
   if (clearing.value) return
   clearing.value = true
   clearError.value = ''
-  ++requestVersion
+  logs.invalidate()
   try {
     await clearLoginEvents()
     clearOpen.value = false
-    await load(1)
+    void load(1)
   } catch (error) {
     clearError.value = error instanceof Error ? error.message : locale.t('common.failed')
-  } finally { clearing.value = false }
+  } finally {
+    clearing.value = false
+  }
 }
 
 function ask(action: RestrictionAction, event: LoginEvent): void {
@@ -161,10 +115,10 @@ async function confirmAction(): Promise<void> {
   try {
     await updateLoginRestriction(action, event.entry, event.ip)
     pending.value = undefined
-    await load()
     emit('changed', action === 'block'
       ? locale.text(`已限制 ${event.ip} 的${entryLabel(event.entry)}登录`, `Blocked ${event.ip} from ${entryLabel(event.entry)} sign-in`)
       : locale.text(`已解除 ${event.ip} 的${entryLabel(event.entry)}限制`, `Removed the ${entryLabel(event.entry)} restriction for ${event.ip}`))
+    void load()
   } catch (error) {
     actionError.value = error instanceof AdminApiError && error.status === 404
       ? locale.text('该 IP 当前没有可解除的限制', 'This IP has no active restriction to remove')
@@ -175,6 +129,7 @@ async function confirmAction(): Promise<void> {
 }
 
 async function saveRetention(): Promise<void> {
+  if (savingRetention.value) return
   const retention = Number(retentionDays.value)
   const maximum = Number(maxEntries.value)
   if (![1, 3, 5, 7, 15, 30].includes(retention)) {
@@ -194,8 +149,8 @@ async function saveRetention(): Promise<void> {
   try {
     await updateLoginSecuritySettings(body)
     retentionOpen.value = false
-    await load(1)
     emit('changed', locale.text('登录日志保存策略已更新', 'Sign-in log retention updated'))
+    void load(1)
   } catch (error) {
     retentionError.value = error instanceof Error ? error.message : locale.text('保存失败', 'Unable to save changes')
   } finally {
@@ -203,14 +158,6 @@ async function saveRetention(): Promise<void> {
   }
 }
 
-watch([kind, entry, pageSize], resetAndLoad)
-watch(refreshSeconds, value => {
-  clearInterval(timer)
-  if (value) timer = setInterval(() => {
-    if (!document.hidden && !loading.value && !clearOpen.value && !retentionOpen.value && !pending.value && pageNumber.value === 1) void load(1)
-  }, value * 1000)
-})
-onBeforeUnmount(() => { clearInterval(timer); ++requestVersion })
 watch(() => props.info, (value) => {
   retentionDays.value = value.security_log_retention_days
   maxEntries.value = value.security_log_max_entries

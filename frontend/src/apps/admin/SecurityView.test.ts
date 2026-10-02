@@ -40,13 +40,180 @@ function eventResponse(url: string): Response {
   })
 }
 
-function mountSecurity(host: HTMLElement) {
-  const app = createApp(SecurityView, { info })
+function mountSecurity(host: HTMLElement, onChanged?: (message: string) => void) {
+  const app = createApp(SecurityView, { info, onChanged })
   app.mount(host)
   return app
 }
 
 describe('SecurityView', () => {
+  it('retains rejected retention edits for a manual retry without reporting success', async () => {
+    let denied = true
+    const fetchMock = vi.fn((url: string, options?: RequestInit) => {
+      if (options?.method === 'PUT') return Promise.resolve(denied
+        ? new Response(JSON.stringify({ error: { code: 'access_denied', message: 'Retention denied' } }), { status: 403, headers: { 'Content-Type': 'application/json' } })
+        : new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }))
+      return Promise.resolve(eventResponse(url))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const changed = vi.fn()
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountSecurity(host, changed)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      host.querySelector<HTMLButtonElement>('button[aria-label="日志设置"]')!.click()
+      await nextTick()
+      const input = host.querySelector<HTMLInputElement>('.drawer-form input')!
+      input.value = '1000'
+      input.dispatchEvent(new Event('input'))
+      const form = host.querySelector('.drawer-form')!
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(changed).not.toHaveBeenCalled()
+      expect(document.querySelector('.app-toast.error')?.textContent).toContain('Retention denied')
+      expect(host.querySelector('.settings-drawer')).not.toBeNull()
+      expect(input.value).toBe('1000')
+      expect(host.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(false)
+      expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'PUT')).toHaveLength(1)
+      denied = false
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const writes = fetchMock.mock.calls.filter(([, options]) => options?.method === 'PUT')
+      expect(writes).toHaveLength(2)
+      for (const [, options] of writes) expect(JSON.parse(String(options?.body))).toEqual({ security_log_retention_days: 7, security_log_max_entries: 1000 })
+      expect(changed).toHaveBeenCalledTimes(1)
+    } finally { app.unmount() }
+  })
+
+  it('reports a confirmed restriction once before a pending log refresh finishes', async () => {
+    let finishWrite!: (response: Response) => void
+    let finishRead!: (response: Response) => void
+    let reads = 0
+    const fetchMock = vi.fn((url: string, options?: RequestInit) => {
+      if (options?.method === 'POST') return new Promise<Response>(resolve => { finishWrite = resolve })
+      if (++reads === 1) return Promise.resolve(eventResponse(url))
+      return new Promise<Response>(resolve => { finishRead = resolve })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const changed = vi.fn()
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountSecurity(host, changed)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      host.querySelector<HTMLButtonElement>('.security-operation button')!.click()
+      await nextTick()
+      const confirm = host.querySelector<HTMLButtonElement>('.confirmation-actions .btn:not(.secondary)')!
+      confirm.click()
+      confirm.click()
+      expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(1)
+      expect(changed).not.toHaveBeenCalled()
+      finishWrite(new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(changed).toHaveBeenCalledWith('已限制 192.0.2.10 的管理员登录')
+      expect(host.querySelector('.confirmation-actions')).toBeNull()
+      finishRead(new Response(JSON.stringify({ error: { code: 'unavailable', message: 'Refresh unavailable' } }), { status: 503, headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(changed).toHaveBeenCalledTimes(1)
+      expect(document.querySelector('.app-toast.error')?.textContent).toContain('Refresh unavailable')
+    } finally { app.unmount() }
+  })
+
+  it.each(['PUT', 'POST', 'DELETE'])('does not cancel a submitted %s write or launch a refresh after unmounting', async method => {
+    let finish!: (response: Response) => void
+    let writeSignal: AbortSignal | undefined
+    const fetchMock = vi.fn((url: string, options?: RequestInit) => {
+      if (options?.method === method) {
+        writeSignal = options.signal ?? undefined
+        return new Promise<Response>(resolve => { finish = resolve })
+      }
+      return Promise.resolve(eventResponse(url))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountSecurity(host)
+    let mounted = true
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      if (method === 'PUT') {
+        host.querySelector<HTMLButtonElement>('button[aria-label="日志设置"]')!.click()
+        await nextTick()
+        host.querySelector('.drawer-form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+      } else {
+        host.querySelector<HTMLButtonElement>(method === 'POST' ? '.security-operation button' : '.log-clear')!.click()
+        await nextTick()
+        host.querySelector<HTMLButtonElement>('.confirmation-actions .btn:not(.secondary)')!.click()
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      app.unmount()
+      mounted = false
+      expect(writeSignal?.aborted).toBe(false)
+      finish(method === 'DELETE' ? new Response(null, { status: 204 }) : new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(writeSignal?.aborted).toBe(false)
+    } finally { if (mounted) app.unmount() }
+  })
+
+  it('keeps a missing unblock target distinct from a successful restriction change', async () => {
+    const fetchMock = vi.fn((_url: string, options?: RequestInit) => options?.method === 'POST'
+      ? Promise.resolve(new Response(JSON.stringify({ error: { code: 'not_found', message: 'Not found' } }), { status: 404, headers: { 'Content-Type': 'application/json' } }))
+      : Promise.resolve(new Response(JSON.stringify({ events: [{ ...normal, current_blocked_until: now + 3600 }], total: 1, page: 1, next_cursor: null }), { headers: { 'Content-Type': 'application/json' } })))
+    vi.stubGlobal('fetch', fetchMock)
+    const changed = vi.fn()
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountSecurity(host, changed)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      host.querySelector<HTMLButtonElement>('.security-operation button')!.click()
+      await nextTick()
+      host.querySelector<HTMLButtonElement>('.confirmation-actions .btn:not(.secondary)')!.click()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(document.querySelector('.app-toast.error')?.textContent).toContain('该 IP 当前没有可解除的限制')
+      expect(changed).not.toHaveBeenCalled()
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+    } finally { app.unmount() }
+  })
+
+  it('saves retention only once and reports the confirmed write before refreshing logs', async () => {
+    let finishSave!: (response: Response) => void
+    let finishRefresh!: (response: Response) => void
+    let reads = 0
+    const fetchMock = vi.fn((url: string, options?: RequestInit) => {
+      if (options?.method === 'PUT') return new Promise<Response>(resolve => { finishSave = resolve })
+      if (++reads === 1) return Promise.resolve(eventResponse(url))
+      return new Promise<Response>(resolve => { finishRefresh = resolve })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const changed = vi.fn()
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountSecurity(host, changed)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      host.querySelector<HTMLButtonElement>('button[aria-label="日志设置"]')!.click()
+      await nextTick()
+      const input = host.querySelector<HTMLInputElement>('.drawer-form input')!
+      input.value = '1000'
+      input.dispatchEvent(new Event('input'))
+      const form = host.querySelector('.drawer-form')!
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'PUT')).toHaveLength(1)
+      finishSave(new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(changed).toHaveBeenCalledWith('登录日志保存策略已更新')
+      expect(host.querySelector('.settings-drawer')).toBeNull()
+      finishRefresh(new Response(JSON.stringify({ error: { code: 'unavailable', message: 'Log refresh failed' } }), { status: 503, headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(changed).toHaveBeenCalledTimes(1)
+      expect(document.querySelector('.app-toast.error')?.textContent).toContain('Log refresh failed')
+    } finally { app.unmount() }
+  })
+
   it('confirms before clearing all logs, keeps failures visible, and resets the page on success', async () => {
     let fail = true
     const fetchMock = vi.fn((url: string, options?: RequestInit) => {

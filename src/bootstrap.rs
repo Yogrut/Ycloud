@@ -5,6 +5,8 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::{app, config, state::AppState};
 
+const RECOVERY_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub async fn run() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(fmt::layer())
@@ -77,10 +79,11 @@ fn spawn_retired_cleanup_task(
                 Some(entry)
             };
             if let Some(entry) = selected {
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                let deadline = tokio::time::Instant::now() + RECOVERY_PASS_BUDGET;
                 let current = state.config_file.read().await.clone();
                 let live = current.storage_instances.iter().find(|instance| matches!(&instance.backend,
                     config::StorageBackendConfig::S3(settings) if config::retired_storage_namespace_matches(settings, &entry.settings)));
+                let cancellation = tokio_util::sync::CancellationToken::new();
                 let work = async {
                     if let Some(live) = live {
                         let Some(backend) = state.backends.cached(&live.id).await else {
@@ -88,13 +91,25 @@ fn spawn_retired_cleanup_task(
                         };
                         // Never scan a live namespace using an independent
                         // client: the backend gate prevents adopting uploads.
-                        match backend.recover_abandoned_uploads().await {
+                        match backend
+                            .recover_abandoned_uploads_before(
+                                Some(deadline),
+                                Some(cancellation.clone()),
+                            )
+                            .await
+                        {
                             Ok(_guard) => Ok(true),
                             Err(crate::error::AppError::Conflict(_)) => Ok(false),
                             Err(error) => Err(error),
                         }
                     } else if let Some(backend) = &entry.runtime {
-                        match backend.recover_abandoned_uploads().await {
+                        match backend
+                            .recover_abandoned_uploads_before(
+                                Some(deadline),
+                                Some(cancellation.clone()),
+                            )
+                            .await
+                        {
                             Ok(_guard) => Ok(true),
                             Err(crate::error::AppError::Conflict(_)) => Ok(false),
                             Err(error) => Err(error),
@@ -102,15 +117,26 @@ fn spawn_retired_cleanup_task(
                     } else {
                         let backend =
                             crate::s3_backend::S3Backend::new(&entry.settings, &state.config)?;
-                        backend.recover_transactions().await.map(|_| true)
+                        backend
+                            .scoped_work(Some(deadline), Some(cancellation.clone()))
+                            .recover_transactions()
+                            .await
+                            .map(|_| true)
                     }
                 };
+                let mut work = Box::pin(work);
                 let result = tokio::select! {
-                    _ = stop.changed() => return,
-                    result = tokio::time::timeout_at(deadline, work) => result,
+                    _ = stop.changed() => {
+                        cancellation.cancel();
+                        // Keep the original client and gates until an issued
+                        // formal write returns. The next read/admission exits.
+                        let _ = work.await;
+                        return;
+                    },
+                    result = &mut work => result,
                 };
                 match result {
-                    Ok(Ok(true)) => {
+                    Ok(true) => {
                         let settled = tokio::select! {
                             _ = stop.changed() => return,
                             result = tokio::time::timeout_at(deadline, settle_retired_uploads(&state, &entry)) => result,
@@ -127,7 +153,7 @@ fn spawn_retired_cleanup_task(
                             }
                         }
                     }
-                    Ok(Ok(false)) => {}
+                    Ok(false) => {}
                     _ => {
                         tracing::warn!(storage_id = %entry.id, "old storage cleanup unavailable; retaining encrypted responsibility for the next bounded attempt")
                     }
@@ -186,7 +212,7 @@ async fn settle_retired_uploads(state: &AppState, entry: &config::RetiredStorage
                 .await
         };
         if matches!(result, Ok(true)) {
-            let _ = state.upload_batches.resolve_unknown(&item, true).await;
+            let _ = state.upload_batches.confirm_unknown_committed(&item).await;
         }
     }
     !state
@@ -237,12 +263,19 @@ fn spawn_cleanup_task(
         capacity_interval.tick().await;
         let mut upload_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         upload_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut upload_recovery = crate::upload_recovery::UploadRecovery::default();
         loop {
             tokio::select! {
                 _ = upload_interval.tick() => {
+                    let cancellation = tokio_util::sync::CancellationToken::new();
+                    let mut recovery = Box::pin(upload_recovery.recover_with_budget(&state, Some(RECOVERY_PASS_BUDGET), cancellation.clone()));
                     tokio::select! {
-                        _ = crate::upload_recovery::recover(&state) => {},
-                        _ = stop.changed() => break,
+                        _ = &mut recovery => {},
+                        _ = stop.changed() => {
+                            cancellation.cancel();
+                            recovery.await;
+                            break;
+                        },
                     }
                 }
                 _ = interval.tick() => {

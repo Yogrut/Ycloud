@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     path::PathBuf,
     sync::{
@@ -17,8 +17,8 @@ use tokio::{
 };
 
 use super::{
-    authenticated_journal, S3Backend, S3MultipartPurpose, S3MultipartSession, S3ObjectSnapshot,
-    S3UploadStage, S3UploadTransaction, S3_ACTIVATION_PROBE_JOURNAL_PURPOSE,
+    authenticated_journal, RawS3Metadata, S3Backend, S3MultipartPurpose, S3MultipartSession,
+    S3ObjectSnapshot, S3UploadStage, S3UploadTransaction, S3_ACTIVATION_PROBE_JOURNAL_PURPOSE,
     S3_INTERNAL_UPLOAD_INTENT_JOURNAL_PURPOSE, S3_MULTIPART_SESSION_JOURNAL_PURPOSE,
     S3_MULTIPART_SESSION_SCHEMA_VERSION, S3_MULTIPART_THRESHOLD, S3_OPERATION_METADATA_KEY,
     S3_SINGLE_COPY_LIMIT,
@@ -29,6 +29,264 @@ use crate::{
 };
 
 const SOURCE_ETAG: &str = "\"source-etag\"";
+
+#[tokio::test]
+async fn single_file_copy_verification_distinguishes_unknown_and_confirmed_rollback() {
+    use axum::{
+        extract::Query,
+        http::{HeaderMap, Method, Response, Uri},
+        routing::any,
+        Router,
+    };
+    for scenario in [
+        "success",
+        "head_denied",
+        "list_denied",
+        "missing",
+        "foreign",
+        "rollback_complete",
+        "rollback_retained",
+        "rollback_replaced",
+        "rollback_denied",
+        "rollback_response_lost",
+    ] {
+        let copied = Arc::new(AtomicBool::new(false));
+        let target = Arc::new(Mutex::new(None::<(u64, String)>));
+        let target_heads = Arc::new(AtomicUsize::new(0));
+        let deletions = Arc::new(AtomicUsize::new(0));
+        let stored = target.clone();
+        let published = copied.clone();
+        let heads = target_heads.clone();
+        let delete_count = deletions.clone();
+        let router = Router::new().route("/{*key}", any(
+            move |method: Method, uri: Uri, headers: HeaderMap, Query(query): Query<HashMap<String, String>>| {
+                let target = stored.clone();
+                let copied = published.clone();
+                let target_heads = heads.clone();
+                let deletions = delete_count.clone();
+                async move {
+                    let response = Response::builder();
+                    if method == Method::HEAD && uri.path() == "/bucket/tenant/source.txt" {
+                        return response.header("content-length", "4").header("etag", SOURCE_ETAG)
+                            .body(Body::empty()).unwrap();
+                    }
+                    if method == Method::HEAD && uri.path() == "/bucket/tenant/target.txt" {
+                        if copied.load(Ordering::SeqCst) {
+                            let pass = target_heads.fetch_add(1, Ordering::SeqCst);
+                            if scenario == "head_denied" {
+                                return response.status(403).body(Body::empty()).unwrap();
+                            }
+                            if scenario == "rollback_replaced" && pass == 1 {
+                                *target.lock().unwrap() = Some((9, "\"foreign-etag\"".into()));
+                            }
+                        }
+                        return match target.lock().unwrap().as_ref() {
+                            Some((size, etag)) => response.header("content-length", *size).header("etag", etag)
+                                .body(Body::empty()).unwrap(),
+                            None => response.status(404).body(Body::empty()).unwrap(),
+                        };
+                    }
+                    if method == Method::GET && query.get("list-type").map(String::as_str) == Some("2") {
+                        if scenario == "list_denied" && copied.load(Ordering::SeqCst)
+                            && query.get("prefix").map(String::as_str) == Some("tenant/target.txt/") {
+                            return response.status(403).body(Body::empty()).unwrap();
+                        }
+                        return response.header("content-type", "application/xml")
+                            .body(Body::from("<ListBucketResult><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"))
+                            .unwrap();
+                    }
+                    if method == Method::PUT && uri.path() == "/bucket/tenant/target.txt" {
+                        assert_eq!(headers.get("x-amz-copy-source-if-match").unwrap(), SOURCE_ETAG);
+                        assert_eq!(headers.get("if-none-match").unwrap(), "*");
+                        let size = if scenario.starts_with("rollback_") { 3 } else { 4 };
+                        let etag = if scenario == "foreign" { "\"foreign-etag\"" } else { "\"copy-etag\"" };
+                        if scenario != "missing" {
+                            *target.lock().unwrap() = Some((size, etag.into()));
+                        }
+                        copied.store(true, Ordering::SeqCst);
+                        return response.header("content-type", "application/xml")
+                            .body(Body::from("<CopyObjectResult><ETag>\"copy-etag\"</ETag></CopyObjectResult>"))
+                            .unwrap();
+                    }
+                    if method == Method::DELETE && uri.path() == "/bucket/tenant/target.txt" {
+                        assert_eq!(headers.get("if-match").unwrap(), "\"copy-etag\"");
+                        deletions.fetch_add(1, Ordering::SeqCst);
+                        if scenario != "rollback_retained" && scenario != "rollback_denied" {
+                            *target.lock().unwrap() = None;
+                        }
+                        return response.status(if scenario == "rollback_denied" || scenario == "rollback_response_lost" { 403 } else { 204 })
+                            .body(Body::empty()).unwrap();
+                    }
+                    response.status(400).body(Body::empty()).unwrap()
+                }
+            }
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let result = backend.copy_file("source.txt", "target.txt").await;
+        server.abort();
+        assert!(copied.load(Ordering::SeqCst), "{scenario}");
+        if scenario == "success" {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            let rolled_back = matches!(scenario, "rollback_complete" | "rollback_response_lost");
+            assert_eq!(
+                error.operation().map(|outcome| outcome.commit),
+                Some(if rolled_back {
+                    CommitState::NotCommitted
+                } else {
+                    CommitState::Unknown
+                }),
+                "{scenario}: {error}"
+            );
+            assert_eq!(error.blocks_retry(), !rolled_back, "{scenario}");
+            if rolled_back {
+                assert_eq!(
+                    error.operation().unwrap().cleanup,
+                    crate::error::CleanupState::Complete
+                );
+                assert!(target.lock().unwrap().is_none());
+            }
+        }
+        let should_delete = scenario.starts_with("rollback_") && scenario != "rollback_replaced";
+        assert_eq!(
+            deletions.load(Ordering::SeqCst),
+            usize::from(should_delete),
+            "{scenario}"
+        );
+        if matches!(
+            scenario,
+            "foreign" | "rollback_replaced" | "rollback_retained" | "rollback_denied"
+        ) {
+            assert!(target.lock().unwrap().is_some(), "{scenario}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_upload_commit_cleans_only_after_verified_absence_or_rollback() {
+    for (existing, fail_cleanup) in [(false, false), (false, true), (true, false), (true, true)] {
+        let destination = "/bucket/tenant/file.txt";
+        let mut initial_objects = HashMap::<String, RawS3Metadata>::new();
+        if existing {
+            initial_objects.insert(
+                destination.into(),
+                RawS3Metadata {
+                    size: 11,
+                    etag: Some("\"original-etag\"".into()),
+                    content_type: Some("text/plain".into()),
+                    operation_id: None,
+                },
+            );
+        }
+        let objects = Arc::new(Mutex::new(initial_objects));
+        let stored = objects.clone();
+        let router = axum::Router::new().route("/{*key}", axum::routing::any(
+            move |method: axum::http::Method, uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+                let objects = stored.clone();
+                async move {
+                    let path = uri.path().to_owned();
+                    let response = axum::http::Response::builder();
+                    let mut objects = objects.lock().unwrap();
+                    if method == axum::http::Method::GET {
+                        return response.header("content-type", "application/xml").body(Body::from(
+                            "<ListBucketResult><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"
+                        )).unwrap();
+                    }
+                    if method == axum::http::Method::HEAD {
+                        return match objects.get(&path) {
+                            Some(metadata) => response.header("etag", metadata.etag.as_deref().unwrap())
+                                .header("content-length", metadata.size)
+                                .body(Body::empty()).unwrap(),
+                            None => response.status(404).body(Body::empty()).unwrap(),
+                        };
+                    }
+                    if method == axum::http::Method::DELETE {
+                        if fail_cleanup && path.contains("/.ycloud-system/uploads/") {
+                            return response.status(403).body(Body::empty()).unwrap();
+                        }
+                        objects.remove(&path);
+                        return response.status(204).body(Body::empty()).unwrap();
+                    }
+                    if method == axum::http::Method::PUT {
+                        if let Some(source) = headers.get("x-amz-copy-source") {
+                            let source = format!("/{}", source.to_str().unwrap().trim_start_matches('/'));
+                            // Fail formal publication, but allow the old object to be
+                            // backed up and subsequently restored with a different ETag.
+                            if path == destination && source.contains("/.ycloud-system/uploads/") {
+                                return response.status(403).body(Body::empty()).unwrap();
+                            }
+                            let Some(mut metadata) = objects.get(&source).cloned() else {
+                                return response.status(404).body(Body::empty()).unwrap();
+                            };
+                            let etag = if path == destination { "\"restored-etag\"" } else { "\"backup-etag\"" };
+                            metadata.etag = Some(etag.into());
+                            objects.insert(path, metadata);
+                            return response.header("content-type", "application/xml").body(Body::from(
+                                format!("<CopyObjectResult><ETag>{etag}</ETag></CopyObjectResult>")
+                            )).unwrap();
+                        }
+                        let size = headers.get("content-length").unwrap().to_str().unwrap().parse().unwrap();
+                        objects.insert(path, RawS3Metadata {
+                            size,
+                            etag: Some("\"journal-etag\"".into()),
+                            content_type: None,
+                            operation_id: None,
+                        });
+                        return response.header("etag", "\"journal-etag\"").body(Body::empty()).unwrap();
+                    }
+                    response.status(400).body(Body::empty()).unwrap()
+                }
+            }
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let error = backend
+            .upload_file("file.txt", Body::from("payload"), 7, 1024, None)
+            .await
+            .unwrap_err();
+        let outcome = error
+            .operation()
+            .expect("verified rollback has a definite result");
+        assert_eq!(outcome.commit, CommitState::NotCommitted);
+        assert_eq!(
+            outcome.cleanup,
+            if fail_cleanup {
+                crate::error::CleanupState::Pending
+            } else {
+                crate::error::CleanupState::Complete
+            }
+        );
+        let objects = objects.lock().unwrap();
+        if existing {
+            let restored = objects.get(destination).expect("old file must remain");
+            assert_eq!(restored.size, 11);
+            assert_eq!(restored.etag.as_deref(), Some("\"restored-etag\""));
+        } else {
+            assert!(!objects.contains_key(destination));
+        }
+        assert_eq!(
+            objects
+                .keys()
+                .any(|key| key.contains("/.ycloud-system/transactions/")),
+            fail_cleanup
+        );
+        assert_eq!(
+            objects
+                .keys()
+                .any(|key| key.contains("/.ycloud-system/uploads/")),
+            fail_cleanup
+        );
+        server.abort();
+    }
+}
 
 #[tokio::test]
 async fn verified_upload_success_does_not_wait_for_slow_temporary_deletion() {
@@ -1039,6 +1297,10 @@ async fn handle_internal_upload_intent_connection(
         } else {
             not_found_response()
         }
+    } else if method == "HEAD"
+        && path == format!("/bucket/tenant/.ycloud-system/transactions/{INTERNAL_INTENT_ID}")
+    {
+        not_found_response()
     } else if method == "DELETE" && path == object_path {
         object_deletes.fetch_add(1, Ordering::SeqCst);
         object_present.store(false, Ordering::SeqCst);
@@ -1109,6 +1371,9 @@ async fn handle_intent_put_response_loss_connection(
     let expected_object_path = captured_id
         .as_deref()
         .map(|id| format!("{object_prefix}{id}"));
+    let expected_transaction_path = captured_id
+        .as_deref()
+        .map(|id| format!("/bucket/tenant/.ycloud-system/transactions/{id}"));
     let response = if method == "PUT" && path.starts_with(intent_prefix) {
         let id = path.trim_start_matches(intent_prefix);
         if valid_protocol_transaction_id(id) {
@@ -1140,6 +1405,9 @@ async fn handle_intent_put_response_loss_connection(
                 .unwrap_or(INTERNAL_INTENT_ID),
         )
     } else if method == "HEAD" && expected_object_path.as_deref() == Some(path) {
+        not_found_response()
+    } else if method == "HEAD" && expected_transaction_path.as_deref() == Some(path) {
+        // The failed intent PUT prevented payload and transaction creation.
         not_found_response()
     } else if method == "HEAD" && expected_intent_path.as_deref() == Some(path) {
         if intent_present.load(Ordering::SeqCst) {
@@ -1697,8 +1965,8 @@ fn bad_request_response() -> String {
     "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\nx-amz-request-id: local-test\r\n\r\n".into()
 }
 
-pub(crate) fn test_backend(endpoint: &str) -> S3Backend {
-    let settings = S3StorageConfig {
+pub(crate) fn test_settings(endpoint: &str) -> S3StorageConfig {
+    S3StorageConfig {
         provider: S3Provider::S3Compatible,
         endpoint: endpoint.into(),
         bucket: "bucket".into(),
@@ -1709,7 +1977,11 @@ pub(crate) fn test_backend(endpoint: &str) -> S3Backend {
         secret_access_key: "local-test-secret-key".into(),
         capacity_limit_bytes: Some(1024 * 1024),
         relay_upload: false,
-    };
+    }
+}
+
+pub(crate) fn test_backend(endpoint: &str) -> S3Backend {
+    let settings = test_settings(endpoint);
     let runtime = Config {
         bind_address: IpAddr::from([127, 0, 0, 1]),
         port: 0,
@@ -1917,37 +2189,47 @@ async fn recovery_inventory_reports_internal_objects_without_deleting_them() {
 }
 
 #[tokio::test]
-async fn startup_recovery_settles_a_pre_transaction_internal_upload_intent() {
-    let simulator = InternalUploadIntentRecoverySimulator::start().await;
-    let backend = test_backend(&simulator.endpoint);
-    let object_key = format!("tenant/.ycloud-system/uploads/{INTERNAL_INTENT_ID}");
+async fn startup_and_runtime_recovery_settle_a_pre_transaction_internal_upload_intent() {
+    for runtime in [false, true] {
+        let simulator = InternalUploadIntentRecoverySimulator::start().await;
+        let backend = test_backend(&simulator.endpoint);
+        let object_key = format!("tenant/.ycloud-system/uploads/{INTERNAL_INTENT_ID}");
 
-    let (_journal_key, _intent, _journal_etag) = backend
-        .create_internal_upload_intent(INTERNAL_INTENT_ID, SOURCE_LENGTH as u64)
-        .await
-        .unwrap();
-    backend
-        .single_upload(
-            &object_key,
-            Body::from("payload"),
-            SOURCE_LENGTH as u64,
-            Some("text/plain"),
-            INTERNAL_INTENT_ID,
-        )
-        .await
-        .unwrap();
+        let (_journal_key, _intent, _journal_etag) = backend
+            .create_internal_upload_intent(INTERNAL_INTENT_ID, SOURCE_LENGTH as u64)
+            .await
+            .unwrap();
+        backend
+            .single_upload(
+                &object_key,
+                Body::from("payload"),
+                SOURCE_LENGTH as u64,
+                Some("text/plain"),
+                INTERNAL_INTENT_ID,
+            )
+            .await
+            .unwrap();
 
-    let recovered = backend.recover_transactions().await.unwrap();
+        let recovered = if runtime {
+            backend
+                .recover_runtime_transactions(&crate::capacity::CapacityTracker::new(None, 0))
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            backend.recover_transactions().await.unwrap()
+        };
 
-    assert_eq!(recovered, 1);
-    assert!(simulator.marker_seen.load(Ordering::SeqCst));
-    assert!(simulator.object_deletes.load(Ordering::SeqCst) >= 1);
-    assert!(!simulator.object_present.load(Ordering::SeqCst));
-    assert!(!simulator.intent_present.load(Ordering::SeqCst));
-    assert_eq!(
-        backend.recovery_status(),
-        super::S3RecoveryStatus::default()
-    );
+        assert_eq!(recovered, 1);
+        assert!(simulator.marker_seen.load(Ordering::SeqCst));
+        assert!(simulator.object_deletes.load(Ordering::SeqCst) >= 1);
+        assert!(!simulator.object_present.load(Ordering::SeqCst));
+        assert!(!simulator.intent_present.load(Ordering::SeqCst));
+        assert_eq!(
+            backend.recovery_status(),
+            super::S3RecoveryStatus::default()
+        );
+    }
 }
 
 #[tokio::test]
@@ -2195,6 +2477,336 @@ async fn runtime_worker_settles_a_tracked_activation_probe_intent() {
     assert_eq!(status.consecutive_failures, 0);
     assert!(!status.recovering);
     backend.stop_recovery_worker();
+}
+
+#[tokio::test]
+async fn runtime_recovery_handles_one_registered_journal_without_a_full_scan() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let router = axum::Router::new().route("/{*key}", axum::routing::any(
+        move |method: axum::http::Method, uri: axum::http::Uri| {
+            let observed = observed.clone();
+            async move {
+                observed.lock().unwrap().push((method.clone(), uri.path().to_owned()));
+                let response = axum::http::Response::builder();
+                if method == axum::http::Method::HEAD {
+                    return response.status(404).body(Body::empty()).unwrap();
+                }
+                response.header("content-type", "application/xml").body(Body::from(
+                    "<ListBucketResult><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"
+                )).unwrap()
+            }
+        }
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let first = super::internal_key("tenant/", "transactions", &format!("{:032x}", 1));
+    // Raw lexical ordering would pick the intent before the upload transaction.
+    let second = super::internal_key("tenant/", "internal-upload-intents", &format!("{:032x}", 2));
+    for key in [&second, &first] {
+        backend.recovery_runtime.journal_write_started(key);
+    }
+    let capacity = crate::capacity::CapacityTracker::new(None, 7);
+    backend.runtime_recovery_started();
+    let result = backend
+        .recover_runtime_transactions(&capacity)
+        .await
+        .unwrap();
+    assert_eq!(result, Some(1));
+    assert_eq!(backend.recovery_status().pending_records, 1);
+    assert!(!backend.recovery_status().recovering);
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        &[(axum::http::Method::HEAD, format!("/bucket/{first}"))]
+    );
+    assert_eq!(capacity.status().used, 7);
+    assert!(!capacity.status().accurate);
+    assert!(backend.recovery_gate.try_write().is_ok());
+    assert!(backend.mutation_gate.try_lock().is_ok());
+    assert_eq!(
+        backend
+            .recover_runtime_transactions(&capacity)
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(backend.recovery_status().pending_records, 0);
+    assert!(!backend.recovery_status().recovering);
+    // Two final orphan inventory reads, not six recovery-category scans.
+    assert_eq!(requests.lock().unwrap().len(), 4);
+    server.abort();
+}
+
+#[tokio::test]
+async fn runtime_recovery_rejects_foreign_or_invalid_registered_keys_before_network_io() {
+    let simulator = RecoveryInventorySimulator::start().await;
+    for key in [
+        super::internal_key("other/", "transactions", INTERNAL_INTENT_ID),
+        super::internal_key("tenant/", "uploads", INTERNAL_INTENT_ID),
+        super::internal_key("tenant/", "transactions", "invalid-id"),
+    ] {
+        let backend = test_backend(&simulator.endpoint);
+        backend.recovery_runtime.journal_write_started(&key);
+        let error = backend
+            .recover_runtime_transactions(&crate::capacity::CapacityTracker::new(None, 0))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("不属于当前日志命名空间"));
+        assert_eq!(backend.recovery_status().pending_records, 1);
+    }
+    assert_eq!(simulator.list_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(simulator.delete_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn runtime_recovery_preserves_pending_evidence_on_head_and_authentication_failures() {
+    for fail_head in [true, false] {
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let observed_deletes = deletes.clone();
+        let router = axum::Router::new().route(
+            "/{*key}",
+            axum::routing::any(move |method: axum::http::Method| {
+                let deletes = observed_deletes.clone();
+                async move {
+                    let response = axum::http::Response::builder();
+                    if method == axum::http::Method::DELETE {
+                        deletes.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if method == axum::http::Method::HEAD {
+                        if fail_head {
+                            return response.status(403).body(Body::empty()).unwrap();
+                        }
+                        return response
+                            .header("etag", "\"journal-etag\"")
+                            .header("content-length", 2)
+                            .body(Body::empty())
+                            .unwrap();
+                    }
+                    // A response that cannot authenticate as a Ycloud journal.
+                    response
+                        .header("etag", "\"journal-etag\"")
+                        .body(Body::from("{}"))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let key = super::internal_key("tenant/", "transactions", INTERNAL_INTENT_ID);
+        backend.recovery_runtime.journal_write_started(&key);
+        assert!(backend
+            .recover_runtime_transactions(&crate::capacity::CapacityTracker::new(None, 7))
+            .await
+            .is_err());
+        assert_eq!(backend.recovery_runtime.pending_keys(), vec![key]);
+        assert_eq!(deletes.load(Ordering::SeqCst), 0);
+        assert!(backend.recovery_gate.try_write().is_ok());
+        assert!(backend.mutation_gate.try_lock().is_ok());
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn runtime_internal_intent_preserves_data_when_an_untracked_upload_transaction_exists() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let router = axum::Router::new().route(
+        "/{*key}",
+        axum::routing::any(move |method: axum::http::Method, uri: axum::http::Uri| {
+            let observed = observed.clone();
+            async move {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((method, uri.path().to_owned()));
+                axum::http::Response::builder()
+                    .header("etag", "\"journal-etag\"")
+                    .header("content-length", 1)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let key = super::internal_key("tenant/", "internal-upload-intents", INTERNAL_INTENT_ID);
+    backend.recovery_runtime.journal_write_started(&key);
+    let error = backend
+        .recover_runtime_transactions(&crate::capacity::CapacityTracker::new(None, 7))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("关联事务待恢复"));
+    assert_eq!(backend.recovery_status().pending_records, 1);
+    let transaction = super::internal_key("tenant/", "transactions", INTERNAL_INTENT_ID);
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        &[
+            (axum::http::Method::HEAD, format!("/bucket/{key}")),
+            (axum::http::Method::HEAD, format!("/bucket/{transaction}")),
+        ]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn runtime_worker_releases_recovery_gate_between_journals_for_a_waiting_edit() {
+    let heads = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let observed = heads.clone();
+    let head_started = started.clone();
+    let head_release = release.clone();
+    let router = axum::Router::new().route(
+        "/{*key}",
+        axum::routing::any(move |method: axum::http::Method| {
+            let heads = observed.clone();
+            let started = head_started.clone();
+            let release = head_release.clone();
+            async move {
+                assert_eq!(method, axum::http::Method::HEAD);
+                if heads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                axum::http::Response::builder()
+                    .status(404)
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    for index in 0..3 {
+        backend
+            .recovery_runtime
+            .journal_write_started(&super::internal_key(
+                "tenant/",
+                "transactions",
+                &format!("{index:032x}"),
+            ));
+    }
+    crate::storage_backend::spawn_s3_recovery_reconciler(
+        backend.clone(),
+        crate::capacity::CapacityTracker::new(None, 7),
+    );
+    tokio::time::timeout(Duration::from_secs(3), started.notified())
+        .await
+        .unwrap();
+    let acquired = Arc::new(tokio::sync::Notify::new());
+    let release_edit = Arc::new(tokio::sync::Notify::new());
+    let edit_gate = backend.recovery_gate.clone();
+    let edit_acquired = acquired.clone();
+    let edit_release = release_edit.clone();
+    let edit = tokio::spawn(async move {
+        let _guard = edit_gate.write_owned().await;
+        edit_acquired.notify_one();
+        edit_release.notified().await;
+    });
+    // Poll the edit into the RwLock's fair writer queue before ending this pass.
+    tokio::task::yield_now().await;
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), acquired.notified())
+        .await
+        .unwrap();
+    assert_eq!(heads.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.recovery_status().pending_records, 2);
+    backend.stop_recovery_worker();
+    release_edit.notify_one();
+    edit.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while backend.recovery_status().recovering {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(heads.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.recovery_status().pending_records, 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn runtime_worker_reconciles_capacity_when_a_foreground_owner_settles_the_last_journal() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let head_started = started.clone();
+    let head_release = release.clone();
+    let router = axum::Router::new().route("/{*key}", axum::routing::any(
+        move |method: axum::http::Method| {
+            let started = head_started.clone();
+            let release = head_release.clone();
+            async move {
+                let response = axum::http::Response::builder();
+                if method == axum::http::Method::HEAD {
+                    started.notify_one();
+                    release.notified().await;
+                    return response.status(404).body(Body::empty()).unwrap();
+                }
+                assert_eq!(method, axum::http::Method::GET);
+                response.header("content-type", "application/xml").body(Body::from(
+                    "<ListBucketResult><Contents><Key>tenant/file.txt</Key><Size>42</Size></Contents><KeyCount>1</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"
+                )).unwrap()
+            }
+        }
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let first = super::internal_key("tenant/", "transactions", &format!("{:032x}", 1));
+    let last = super::internal_key("tenant/", "transactions", &format!("{:032x}", 2));
+    for key in [&first, &last] {
+        backend.recovery_runtime.journal_write_started(key);
+    }
+    let capacity = crate::capacity::CapacityTracker::new(None, 7);
+    crate::storage_backend::spawn_s3_recovery_reconciler(backend.clone(), capacity.clone());
+    tokio::time::timeout(Duration::from_secs(3), started.notified())
+        .await
+        .unwrap();
+    assert!(!capacity.status().accurate);
+    let acquired = Arc::new(tokio::sync::Notify::new());
+    let release_owner = Arc::new(tokio::sync::Notify::new());
+    let owner_gate = backend.recovery_gate.clone();
+    let owner_acquired = acquired.clone();
+    let owner_release = release_owner.clone();
+    let foreground = tokio::spawn(async move {
+        let _lease = owner_gate.read_owned().await;
+        owner_acquired.notify_one();
+        owner_release.notified().await;
+    });
+    tokio::task::yield_now().await;
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), acquired.notified())
+        .await
+        .unwrap();
+    backend.recovery_runtime.journal_settled(&last);
+    release_owner.notify_one();
+    foreground.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !capacity.status().accurate || capacity.status().used != 42 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("capacity uncertainty stranded between recovery passes");
+    assert_eq!(backend.recovery_status().pending_records, 0);
+    assert!(!backend.recovery_status().recovering);
+    backend.stop_recovery_worker();
+    server.abort();
 }
 
 #[tokio::test]

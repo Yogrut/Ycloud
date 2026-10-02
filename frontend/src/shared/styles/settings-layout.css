@@ -129,7 +129,7 @@
 .settings-drawer .modal-actions, .settings-drawer .admin-save-row { position: sticky; bottom: 0; z-index: 3; flex-shrink: 0; display: flex; justify-content: flex-end; gap: 12px; margin: auto -28px 0; padding: 14px 24px; border-top: 1px solid var(--line); background: var(--panel); }
 .confirmation-actions .btn, .settings-drawer .modal-actions .btn, .settings-drawer .admin-save-row .btn { min-width: 60px; min-height: 32px; height: 32px; padding: 5px 14px; font-size: 14px; font-weight: 400; line-height: 20px; }
 .settings-drawer .field-hint { margin: -10px 0 0; color: var(--muted-2); font-size: 12px; line-height: 1.6; }
-.settings-drawer .webdav-options { margin-top: 0; gap: 24px; }
+.settings-drawer .webdav-options { display: grid; grid-template-columns: minmax(0, 1fr); margin-top: 0; gap: 16px; }
 .settings-drawer .app-switch-field { display: inline-flex; align-items: center; gap: 10px; width: auto; min-height: 32px; padding: 0; margin: 0; border: 0; background: transparent; font-weight: 400; }
 .settings-drawer .storage-access-options { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 .settings-drawer .storage-grant-list { margin-top: 0; }

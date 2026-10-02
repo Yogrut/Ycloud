@@ -6,6 +6,8 @@ import {
   deleteFolderLock,
   deleteWebDavMount,
   getAdminInfo,
+  getDomainBinding,
+  getLoginEvents,
   updateAccount,
   updateFolderLock,
   updateLoginRestriction,
@@ -14,11 +16,83 @@ import {
   updateLocalStorage,
   updateS3Storage,
   updateWebDavMount,
+  saveDomainBinding,
+  removeDomainBinding,
+  logoutSession,
 } from './admin'
 
 afterEach(() => vi.unstubAllGlobals())
 
 describe('admin API', () => {
+  it('cancels an obsolete administrator info read through the shared client', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => new Promise<Response>(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new AbortController()
+    const result = getAdminInfo(controller.signal)
+    const rejected = expect(result).rejects.toMatchObject({ name: 'AbortError' })
+    const signal = fetchMock.mock.calls[0]![1].signal as AbortSignal
+    controller.abort()
+    await rejected
+    expect(signal.aborted).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls[0]![0]).toBe('/api/admin/info')
+  })
+
+  it('bounds the logout wait and does not automatically repeat it after a lost response', async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchMock = vi.fn().mockImplementation(() => new Promise<Response>(() => {}))
+      vi.stubGlobal('fetch', fetchMock)
+      const result = logoutSession()
+      const rejected = expect(result).rejects.toMatchObject({ code: 'operation_result_unknown', blocksRetry: true })
+      expect(fetchMock).toHaveBeenCalledWith('/api/logout', expect.objectContaining({ method: 'POST', credentials: 'same-origin' }))
+      await vi.advanceTimersByTimeAsync(330_000)
+      await rejected
+      expect(fetchMock.mock.calls[0]![1].signal.aborted).toBe(true)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('cancels a disposed domain read through the shared request deadline', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => new Promise<Response>(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new AbortController()
+    const result = getDomainBinding(controller.signal)
+    const rejected = expect(result).rejects.toMatchObject({ name: 'AbortError' })
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/domain-binding', expect.objectContaining({ credentials: 'same-origin' }))
+    const signal = fetchMock.mock.calls[0]![1].signal as AbortSignal
+    expect(signal.aborted).toBe(false)
+    controller.abort()
+    await rejected
+    expect(signal.aborted).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['save', 'remove'] as const)('does not retry an unconfirmed domain %s or infer it from administrator info', async operation => {
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError('connection lost'))
+    vi.stubGlobal('fetch', fetchMock)
+    const result = operation === 'save' ? saveDomainBinding({ public_url: 'https://cloud.example.com' }) : removeDomainBinding()
+    await expect(result).rejects.toMatchObject({ code: 'operation_result_unknown', blocksRetry: true })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith('/api/admin/domain-binding', expect.objectContaining({ method: operation === 'save' ? 'PUT' : 'DELETE' }))
+  })
+
+  it('cancels obsolete log reads through the existing request deadline without retrying', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => new Promise<Response>(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const controller = new AbortController()
+    const result = getLoginEvents({ success: false, entry: 'admin', page: 2, limit: 50, search: '  Browser A  ' }, controller.signal)
+    const rejected = expect(result).rejects.toMatchObject({ name: 'AbortError' })
+    const [url, options] = fetchMock.mock.calls[0]!
+    const params = new URL(url, 'http://localhost').searchParams
+    expect(Object.fromEntries(params)).toEqual({ success: 'false', entry: 'admin', page: '2', limit: '50', search: 'Browser A' })
+    expect(options.signal.aborted).toBe(false)
+    controller.abort()
+    await rejected
+    expect(options.signal.aborted).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   it('reads back a lost settings response without repeating the write', async () => {
     const fetchMock = vi.fn()
       .mockRejectedValueOnce(new TypeError('connection lost'))

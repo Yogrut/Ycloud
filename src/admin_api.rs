@@ -127,6 +127,43 @@ pub struct StorageInstanceView {
     pub s3_recovery_running: Option<bool>,
 }
 
+impl StorageInstanceView {
+    fn from_config(instance: StorageInstanceConfig, config: &Config, status: &'static str) -> Self {
+        Self {
+            revision: crate::config::entity_revision(&instance),
+            health_ok: false,
+            health_checked_at: None,
+            id: instance.id,
+            name: instance.name,
+            enabled: instance.enabled,
+            allow_guest_access: instance.allow_guest_access,
+            allow_guest_download: instance.allow_guest_access
+                && instance.allow_guest_download.unwrap_or(true),
+            status,
+            ready: false,
+            backend: StorageBackendView::from_config(&instance.backend, config),
+            usage_bytes: 0,
+            reserved_bytes: 0,
+            capacity_accurate: false,
+            capacity_reconciling: false,
+            cleanup_pending_bytes: None,
+            cleanup_debt_complete: None,
+            staging_cleanup_pending_uploads: None,
+            staging_cleanup_pending_copies: None,
+            staging_cleanup_failed_attempts: None,
+            s3_orphan_uploads: None,
+            s3_orphan_backups: None,
+            s3_recovery_pending_records: None,
+            s3_recovery_oldest_pending_seconds: None,
+            s3_recovery_consecutive_failures: None,
+            s3_recovery_last_failure: None,
+            s3_recovery_last_failure_unix: None,
+            s3_recovery_next_retry_unix: None,
+            s3_recovery_running: None,
+        }
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StorageBackendView {
@@ -261,58 +298,50 @@ pub struct UpdateAdminRequest {
 }
 
 pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminInfo>> {
-    let (
-        username,
-        has_global_web_password,
-        admin_totp_enabled,
-        admin_recovery_codes_remaining,
-        shares,
-        folder_locks,
-        max_upload_bytes,
-        max_upload_batch_bytes,
-        max_upload_batch_entries,
-        max_archive_bytes,
-        max_archive_entries,
-        upload_rate_bytes_per_sec,
-        download_rate_bytes_per_sec,
-        admin_login_failures,
-        web_login_failures,
-        admin_login_block_seconds,
-        web_login_block_seconds,
-        security_log_retention_days,
-        security_log_max_entries,
-        storage_configs,
-        pending_storage_config,
-        user_accounts,
-    ) = {
+    // Capture all persisted fields under one read lock, then release it before
+    // querying storage runtime state or mount status.
+    let (mut info, storage_configs) = {
         let config = state.config_file.read().await;
-        (
-            config.admin_username.clone(),
-            config.global_web_password_hash.is_some(),
-            config.admin_totp_secret.is_some(),
-            config.admin_recovery_code_hashes.len(),
-            config.shares.iter().map(ShareView::from).collect(),
-            config
+        let storage_configs = config.storage_instances.clone();
+        let info = AdminInfo {
+            domain_binding: crate::domain_binding::BindingView::from_binding(
+                config.domain_binding.clone(),
+            ),
+            username: config.admin_username.clone(),
+            has_global_web_password: config.global_web_password_hash.is_some(),
+            admin_totp_enabled: config.admin_totp_secret.is_some(),
+            admin_recovery_codes_remaining: config.admin_recovery_code_hashes.len(),
+            shares: config.shares.iter().map(ShareView::from).collect(),
+            folder_locks: config
                 .folder_locks
                 .iter()
                 .map(FolderLockView::from)
                 .collect(),
-            config.max_upload_bytes,
-            config.max_upload_batch_bytes,
-            config.max_upload_batch_entries,
-            config.max_archive_bytes,
-            config.max_archive_entries,
-            config.upload_rate_bytes_per_sec,
-            config.download_rate_bytes_per_sec,
-            config.admin_login_failures,
-            config.web_login_failures,
-            config.admin_login_block_seconds,
-            config.web_login_block_seconds,
-            config.security_log_retention_days,
-            config.security_log_max_entries,
-            config.storage_instances.clone(),
-            config.pending_storage_instance.clone(),
-            config
+            max_upload_bytes: config.max_upload_bytes,
+            max_upload_batch_bytes: config.max_upload_batch_bytes,
+            max_upload_batch_entries: config.max_upload_batch_entries,
+            max_archive_bytes: config.max_archive_bytes,
+            max_archive_entries: config.max_archive_entries,
+            deployment_max_upload_bytes: state.config.max_upload_bytes,
+            deployment_max_upload_batch_bytes: state.config.max_upload_batch_bytes,
+            deployment_max_upload_batch_entries: state.config.max_upload_batch_entries,
+            deployment_max_archive_bytes: state.config.max_archive_bytes,
+            deployment_max_archive_entries: state.config.max_archive_entries,
+            upload_rate_bytes_per_sec: config.upload_rate_bytes_per_sec,
+            download_rate_bytes_per_sec: config.download_rate_bytes_per_sec,
+            admin_login_failures: config.admin_login_failures,
+            web_login_failures: config.web_login_failures,
+            admin_login_block_seconds: config.admin_login_block_seconds,
+            web_login_block_seconds: config.web_login_block_seconds,
+            security_log_retention_days: config.security_log_retention_days,
+            security_log_max_entries: config.security_log_max_entries,
+            storage_instances: Vec::with_capacity(storage_configs.len()),
+            pending_storage_instance: config.pending_storage_instance.clone().map(|instance| {
+                StorageInstanceView::from_config(instance, &state.config, "pending")
+            }),
+            local_storage_path: state.config.storage_path.to_string_lossy().into_owned(),
+            local_mounts: Vec::with_capacity(state.config.local_mounts.all().len()),
+            user_accounts: config
                 .user_accounts
                 .iter()
                 .map(|account| {
@@ -322,9 +351,10 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
                     view
                 })
                 .collect(),
-        )
+        };
+        (info, storage_configs)
     };
-    let mut storage_instances = Vec::with_capacity(storage_configs.len());
+
     let configured_local_mounts = storage_configs
         .iter()
         .filter_map(|instance| match &instance.backend {
@@ -335,41 +365,9 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
         })
         .collect::<std::collections::HashMap<_, _>>();
     for instance in storage_configs {
-        storage_instances.push(storage_instance_view(&state, instance).await);
+        info.storage_instances
+            .push(storage_instance_view(&state, instance).await);
     }
-    let pending_storage_instance = pending_storage_config.map(|instance| StorageInstanceView {
-        revision: crate::config::entity_revision(&instance),
-        id: instance.id,
-        name: instance.name,
-        enabled: instance.enabled,
-        allow_guest_access: instance.allow_guest_access,
-        allow_guest_download: instance.allow_guest_access
-            && instance.allow_guest_download.unwrap_or(true),
-        status: "pending",
-        ready: false,
-        health_ok: false,
-        health_checked_at: None,
-        backend: StorageBackendView::from_config(&instance.backend, &state.config),
-        usage_bytes: 0,
-        reserved_bytes: 0,
-        capacity_accurate: false,
-        capacity_reconciling: false,
-        cleanup_pending_bytes: None,
-        cleanup_debt_complete: None,
-        staging_cleanup_pending_uploads: None,
-        staging_cleanup_pending_copies: None,
-        staging_cleanup_failed_attempts: None,
-        s3_orphan_uploads: None,
-        s3_orphan_backups: None,
-        s3_recovery_pending_records: None,
-        s3_recovery_oldest_pending_seconds: None,
-        s3_recovery_consecutive_failures: None,
-        s3_recovery_last_failure: None,
-        s3_recovery_last_failure_unix: None,
-        s3_recovery_next_retry_unix: None,
-        s3_recovery_running: None,
-    });
-    let mut local_mounts = Vec::with_capacity(state.config.local_mounts.all().len());
     for mount in state.config.local_mounts.all() {
         let status = state.config.local_mounts.status(&mount.id).await;
         let storage_id = configured_local_mounts.get(&mount.id).cloned();
@@ -377,7 +375,7 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
             Some(id) => state.backends.is_ready(id).await,
             None => status.ready,
         };
-        local_mounts.push(LocalMountView {
+        info.local_mounts.push(LocalMountView {
             mount_id: mount.id.clone(),
             name: mount.name.clone(),
             path: mount.path.to_string_lossy().into_owned(),
@@ -387,151 +385,66 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
             available_bytes: status.available_bytes,
         });
     }
-    Ok(Json(AdminInfo {
-        domain_binding: crate::domain_binding::view(&state).await,
-        username,
-        has_global_web_password,
-        admin_totp_enabled,
-        admin_recovery_codes_remaining,
-        shares,
-        folder_locks,
-        max_upload_bytes,
-        max_upload_batch_bytes,
-        max_upload_batch_entries,
-        max_archive_bytes,
-        max_archive_entries,
-        deployment_max_upload_bytes: state.config.max_upload_bytes,
-        deployment_max_upload_batch_bytes: state.config.max_upload_batch_bytes,
-        deployment_max_upload_batch_entries: state.config.max_upload_batch_entries,
-        deployment_max_archive_bytes: state.config.max_archive_bytes,
-        deployment_max_archive_entries: state.config.max_archive_entries,
-        upload_rate_bytes_per_sec,
-        download_rate_bytes_per_sec,
-        admin_login_failures,
-        web_login_failures,
-        admin_login_block_seconds,
-        web_login_block_seconds,
-        security_log_retention_days,
-        security_log_max_entries,
-        storage_instances,
-        pending_storage_instance,
-        local_storage_path: state.config.storage_path.to_string_lossy().into_owned(),
-        local_mounts,
-        user_accounts,
-    }))
+    Ok(Json(info))
 }
 
 async fn storage_instance_view(
     state: &AppState,
     instance: StorageInstanceConfig,
 ) -> StorageInstanceView {
-    let health = state
-        .backends
-        .cached(&instance.id)
-        .await
-        .map(|backend| backend.health_status());
-    let backend_view = StorageBackendView::from_config(&instance.backend, &state.config);
-    let (
-        ready,
-        usage_bytes,
-        reserved_bytes,
-        capacity_accurate,
-        capacity_reconciling,
-        cleanup_pending_bytes,
-        cleanup_debt_complete,
-        staging_cleanup_pending_uploads,
-        staging_cleanup_pending_copies,
-        staging_cleanup_failed_attempts,
-        s3_orphan_uploads,
-        s3_orphan_backups,
-        s3_recovery_pending_records,
-        s3_recovery_oldest_pending_seconds,
-        s3_recovery_consecutive_failures,
-        s3_recovery_last_failure,
-        s3_recovery_last_failure_unix,
-        s3_recovery_next_retry_unix,
-        s3_recovery_running,
-    ) = match state.storage_backend(&instance.id).await {
-        Ok(backend) => {
-            let capacity = backend.capacity_status();
-            let cleanup = backend.local_cleanup_status();
-            let staging = backend.local_staging_cleanup_status();
-            let s3_recovery = backend.s3_recovery_status();
-            (
-                true,
-                capacity.used,
-                capacity.reserved,
-                capacity.accurate,
-                capacity.reconciling,
-                cleanup.map(|status| status.pending_bytes_upper_bound),
-                cleanup.map(|status| status.pending_bytes_complete),
-                staging.map(|status| status.pending_uploads),
-                staging.map(|status| status.pending_copies),
-                staging.map(|status| status.failed_attempts),
-                s3_recovery.as_ref().map(|status| status.orphan_uploads),
-                s3_recovery.as_ref().map(|status| status.orphan_backups),
-                s3_recovery.as_ref().map(|status| status.pending_records),
-                s3_recovery
-                    .as_ref()
-                    .and_then(|status| status.oldest_pending_age_seconds),
-                s3_recovery
-                    .as_ref()
-                    .map(|status| status.consecutive_failures),
-                s3_recovery
-                    .as_ref()
-                    .and_then(|status| status.last_failure.clone()),
-                s3_recovery
-                    .as_ref()
-                    .and_then(|status| status.last_failure_unix),
-                s3_recovery
-                    .as_ref()
-                    .and_then(|status| status.next_retry_unix),
-                s3_recovery.as_ref().map(|status| status.recovering),
-            )
-        }
-        Err(_) => (
-            false, 0, 0, false, false, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None,
-        ),
-    };
-    StorageInstanceView {
-        revision: crate::config::entity_revision(&instance),
-        health_ok: health.is_some_and(|value| value.0),
-        health_checked_at: health.map(|value| value.1),
-        status: if !instance.enabled {
-            "disabled"
-        } else if ready {
-            "enabled"
-        } else {
-            "abnormal"
-        },
-        enabled: instance.enabled,
-        allow_guest_access: instance.allow_guest_access,
-        allow_guest_download: instance.allow_guest_access
-            && instance.allow_guest_download.unwrap_or(true),
-        id: instance.id,
-        name: instance.name,
-        ready,
-        backend: backend_view,
-        usage_bytes,
-        reserved_bytes,
-        capacity_accurate,
-        capacity_reconciling,
-        cleanup_pending_bytes,
-        cleanup_debt_complete,
-        staging_cleanup_pending_uploads,
-        staging_cleanup_pending_copies,
-        staging_cleanup_failed_attempts,
-        s3_orphan_uploads,
-        s3_orphan_backups,
-        s3_recovery_pending_records,
-        s3_recovery_oldest_pending_seconds,
-        s3_recovery_consecutive_failures,
-        s3_recovery_last_failure,
-        s3_recovery_last_failure_unix,
-        s3_recovery_next_retry_unix,
-        s3_recovery_running,
+    let storage_id = instance.id.clone();
+    let mut view = StorageInstanceView::from_config(instance, &state.config, "abnormal");
+    let cached = state.backends.cached(&storage_id).await;
+    let health = cached.as_ref().map(|backend| backend.health_status());
+    view.health_ok = health.is_some_and(|value| value.0);
+    view.health_checked_at = health.map(|value| value.1);
+
+    if let Ok(backend) = state.storage_backend(&storage_id).await {
+        let capacity = backend.capacity_status();
+        let cleanup = backend.local_cleanup_status();
+        let staging = backend.local_staging_cleanup_status();
+        let s3_recovery = backend.s3_recovery_status();
+        view.ready = true;
+        view.usage_bytes = capacity.used;
+        view.reserved_bytes = capacity.reserved;
+        view.capacity_accurate = capacity.accurate;
+        view.capacity_reconciling = capacity.reconciling;
+        view.cleanup_pending_bytes = cleanup.map(|status| status.pending_bytes_upper_bound);
+        view.cleanup_debt_complete = cleanup.map(|status| status.pending_bytes_complete);
+        view.staging_cleanup_pending_uploads = staging.map(|status| status.pending_uploads);
+        view.staging_cleanup_pending_copies = staging.map(|status| status.pending_copies);
+        view.staging_cleanup_failed_attempts = staging.map(|status| status.failed_attempts);
+        view.s3_orphan_uploads = s3_recovery.as_ref().map(|status| status.orphan_uploads);
+        view.s3_orphan_backups = s3_recovery.as_ref().map(|status| status.orphan_backups);
+        view.s3_recovery_pending_records =
+            s3_recovery.as_ref().map(|status| status.pending_records);
+        view.s3_recovery_oldest_pending_seconds = s3_recovery
+            .as_ref()
+            .and_then(|status| status.oldest_pending_age_seconds);
+        view.s3_recovery_consecutive_failures = s3_recovery
+            .as_ref()
+            .map(|status| status.consecutive_failures);
+        view.s3_recovery_last_failure = s3_recovery
+            .as_ref()
+            .and_then(|status| status.last_failure.clone());
+        view.s3_recovery_last_failure_unix = s3_recovery
+            .as_ref()
+            .and_then(|status| status.last_failure_unix);
+        view.s3_recovery_next_retry_unix = s3_recovery
+            .as_ref()
+            .and_then(|status| status.next_retry_unix);
+        view.s3_recovery_running = s3_recovery.as_ref().map(|status| status.recovering);
     }
+    view.status = if !view.enabled {
+        "disabled"
+    } else if view.ready {
+        "enabled"
+    } else if cached.is_some_and(|backend| backend.interruption_pending()) {
+        "pending"
+    } else {
+        "abnormal"
+    };
+    view
 }
 
 /// Validate credentials and the minimum list permission without changing the
@@ -1338,6 +1251,82 @@ mod tests {
         assert!(validate_password("密码安全", 4, "测试").is_ok());
         assert!(validate_password("密码安全", 5, "测试").is_err());
         assert!(validate_password("Dav密码-2026-安全", 12, "WebDAV").is_ok());
+    }
+
+    #[tokio::test]
+    async fn pending_storage_view_does_not_claim_runtime_health_or_usage() {
+        use super::*;
+        use crate::test_support::{app_state, TestDirectory};
+
+        let directory = TestDirectory::new("pending-storage-view");
+        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
+        let instance = state.config_file.read().await.storage_instances[0].clone();
+        let pending = StorageInstanceView::from_config(instance.clone(), &state.config, "pending");
+        let active = storage_instance_view(&state, instance).await;
+
+        assert_eq!(pending.status, "pending");
+        assert!(!pending.ready);
+        assert!(!pending.health_ok);
+        assert_eq!(pending.usage_bytes, 0);
+        assert!(pending.s3_recovery_running.is_none());
+        assert_eq!(active.status, "enabled");
+        assert!(active.ready);
+        assert_eq!(pending.id, active.id);
+        assert_eq!(pending.revision, active.revision);
+    }
+
+    #[tokio::test]
+    async fn interrupted_storage_view_reports_settling_instead_of_connection_failure() {
+        use super::*;
+        use crate::test_support::{app_state, wait_storage_settled, TestDirectory};
+        let directory = TestDirectory::new("settling-storage-view");
+        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
+        let instance = state.config_file.read().await.storage_instances[0].clone();
+        let backend = state.backends.cached("primary").await.unwrap();
+        let guard = backend.interrupt_for_policy().unwrap();
+
+        let settling = storage_instance_view(&state, instance.clone()).await;
+        assert_eq!(settling.status, "pending");
+        assert!(!settling.ready);
+        assert!(settling.health_ok);
+        assert!(!state.backends.is_ready("primary").await);
+        let mut disabled = instance.clone();
+        disabled.enabled = false;
+        assert_eq!(
+            storage_instance_view(&state, disabled).await.status,
+            "disabled"
+        );
+
+        drop(guard);
+        wait_storage_settled(&backend).await;
+        assert_eq!(
+            storage_instance_view(&state, instance).await.status,
+            "enabled"
+        );
+        assert!(state.backends.is_ready("primary").await);
+    }
+
+    #[tokio::test]
+    async fn admin_info_reports_binding_and_limits_from_the_same_config_snapshot() {
+        use super::*;
+        use crate::test_support::{app_state, TestDirectory};
+
+        let directory = TestDirectory::new("admin-info-snapshot");
+        let mut persisted = crate::config::ConfigFile::with_test_storage();
+        persisted.domain_binding =
+            Some(serde_json::from_str(r#"{"public_url":"https://files.example.com"}"#).unwrap());
+        let expected_upload_limit = persisted.max_upload_bytes;
+        let state = app_state(&directory, persisted).await;
+        let Json(info) = admin_info(State(state)).await.unwrap();
+
+        assert_eq!(info.domain_binding.source, "settings");
+        assert_eq!(
+            info.domain_binding.binding.unwrap().public_url,
+            "https://files.example.com"
+        );
+        assert_eq!(info.max_upload_bytes, expected_upload_limit);
+        assert_eq!(info.storage_instances.len(), 1);
+        assert_eq!(info.local_mounts.len(), 1);
     }
 
     #[tokio::test]

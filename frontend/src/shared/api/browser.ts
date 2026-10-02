@@ -16,8 +16,8 @@ import type { ErrorEnvelope, OperationOutcome } from './client'
 
 const locale = useLocale()
 
-export async function checkDownload(url: string): Promise<void> {
-  const response = await requestWithDeadline(url, { method: 'HEAD', cache: 'no-store' }, async response => response)
+export async function checkDownload(url: string, signal?: AbortSignal): Promise<void> {
+  const response = await requestWithDeadline(url, { method: 'HEAD', cache: 'no-store', signal }, async response => response)
   if (response.ok) return
   const message = response.status === 429
     ? locale.text('下载流量不足或请求过于频繁，请稍后重试或联系管理员', 'Insufficient download allowance or too many requests. Try later or contact the administrator.')
@@ -27,9 +27,9 @@ export async function checkDownload(url: string): Promise<void> {
   throw new ApiError(message, response.status)
 }
 
-export async function isPreviewTrafficExhausted(url: string): Promise<boolean> {
+export async function isPreviewTrafficExhausted(url: string, signal?: AbortSignal): Promise<boolean> {
   try {
-    const response = await requestWithDeadline(url, { method: 'HEAD', cache: 'no-store' }, async response => response)
+    const response = await requestWithDeadline(url, { method: 'HEAD', cache: 'no-store', signal }, async response => response)
     return response.status === 429
   } catch {
     return false

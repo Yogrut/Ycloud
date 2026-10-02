@@ -290,6 +290,53 @@ describe('BrowserView', () => {
     app.unmount()
   })
 
+  it('does not navigate to a prepared archive after leaving the file page', async () => {
+    let resolveArchive!: (response: Response) => void
+    const pendingArchive = new Promise<Response>(resolve => { resolveArchive = resolve })
+    const images = ['one.jpg', 'two.jpg'].map(name => ({
+      name, path: name, is_dir: false, size: 12, modified: '', mime: 'image/jpeg', icon: 'image', locked: false,
+    }))
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      if (String(input).startsWith('/api/archive/prepare')) return pendingArchive
+      const gallery = new URL(String(input), 'http://localhost').searchParams.get('gallery') === 'true'
+      return Promise.resolve(new Response(JSON.stringify(gallery ? { ...listResponse([]), entries: images } : listResponse([])), { status: 200 }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    const navigate = vi.spyOn(window.location, 'href', 'set').mockImplementation(() => {})
+    try {
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+      host.querySelector<HTMLButtonElement>('.gallery-toggle')!.click()
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+      await nextTick()
+      host.querySelectorAll<HTMLButtonElement>('.gallery-select').forEach(button => button.click())
+      await nextTick()
+      host.querySelector<HTMLElement>('.gallery-card.selected')!.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 }))
+      await nextTick()
+      const archiveAction = [...host.querySelectorAll<HTMLButtonElement>('.context-menu .menu-item')].find(button => button.textContent?.includes('打包下载'))!
+      archiveAction.click()
+      await nextTick()
+      const archiveCalls = fetchMock.mock.calls.filter(([input]) => String(input).startsWith('/api/archive/prepare'))
+      expect(archiveCalls).toHaveLength(1)
+      const requestSignal = archiveCalls[0]?.[1]?.signal as AbortSignal
+      expect(requestSignal.aborted).toBe(false)
+      app.unmount()
+      expect(requestSignal.aborted).toBe(false)
+      resolveArchive(new Response(JSON.stringify({
+        ticket: 'prepared', total_bytes: 24, file_count: 2, entry_count: 2, max_bytes: 1024, max_entries: 100,
+      }), { status: 200 }))
+      await new Promise(resolve => window.setTimeout(resolve, 0))
+      await nextTick()
+      expect(navigate).not.toHaveBeenCalled()
+      expect(document.querySelector('.app-feedback-toast')).toBeNull()
+      expect(fetchMock.mock.calls.filter(([input]) => String(input).startsWith('/api/archive/prepare'))).toHaveLength(1)
+    } finally {
+      navigate.mockRestore()
+    }
+  })
+
   it('shows a left-side music icon that toggles the player while videos preview and unsupported files ask before downloading', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['song.flac', 'other.mp3', 'clip.mp4', 'setup.msi'])), {
       status: 200,
@@ -423,6 +470,86 @@ describe('BrowserView', () => {
     expect(document.body.querySelector('.confirmation-dialog')).toBeNull()
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'HEAD')).toBe(true)
     app.unmount()
+  })
+
+  it.each(['clip.mp4', 'archive.zip'])('closes the old %s preview interaction when switching storage', async name => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const storageId = new URL(String(input), 'http://localhost').searchParams.get('storage_id') ?? 'primary'
+      return Promise.resolve(new Response(JSON.stringify({
+        ...listResponse([name]), storage_id: storageId,
+        storages: [{ id: 'primary', name: 'Local', requires_login: false }, { id: 'rustfs', name: 'RustFS', requires_login: false }],
+      })))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      host.querySelector<HTMLElement>(`[data-entry-path="${name}"]`)!.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+      await nextTick()
+      expect(document.body.querySelector('.ycloud-preview-dialog, .confirmation-dialog')).not.toBeNull()
+      await chooseOption(host, '.storage-switcher', 'RustFS')
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(document.body.querySelector('.ycloud-preview-dialog, .confirmation-dialog')).toBeNull()
+    } finally {
+      app.unmount()
+    }
+  })
+
+  it.each([200, 429])('ignores an old audio error check after switching storage (HEAD %s)', async status => {
+    let resolveHead!: (response: Response) => void
+    const pendingHead = new Promise<Response>(resolve => { resolveHead = resolve })
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'HEAD') return pendingHead
+      const storageId = new URL(String(input), 'http://localhost').searchParams.get('storage_id') ?? 'primary'
+      return Promise.resolve(new Response(JSON.stringify({
+        ...listResponse(['song.flac']), storage_id: storageId,
+        storages: [{ id: 'primary', name: 'Local', requires_login: false }, { id: 'rustfs', name: 'RustFS', requires_login: false }],
+      })))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      host.querySelector<HTMLElement>('[data-entry-path="song.flac"]')!.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+      await nextTick()
+      host.querySelector('audio')!.dispatchEvent(new Event('error'))
+      await nextTick()
+      expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'HEAD')).toHaveLength(1)
+      await chooseOption(host, '.storage-switcher', 'RustFS')
+      await new Promise(resolve => setTimeout(resolve, 0))
+      resolveHead(new Response(null, { status }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(document.body.querySelector('.confirmation-dialog')).toBeNull()
+      expect(document.body.querySelector('.app-toast')).toBeNull()
+      expect(host.querySelector('.ycloud-audio-dock')).toBeNull()
+    } finally {
+      resolveHead(new Response(null, { status }))
+      app.unmount()
+    }
+  })
+
+  it.each([true, false])('uses the normal download capability gate for gallery opening (allowed: %s)', async allowed => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      ...listResponse(['photo.jpg']),
+      capabilities: { download: allowed, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false },
+    }))))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      host.querySelector<HTMLButtonElement>('.gallery-toggle')!.click()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      host.querySelector<HTMLButtonElement>('.gallery-card-open')!.click()
+      await nextTick()
+      expect(document.body.querySelector('.gallery-lightbox') !== null).toBe(allowed)
+    } finally {
+      app.unmount()
+    }
   })
 
   it('lets an administrator switch storage without mixing the previous path or selection', async () => {

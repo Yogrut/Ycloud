@@ -210,7 +210,8 @@ impl StorageService {
             transactions.clone(),
             io_gate.clone(),
             mutation_gate.clone(),
-        );
+        )
+        .await?;
         let upload_cleanup =
             upload_cleanup::UploadCleanupWorker::start(transactions.clone(), io_gate.clone());
         Ok(Self {
@@ -342,7 +343,9 @@ impl StorageService {
 
     pub(crate) async fn recover_quiesced_uploads(&self) -> AppResult<()> {
         let _mutation = self.mutation_gate.lock().await;
-        self.transactions.recover(self.root()).await
+        self.transactions.recover(self.root()).await?;
+        self.cleanup.notify();
+        Ok(())
     }
 
     pub(crate) async fn upload_committed(

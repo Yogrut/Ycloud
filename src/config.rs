@@ -13,6 +13,7 @@ use crate::{
 };
 
 mod commit;
+mod credentials;
 /// Process-local opaque entity version. A restart invalidates old forms;
 /// keyed hashing prevents a version from exposing secret configuration values.
 pub(crate) fn entity_revision(value: &impl serde::Serialize) -> String {
@@ -223,9 +224,6 @@ pub struct Config {
     /// Additional exact Host authorities accepted only in local/LAN mode.
     /// Public proxy mode always uses `public_host` exclusively.
     pub allowed_hosts: HashSet<String>,
-    /// Exact origins that administrators may use for MinIO/RustFS or generic
-    /// S3 endpoints. Official Alibaba and Tencent endpoints are constrained by
-    /// their provider presets instead.
     /// Installation-local authentication key for mutating recovery records.
     /// It is derived from the protected configuration master key and must
     /// never be serialized or returned by an API.
@@ -314,42 +312,6 @@ const fn default_security_log_max_entries() -> usize {
 
 // ── ConfigFile ────────────────────────────────────────────────────
 
-impl Default for ConfigFile {
-    fn default() -> Self {
-        let first = Uuid::new_v4().simple().to_string();
-        let second = Uuid::new_v4().simple().to_string();
-        let default_hash = hash_password(&format!("{}{}", &first[..12], &second[..12]));
-        Self {
-            schema_version: CONFIG_SCHEMA_VERSION,
-            traffic: crate::traffic::TrafficSettings::default(),
-            domain_binding: None,
-            storage_instances: Vec::new(),
-            pending_storage_instance: None,
-            admin_username: default_admin_username(),
-            admin_password_hash: default_hash.clone(),
-            admin_totp_secret: None,
-            admin_recovery_code_hashes: Vec::new(),
-            user_accounts: Vec::new(),
-            global_web_password_hash: Some(default_hash),
-            folder_locks: Vec::new(),
-            shares: Vec::new(),
-            max_upload_bytes: DEFAULT_MAX_UPLOAD_BYTES,
-            max_upload_batch_bytes: DEFAULT_MAX_UPLOAD_BATCH_BYTES,
-            max_upload_batch_entries: DEFAULT_MAX_UPLOAD_BATCH_ENTRIES,
-            max_archive_bytes: DEFAULT_MAX_ARCHIVE_BYTES,
-            max_archive_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
-            admin_login_failures: DEFAULT_ADMIN_LOGIN_FAILURES,
-            web_login_failures: DEFAULT_WEB_LOGIN_FAILURES,
-            admin_login_block_seconds: DEFAULT_LOGIN_BLOCK_SECONDS,
-            web_login_block_seconds: DEFAULT_LOGIN_BLOCK_SECONDS,
-            upload_rate_bytes_per_sec: 0,
-            download_rate_bytes_per_sec: 0,
-            security_log_retention_days: DEFAULT_SECURITY_LOG_RETENTION_DAYS,
-            security_log_max_entries: DEFAULT_SECURITY_LOG_MAX_ENTRIES,
-        }
-    }
-}
-
 #[cfg(test)]
 impl ConfigFile {
     pub(crate) fn with_test_storage() -> Self {
@@ -363,7 +325,9 @@ impl ConfigFile {
 }
 
 #[cfg(test)]
-use persistence::{config_backup_path, initial_credentials_path};
+use commit::config_backup_path;
+#[cfg(test)]
+use persistence::initial_credentials_path;
 
 #[cfg(test)]
 mod tests {

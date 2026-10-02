@@ -46,18 +46,13 @@ impl S3Backend {
         Ok((journal_key, intent, etag))
     }
 
-    pub(super) async fn recover_activation_probe_intents(&self) -> AppResult<usize> {
-        let keys = self.list_recovery_journal_keys(JOURNAL_CATEGORY).await?;
-        let recovered = keys.len();
-        for key in keys {
-            let (intent, journal_etag) = self
-                .read_authenticated_json_journal(&key, S3_ACTIVATION_PROBE_JOURNAL_PURPOSE)
-                .await?;
-            validate_intent(&self.prefix, &key, &intent)?;
-            self.settle_activation_probe_intent(&key, Some(&journal_etag), &intent)
-                .await?;
-        }
-        Ok(recovered)
+    pub(super) async fn recover_activation_probe_intent(&self, key: &str) -> AppResult<()> {
+        let (intent, journal_etag) = self
+            .read_authenticated_json_journal(key, S3_ACTIVATION_PROBE_JOURNAL_PURPOSE)
+            .await?;
+        validate_intent(&self.prefix, key, &intent)?;
+        self.settle_activation_probe_intent(key, Some(&journal_etag), &intent)
+            .await
     }
 
     pub(super) async fn settle_activation_probe_intent(

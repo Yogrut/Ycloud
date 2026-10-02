@@ -82,18 +82,13 @@ impl S3Backend {
         error.with_operation(CommitState::NotCommitted, cleanup)
     }
 
-    pub(super) async fn recover_internal_upload_intents(&self) -> AppResult<usize> {
-        let keys = self.list_recovery_journal_keys(JOURNAL_CATEGORY).await?;
-        let recovered = keys.len();
-        for key in keys {
-            let (intent, journal_etag) = self
-                .read_authenticated_json_journal(&key, S3_INTERNAL_UPLOAD_INTENT_JOURNAL_PURPOSE)
-                .await?;
-            validate_intent(&self.prefix, &key, &intent)?;
-            self.settle_internal_upload_intent(&key, Some(&journal_etag), &intent)
-                .await?;
-        }
-        Ok(recovered)
+    pub(super) async fn recover_internal_upload_intent(&self, key: &str) -> AppResult<()> {
+        let (intent, journal_etag) = self
+            .read_authenticated_json_journal(key, S3_INTERNAL_UPLOAD_INTENT_JOURNAL_PURPOSE)
+            .await?;
+        validate_intent(&self.prefix, key, &intent)?;
+        self.settle_internal_upload_intent(key, Some(&journal_etag), &intent)
+            .await
     }
 
     async fn settle_internal_upload_intent(

@@ -3,13 +3,14 @@ import AppFeedback from '../../shared/components/AppFeedback.vue'
 import SettingsDrawer from '../../shared/components/SettingsDrawer.vue'
 import AppSwitch from '../../shared/components/AppSwitch.vue'
 import ConfirmDialog from '../../shared/components/ConfirmDialog.vue'
-import { computed, nextTick, ref } from 'vue'
-import type { StorageInstanceView, UpdateWebDavMountRequest, WebDavMountView } from '../../shared/api/admin'
+import { computed, ref } from 'vue'
+import type { StorageInstanceView, WebDavMountView } from '../../shared/api/admin'
 import { createWebDavMount, deleteWebDavMount, updateWebDavMount } from '../../shared/api/admin'
 import AppSelect from '../../shared/components/AppSelect.vue'
 import { useLocale } from '../../shared/i18n'
+import { STORED_PASSWORD_MASK as MASK, selectStoredPassword as selectMask } from '../../shared/passwordInput'
+import { createWebDavRequest, displayStoragePath as displayPath, webDavChanges, webDavPassword as initialPassword, type WebDavDraft } from './storageAccessForm'
 
-const MASK = '••••••'
 const { mounts, storages } = defineProps<{
   mounts: WebDavMountView[]
   storages: StorageInstanceView[]
@@ -37,33 +38,20 @@ const storageOptions = computed(() => storages.map(storage => ({
   disabled: !storage.ready,
 })))
 
-function normalizePath(value: string): string {
-  return value.replace(/\\/g, '/').split('/').filter(Boolean).join('/')
-}
-
-function displayPath(value: string): string {
-  const normalized = normalizePath(value)
-  return normalized ? `/${normalized}` : '/'
-}
-
 function connectionPath(value: string): string {
   return `/dav/${value.trim()}`
 }
 
-function initialPassword(mount: WebDavMountView): string {
-  return mount.has_password ? MASK : ''
-}
-
+const draft = computed<WebDavDraft>(() => ({
+  storageId: storageId.value, name: name.value, path: path.value,
+  username: username.value, password: password.value,
+  enabled: webdavEnabled.value, readonly: readonly.value,
+}))
+const editorChanges = computed(() => editing.value ? webDavChanges(editing.value, draft.value) : {})
 const hasChanges = computed(() => {
   if (!showEditor.value) return false
   if (!editing.value) return true
-  return name.value.trim() !== editing.value.name
-    || storageId.value !== editing.value.storage_id
-    || normalizePath(path.value) !== editing.value.path
-    || username.value.trim() !== (editing.value.username ?? '')
-    || password.value !== initialPassword(editing.value)
-    || webdavEnabled.value !== editing.value.webdav_enabled
-    || readonly.value !== editing.value.readonly
+  return Object.keys(editorChanges.value).length > 0
 })
 
 function openCreate(): void {
@@ -99,11 +87,6 @@ function closeEditor(): void {
   errorMessage.value = ''
 }
 
-function selectMask(event: FocusEvent): void {
-  const input = event.target as HTMLInputElement
-  if (input.value === MASK) nextTick(() => input.select())
-}
-
 function validate(): string | undefined {
   const normalizedName = name.value.trim()
   if (!normalizedName) return locale.text('挂载名称不能为空', 'Mount name is required')
@@ -124,33 +107,16 @@ async function submit(): Promise<void> {
   }
 
   const normalizedName = name.value.trim()
-  const normalizedPath = normalizePath(path.value)
-  const normalizedUsername = username.value.trim()
   saving.value = true
   errorMessage.value = ''
   try {
     if (editing.value) {
-      const body: UpdateWebDavMountRequest = { expected_revision: editing.value.revision }
-      if (storageId.value !== editing.value.storage_id) body.storage_id = storageId.value
-      if (normalizedName !== editing.value.name) body.name = normalizedName
-      if (normalizedPath !== editing.value.path) body.path = normalizedPath
-      if (normalizedUsername !== (editing.value.username ?? '')) body.username = normalizedUsername
-      if (password.value !== initialPassword(editing.value)) body.password = password.value
-      if (webdavEnabled.value !== editing.value.webdav_enabled) body.webdav_enabled = webdavEnabled.value
-      if (readonly.value !== editing.value.readonly) body.readonly = readonly.value
+      const body = { expected_revision: editing.value.revision, ...editorChanges.value }
       await updateWebDavMount(editing.value.id, body)
       showEditor.value = false
       emit('changed', locale.text(`WebDAV 挂载“${normalizedName}”已更新`, `WebDAV mount “${normalizedName}” updated`))
     } else {
-      await createWebDavMount({
-        storage_id: storageId.value,
-        name: normalizedName,
-        path: normalizedPath,
-        username: normalizedUsername || undefined,
-        password: password.value || undefined,
-        webdav_enabled: webdavEnabled.value,
-        readonly: readonly.value,
-      })
+      await createWebDavMount(createWebDavRequest(draft.value))
       showEditor.value = false
       emit('changed', locale.text(`WebDAV 挂载“${normalizedName}”已创建`, `WebDAV mount “${normalizedName}” created`))
     }

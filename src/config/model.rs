@@ -133,6 +133,17 @@ pub struct StorageInstanceConfig {
 }
 
 impl StorageInstanceConfig {
+    /// Preserve the previous download choice when an edit only changes guest
+    /// visibility. Disabling guest access always disables guest downloads.
+    pub(crate) fn update_guest_access(&mut self, access: super::GuestAccess) {
+        self.allow_guest_access = access.access;
+        self.allow_guest_download = if access.access {
+            access.download.or(self.allow_guest_download)
+        } else {
+            Some(false)
+        };
+    }
+
     #[cfg(test)]
     pub(super) fn primary(backend: StorageBackendConfig) -> Self {
         let name = match &backend {
@@ -147,6 +158,29 @@ impl StorageInstanceConfig {
             allow_guest_download: None,
             backend,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StorageBackendConfig, StorageInstanceConfig};
+    use crate::config::GuestAccess;
+
+    #[test]
+    fn guest_access_edits_preserve_explicit_download_policy() {
+        let mut instance = StorageInstanceConfig::primary(StorageBackendConfig::default());
+        instance.update_guest_access(GuestAccess {
+            access: true,
+            download: Some(false),
+        });
+        assert_eq!(instance.allow_guest_download, Some(false));
+
+        instance.update_guest_access(true.into());
+        assert_eq!(instance.allow_guest_download, Some(false));
+
+        instance.update_guest_access(false.into());
+        assert!(!instance.allow_guest_access);
+        assert_eq!(instance.allow_guest_download, Some(false));
     }
 }
 
@@ -288,6 +322,56 @@ pub struct ConfigFile {
     pub security_log_retention_days: u32,
     #[serde(default = "default_security_log_max_entries")]
     pub security_log_max_entries: usize,
+}
+
+impl ConfigFile {
+    /// Defaults belong to the model; bootstrap supplies independently generated
+    /// credentials and then applies the deployment's transport limits.
+    pub(super) fn with_credentials(
+        admin_username: String,
+        admin_password_hash: String,
+        global_web_password_hash: Option<String>,
+    ) -> Self {
+        Self {
+            schema_version: super::CONFIG_SCHEMA_VERSION,
+            traffic: crate::traffic::TrafficSettings::default(),
+            domain_binding: None,
+            storage_instances: Vec::new(),
+            pending_storage_instance: None,
+            admin_username,
+            admin_password_hash,
+            admin_totp_secret: None,
+            admin_recovery_code_hashes: Vec::new(),
+            user_accounts: Vec::new(),
+            global_web_password_hash,
+            folder_locks: Vec::new(),
+            shares: Vec::new(),
+            max_upload_bytes: default_max_upload_bytes(),
+            max_upload_batch_bytes: default_max_upload_batch_bytes(),
+            max_upload_batch_entries: default_max_upload_batch_entries(),
+            max_archive_bytes: default_max_archive_bytes(),
+            max_archive_entries: default_max_archive_entries(),
+            admin_login_failures: default_admin_login_failures(),
+            web_login_failures: default_web_login_failures(),
+            admin_login_block_seconds: default_login_block_seconds(),
+            web_login_block_seconds: default_login_block_seconds(),
+            upload_rate_bytes_per_sec: 0,
+            download_rate_bytes_per_sec: 0,
+            security_log_retention_days: default_security_log_retention_days(),
+            security_log_max_entries: default_security_log_max_entries(),
+        }
+    }
+}
+
+impl Default for ConfigFile {
+    fn default() -> Self {
+        let default_hash = super::hash_password(&uuid::Uuid::new_v4().to_string());
+        Self::with_credentials(
+            super::default_admin_username(),
+            default_hash.clone(),
+            Some(default_hash),
+        )
+    }
 }
 
 impl fmt::Debug for ConfigFile {

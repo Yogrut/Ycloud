@@ -66,8 +66,8 @@ export interface DomainBindingView {
   source: 'none' | 'settings'
 }
 
-export function getDomainBinding(): Promise<DomainBindingView> {
-  return adminRequest('/api/admin/domain-binding')
+export function getDomainBinding(signal?: AbortSignal): Promise<DomainBindingView> {
+  return adminRequest('/api/admin/domain-binding', { signal })
 }
 
 export function saveDomainBinding(binding: DomainBinding): Promise<DomainBindingView> {
@@ -398,8 +398,12 @@ async function rawAdminRequest<T>(url: string, options: RequestInit = {}): Promi
   return body
 }
 
-export function getAdminInfo(): Promise<AdminInfo> {
-  return adminRequest('/api/admin/info')
+export function getAdminInfo(signal?: AbortSignal): Promise<AdminInfo> {
+  return adminRequest('/api/admin/info', { signal })
+}
+
+export function logoutSession(): Promise<{ success: boolean }> {
+  return adminRequest('/api/logout', { method: 'POST' })
 }
 
 export function loginAdministrator(username: string, password: string, totpCode?: string): Promise<{ success: boolean; message?: string; is_admin: boolean; totp_required?: boolean }> {
@@ -539,7 +543,7 @@ export interface LoginEventQuery {
   search?: string
 }
 
-export function getLoginEvents(query: LoginEventQuery): Promise<LoginEventPage> {
+export function getLoginEvents(query: LoginEventQuery, signal?: AbortSignal): Promise<LoginEventPage> {
   const params = new URLSearchParams({
     limit: String(query.limit ?? 20),
   })
@@ -550,7 +554,7 @@ export function getLoginEvents(query: LoginEventQuery): Promise<LoginEventPage> 
   if (query.entry) params.set('entry', query.entry)
   if (query.ip?.trim()) params.set('ip', query.ip.trim())
   if (query.cursor !== undefined) params.set('cursor', String(query.cursor))
-  return adminRequest(`/api/admin/security/events?${params}`)
+  return adminRequest(`/api/admin/security/events?${params}`, { signal })
 }
 
 export function clearLoginEvents(): Promise<void> {

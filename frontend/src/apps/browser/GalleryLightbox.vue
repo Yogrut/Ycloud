@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { PhX } from '@phosphor-icons/vue'
 import type { FileEntry } from '../../shared/api/browser'
-import { checkDownload, downloadUrl, isPreviewTrafficExhausted, previewUrl } from '../../shared/api/browser'
+import { downloadUrl, previewUrl } from '../../shared/api/browser'
 import { useLocale } from '../../shared/i18n'
+import { useMediaPreview } from '../../shared/composables/useMediaPreview'
+import { usePreviewDownload } from '../../shared/composables/usePreviewDownload'
 
 const props = defineProps<{
   entry: FileEntry
@@ -17,9 +19,10 @@ const zoom = ref(100)
 const panX = ref(0)
 const panY = ref(0)
 const dragging = ref(false)
-const imageError = ref(false)
-const trafficExhausted = ref(false)
-const downloadError = ref('')
+const source = computed(() => previewUrl(props.entry.path, props.storageId))
+const target = computed(() => downloadUrl(props.entry.path, props.storageId))
+const { failed: imageError, trafficExhausted, onError: handleImageError } = useMediaPreview(source)
+const { error: downloadError, startDownload } = usePreviewDownload(target)
 const minZoom = 50
 const maxZoom = 300
 const zoomStep = 25
@@ -71,24 +74,6 @@ function handleWheel(event: WheelEvent): void {
   setZoom(zoom.value + (event.deltaY < 0 ? zoomStep : -zoomStep))
 }
 
-async function startDownload(): Promise<void> {
-  const url = downloadUrl(props.entry.path, props.storageId)
-  try {
-    downloadError.value = ''
-    await checkDownload(url)
-    window.location.href = url
-  } catch (error) {
-    downloadError.value = error instanceof Error ? error.message : locale.text('下载失败', 'Download failed')
-  }
-}
-
-async function handleImageError(): Promise<void> {
-  const path = props.entry.path
-  imageError.value = true
-  const exhausted = await isPreviewTrafficExhausted(previewUrl(path, props.storageId))
-  if (props.entry.path === path) trafficExhausted.value = exhausted
-}
-
 function handleKeydown(event: KeyboardEvent): void {
   if (event.key === 'Escape') emit('close')
   if (event.key === 'ArrowLeft' && props.index > 0) emit('previous')
@@ -98,12 +83,7 @@ function handleKeydown(event: KeyboardEvent): void {
   if (event.key === '0') resetZoom()
 }
 
-watch(() => props.entry.path, () => {
-  resetZoom()
-  imageError.value = false
-  trafficExhausted.value = false
-  downloadError.value = ''
-})
+watch(source, resetZoom, { flush: 'sync' })
 onMounted(() => document.addEventListener('keydown', handleKeydown))
 onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
 </script>
@@ -124,7 +104,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
       <div class="gallery-lightbox-stage" @wheel.prevent="handleWheel">
         <img
           v-if="!imageError"
-          :src="previewUrl(entry.path, storageId)"
+          :src="source"
           :alt="entry.name"
           :class="{ 'is-panning': dragging }"
           :style="{ transform: `translate(${panX}px, ${panY}px) scale(${zoom / 100})` }"
@@ -139,7 +119,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
         >
         <div v-else class="gallery-lightbox-unavailable">
           <strong>{{ trafficExhausted ? locale.text('下载流量已用尽或剩余流量不足，请等待重置或联系管理员', 'Download allowance is exhausted or insufficient. Wait for the reset or contact the administrator.') : locale.text('浏览器无法预览此图片', 'This image cannot be previewed in the browser') }}</strong>
-          <a v-if="!trafficExhausted" :href="downloadUrl(entry.path, storageId)" @click.prevent="startDownload">{{ locale.text('下载文件', 'Download file') }}</a>
+          <a v-if="!trafficExhausted" :href="target" @click.prevent="startDownload">{{ locale.text('下载文件', 'Download file') }}</a>
           <p v-if="downloadError">{{ downloadError }}</p>
         </div>
       </div>

@@ -1,82 +1,41 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watchEffect } from 'vue'
+import { computed, watchEffect } from 'vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
 import AppFeedback from '../../shared/components/AppFeedback.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import type { ThemeController } from '../../shared/composables/useTheme'
 import { useLocale } from '../../shared/i18n'
-import { checkDownload, isPreviewTrafficExhausted } from '../../shared/api/browser'
+import { downloadUrl as fileDownloadUrl, previewUrl as filePreviewUrl } from '../../shared/api/browser'
 import { previewKind } from '../../shared/previewFormats'
 import MediaPlayer from '../../shared/components/MediaPlayer.vue'
+import { useTextPreview } from '../../shared/composables/useTextPreview'
+import { useMediaPreview } from '../../shared/composables/useMediaPreview'
+import { usePreviewDownload } from '../../shared/composables/usePreviewDownload'
 
 defineProps<{ theme: ThemeController }>()
 const locale = useLocale()
 
-const requestPath = new URLSearchParams(window.location.search).get('path') ?? ''
-const storageId = new URLSearchParams(window.location.search).get('storage_id') ?? ''
+const parameters = new URLSearchParams(window.location.search)
+const requestPath = parameters.get('path') ?? ''
+const storageId = parameters.get('storage_id') ?? ''
 const cleanPath = requestPath.replace(/^\/+/, '')
 const name = cleanPath.split('/').filter(Boolean).pop() ?? ''
-const storageQuery = storageId ? `&storage_id=${encodeURIComponent(storageId)}` : ''
-const previewUrl = `/api/preview?path=${encodeURIComponent(`/${cleanPath}`)}${storageQuery}`
-const downloadUrl = `/api/download?path=${encodeURIComponent(`/${cleanPath}`)}${storageQuery}`
-const text = ref('')
-const textError = ref('')
-const textTruncated = ref(false)
-const mediaError = ref(false)
-const trafficExhausted = ref(false)
-const pdfReady = ref(false)
+const previewUrl = filePreviewUrl(cleanPath, storageId)
+const downloadUrl = fileDownloadUrl(cleanPath, storageId)
 const pdfViewerAvailable = navigator.pdfViewerEnabled !== false
 
 const kind = computed(() => previewKind(name))
-
-async function loadText(): Promise<void> {
-  if (kind.value !== 'text') return
-  try {
-    const response = await fetch(previewUrl, { credentials: 'same-origin', headers: { Range: 'bytes=0-2097151' } })
-    if (response.status === 429) {
-      trafficExhausted.value = true
-      textError.value = locale.text('下载流量已用尽或剩余流量不足，请等待重置或联系管理员', 'Download allowance is exhausted or insufficient. Wait for the reset or contact the administrator.')
-      return
-    }
-    if (!response.ok) throw new Error(`${locale.t('preview.failed')} (${response.status})`)
-    text.value = await response.text()
-    const contentRange = response.headers.get('Content-Range')
-    const range = contentRange?.match(/^bytes\s+\d+-(\d+)\/(\d+)$/i)
-    textTruncated.value = range ? Number(range[1]) + 1 < Number(range[2]) : false
-  } catch (error) {
-    textError.value = error instanceof Error ? error.message : locale.t('preview.failed')
-  }
-}
-
-async function handleMediaError(): Promise<void> {
-  mediaError.value = true
-  trafficExhausted.value = await isPreviewTrafficExhausted(previewUrl)
-}
-
-async function checkPdfPreview(): Promise<void> {
-  if (kind.value !== 'pdf' || !pdfViewerAvailable) return
-  trafficExhausted.value = await isPreviewTrafficExhausted(previewUrl)
-  if (trafficExhausted.value) mediaError.value = true
-  else pdfReady.value = true
-}
-
-async function startDownload(): Promise<void> {
-  try {
-    await checkDownload(downloadUrl)
-    window.location.href = downloadUrl
-  } catch (error) {
-    textError.value = error instanceof Error ? error.message : locale.t('preview.failed')
-  }
-}
+const { failed: mediaError, trafficExhausted: mediaTrafficExhausted, ready: pdfReady, onError: handleMediaError } = useMediaPreview(
+  computed(() => ['image', 'video', 'audio', 'pdf'].includes(kind.value) && (kind.value !== 'pdf' || pdfViewerAvailable) ? previewUrl : ''),
+  computed(() => kind.value === 'pdf'),
+)
+const { error: downloadError, startDownload } = usePreviewDownload(computed(() => name ? downloadUrl : ''))
+const { text, error: textError, truncated: textTruncated, trafficExhausted: textTrafficExhausted } = useTextPreview(computed(() => kind.value === 'text' ? previewUrl : ''))
+const trafficExhausted = computed(() => mediaTrafficExhausted.value || textTrafficExhausted.value)
 
 function closePreview(): void {
   window.close()
 }
-
-onMounted(() => {
-  void loadText()
-  void checkPdfPreview()
-})
 
 watchEffect(() => {
   const title = locale.t('preview.title')
@@ -86,7 +45,7 @@ watchEffect(() => {
 
 <template>
   <div class="preview-page">
-    <AppFeedback :message="textError" />
+    <AppFeedback :message="downloadError || textError" />
     <header class="preview-toolbar">
       <span class="preview-title">{{ name || locale.t('preview.title') }}</span>
       <div class="preview-actions">

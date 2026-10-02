@@ -32,11 +32,10 @@ use crate::{
 use super::{
     copy_source, internal_key, list_prefix, listing::collect_page_entries, multipart_part_size,
     multipart_session_matches, object_key, parent_relative, simple_copy_matches, snapshot_matches,
-    uses_oss_native_write_conditions, valid_transaction_id, validate_multipart_session,
-    validate_upload_transaction, ExactLengthBody, RawS3Metadata, S3Backend, S3MultipartPurpose,
-    S3MultipartSession, S3ObjectSnapshot, S3UploadStage, S3UploadTransaction,
-    S3_MULTIPART_MAX_PARTS, S3_MULTIPART_MAX_PART_BYTES, S3_MULTIPART_SESSION_SCHEMA_VERSION,
-    S3_MULTIPART_THRESHOLD, S3_SINGLE_COPY_LIMIT,
+    uses_oss_native_write_conditions, valid_transaction_id, ExactLengthBody, RawS3Metadata,
+    S3Backend, S3MultipartPurpose, S3MultipartSession, S3ObjectSnapshot, S3_MULTIPART_MAX_PARTS,
+    S3_MULTIPART_MAX_PART_BYTES, S3_MULTIPART_SESSION_SCHEMA_VERSION, S3_MULTIPART_THRESHOLD,
+    S3_SINGLE_COPY_LIMIT,
 };
 
 const SMOKE_STREAM_CHUNK_BYTES: u64 = 1024 * 1024;
@@ -367,7 +366,10 @@ async fn cleanup_smoke_multipart_state(backend: &S3Backend) {
             let _ = backend.abort_multipart_operation(&key, &upload_id).await;
         }
     }
-    if let Ok(keys) = backend.list_multipart_session_keys().await {
+    if let Ok(keys) = backend
+        .list_recovery_journal_keys("multipart-sessions")
+        .await
+    {
         for key in keys {
             let _ = backend.delete_key(&key, None).await;
         }
@@ -1025,82 +1027,6 @@ fn parent_paths_remain_relative_to_the_storage_prefix() {
     assert_eq!(parent_relative("file.txt"), "");
     assert_eq!(parent_relative("folder/file.txt"), "folder");
     assert_eq!(parent_relative("a/b/file.txt"), "a/b");
-}
-
-#[test]
-fn transaction_records_are_confined_and_require_etags() {
-    let transaction = S3UploadTransaction {
-        schema_version: 1,
-        id: "0123456789abcdef0123456789abcdef".into(),
-        relative: "folder/file.bin".into(),
-        stage: S3UploadStage::Prepared,
-        temporary: S3ObjectSnapshot {
-            size: 42,
-            etag: Some("new".into()),
-        },
-        previous: Some(S3ObjectSnapshot {
-            size: 21,
-            etag: Some("old".into()),
-        }),
-    };
-    let key = internal_key("tenant/", "transactions", &transaction.id);
-    assert!(validate_upload_transaction("tenant/", &key, &transaction).is_ok());
-    assert!(valid_transaction_id(&transaction.id));
-
-    let mut escaped = transaction.clone();
-    escaped.relative = "../outside".into();
-    assert!(validate_upload_transaction("tenant/", &key, &escaped).is_err());
-
-    let mut unverifiable = transaction.clone();
-    unverifiable.temporary.etag = None;
-    assert!(validate_upload_transaction("tenant/", &key, &unverifiable).is_err());
-}
-
-#[test]
-fn multipart_recovery_records_are_confined_to_the_backend_namespace() {
-    let id = "0123456789abcdef0123456789abcdef";
-    let mut session = S3MultipartSession {
-        schema_version: 1,
-        id: id.into(),
-        key: format!("tenant/.ycloud-system/uploads/{id}"),
-        upload_id: Some("provider-upload-id".into()),
-        purpose: None,
-        expected_size: None,
-    };
-    let journal_key = internal_key("tenant/", "multipart-sessions", id);
-    assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
-
-    session.upload_id = None;
-    assert!(validate_multipart_session("tenant/", &journal_key, &session).is_err());
-    session.schema_version = S3_MULTIPART_SESSION_SCHEMA_VERSION;
-    session.purpose = Some(S3MultipartPurpose::Upload);
-    session.expected_size = Some(S3_MULTIPART_THRESHOLD);
-    assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
-    for size in [0, 1, S3_MULTIPART_THRESHOLD - 1, S3_MULTIPART_THRESHOLD] {
-        session.expected_size = Some(size);
-        assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
-    }
-    session.upload_id = Some("provider-upload-id".into());
-    assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
-
-    session.key = "tenant/folder/file.bin".into();
-    assert!(validate_multipart_session("tenant/", &journal_key, &session).is_err());
-    session.purpose = Some(S3MultipartPurpose::Copy);
-    session.expected_size = Some(S3_SINGLE_COPY_LIMIT + 1);
-    assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
-
-    session.key = format!("tenant/.ycloud-system/backups/{id}");
-    assert!(validate_multipart_session("tenant/", &journal_key, &session).is_ok());
-
-    session.key = "other-tenant/file.bin".into();
-    assert!(validate_multipart_session("tenant/", &journal_key, &session).is_err());
-
-    session.key = "tenant/.ycloud-system/transactions/forged".into();
-    assert!(validate_multipart_session("tenant/", &journal_key, &session).is_err());
-
-    session.key = "tenant/folder/file.bin".into();
-    session.upload_id = Some("bad\nupload-id".into());
-    assert!(validate_multipart_session("tenant/", &journal_key, &session).is_err());
 }
 
 #[test]

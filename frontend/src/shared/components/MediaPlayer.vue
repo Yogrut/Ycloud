@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref, toRef, useId, watch } from 'vue'
 import { PhArrowsOut, PhPause, PhPlay, PhSkipBack, PhSkipForward, PhSpeakerHigh, PhSpeakerX } from '@phosphor-icons/vue'
 import AppIcon from './AppIcon.vue'
 import { useLocale } from '../i18n'
+import { useMediaPlayback } from '../composables/useMediaPlayback'
 
 const props = defineProps<{ src: string; name: string; kind: 'video' | 'audio'; hasPrevious?: boolean; hasNext?: boolean; showClose?: boolean; autoplay?: boolean }>()
 const emit = defineEmits<{ error: []; previous: []; next: []; close: [] }>()
@@ -12,53 +13,21 @@ const media = ref<HTMLMediaElement | null>(null)
 const volumeControl = ref<HTMLElement | null>(null)
 const volumeButton = ref<HTMLButtonElement | null>(null)
 const volumeOpen = ref(false)
-const playing = ref(false)
-const looping = ref(false)
-const muted = ref(false)
-const volume = ref(1)
-const currentTime = ref(0)
-const duration = ref(0)
+const volumePanelId = `ycloud-audio-volume-${useId()}`
+const {
+  playing, looping, muted, volume, currentTime, duration, progressPercent,
+  togglePlayback, skip, seek, changeVolume, toggleMute, toggleLoop,
+} = useMediaPlayback(media, toRef(props, 'autoplay'), () => emit('error'), () => {
+  if (props.kind === 'audio' && props.hasNext) emit('next')
+})
 
-function syncProgress(): void {
-  const element = media.value
-  if (!element) return
-  currentTime.value = element.currentTime || 0
-  duration.value = Number.isFinite(element.duration) ? element.duration : 0
-  volume.value = element.volume
-  muted.value = element.muted
-}
+watch(() => [props.src, props.kind], () => { volumeOpen.value = false })
 
 function formatTime(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return '0:00'
   const minutes = Math.floor(seconds / 60)
   const remainder = Math.floor(seconds % 60).toString().padStart(2, '0')
   return `${minutes}:${remainder}`
-}
-
-async function togglePlayback(): Promise<void> {
-  const element = media.value
-  if (!element) return
-  if (!element.paused) { element.pause(); return }
-  try { await element.play() } catch { emit('error') }
-}
-
-function skip(seconds: number): void {
-  if (!media.value || !duration.value) return
-  media.value.currentTime = Math.max(0, Math.min(duration.value, media.value.currentTime + seconds))
-  syncProgress()
-}
-
-function seek(event: Event): void {
-  if (!media.value) return
-  media.value.currentTime = Number((event.target as HTMLInputElement).value)
-  syncProgress()
-}
-
-function changeVolume(event: Event): void {
-  if (!media.value) return
-  media.value.volume = Number((event.target as HTMLInputElement).value)
-  media.value.muted = media.value.volume === 0
-  syncProgress()
 }
 
 function closeVolumeOnOutsidePointer(event: PointerEvent): void {
@@ -70,46 +39,27 @@ function closeVolume(): void {
   volumeButton.value?.focus()
 }
 
-function toggleMute(): void {
-  if (!media.value) return
-  media.value.muted = !media.value.muted
-  syncProgress()
-}
-
-function toggleLoop(): void {
-  if (!media.value) return
-  media.value.loop = !media.value.loop
-  looping.value = media.value.loop
-}
-
 async function toggleFullscreen(): Promise<void> {
   if (document.fullscreenElement) await document.exitFullscreen()
   else await player.value?.requestFullscreen?.()
 }
 
-function onEnded(): void {
-  playing.value = false
-  if (props.kind === 'audio' && props.hasNext) emit('next')
-}
-
 onMounted(() => {
-  if (props.kind === 'audio') document.addEventListener('pointerdown', closeVolumeOnOutsidePointer)
-  if (props.autoplay) void media.value?.play().catch(() => undefined)
+  document.addEventListener('pointerdown', closeVolumeOnOutsidePointer)
 })
 onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', closeVolumeOnOutsidePointer)
-  media.value?.pause()
 })
 </script>
 
 <template>
   <section ref="player" class="ycloud-media-player" :class="kind" :aria-label="name">
     <div v-if="kind === 'video'" class="ycloud-video-stage">
-      <video ref="media" :src="src" preload="metadata" playsinline @click="togglePlayback" @loadedmetadata="syncProgress" @durationchange="syncProgress" @timeupdate="syncProgress" @volumechange="syncProgress" @play="playing = true" @pause="playing = false" @ended="playing = false" @error="emit('error')" />
+      <video :key="src" ref="media" :src="src" preload="metadata" playsinline @click="togglePlayback" />
       <button v-if="!playing" class="ycloud-video-play" type="button" :aria-label="locale.text('播放视频', 'Play video')" @click="togglePlayback"><PhPlay :size="29" weight="fill" /></button>
       <div class="ycloud-video-controls">
         <div class="ycloud-video-progress">
-          <span class="ycloud-video-progress-fill" :style="{ width: `${duration ? Math.min(100, currentTime / duration * 100) : 0}%` }" />
+          <span class="ycloud-video-progress-fill" :style="{ width: `${progressPercent}%` }" />
           <input class="ycloud-media-seek" type="range" min="0" :max="duration || 0" step="0.1" :value="currentTime" :disabled="!duration" :aria-label="locale.text('播放进度', 'Playback position')" @input="seek">
         </div>
         <div class="ycloud-video-actions">
@@ -128,7 +78,7 @@ onBeforeUnmount(() => {
       </div>
     </div>
     <template v-else>
-      <audio ref="media" :src="src" preload="metadata" @loadedmetadata="syncProgress" @durationchange="syncProgress" @timeupdate="syncProgress" @volumechange="syncProgress" @play="playing = true" @pause="playing = false" @ended="onEnded" @error="emit('error')" />
+      <audio :key="src" ref="media" :src="src" preload="metadata" />
       <div class="ycloud-audio-transport">
         <button v-if="hasPrevious !== undefined" type="button" :disabled="!hasPrevious" :aria-label="locale.text('上一首', 'Previous track')" @click="emit('previous')"><AppIcon name="skip-back-circle" :size="20" weight="fill" /></button>
         <button class="ycloud-audio-play" type="button" :aria-label="playing ? locale.text('暂停', 'Pause') : locale.text('播放', 'Play')" @click="togglePlayback"><AppIcon :name="playing ? 'pause-circle' : 'play-circle'" :size="24" weight="fill" /></button>
@@ -137,16 +87,16 @@ onBeforeUnmount(() => {
       <div class="ycloud-audio-track">
         <strong :title="name">{{ name.replace(/\.[^.]+$/, '') }}</strong>
         <div class="ycloud-audio-progress">
-          <span class="ycloud-audio-progress-fill" :style="{ width: `${duration ? currentTime / duration * 100 : 0}%` }" />
+          <span class="ycloud-audio-progress-fill" :style="{ width: `${progressPercent}%` }" />
           <input class="ycloud-media-seek" type="range" min="0" :max="duration || 0" step="0.1" :value="currentTime" :disabled="!duration" :aria-label="locale.text('播放进度', 'Playback position')" @input="seek">
         </div>
       </div>
       <span class="visually-hidden">{{ formatTime(currentTime) }} / {{ formatTime(duration) }}</span>
       <button class="ycloud-audio-loop" :class="{ active: looping }" type="button" :aria-label="looping ? locale.text('关闭循环播放', 'Turn off repeat') : locale.text('循环播放', 'Repeat track')" :title="looping ? locale.text('关闭循环播放', 'Turn off repeat') : locale.text('循环播放', 'Repeat track')" :aria-pressed="looping" @click="toggleLoop"><AppIcon name="repeat" :size="19" weight="fill" /></button>
       <div ref="volumeControl" class="ycloud-audio-volume" :class="{ 'is-open': volumeOpen }" @keydown.esc.stop.prevent="closeVolume">
-        <button ref="volumeButton" type="button" :aria-label="locale.text('调整音量', 'Adjust volume')" :title="locale.text('调整音量', 'Adjust volume')" :aria-expanded="volumeOpen" aria-controls="ycloud-audio-volume-panel" @click="volumeOpen = !volumeOpen"><AppIcon :name="muted ? 'volume-off' : 'volume'" :size="19" weight="fill" /></button>
+        <button ref="volumeButton" type="button" :aria-label="locale.text('调整音量', 'Adjust volume')" :title="locale.text('调整音量', 'Adjust volume')" :aria-expanded="volumeOpen" :aria-controls="volumePanelId" @click="volumeOpen = !volumeOpen"><AppIcon :name="muted ? 'volume-off' : 'volume'" :size="19" weight="fill" /></button>
         <Transition name="ycloud-volume">
-          <div v-if="volumeOpen" id="ycloud-audio-volume-panel" class="ycloud-audio-volume-popover">
+          <div v-if="volumeOpen" :id="volumePanelId" class="ycloud-audio-volume-popover">
             <span>{{ Math.round((muted ? 0 : volume) * 100) }}%</span>
             <div class="ycloud-audio-volume-rail">
               <input class="ycloud-media-volume" type="range" min="0" max="1" step="0.01" :value="muted ? 0 : volume" :style="{ '--volume-fill': `${Math.round((muted ? 0 : volume) * 100)}%` }" :aria-label="locale.text('音量', 'Volume')" aria-orientation="vertical" @input="changeVolume">

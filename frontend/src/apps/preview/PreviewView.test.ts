@@ -1,9 +1,24 @@
-/* eslint-disable vue/one-component-per-file -- createApp receives prop objects in this component test. */
 import { createApp, nextTick, ref } from 'vue'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Window as TestWindow } from 'happy-dom'
 import PreviewView from './PreviewView.vue'
 
+const mountedApps: Array<ReturnType<typeof createApp>> = []
+const iframeNavigation = (window as unknown as TestWindow).happyDOM.settings.navigation
+const originalChildNavigation = iframeNavigation.disableChildFrameNavigation
+
+beforeEach(() => { iframeNavigation.disableChildFrameNavigation = true })
+
+function mountPreview(host: HTMLElement) {
+  const app = createApp(PreviewView, { theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() } })
+  mountedApps.push(app)
+  app.mount(host)
+  return app
+}
+
 afterEach(() => {
+  mountedApps.splice(0).forEach(app => app.unmount())
+  iframeNavigation.disableChildFrameNavigation = originalChildNavigation
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   Reflect.deleteProperty(navigator, 'pdfViewerEnabled')
@@ -17,7 +32,7 @@ describe('PreviewView', () => {
       window.history.replaceState(null, '', `/preview?path=${encodeURIComponent(`/${filename}`)}`)
       const host = document.createElement('div')
       document.body.append(host)
-      createApp(PreviewView, { theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() } }).mount(host)
+      mountPreview(host)
       await nextTick()
       expect(host.querySelector('video, audio, img, iframe, pre')).toBeNull()
       expect(host.querySelector('.preview-message a')?.textContent).toBe('下载文件')
@@ -36,7 +51,7 @@ describe('PreviewView', () => {
     window.history.replaceState(null, '', `/preview?path=${encodeURIComponent(`/${filename}`)}`)
     const host = document.createElement('div')
     document.body.append(host)
-    createApp(PreviewView, { theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() } }).mount(host)
+    mountPreview(host)
     await nextTick()
     expect(host.querySelector(selector)).not.toBeNull()
     if (selector === 'video' || selector === 'audio') {
@@ -50,7 +65,7 @@ describe('PreviewView', () => {
     Object.defineProperty(navigator, 'pdfViewerEnabled', { configurable: true, value: false })
     const host = document.createElement('div')
     document.body.append(host)
-    createApp(PreviewView, { theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() } }).mount(host)
+    mountPreview(host)
     await nextTick()
     expect(host.querySelector('iframe')).toBeNull()
     expect(host.querySelector('.preview-message a')?.textContent).toBe('下载文件')
@@ -61,7 +76,7 @@ describe('PreviewView', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 429 })))
     const host = document.createElement('div')
     document.body.append(host)
-    createApp(PreviewView, { theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() } }).mount(host)
+    mountPreview(host)
     await new Promise(resolve => setTimeout(resolve, 0))
     await nextTick()
     expect(host.querySelector('iframe')).toBeNull()
@@ -73,7 +88,7 @@ describe('PreviewView', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 429 })))
     const host = document.createElement('div')
     document.body.append(host)
-    createApp(PreviewView, { theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() } }).mount(host)
+    mountPreview(host)
     await nextTick()
     host.querySelector('img')!.dispatchEvent(new Event('error'))
     await new Promise(resolve => setTimeout(resolve, 0))
@@ -88,7 +103,7 @@ describe('PreviewView', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { code: 'traffic_exhausted' } }), { status: 429 })))
     const host = document.createElement('div')
     document.body.append(host)
-    createApp(PreviewView, { theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() } }).mount(host)
+    mountPreview(host)
     await new Promise(resolve => setTimeout(resolve, 0))
     await nextTick()
     expect(host.querySelector('.preview-message')?.textContent).toContain('下载流量已用尽或剩余流量不足')
@@ -104,7 +119,7 @@ describe('PreviewView', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 404 })))
     const host = document.createElement('div')
     document.body.append(host)
-    createApp(PreviewView, { theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() } }).mount(host)
+    mountPreview(host)
     await nextTick()
     host.querySelector(selector)?.dispatchEvent(new Event('error'))
     await nextTick()
@@ -120,7 +135,7 @@ describe('PreviewView', () => {
     })))
     const host = document.createElement('div')
     document.body.append(host)
-    createApp(PreviewView, { theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() } }).mount(host)
+    mountPreview(host)
     await nextTick()
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(host.querySelector('pre')?.textContent).toBe('complete')
@@ -134,9 +149,108 @@ describe('PreviewView', () => {
     })))
     const host = document.createElement('div')
     document.body.append(host)
-    createApp(PreviewView, { theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() } }).mount(host)
+    mountPreview(host)
     await nextTick()
     await new Promise(resolve => setTimeout(resolve, 0))
     expect(host.querySelector('pre')?.textContent).toContain('[预览已截断，仅显示前 2 MiB]')
+  })
+
+  it('cancels text reading on unmount and drops its late quota response', async () => {
+    window.history.replaceState(null, '', '/preview?path=%2Fnotes.txt')
+    let resolve!: (response: Response) => void
+    const fetchMock = vi.fn().mockReturnValue(new Promise<Response>(accept => { resolve = accept }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountPreview(host)
+    app.unmount()
+    mountedApps.splice(mountedApps.indexOf(app), 1)
+    expect(fetchMock.mock.calls[0]?.[1].signal.aborted).toBe(true)
+    resolve(new Response(null, { status: 429 }))
+    await new Promise(accept => setTimeout(accept, 0))
+    await nextTick()
+    expect(document.body.querySelector('.preview-page')).toBeNull()
+    expect(document.body.textContent).not.toContain('下载流量已用尽')
+  })
+
+  it('keeps readable text visible if its separate download check fails', async () => {
+    window.history.replaceState(null, '', '/preview?path=%2Fnotes.txt')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response('readable document')).mockResolvedValueOnce(new Response(null, { status: 403 })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    mountPreview(host)
+    await new Promise(accept => setTimeout(accept, 0))
+    host.querySelector<HTMLAnchorElement>('.preview-actions a')!.click()
+    await new Promise(accept => setTimeout(accept, 0))
+    await nextTick()
+    expect(host.querySelector('pre')?.textContent).toBe('readable document')
+    expect(document.body.textContent).toContain('没有下载权限')
+    expect(host.querySelector('.preview-message')).toBeNull()
+  })
+
+  it('caps a text body that ignores Range and shows truncation', async () => {
+    window.history.replaceState(null, '', '/preview?path=%2Flarge.txt')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('a'.repeat(2 * 1024 * 1024 + 1))))
+    const host = document.createElement('div')
+    document.body.append(host)
+    mountPreview(host)
+    await new Promise(accept => setTimeout(accept, 0))
+    await nextTick()
+    expect(host.querySelector('pre')?.textContent).toBe(`${'a'.repeat(2 * 1024 * 1024)}\n\n[预览已截断，仅显示前 2 MiB]`)
+  })
+
+  it('deduplicates header and fallback download clicks', () => {
+    window.history.replaceState(null, '', '/preview?path=%2Farchive.zip')
+    const fetchMock = vi.fn().mockImplementation(() => new Promise(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    mountPreview(host)
+    host.querySelector<HTMLAnchorElement>('.preview-actions a')!.click()
+    host.querySelector<HTMLAnchorElement>('.preview-message a')!.click()
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it.each([200, 403])('cancels pending download admission (%s) on unmount', async status => {
+    window.history.replaceState(null, '', '/preview?path=%2Farchive.zip')
+    let resolve!: (response: Response) => void
+    const fetchMock = vi.fn().mockReturnValue(new Promise<Response>(accept => { resolve = accept }))
+    vi.stubGlobal('fetch', fetchMock)
+    const navigate = vi.spyOn(window.location, 'href', 'set').mockImplementation(() => {})
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountPreview(host)
+    host.querySelector<HTMLAnchorElement>('.preview-actions a')!.click()
+    app.unmount()
+    mountedApps.splice(mountedApps.indexOf(app), 1)
+    expect(fetchMock.mock.calls[0]?.[1].signal.aborted).toBe(true)
+    resolve(new Response(null, { status }))
+    await new Promise(accept => setTimeout(accept, 0))
+    expect(navigate).not.toHaveBeenCalled()
+    expect(document.body.textContent).not.toContain('没有下载权限')
+  })
+
+  it('cancels PDF admission when leaving the preview page', () => {
+    window.history.replaceState(null, '', '/preview?path=%2Freport.pdf')
+    const fetchMock = vi.fn().mockImplementation(() => new Promise(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountPreview(host)
+    app.unmount()
+    mountedApps.splice(mountedApps.indexOf(app), 1)
+    expect(fetchMock.mock.calls[0]?.[1].signal.aborted).toBe(true)
+  })
+
+  it('does not start a root download for a missing preview path', async () => {
+    window.history.replaceState(null, '', '/preview')
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    mountPreview(host)
+    host.querySelector<HTMLAnchorElement>('.preview-actions a')!.click()
+    await nextTick()
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })

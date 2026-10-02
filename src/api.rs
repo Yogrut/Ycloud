@@ -721,6 +721,15 @@ pub async fn download_file(
     headers: HeaderMap,
     Query(query): Query<FileQuery>,
 ) -> AppResult<axum::response::Response> {
+    file_response(state, headers, query, FileResponseMode::Attachment).await
+}
+
+async fn file_response(
+    state: AppState,
+    headers: HeaderMap,
+    query: FileQuery,
+    mode: FileResponseMode,
+) -> AppResult<axum::response::Response> {
     let share = resolve_share(&state, &headers, &query).await?;
     ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Download).await?;
     let backend = state.storage_backend(&share.storage_id).await?;
@@ -733,9 +742,7 @@ pub async fn download_file(
     )
     .await?;
     let file = share_storage_path(&share, request_path);
-    let response = backend
-        .stream_file(&file, &headers, FileResponseMode::Attachment)
-        .await?;
+    let response = backend.stream_file(&file, &headers, mode).await?;
     let subject = crate::traffic::browser_subject(&state, &headers).await;
     Ok(state
         .download_limiter
@@ -815,25 +822,7 @@ pub async fn preview_file(
     headers: HeaderMap,
     Query(query): Query<FileQuery>,
 ) -> AppResult<axum::response::Response> {
-    let share = resolve_share(&state, &headers, &query).await?;
-    ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Download).await?;
-    let backend = state.storage_backend(&share.storage_id).await?;
-    let request_path = query.path.as_deref().unwrap_or("");
-    check_folder_locks(
-        &state,
-        &headers,
-        &share.storage_id,
-        &share_storage_path(&share, request_path),
-    )
-    .await?;
-    let file = share_storage_path(&share, request_path);
-    let response = backend
-        .stream_file(&file, &headers, FileResponseMode::Preview)
-        .await?;
-    let subject = crate::traffic::browser_subject(&state, &headers).await;
-    Ok(state
-        .download_limiter
-        .wrap_response(state.traffic.download(response, subject).await?))
+    file_response(state, headers, query, FileResponseMode::Preview).await
 }
 
 /// POST /api/folder/unlock — verify a folder lock password and return a token cookie.
@@ -1082,5 +1071,70 @@ mod pagination_tests {
         assert_eq!(page_size(None).unwrap(), 20);
         assert_eq!(page_size(Some(100)).unwrap(), 100);
         assert!(page_size(Some(25)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::{download_file, preview_file};
+    use crate::{
+        file_access::FileQuery,
+        test_support::{app_state, TestDirectory},
+    };
+    use axum::{
+        body::to_bytes,
+        extract::{Query, State},
+        http::{header, HeaderMap, HeaderValue, StatusCode},
+    };
+
+    #[tokio::test]
+    async fn download_and_preview_share_access_but_keep_their_response_modes() {
+        let directory = TestDirectory::new("browser-file-response");
+        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
+        tokio::fs::write(state.config.storage_path.join("note.txt"), b"file content")
+            .await
+            .unwrap();
+        let token = state.sessions.create().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("session={token}")).unwrap(),
+        );
+        let query = || FileQuery {
+            path: Some("note.txt".into()),
+            storage_id: Some(crate::config::DEFAULT_STORAGE_ID.into()),
+            batch: None,
+        };
+
+        assert!(
+            download_file(State(state.clone()), HeaderMap::new(), Query(query()))
+                .await
+                .is_err()
+        );
+        assert!(
+            preview_file(State(state.clone()), HeaderMap::new(), Query(query()))
+                .await
+                .is_err()
+        );
+
+        let download = download_file(State(state.clone()), headers.clone(), Query(query()))
+            .await
+            .unwrap();
+        assert_eq!(download.status(), StatusCode::OK);
+        assert!(download.headers().contains_key(header::CONTENT_DISPOSITION));
+        assert_eq!(
+            to_bytes(download.into_body(), 1024).await.unwrap(),
+            "file content"
+        );
+
+        let preview = preview_file(State(state), headers, Query(query()))
+            .await
+            .unwrap();
+        assert_eq!(preview.status(), StatusCode::OK);
+        assert!(!preview.headers().contains_key(header::CONTENT_DISPOSITION));
+        assert_eq!(
+            to_bytes(preview.into_body(), 1024).await.unwrap(),
+            "file content"
+        );
     }
 }

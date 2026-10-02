@@ -1,9 +1,10 @@
-import { ref } from 'vue'
+import { effectScope, ref, type EffectScope } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BrowserCapabilities, FileEntry, FileListResponse, UploadBatchStatus } from '../../shared/api/browser'
 import { batchOperation, checkDownload, getUploadBatchStatus, listFiles, listStorages, prepareArchive, prepareUploadBatch, uploadFile } from '../../shared/api/browser'
 import { ApiError } from '../../shared/api/client'
 import { useBrowserFileOperations } from './useBrowserFileOperations'
+import { useBrowserDownloads } from './useBrowserDownloads'
 import { useBrowserListing } from './useBrowserListing'
 import { useUploadQueue } from './useUploadQueue'
 
@@ -28,6 +29,7 @@ async function settle() {
 
 const capabilities: BrowserCapabilities = { download: true, upload: true, create_directory: true, rename: true, move_items: true, copy: true, delete: true }
 const completed = { success: 1, failed: 0, results: [] }
+const downloadScopes: EffectScope[] = []
 
 function operations() {
   const context = {
@@ -36,7 +38,10 @@ function operations() {
     selected: ref(new Set<string>()), requireCapability: () => true,
     announce: vi.fn(), refresh: vi.fn().mockResolvedValue(undefined),
   }
-  return { context, actions: useBrowserFileOperations(context) }
+  const scope = effectScope()
+  downloadScopes.push(scope)
+  const actions = scope.run(() => ({ ...useBrowserFileOperations(context), ...useBrowserDownloads(context) }))!
+  return { context, actions }
 }
 
 function listingData(path: string): FileListResponse {
@@ -63,9 +68,84 @@ beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(prepareUploadBatch).mockResolvedValue({ ticket: 'ticket' })
 })
-afterEach(() => vi.useRealTimers())
+afterEach(() => {
+  downloadScopes.splice(0).forEach(scope => scope.stop())
+  vi.useRealTimers()
+})
 
 describe('file operation resilience', () => {
+  it('uses individual unknown outcomes for feedback when legacy totals omit pending', async () => {
+    vi.mocked(batchOperation).mockResolvedValue({ success: 0, failed: 0, results: [
+      { path: 'one.txt', status: 409, code: 'operation_result_unknown', message: 'Verify first' },
+    ] })
+    const { context, actions } = operations()
+    actions.requestDelete(['one.txt'])
+    await actions.confirmDelete()
+    expect(context.announce).toHaveBeenCalledWith(expect.stringContaining('结果待确认 1 项'), 'error')
+    expect(actions.batchResult.value).not.toBeNull()
+  })
+
+  it('clears an earlier attention report when the next batch succeeds', async () => {
+    vi.mocked(batchOperation).mockResolvedValueOnce({ success: 0, failed: 1, results: [
+      { path: 'one.txt', status: 403, code: 'forbidden', message: 'Denied' },
+    ] }).mockResolvedValueOnce({ success: 1, failed: 0, results: [
+      { path: 'two.txt', status: 200, code: 'ok', message: 'Completed' },
+    ] })
+    const { actions } = operations()
+    actions.requestDelete(['one.txt'])
+    await actions.confirmDelete()
+    expect(actions.batchResult.value).not.toBeNull()
+    actions.requestDelete(['two.txt'])
+    await actions.confirmDelete()
+    expect(actions.batchResult.value).toBeNull()
+  })
+
+  it.each(['move', 'copy'] as const)('keeps %s feedback and details consistent with individual failure evidence', async operation => {
+    vi.mocked(batchOperation).mockResolvedValue({ success: 9, failed: 0, results: [
+      { path: 'one.txt', status: 403, code: 'forbidden', message: 'Denied' },
+    ] })
+    const { context, actions } = operations()
+    const paths = ['one.txt']
+    actions.requestTransfer(operation, paths)
+    paths.push('unselected.txt')
+    context.storageId.value = 'other'
+    await actions.confirmTransfer('target')
+    expect(batchOperation).toHaveBeenCalledExactlyOnceWith(operation, ['one.txt'], 'target', 'primary')
+    expect(context.announce).toHaveBeenCalledWith(expect.stringContaining('失败 1 项'), 'error')
+    expect(actions.batchResult.value?.attentionItems.map(item => item.path)).toEqual(['one.txt'])
+    expect(actions.operationBusy.value).toBe(false)
+    expect(actions.pickerOperation.value).toBeNull()
+  })
+
+  it('does not label committed follow-up work as a failed file operation', async () => {
+    vi.mocked(batchOperation).mockResolvedValue({ success: 1, failed: 5, results: [
+      { path: 'one.txt', status: 503, code: 'service_unavailable', message: 'Cleanup pending', operation: { commit: 'committed', cleanup: 'pending', retry: 'do_not_repeat' } },
+    ] })
+    const { context, actions } = operations()
+    actions.requestDelete(['one.txt'])
+    await actions.confirmDelete()
+    expect(context.announce).toHaveBeenCalledWith(expect.stringContaining('已提交待收尾 1 项'), 'success')
+    expect(actions.batchResult.value?.failed).toBe(0)
+    expect(actions.batchResult.value?.committed).toBe(1)
+    expect(actions.showDelete.value).toBe(false)
+    await actions.confirmDelete()
+    expect(batchOperation).toHaveBeenCalledOnce()
+  })
+
+  it('reports archive limits from the requested storage after the current storage changes', async () => {
+    const pending = deferred<Awaited<ReturnType<typeof prepareArchive>>>()
+    vi.mocked(prepareArchive).mockReturnValue(pending.promise)
+    const { context, actions } = operations()
+    context.maxArchiveBytes.value = 1024
+    const request = actions.startArchive(['one.txt'])
+    context.storageId.value = 'other-storage'
+    context.maxArchiveBytes.value = 2048
+    pending.reject(new Error('payload too large'))
+    await request
+    expect(prepareArchive).toHaveBeenCalledWith(['one.txt'], 'primary')
+    expect(context.announce).toHaveBeenCalledWith('所选文件总大小超过 1.0 KB，请拆分选择')
+  })
+
   it('does not stack identical download checks or archive preparations on repeated clicks', async () => {
     const download = deferred<void>()
     const archive = deferred<Awaited<ReturnType<typeof prepareArchive>>>()

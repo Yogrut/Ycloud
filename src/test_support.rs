@@ -77,3 +77,14 @@ pub(crate) async fn app_state(
     .await
     .unwrap()
 }
+
+/// Synchronize with the single background drain, without timing-dependent sleeps.
+pub(crate) async fn wait_storage_settled(backend: &crate::storage_backend::StorageBackend) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while backend.interruption_pending() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("interrupted storage did not settle");
+}

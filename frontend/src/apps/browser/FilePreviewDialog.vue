@@ -2,12 +2,15 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { PhArrowsOut, PhDownloadSimple, PhX } from '@phosphor-icons/vue'
 import type { FileEntry } from '../../shared/api/browser'
-import { checkDownload, downloadUrl, isPreviewTrafficExhausted, previewUrl } from '../../shared/api/browser'
+import { downloadUrl, previewUrl } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import { useLocale } from '../../shared/i18n'
 import { previewKind } from '../../shared/previewFormats'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import MediaPlayer from '../../shared/components/MediaPlayer.vue'
+import { useTextPreview } from '../../shared/composables/useTextPreview'
+import { useMediaPreview } from '../../shared/composables/useMediaPreview'
+import { usePreviewDownload } from '../../shared/composables/usePreviewDownload'
 
 const props = defineProps<{ entry: FileEntry; storageId: string }>()
 const emit = defineEmits<{ close: [] }>()
@@ -18,65 +21,23 @@ const isHtml = computed(() => /\.html?$/i.test(props.entry.name))
 const source = computed(() => previewUrl(props.entry.path, props.storageId))
 const target = computed(() => downloadUrl(props.entry.path, props.storageId))
 const pdfViewerAvailable = navigator.pdfViewerEnabled !== false
-const failed = ref(false)
-const trafficExhausted = ref(false)
-const pdfReady = ref(false)
-const text = ref('')
-const textTruncated = ref(false)
-const textReady = ref(false)
+const { failed: mediaFailed, trafficExhausted: mediaTrafficExhausted, ready: pdfReady, onError: handlePreviewError } = useMediaPreview(
+  computed(() => ['video', 'audio', 'pdf'].includes(kind.value) && (kind.value !== 'pdf' || pdfViewerAvailable) ? source.value : ''),
+  computed(() => kind.value === 'pdf'),
+)
+const { text, error: textError, truncated: textTruncated, ready: textReady, trafficExhausted: textTrafficExhausted } = useTextPreview(computed(() => kind.value === 'text' ? source.value : ''))
+const failed = computed(() => mediaFailed.value || Boolean(textError.value))
+const trafficExhausted = computed(() => mediaTrafficExhausted.value || textTrafficExhausted.value)
 const documentMode = ref<'preview' | 'source'>('preview')
 const safeHtml = computed(() => `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:;">${text.value}`)
-const downloadError = ref('')
+const { error: downloadError, startDownload } = usePreviewDownload(target)
 const dialogElement = ref<HTMLElement | null>(null)
-const abort = new AbortController()
 let previousFocus: HTMLElement | null = null
 let previousOverflow = ''
-
-async function loadText(): Promise<void> {
-  if (kind.value !== 'text') return
-  try {
-    const response = await fetch(source.value, { credentials: 'same-origin', headers: { Range: 'bytes=0-2097151' }, signal: abort.signal })
-    if (response.status === 429) {
-      trafficExhausted.value = true
-      failed.value = true
-      return
-    }
-    if (!response.ok) throw new Error(`${locale.t('preview.failed')} (${response.status})`)
-    text.value = await response.text()
-    textReady.value = true
-    const range = response.headers.get('Content-Range')?.match(/^bytes\s+\d+-(\d+)\/(\d+)$/i)
-    textTruncated.value = range ? Number(range[1]) + 1 < Number(range[2]) : false
-  } catch {
-    if (!abort.signal.aborted) failed.value = true
-  }
-}
-
-async function handlePreviewError(): Promise<void> {
-  failed.value = true
-  trafficExhausted.value = await isPreviewTrafficExhausted(source.value)
-}
-
-async function checkPdfPreview(): Promise<void> {
-  if (kind.value !== 'pdf' || !pdfViewerAvailable) return
-  if (await isPreviewTrafficExhausted(source.value)) {
-    trafficExhausted.value = true
-    failed.value = true
-  } else pdfReady.value = true
-}
 
 async function toggleFullscreen(): Promise<void> {
   if (document.fullscreenElement) await document.exitFullscreen()
   else await dialogElement.value?.requestFullscreen?.()
-}
-
-async function startDownload(): Promise<void> {
-  try {
-    downloadError.value = ''
-    await checkDownload(target.value)
-    window.location.href = target.value
-  } catch (error) {
-    downloadError.value = error instanceof Error ? error.message : locale.text('下载失败', 'Download failed')
-  }
 }
 
 function keydown(event: KeyboardEvent): void {
@@ -90,13 +51,10 @@ onMounted(async () => {
   previousFocus = document.activeElement as HTMLElement | null
   previousOverflow = document.body.style.overflow
   document.body.style.overflow = 'hidden'
-  void loadText()
-  void checkPdfPreview()
   await nextTick()
   dialogElement.value?.focus({ preventScroll: true })
 })
 onBeforeUnmount(() => {
-  abort.abort()
   document.body.style.overflow = previousOverflow
   previousFocus?.focus()
 })

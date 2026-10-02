@@ -1,12 +1,18 @@
-import { createApp, nextTick } from 'vue'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createApp, nextTick, reactive } from 'vue'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Window as TestWindow } from 'happy-dom'
 import type { FileEntry } from '../../shared/api/browser'
 import FilePreviewDialog from './FilePreviewDialog.vue'
 
 const mountedApps: Array<ReturnType<typeof createApp>> = []
+const iframeNavigation = (window as unknown as TestWindow).happyDOM.settings.navigation
+const originalChildNavigation = iframeNavigation.disableChildFrameNavigation
 
-function showFile(name: string): void {
-  const entry: FileEntry = {
+// Test the viewer's DOM without starting a separate iframe network request.
+beforeEach(() => { iframeNavigation.disableChildFrameNavigation = true })
+
+function showFile(name: string) {
+  const entry = reactive<FileEntry>({
     name,
     path: name,
     is_dir: false,
@@ -15,16 +21,19 @@ function showFile(name: string): void {
     mime: '',
     icon: '',
     locked: false,
-  }
+  })
   const host = document.createElement('div')
   document.body.append(host)
   const app = createApp(FilePreviewDialog, { entry, storageId: '' })
   mountedApps.push(app)
   app.mount(host)
+  return { app, entry }
 }
 
 afterEach(() => {
   mountedApps.splice(0).forEach(app => app.unmount())
+  iframeNavigation.disableChildFrameNavigation = originalChildNavigation
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
   document.body.replaceChildren()
 })
@@ -118,5 +127,97 @@ describe('FilePreviewDialog', () => {
     document.body.querySelectorAll<HTMLButtonElement>('.ycloud-document-modes button')[1]!.click()
     await nextTick()
     expect(document.body.querySelector('.ycloud-preview-dialog.document pre')?.textContent).toBe('<h1>Hello</h1>')
+  })
+
+  it.each(['success', 'quota'])('ignores an old text %s after replacing the dialog target', async outcome => {
+    let resolve!: (response: Response) => void
+    const old = new Promise<Response>(accept => { resolve = accept })
+    const fetchMock = vi.fn().mockReturnValueOnce(old).mockResolvedValueOnce(new Response('new content'))
+    vi.stubGlobal('fetch', fetchMock)
+    const { entry } = showFile('old.txt')
+    entry.path = 'new.txt'
+    entry.name = 'new.txt'
+    await new Promise(accept => setTimeout(accept, 0))
+    expect(fetchMock.mock.calls[0]?.[1].signal.aborted).toBe(true)
+    expect(fetchMock.mock.calls[1]?.[0]).toContain('new.txt')
+    resolve(new Response('old content', { status: outcome === 'quota' ? 429 : 200 }))
+    await new Promise(accept => setTimeout(accept, 0))
+    await nextTick()
+    expect(document.body.querySelector('pre')?.textContent).toBe('new content')
+    expect(document.body.querySelector('.ycloud-preview-fallback')).toBeNull()
+    expect(document.body.querySelector('.ycloud-preview-head a')).not.toBeNull()
+  })
+
+  it('cancels an unfinished text request when the dialog closes', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => new Promise(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const { app } = showFile('notes.txt')
+    app.unmount()
+    mountedApps.splice(mountedApps.indexOf(app), 1)
+    expect(fetchMock.mock.calls[0]?.[1].signal.aborted).toBe(true)
+    await nextTick()
+    expect(document.body.querySelector('.ycloud-preview-dialog')).toBeNull()
+  })
+
+  it('shows only source for oversized HTML even when the endpoint ignores Range', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('a'.repeat(2 * 1024 * 1024 + 1))))
+    showFile('large.html')
+    await new Promise(accept => setTimeout(accept, 0))
+    await nextTick()
+    expect(document.body.querySelector('iframe')).toBeNull()
+    expect(document.body.querySelector('.ycloud-document-modes')).toBeNull()
+    expect(document.body.querySelector('pre')?.textContent).toBe(`${'a'.repeat(2 * 1024 * 1024)}\n\n[预览已截断，仅显示前 2 MiB]`)
+  })
+
+  it('deduplicates consecutive document download clicks', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => new Promise(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    showFile('clip.mp4')
+    const link = document.body.querySelector<HTMLAnchorElement>('.ycloud-preview-head a')!
+    link.click()
+    link.click()
+    expect(fetchMock).toHaveBeenCalledOnce()
+  })
+
+  it.each([200, 403])('drops an old download check (%s) after replacing the file', async status => {
+    let resolve!: (response: Response) => void
+    const fetchMock = vi.fn().mockReturnValue(new Promise<Response>(accept => { resolve = accept }))
+    vi.stubGlobal('fetch', fetchMock)
+    const navigate = vi.spyOn(window.location, 'href', 'set').mockImplementation(() => {})
+    const { entry } = showFile('old.mp4')
+    document.body.querySelector<HTMLAnchorElement>('.ycloud-preview-head a')!.click()
+    entry.path = 'new.mp4'
+    entry.name = 'new.mp4'
+    await nextTick()
+    expect(fetchMock.mock.calls[0]?.[1].signal.aborted).toBe(true)
+    resolve(new Response(null, { status }))
+    await new Promise(accept => setTimeout(accept, 0))
+    expect(navigate).not.toHaveBeenCalled()
+    expect(document.body.querySelector('.ycloud-preview-error')).toBeNull()
+  })
+
+  it('cancels PDF admission when the dialog closes', async () => {
+    const fetchMock = vi.fn().mockImplementation(() => new Promise(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const { app } = showFile('report.pdf')
+    app.unmount()
+    mountedApps.splice(mountedApps.indexOf(app), 1)
+    expect(fetchMock.mock.calls[0]?.[1].signal.aborted).toBe(true)
+  })
+
+  it('checks a replacement PDF rather than applying the old quota response', async () => {
+    let resolve!: (response: Response) => void
+    const fetchMock = vi.fn().mockReturnValueOnce(new Promise<Response>(accept => { resolve = accept })).mockResolvedValueOnce(new Response(null))
+    vi.stubGlobal('fetch', fetchMock)
+    const { entry } = showFile('old.pdf')
+    entry.path = 'new.pdf'
+    entry.name = 'new.pdf'
+    await new Promise(accept => setTimeout(accept, 0))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    resolve(new Response(null, { status: 429 }))
+    await new Promise(accept => setTimeout(accept, 0))
+    await nextTick()
+    expect(document.body.querySelector('iframe')?.getAttribute('src')).toContain('new.pdf')
+    expect(document.body.querySelector('.ycloud-preview-fallback')).toBeNull()
   })
 })

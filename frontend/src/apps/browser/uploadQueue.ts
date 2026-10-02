@@ -1,9 +1,6 @@
-export type UploadTaskStatus = 'preparing' | 'queued' | 'uploading' | 'paused' | 'verifying' | 'succeeded' | 'failed' | 'cancelled'
+import type { UploadCandidate } from './uploadCandidates'
 
-export interface UploadCandidate {
-  file: File
-  relativePath: string
-}
+export type UploadTaskStatus = 'preparing' | 'queued' | 'uploading' | 'paused' | 'verifying' | 'succeeded' | 'failed' | 'cancelled'
 
 export interface UploadTask extends UploadCandidate {
   id: number
@@ -23,54 +20,59 @@ export interface UploadTask extends UploadCandidate {
   pauseRequested?: boolean
 }
 
-function cleanRelativePath(path: string): string {
-  return path.replaceAll('\\', '/').split('/').filter(part => part && part !== '.').join('/')
+export type UploadTaskAction = 'pause' | 'resume' | 'terminate' | 'retry' | 'clear'
+
+export function isUploadTaskActive(task: UploadTask): boolean {
+  return task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading'
+    || task.status === 'paused' || task.status === 'verifying'
 }
 
-export function candidatesFromFiles(files: Iterable<File>): UploadCandidate[] {
-  return Array.from(files, file => ({
-    file,
-    relativePath: cleanRelativePath(file.webkitRelativePath || file.name),
-  })).filter(candidate => candidate.relativePath.length > 0)
-}
-
-function readFileEntry(entry: FileSystemFileEntry): Promise<File> {
-  return new Promise((resolve, reject) => entry.file(resolve, reject))
-}
-
-function readDirectoryChunk(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
-  return new Promise((resolve, reject) => reader.readEntries(resolve, reject))
-}
-
-async function readDirectoryEntries(entry: FileSystemDirectoryEntry): Promise<FileSystemEntry[]> {
-  const reader = entry.createReader()
-  const entries: FileSystemEntry[] = []
-  while (true) {
-    const chunk = await readDirectoryChunk(reader)
-    if (!chunk.length) return entries
-    entries.push(...chunk)
+export function canUploadTaskAction(task: UploadTask, action: UploadTaskAction): boolean {
+  switch (action) {
+    case 'pause': return task.status === 'preparing' || task.status === 'queued' || task.status === 'uploading'
+    case 'resume': return task.status === 'paused'
+    case 'terminate': return canUploadTaskAction(task, 'pause') || task.status === 'paused'
+    case 'retry': return task.status === 'failed' && !task.retryBlocked
+    // Clearing a terminal record is not deleting the uploaded file or
+    // declaring an uncertain server operation uncommitted.
+    case 'clear': return !isUploadTaskActive(task)
   }
 }
 
-async function candidatesFromEntry(entry: FileSystemEntry): Promise<UploadCandidate[]> {
-  if (entry.isFile) {
-    const file = await readFileEntry(entry as FileSystemFileEntry)
-    return [{ file, relativePath: cleanRelativePath(entry.fullPath || file.name) }]
+export function isUploadPathReserved(task: UploadTask): boolean {
+  return isUploadTaskActive(task) || task.retryBlocked === true
+}
+
+export function uploadLoadedBytes(task: UploadTask): number {
+  return Number.isNaN(task.loaded) ? 0 : Math.max(0, Math.min(task.file.size, task.loaded))
+}
+
+export function uploadTaskPercent(task: UploadTask): number {
+  if (task.status === 'succeeded') return 100
+  if (!task.file.size || (task.status !== 'uploading' && task.status !== 'verifying')) return 0
+  return Math.min(99, Math.round(uploadLoadedBytes(task) / task.file.size * 100))
+}
+
+export function summarizeUploadTasks(tasks: readonly UploadTask[]) {
+  let succeeded = 0
+  let failed = 0
+  let cancelled = 0
+  let active = 0
+  let totalBytes = 0
+  let uploadedBytes = 0
+  for (const task of tasks) {
+    totalBytes += task.file.size
+    if (isUploadTaskActive(task)) active++
+    if (task.status === 'succeeded') {
+      succeeded++
+      uploadedBytes += task.file.size
+    } else if (task.status === 'failed') failed++
+    else if (task.status === 'cancelled') cancelled++
+    if (task.status === 'uploading' || task.status === 'verifying') uploadedBytes += uploadLoadedBytes(task)
   }
-  if (!entry.isDirectory) return []
-  const children = await readDirectoryEntries(entry as FileSystemDirectoryEntry)
-  return (await Promise.all(children.map(candidatesFromEntry))).flat()
-}
-
-export async function candidatesFromDrop(transfer: DataTransfer): Promise<UploadCandidate[]> {
-  const entries = Array.from(transfer.items)
-    .filter(item => item.kind === 'file')
-    .map(item => item.webkitGetAsEntry())
-    .filter((entry): entry is FileSystemEntry => entry !== null)
-  if (!entries.length) return candidatesFromFiles(transfer.files)
-  return (await Promise.all(entries.map(candidatesFromEntry))).flat()
-}
-
-export function joinUploadPath(directory: string, relativePath: string): string {
-  return [cleanRelativePath(directory), cleanRelativePath(relativePath)].filter(Boolean).join('/')
+  const allSucceeded = tasks.length > 0 && succeeded === tasks.length
+  const percent = totalBytes
+    ? Math.min(allSucceeded ? 100 : 99, Math.round(uploadedBytes / totalBytes * 100))
+    : allSucceeded ? 100 : 0
+  return { succeeded, failed, cancelled, active, totalBytes, uploadedBytes, percent }
 }

@@ -252,15 +252,11 @@ impl BatchPersistence {
                     if let Some(saved) = &saved {
                         expires_unix = expires_unix.max(saved.expires_unix);
                     }
-                    let status = match saved
+                    let status = saved
                         .as_ref()
                         .map(|value| value.status)
                         .unwrap_or(UploadStatus::Pending)
-                    {
-                        UploadStatus::Pending => UploadStatus::Cancelled,
-                        UploadStatus::InProgress => UploadStatus::Unknown,
-                        other => other,
-                    };
+                        .after_restart();
                     items.insert(
                         record.path.clone(),
                         UploadItem {
@@ -271,10 +267,8 @@ impl BatchPersistence {
                         },
                     );
                 }
-                let retained = expires_unix > now
-                    || items
-                        .values()
-                        .any(|item| matches!(item.status, UploadStatus::Unknown));
+                let retained =
+                    expires_unix > now || items.values().any(|item| item.status.needs_recovery());
                 if !retained {
                     std::fs::remove_dir_all(&directory).map_err(index_error)?;
                     continue;

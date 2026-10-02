@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import AppFeedback from '../../shared/components/AppFeedback.vue'
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import type { AdminInfo } from '../../shared/api/admin'
-import { AdminApiError, getAdminInfo, loginAdministrator } from '../../shared/api/admin'
+import { computed, onMounted } from 'vue'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import AdminLoginCard from '../../shared/components/AdminLoginCard.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
@@ -19,37 +17,11 @@ import SecurityView from './SecurityView.vue'
 import StorageView from './StorageView.vue'
 import WebDavView from './WebDavView.vue'
 import UsersView from './UsersView.vue'
-import { appPath } from '../../shared/routes'
+import { appPath, currentAppPath } from '../../shared/routes'
+import { useAdminSession } from './useAdminSession'
 
 defineProps<{ theme: ThemeController }>()
 const locale = useLocale()
-
-const info = ref<AdminInfo>()
-const loading = ref(true)
-const requiresLogin = ref(false)
-const username = ref('')
-const password = ref('')
-const totpCode = ref('')
-const totpRequired = ref(false)
-const loginError = ref('')
-const loggingIn = ref(false)
-const notice = ref('')
-const noticeRevision = ref(0)
-const activeSection = window.location.pathname.endsWith('/security')
-  ? 'security'
-  : window.location.pathname.endsWith('/protection')
-    ? 'protection'
-    : window.location.pathname.endsWith('/limits')
-    ? 'limits'
-    : window.location.pathname.endsWith('/locks')
-      ? 'locks'
-      : window.location.pathname.endsWith('/webdav')
-        ? 'webdav'
-        : window.location.pathname.endsWith('/storage')
-          ? 'storage'
-          : window.location.pathname.endsWith('/users')
-            ? 'users'
-            : window.location.pathname.endsWith('/account') ? 'account' : 'dashboard'
 
 const navigation = computed(() => [
   { id: 'dashboard', label: locale.text('仪表盘', 'Dashboard'), href: appPath('/admin/dashboard') },
@@ -63,86 +35,14 @@ const navigation = computed(() => [
   { id: 'security', label: locale.text('访问日志', 'Access logs'), href: appPath('/admin/security') },
 ] as const)
 
-let loadRevision = 0
-async function load(background = false): Promise<void> {
-  const revision = ++loadRevision
-  if (!background) loading.value = true
-  try {
-    const result = await getAdminInfo()
-    if (revision !== loadRevision) return
-    info.value = result
-    requiresLogin.value = false
-  } catch (error) {
-    if (revision !== loadRevision) return
-    if (error instanceof AdminApiError && (error.status === 401 || error.status === 403)) {
-      requiresLogin.value = true
-      info.value = undefined
-    } else {
-      loginError.value = error instanceof Error ? error.message : locale.text('管理后台加载失败', 'Unable to load the admin console')
-    }
-  } finally {
-    if (revision === loadRevision) loading.value = false
-  }
-}
+const activeSection = navigation.value.find(item => item.href === currentAppPath())?.id ?? 'dashboard'
+const {
+  info, loading, requiresLogin, loadError, username, password, totpCode, totpRequired,
+  loginError, loggingIn, notice, noticeRevision, submitLogin, resetTotpChallenge,
+  showNotice, sessionExpired, start,
+} = useAdminSession(activeSection === 'storage')
 
-async function submitLogin(): Promise<void> {
-  if (!username.value.trim() || !password.value || loggingIn.value) {
-    if (!username.value.trim() || !password.value) loginError.value = locale.text('请输入用户名和密码', 'Enter your username and password')
-    return
-  }
-  loggingIn.value = true
-  loginError.value = ''
-  try {
-    const result = await loginAdministrator(username.value.trim(), password.value, totpCode.value.trim())
-    if (result.totp_required) {
-      totpRequired.value = true
-      loginError.value = ''
-      return
-    }
-    if (!result.success) throw new Error(result.message ?? locale.text('登录失败', 'Sign-in failed'))
-    if (!result.is_admin) {
-      await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' })
-      throw new Error(locale.text('用户账号不能进入管理后台', 'This user cannot open the admin console.'))
-    }
-    password.value = ''
-    totpCode.value = ''
-    totpRequired.value = false
-    await load()
-  } catch (error) {
-    loginError.value = error instanceof Error ? error.message : locale.text('登录失败', 'Sign-in failed')
-  } finally {
-    loggingIn.value = false
-  }
-}
-
-function resetTotpChallenge(): void {
-  if (!totpRequired.value) return
-  totpRequired.value = false
-  totpCode.value = ''
-  loginError.value = ''
-}
-
-function showNotice(message: string): void {
-  notice.value = message
-  noticeRevision.value += 1
-  void load()
-}
-
-function sessionExpired(): void {
-  window.setTimeout(() => window.location.replace(appPath('/browse')), 700)
-}
-
-let healthRefresh: ReturnType<typeof setInterval> | undefined
-onMounted(() => {
-  void load()
-  if (activeSection === 'storage') healthRefresh = setInterval(() => {
-    if (!document.hidden && !requiresLogin.value) void load(true)
-  }, 300_000)
-})
-onUnmounted(() => {
-  clearInterval(healthRefresh)
-  loadRevision++
-})
+onMounted(start)
 </script>
 
 <template>
@@ -200,7 +100,7 @@ onUnmounted(() => {
           @changed="showNotice"
         />
         <AccountView v-else-if="info" :info="info" @saved="showNotice" @expired="sessionExpired" />
-        <div v-else class="admin-loading glass">{{ loginError || locale.text('管理后台暂时无法加载', 'The admin console is temporarily unavailable') }}</div>
+        <div v-else class="admin-loading glass">{{ loadError || locale.text('管理后台暂时无法加载', 'The admin console is temporarily unavailable') }}</div>
       </div>
     </div>
   </main>
@@ -219,4 +119,5 @@ onUnmounted(() => {
   </main>
 
   <AppFeedback :message="notice" :revision="noticeRevision" kind="success" />
+  <AppFeedback :message="loadError" />
 </template>

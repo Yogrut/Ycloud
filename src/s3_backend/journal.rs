@@ -11,6 +11,44 @@ use super::{
 };
 use crate::error::{AppError, AppResult};
 
+/// Collect only bounded recovery records, never file payloads. Header checks
+/// precede body polling; actual chunks are checked before appending to the buffer.
+pub(super) async fn read_journal_payload(
+    output: aws_sdk_s3::operation::get_object::GetObjectOutput,
+    max_bytes: usize,
+) -> AppResult<(Vec<u8>, String)> {
+    let declared_length = output
+        .content_length()
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| oversized_journal())?;
+    if declared_length.is_some_and(|length| length > max_bytes) {
+        return Err(oversized_journal());
+    }
+    let etag = output
+        .e_tag()
+        .map(str::to_owned)
+        .ok_or_else(|| AppError::ServiceUnavailable("恢复记录缺少 ETag".into()))?;
+    let mut body = output.body;
+    let mut data = Vec::with_capacity(declared_length.unwrap_or(0));
+    while let Some(chunk) = body
+        .try_next()
+        .await
+        .map_err(|error| AppError::with_source("failed to stream S3 recovery journal", error))?
+    {
+        // data.len() never exceeds max_bytes, so subtraction cannot underflow.
+        if chunk.len() > max_bytes - data.len() {
+            return Err(oversized_journal());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok((data, etag))
+}
+
+fn oversized_journal() -> AppError {
+    AppError::ServiceUnavailable("对象存储恢复记录超过安全上限".into())
+}
+
 impl S3Backend {
     pub(super) async fn write_upload_transaction(
         &self,
@@ -180,14 +218,6 @@ impl S3Backend {
         }
     }
 
-    pub(super) async fn list_transaction_keys(&self) -> AppResult<Vec<String>> {
-        self.list_recovery_journal_keys("transactions").await
-    }
-
-    pub(super) async fn list_multipart_session_keys(&self) -> AppResult<Vec<String>> {
-        self.list_recovery_journal_keys("multipart-sessions").await
-    }
-
     pub(super) async fn list_recovery_journal_keys(&self, area: &str) -> AppResult<Vec<String>> {
         self.maintenance
             .read(self.list_recovery_journal_keys_uninterrupted(area))
@@ -327,30 +357,12 @@ impl S3Backend {
                 );
                 AppError::ServiceUnavailable("无法读取对象存储恢复记录".into())
             })?;
-        if output.content_length().is_some_and(|length| {
-            length < 0
-                || usize::try_from(length).map_or(true, |value| {
-                    value > authenticated_journal::MAX_ENVELOPE_BYTES
-                })
-        }) {
-            return Err(AppError::ServiceUnavailable(
-                "对象存储恢复记录超过安全上限".into(),
-            ));
-        }
-        let etag = output
-            .e_tag()
-            .map(str::to_owned)
-            .ok_or_else(|| AppError::ServiceUnavailable("恢复记录缺少 ETag".into()))?;
-        let data = output.body.collect().await.map_err(|error| {
-            AppError::with_source("failed to stream S3 recovery journal", error)
-        })?;
-        let data = data.into_bytes();
-        if data.len() > authenticated_journal::MAX_ENVELOPE_BYTES {
-            return Err(AppError::ServiceUnavailable(
-                "对象存储恢复记录超过安全上限".into(),
-            ));
-        }
+        let (data, etag) =
+            read_journal_payload(output, authenticated_journal::MAX_ENVELOPE_BYTES).await?;
         let value = authenticated_journal::decode(&self.transaction_auth_key, purpose, &data)?;
         Ok((value, etag))
     }
 }
+
+#[cfg(test)]
+mod tests;

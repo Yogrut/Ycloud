@@ -13,6 +13,13 @@ use crate::{
 pub(super) const MAX_JOURNAL_BYTES: u64 = 16 * 1024;
 pub(super) const MAX_RECOVERY_ENTRIES: usize = 4096;
 
+pub(super) fn valid_operation_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct TransactionId(String);
@@ -132,11 +139,7 @@ impl ReplaceJournal {
         }
         match (&self.operation_id, self.operation_size) {
             (None, None) => {}
-            (Some(id), Some(_))
-                if id.len() == 32
-                    && id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) => {}
+            (Some(id), Some(_)) if valid_operation_id(id) => {}
             _ => {
                 return Err(AppError::Conflict(
                     "Invalid upload operation identity; recovery stopped".into(),
@@ -169,4 +172,17 @@ pub(super) fn resource_id(path: &Path) -> AppResult<TransactionId> {
         })?;
     TransactionId::try_from(name.to_owned())
         .map_err(|_| AppError::Conflict("Unrecognized internal resource; recovery stopped".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_operation_id;
+
+    #[test]
+    fn operation_id_requires_exactly_32_lowercase_hex_digits() {
+        assert!(valid_operation_id("0123456789abcdef0123456789abcdef"));
+        assert!(!valid_operation_id("0123456789ABCDEF0123456789ABCDEF"));
+        assert!(!valid_operation_id("0123456789abcdef"));
+        assert!(!valid_operation_id("0123456789abcdef0123456789abcdeg"));
+    }
 }

@@ -8,6 +8,8 @@ import { computed, onMounted, ref, useId } from 'vue'
 import type { AdminInfo, StoragePermission, TrafficInfo, TrafficQuota, UserAccountView } from '../../shared/api/admin'
 import { createUserAccount, deleteUserAccount, getTraffic, updateUserAccount } from '../../shared/api/admin'
 import { useLocale } from '../../shared/i18n'
+import { emptyTrafficQuota, validTrafficQuota } from './trafficQuota'
+import { changePermission, createUserRequest, permissionDrafts, userAccountChanges, type PermissionAction, type UserAccountDraft } from './userAccountForm'
 
 const props = defineProps<{ info: AdminInfo }>()
 const emit = defineEmits<{ changed: [message: string] }>()
@@ -19,7 +21,7 @@ const password = ref('')
 const enabled = ref(true)
 const permissions = ref<StoragePermission[]>([])
 const trafficInfo = ref<TrafficInfo>()
-const trafficQuota = ref<TrafficQuota>({ enabled: false, upload: 0, download: 0 })
+const trafficQuota = ref<TrafficQuota>(emptyTrafficQuota())
 const trafficReady = ref(false)
 const error = ref('')
 const saving = ref(false)
@@ -48,16 +50,13 @@ const actions = computed(() => [
   ['copy', locale.text('复制', 'Copy')], ['delete', locale.text('删除', 'Delete')],
 ] as const)
 
-function emptyPermission(storageId: string): StoragePermission {
-  return { storage_id: storageId, browse: false, download: false, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false }
-}
 function formatTraffic(bytes: number): string {
   if (!bytes) return '∞'
   const power = Math.max(0, Math.min(4, Math.floor(Math.log(bytes) / Math.log(1024))))
   return (bytes / 1024 ** power).toLocaleString(undefined, { maximumFractionDigits: 2 }) + ['B', 'K', 'M', 'G', 'T'][power]
 }
 function quotaFor(account: UserAccountView): TrafficQuota {
-  return trafficInfo.value?.settings.users[account.id] ?? { enabled: false, upload: 0, download: 0 }
+  return trafficInfo.value?.settings.users[account.id] ?? emptyTrafficQuota()
 }
 function quotaSummary(account: UserAccountView): string {
   if (!trafficInfo.value) return '—'
@@ -78,11 +77,11 @@ async function openEditor(account?: UserAccountView): Promise<void> {
   username.value = account?.username ?? ''
   password.value = ''
   enabled.value = account?.enabled ?? true
-  permissions.value = props.info.storage_instances.map(storage => account?.permissions.find(item => item.storage_id === storage.id) ?? emptyPermission(storage.id))
+  permissions.value = permissionDrafts(props.info.storage_instances.map(storage => storage.id), account?.permissions)
   error.value = ''
   storageSearch.value = ''
   expandedStorageId.value = ''
-  trafficQuota.value = { enabled: false, upload: 0, download: 0 }
+  trafficQuota.value = emptyTrafficQuota()
   trafficReady.value = !account
   if (!trafficInfo.value) {
     try { await loadTraffic() }
@@ -95,16 +94,8 @@ async function openEditor(account?: UserAccountView): Promise<void> {
     trafficReady.value = true
   }
 }
-function setPermission(index: number, action: keyof StoragePermission, value: boolean): void {
-  const next = permissions.value.map(item => ({ ...item }))
-  const permission = next[index]
-  if (!permission || action === 'storage_id') return
-  permission[action] = value
-  if (action !== 'browse' && value) permission.browse = true
-  if (action === 'browse' && !value) {
-    Object.assign(permission, emptyPermission(permission.storage_id))
-  }
-  permissions.value = next
+function setPermission(index: number, action: PermissionAction, value: boolean): void {
+  permissions.value = changePermission(permissions.value, index, action, value)
 }
 function storageDescription(storageId: string): string {
   const storage = props.info.storage_instances.find(item => item.id === storageId)
@@ -128,24 +119,29 @@ async function save(): Promise<void> {
   }
   saving.value = true
   error.value = ''
-  const activePermissions = permissions.value.filter(item => item.browse)
   try {
-    if (!trafficReady.value || (['upload', 'download'] as const).some(direction => !Number.isSafeInteger(trafficQuota.value[direction]) || trafficQuota.value[direction] < 0)) {
+    if (!trafficReady.value || !validTrafficQuota(trafficQuota.value)) {
       throw new Error(locale.text('请输入有效的上传和下载额度', 'Enter valid upload and download allowances'))
+    }
+    const draft: UserAccountDraft = {
+      username: username.value, password: password.value, enabled: enabled.value,
+      permissions: permissions.value, traffic: trafficQuota.value,
     }
     let saved: UserAccountView
     if (editing.value) {
-      const previous = { ...editing.value, traffic: trafficInfo.value?.settings.users[editing.value.id] }
-      const changes = { username: username.value.trim(), password: password.value || undefined, enabled: enabled.value, permissions: activePermissions, traffic: trafficQuota.value }
-      saved = await updateUserAccount(editing.value.id, { ...Object.fromEntries(Object.entries(changes).filter(([key, value]) => value !== undefined && JSON.stringify(value) !== JSON.stringify(previous[key as keyof typeof previous]))), expected_revision: editing.value.revision })
+      const account = editing.value
+      saved = await updateUserAccount(account.id, userAccountChanges(account, trafficInfo.value?.settings.users[account.id], draft))
     } else {
-      saved = await createUserAccount({ username: username.value.trim(), password: password.value, enabled: enabled.value, permissions: activePermissions, traffic: trafficQuota.value })
+      saved = await createUserAccount(createUserRequest(draft))
     }
     if (trafficInfo.value) trafficInfo.value.settings.users[saved.id] = { ...trafficQuota.value }
     editing.value = undefined
     emit('changed', locale.text('用户设置已保存', 'User settings saved.'))
-  } catch (reason) { error.value = reason instanceof Error ? reason.message : locale.t('common.requestFailed', { status: '' }) }
-  finally { saving.value = false }
+  } catch (reason) {
+    error.value = reason instanceof Error ? reason.message : locale.t('common.requestFailed', { status: '' })
+  } finally {
+    saving.value = false
+  }
 }
 onMounted(() => { void loadTraffic().catch(() => undefined) })
 async function remove(): Promise<void> {
@@ -157,8 +153,11 @@ async function remove(): Promise<void> {
     await deleteUserAccount(account.id)
     pendingDelete.value = undefined
     emit('changed', locale.text('用户已删除', 'User deleted.'))
-  } catch (reason) { deleteError.value = reason instanceof Error ? reason.message : locale.text('删除失败', 'Delete failed.') }
-  finally { deleting.value = false }
+  } catch (reason) {
+    deleteError.value = reason instanceof Error ? reason.message : locale.text('删除失败', 'Delete failed.')
+  } finally {
+    deleting.value = false
+  }
 }
 </script>
 

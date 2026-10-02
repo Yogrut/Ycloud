@@ -1,77 +1,54 @@
 <script setup lang="ts">
 import AppFeedback from '../../shared/components/AppFeedback.vue'
-import { computed, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import SettingRow from '../../shared/components/SettingRow.vue'
 import SettingsDrawer from '../../shared/components/SettingsDrawer.vue'
 import type { AdminInfo, UpdateLoginSecuritySettingsRequest } from '../../shared/api/admin'
 import { updateLoginSecuritySettings } from '../../shared/api/admin'
 import { useLocale } from '../../shared/i18n'
+import { LOGIN_PROTECTION_LIMITS, buildLoginProtectionRequest, loginProtectionChanges, loginProtectionDraft } from './loginProtectionForm'
 
 const props = defineProps<{ info: AdminInfo }>()
 const emit = defineEmits<{ saved: [message: string] }>()
 const locale = useLocale()
 const feedbackRevision = ref(0)
-const adminFailures = ref<string | number>('')
-const adminBlockMinutes = ref<string | number>('')
-const webFailures = ref<string | number>('')
-const webBlockMinutes = ref<string | number>('')
+const draft = reactive(loginProtectionDraft(props.info))
+const inputFields = ['adminFailures', 'adminBlockMinutes', 'webFailures', 'webBlockMinutes'] as const
 const saving = ref(false)
 const errorMessage = ref('')
 const editor = ref<number>()
-const fields = computed(() => [
-  { label: locale.text('管理员错误次数', 'Administrator failure limit'), value: props.info.admin_login_failures, min: 3, max: 10, unit: locale.text('次', 'attempts') },
-  { label: locale.text('管理员封禁时间', 'Administrator block duration'), value: props.info.admin_login_block_seconds / 60, min: 5, max: 1440, unit: locale.text('分钟', 'minutes') },
-  { label: locale.text('首页错误次数', 'Browser failure limit'), value: props.info.web_login_failures, min: 3, max: 20, unit: locale.text('次', 'attempts') },
-  { label: locale.text('首页封禁时间', 'Browser block duration'), value: props.info.web_login_block_seconds / 60, min: 5, max: 1440, unit: locale.text('分钟', 'minutes') },
-])
-const activeValue = computed({ get: () => [adminFailures, adminBlockMinutes, webFailures, webBlockMinutes][editor.value ?? 0]!.value, set: value => { [adminFailures, adminBlockMinutes, webFailures, webBlockMinutes][editor.value ?? 0]!.value = value } })
-function openEditor(index: number): void { reset(); editor.value = index }
+const fields = computed(() => {
+  const current = loginProtectionDraft(props.info)
+  return [
+    { label: locale.text('管理员错误次数', 'Administrator failure limit'), value: current.adminFailures, ...LOGIN_PROTECTION_LIMITS.adminFailures, unit: locale.text('次', 'attempts') },
+    { label: locale.text('管理员封禁时间', 'Administrator block duration'), value: current.adminBlockMinutes, ...LOGIN_PROTECTION_LIMITS.blockMinutes, unit: locale.text('分钟', 'minutes') },
+    { label: locale.text('首页错误次数', 'Browser failure limit'), value: current.webFailures, ...LOGIN_PROTECTION_LIMITS.webFailures, unit: locale.text('次', 'attempts') },
+    { label: locale.text('首页封禁时间', 'Browser block duration'), value: current.webBlockMinutes, ...LOGIN_PROTECTION_LIMITS.blockMinutes, unit: locale.text('分钟', 'minutes') },
+  ]
+})
+const activeValue = computed({
+  get: () => draft[inputFields[editor.value ?? 0]!],
+  set: value => { draft[inputFields[editor.value ?? 0]!] = value },
+})
+const hasChanges = computed(() => Object.keys(loginProtectionChanges(draft, props.info)).length > 0)
 
-const hasChanges = computed(() => (
-  Number(adminFailures.value) !== props.info.admin_login_failures
-  || Number(adminBlockMinutes.value) * 60 !== props.info.admin_login_block_seconds
-  || Number(webFailures.value) !== props.info.web_login_failures
-  || Number(webBlockMinutes.value) * 60 !== props.info.web_login_block_seconds
-))
+function openEditor(index: number): void {
+  reset()
+  editor.value = index
+}
 
 function reset(): void {
-  adminFailures.value = props.info.admin_login_failures
-  adminBlockMinutes.value = props.info.admin_login_block_seconds / 60
-  webFailures.value = props.info.web_login_failures
-  webBlockMinutes.value = props.info.web_login_block_seconds / 60
+  Object.assign(draft, loginProtectionDraft(props.info))
   errorMessage.value = ''
 }
 
-watch(() => props.info, reset, { immediate: true })
-
-function requestBody(): UpdateLoginSecuritySettingsRequest {
-  const adminAttempts = Number(adminFailures.value)
-  const webAttempts = Number(webFailures.value)
-  const adminMinutes = Number(adminBlockMinutes.value)
-  const webMinutes = Number(webBlockMinutes.value)
-  if (!Number.isInteger(adminAttempts) || adminAttempts < 3 || adminAttempts > 10) {
-    throw new Error(locale.text('管理员错误次数必须在 3 到 10 之间', 'Administrator failures must be between 3 and 10'))
-  }
-  if (!Number.isInteger(webAttempts) || webAttempts < 3 || webAttempts > 20) {
-    throw new Error(locale.text('首页错误次数必须在 3 到 20 之间', 'Browser failures must be between 3 and 20'))
-  }
-  if (!Number.isInteger(adminMinutes) || adminMinutes < 5 || adminMinutes > 1440
-    || !Number.isInteger(webMinutes) || webMinutes < 5 || webMinutes > 1440) {
-    throw new Error(locale.text('封禁时间必须在 5 到 1440 分钟之间', 'Block duration must be between 5 and 1440 minutes'))
-  }
-  return Object.fromEntries(Object.entries({
-    admin_login_failures: adminAttempts,
-    web_login_failures: webAttempts,
-    admin_login_block_seconds: adminMinutes * 60,
-    web_login_block_seconds: webMinutes * 60,
-  }).filter(([key, value]) => value !== props.info[key as keyof AdminInfo]))
-}
+watch(() => props.info, reset)
 
 async function submit(): Promise<void> {
   if (saving.value || !hasChanges.value) return
   let body: UpdateLoginSecuritySettingsRequest
   try {
-    body = requestBody()
+    body = buildLoginProtectionRequest(draft, props.info, locale.text)
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : locale.text('登录保护设置无效', 'Invalid sign-in protection settings')
     return

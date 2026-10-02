@@ -1,11 +1,16 @@
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import type { Ref } from 'vue'
 import { cancelUploadBatch, getUploadBatchStatus, prepareUploadBatch, uploadFile } from '../../shared/api/browser'
-import type { UploadBatchItemState } from '../../shared/api/browser'
+import type { UploadBatchItemState, UploadBatchStatus } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import { useLocale } from '../../shared/i18n'
-import { candidatesFromDrop, candidatesFromFiles, joinUploadPath } from './uploadQueue'
-import type { UploadCandidate, UploadTask } from './uploadQueue'
+import { candidatesFromDrop, candidatesFromFiles, joinUploadPath, MAX_UPLOAD_QUEUE_TASKS, UploadSelectionLimitError } from './uploadCandidates'
+import type { UploadCandidate } from './uploadCandidates'
+import type { UploadTask } from './uploadQueue'
+import { canUploadTaskAction, isUploadPathReserved } from './uploadQueue'
+import { groupUploadTasksByStorage, groupUploadTasksByTicket, uploadTicketKey } from './uploadTaskGroups'
+import { applyUploadServerState, markUploadUnconfirmed } from './uploadTaskState'
+import { createUploadReconciliation, indexUploadBatchItems } from './uploadReconciliation'
 import { ApiError } from '../../shared/api/client'
 
 interface UploadQueueContext {
@@ -20,8 +25,10 @@ interface UploadQueueContext {
   refresh: () => Promise<void>
 }
 
-// Match the server's active item budget; keep admission bounded across drops.
-const MAX_UPLOAD_QUEUE_TASKS = 20_000
+interface UploadDestination {
+  storageId: string
+  basePath: string
+}
 
 export function useUploadQueue(context: UploadQueueContext) {
   const locale = useLocale()
@@ -31,14 +38,21 @@ export function useUploadQueue(context: UploadQueueContext) {
   const showUpload = ref(false)
   const uploading = ref(false)
   const uploadTasks = ref<UploadTask[]>([])
+  const retainedUploadTasks = computed(() => new Set(uploadTasks.value))
   const uploadDropActive = ref(false)
   let uploadTaskSequence = 0
   let uploadDragDepth = 0
   let currentUploadController: AbortController | undefined
   let currentUploadTaskId: number | undefined
   let disposed = false
-  const reconcileTimers = new Set<number>()
-  const reconcileDelays = [0, 1000, 3000, 7000, 15000, 30000]
+  const selectionControllers = new Set<AbortController>()
+  let refreshing = false
+  let pendingRefresh: UploadDestination | undefined
+  const reconciliation = createUploadReconciliation({
+    tasks: () => retainedUploadTasks.value,
+    applyResult: (task, item) => applyServerUploadState(task, item.status, item.operation),
+    unconfirmed: markUnconfirmed,
+  })
 
   function chooseFiles(): void {
     if (context.requireUpload()) fileInput.value?.click()
@@ -63,9 +77,22 @@ export function useUploadQueue(context: UploadQueueContext) {
 
   function uploadFiles(event: Event): void {
     const input = event.target as HTMLInputElement
-    const candidates = candidatesFromFiles(input.files ?? [])
-    input.value = ''
-    if (candidates.length) void queueUploads(candidates)
+    try {
+      if (disposed || !context.requireUpload()) return
+      const candidates = candidatesFromFiles(input.files ?? [])
+      if (candidates.length) void queueUploads(candidates)
+    } catch (error) {
+      announceSelectionError(error)
+    } finally {
+      input.value = ''
+    }
+  }
+
+  function announceSelectionError(error: unknown): void {
+    if (disposed) return
+    context.announce(error instanceof UploadSelectionLimitError
+      ? locale.text(`一次最多选择 ${MAX_UPLOAD_QUEUE_TASKS} 个文件及目录，请分批上传`, `Select at most ${MAX_UPLOAD_QUEUE_TASKS} files and folders at a time; split the upload`)
+      : error instanceof Error ? error.message : locale.text('无法读取上传内容', 'Unable to read the selected items'))
   }
 
   function uploadLimitError(file: File): string {
@@ -95,12 +122,11 @@ export function useUploadQueue(context: UploadQueueContext) {
     return ''
   }
 
-  async function queueUploads(candidates: UploadCandidate[]): Promise<void> {
+  async function queueUploads(candidates: UploadCandidate[], destination: UploadDestination = { storageId: context.storageId.value, basePath: context.path.value }): Promise<void> {
     if (disposed || !candidates.length || !context.requireUpload()) return
-    const storageId = context.storageId.value
-    const basePath = context.path.value
+    const { storageId, basePath } = destination
     const occupied = new Set(uploadTasks.value.filter(task => task.storageId === storageId
-      && (['preparing', 'queued', 'uploading', 'paused', 'verifying'].includes(task.status) || task.retryBlocked))
+      && isUploadPathReserved(task))
       .map(task => task.originalTargetPath ?? task.targetPath))
     const unique = candidates.filter(candidate => {
       const target = joinUploadPath(basePath, candidate.relativePath)
@@ -136,168 +162,179 @@ export function useUploadQueue(context: UploadQueueContext) {
     }
   }
 
+  async function verifyExistingTickets(tasks: UploadTask[]): Promise<void> {
+    // Only definitely unstarted or confirmed-uncommitted files may receive a
+    // fresh reservation after an old ticket expires.
+    const checkedTickets = new Map<string, Map<string, UploadBatchStatus['items'][number]> | Error>()
+    for (const task of tasks) {
+      if (disposed) return
+      if (!task.ticket) continue
+      const key = uploadTicketKey(task.storageId, task.ticket)
+      if (!checkedTickets.has(key)) {
+        try {
+          const batch = await getUploadBatchStatus(task.ticket, task.storageId)
+          if (disposed) return
+          checkedTickets.set(key, indexUploadBatchItems(batch))
+        } catch (error) {
+          if (disposed) return
+          checkedTickets.set(key, error instanceof Error ? error : new Error(String(error)))
+        }
+      }
+      const checked = checkedTickets.get(key)!
+      if (checked instanceof Error) {
+        if (checked instanceof ApiError && checked.code === 'upload_batch_expired' && (!task.attempted || task.safeToPrepare)) {
+          task.ticket = undefined
+          task.targetPath = task.originalTargetPath ?? task.targetPath
+          task.relativePath = task.basePath && task.targetPath.startsWith(task.basePath + '/')
+            ? task.targetPath.slice(task.basePath.length + 1) : task.targetPath
+        } else if (task.attempted && !task.safeToPrepare) {
+          markUnconfirmed(task)
+        } else {
+          task.status = 'failed'
+          task.error = checked.message
+        }
+        continue
+      }
+      const item = checked.get(task.targetPath)
+      if (!item) { markUnconfirmed(task); continue }
+      if (item.status !== 'pending' && item.status !== 'failed') {
+        applyServerUploadState(task, item.status, item.operation)
+        if (item.status === 'in_progress' || item.status === 'unknown') void reconciliation.reconcile(task)
+      }
+    }
+  }
+
+  async function prepareMissingTickets(tasks: UploadTask[]): Promise<void> {
+    const prepareGroups = groupUploadTasksByStorage(tasks.filter(task => task.status === 'queued' && !task.ticket))
+    for (const [storageId, group] of prepareGroups) {
+      if (disposed) return
+      const limitError = batchLimitError(group)
+      if (limitError) {
+        for (const task of group) {
+          task.status = 'failed'
+          task.error = limitError
+        }
+        continue
+      }
+      for (const task of group) task.status = 'preparing'
+      try {
+        const prepared = await prepareUploadBatch(
+          group.map(task => ({ path: task.targetPath, size: task.file.size })),
+          storageId,
+        )
+        if (disposed) {
+          await cancelUploadBatch(prepared.ticket, storageId).catch(() => undefined)
+          return
+        }
+        const assignedPaths = new Map<string, string>()
+        for (const item of prepared.items ?? []) {
+          const originalPath = item.original_path
+          if (!assignedPaths.has(originalPath)) assignedPaths.set(originalPath, item.path)
+        }
+        for (const task of group) {
+          const assignedPath = assignedPaths.get(task.targetPath)
+          if (assignedPath !== undefined) {
+            task.targetPath = assignedPath
+            task.relativePath = task.basePath && assignedPath.startsWith(task.basePath + '/')
+              ? assignedPath.slice(task.basePath.length + 1) : assignedPath
+          }
+        }
+        const cancelledPaths = group
+          .filter(task => task.status === 'cancelled')
+          .map(task => task.targetPath)
+        if (cancelledPaths.length) {
+          await cancelUploadBatch(prepared.ticket, storageId, cancelledPaths).catch(() => undefined)
+        }
+        if (disposed) {
+          await cancelUploadBatch(prepared.ticket, storageId).catch(() => undefined)
+          return
+        }
+        for (const task of group) {
+          if (task.status === 'cancelled') continue
+          task.ticket = prepared.ticket
+          task.directUpload = prepared.upload_mode === 'direct'
+          if (task.status === 'preparing') task.status = 'queued'
+        }
+      } catch (error) {
+        if (disposed) return
+        const message = error instanceof Error ? error.message : locale.text('无法开始上传', 'Unable to start the upload')
+        for (const task of group) {
+          if (task.status !== 'preparing') continue
+          task.status = 'failed'
+          task.error = message
+        }
+        context.announce(message)
+      }
+    }
+  }
+
+  async function uploadPreparedTasks(tasks: UploadTask[], completedContexts: Set<string>): Promise<void> {
+    const groups = groupUploadTasksByTicket(tasks.filter(task => task.status === 'queued'))
+    for (const { tasks: group, ticket, storageId } of groups.values()) {
+      if (!storageId) continue
+      for (const task of group) {
+        if (disposed) return
+        if (task.status !== 'queued' || task.ticket !== ticket || task.storageId !== storageId) continue
+        task.status = 'uploading'
+        task.loaded = 0
+        task.error = ''
+        try {
+          currentUploadTaskId = task.id
+          currentUploadController = new AbortController()
+          task.attempted = true
+          task.safeToPrepare = false
+          await uploadFile(task.targetPath, task.file, loaded => { task.loaded = loaded }, task.storageId, ticket, currentUploadController.signal, task.directUpload)
+          if (disposed) return
+          if (task.cancelRequested || task.pauseRequested) {
+            await reconcileInterruptedUpload(task)
+          } else {
+            task.loaded = task.file.size
+            task.status = 'succeeded'
+            completedContexts.add(`${task.storageId}\u0000${task.basePath}`)
+          }
+        } catch (error) {
+          if (disposed) return
+          if (task.cancelRequested || task.pauseRequested) {
+            task.loaded = 0
+            await reconcileInterruptedUpload(task)
+          } else {
+            task.error = error instanceof Error ? error.message : locale.text('上传异常', 'Upload error')
+            if (error instanceof ApiError && error.blocksRetry) {
+              task.status = 'verifying'
+              task.retryBlocked = true
+              void reconciliation.reconcile(task)
+            } else {
+              task.status = 'failed'
+              task.retryBlocked = false
+              task.safeToPrepare = error instanceof ApiError && (error.code === 'upload_batch_expired' || error.operation?.commit === 'not_committed')
+              context.announce(task.error)
+            }
+          }
+        } finally {
+          currentUploadController = undefined
+          currentUploadTaskId = undefined
+        }
+      }
+    }
+  }
+
   async function runUploadTasks(taskIds: number[]): Promise<void> {
-    if (!taskIds.length || uploading.value) return
+    if (disposed || !taskIds.length || uploading.value) return
     const selectedIds = new Set(taskIds)
     const tasks = uploadTasks.value.filter(task => selectedIds.has(task.id) && task.status === 'queued')
     if (!tasks.length) return
     uploading.value = true
     const completedContexts = new Set<string>()
     try {
-      // Revalidate old tickets before resuming. Only definitely unstarted or
-      // confirmed-uncommitted files may receive a fresh reservation.
-      const checkedTickets = new Map<string, Awaited<ReturnType<typeof getUploadBatchStatus>> | Error>()
-      for (const task of tasks) {
-        if (!task.ticket) continue
-        const key = `${task.storageId}\u0000${task.ticket}`
-        if (!checkedTickets.has(key)) {
-          try { checkedTickets.set(key, await getUploadBatchStatus(task.ticket, task.storageId)) }
-          catch (error) { checkedTickets.set(key, error instanceof Error ? error : new Error(String(error))) }
-        }
-        const checked = checkedTickets.get(key)!
-        if (checked instanceof Error) {
-          if (checked instanceof ApiError && checked.code === 'upload_batch_expired' && (!task.attempted || task.safeToPrepare)) {
-            task.ticket = undefined
-            task.targetPath = task.originalTargetPath ?? task.targetPath
-            task.relativePath = task.basePath && task.targetPath.startsWith(task.basePath + '/')
-              ? task.targetPath.slice(task.basePath.length + 1) : task.targetPath
-          } else if (task.attempted && !task.safeToPrepare) {
-            markUnconfirmed(task)
-          } else {
-            task.status = 'failed'
-            task.error = checked.message
-          }
-          continue
-        }
-        const item = checked.items.find(item => item.path === task.targetPath)
-        if (!item) { markUnconfirmed(task); continue }
-        if (item.status !== 'pending' && item.status !== 'failed') {
-          applyServerUploadState(task, item.status, item.operation)
-          if (item.status === 'in_progress' || item.status === 'unknown') void reconcileUploadTask(task)
-        }
-      }
-      const tasksWithoutTicket = tasks.filter(task => task.status === 'queued' && !task.ticket)
-      const prepareGroups = new Map<string, UploadTask[]>()
-      for (const task of tasksWithoutTicket) {
-        prepareGroups.set(task.storageId, [...(prepareGroups.get(task.storageId) ?? []), task])
-      }
-      for (const [storageId, group] of prepareGroups) {
-        const limitError = batchLimitError(group)
-        if (limitError) {
-          for (const task of group) {
-            task.status = 'failed'
-            task.error = limitError
-          }
-          continue
-        }
-        for (const task of group) task.status = 'preparing'
-        try {
-          const prepared = await prepareUploadBatch(
-            group.map(task => ({ path: task.targetPath, size: task.file.size })),
-            storageId,
-          )
-          for (const task of group) {
-            const assigned = prepared.items?.find(item => item.original_path === task.targetPath)
-            if (assigned) {
-              task.targetPath = assigned.path
-              task.relativePath = task.basePath && assigned.path.startsWith(task.basePath + '/')
-                ? assigned.path.slice(task.basePath.length + 1) : assigned.path
-            }
-          }
-          if (disposed) {
-            await cancelUploadBatch(prepared.ticket, storageId).catch(() => undefined)
-            for (const task of group) {
-              if (task.status === 'preparing') task.status = 'queued'
-            }
-            continue
-          }
-          const cancelledPaths = group
-            .filter(task => task.status === 'cancelled')
-            .map(task => task.targetPath)
-          if (cancelledPaths.length) {
-            await cancelUploadBatch(prepared.ticket, storageId, cancelledPaths).catch(() => undefined)
-          }
-          for (const task of group) {
-            if (task.status === 'cancelled') continue
-            task.ticket = prepared.ticket
-            task.directUpload = prepared.upload_mode === 'direct'
-            if (task.status === 'preparing') task.status = 'queued'
-          }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : locale.text('无法开始上传', 'Unable to start the upload')
-          for (const task of group) {
-            if (task.status !== 'preparing') continue
-            task.status = 'failed'
-            task.error = message
-          }
-          context.announce(message)
-        }
-      }
-      const groups = new Map<string, UploadTask[]>()
-      for (const task of tasks) {
-        if (task.status !== 'queued' || !task.ticket) continue
-        const key = `${task.storageId}\u0000${task.ticket}`
-        groups.set(key, [...(groups.get(key) ?? []), task])
-      }
-      for (const group of groups.values()) {
-        const ticket = group[0]?.ticket
-        const storageId = group[0]?.storageId
-        if (!ticket || !storageId) continue
-        for (const task of group) {
-          if (task.status !== 'queued' || task.ticket !== ticket || task.storageId !== storageId) continue
-          task.status = 'uploading'
-          task.loaded = 0
-          task.error = ''
-          try {
-            currentUploadTaskId = task.id
-            currentUploadController = new AbortController()
-            task.attempted = true
-            task.safeToPrepare = false
-            await uploadFile(task.targetPath, task.file, loaded => { task.loaded = loaded }, task.storageId, ticket, currentUploadController.signal, task.directUpload)
-            if (task.cancelRequested) {
-              task.status = 'verifying'
-              task.error = locale.text('正在确认终止后的实际结果', 'Checking the result after termination')
-              await requestCancellationAndReconcile(task)
-            } else if (task.pauseRequested) {
-              task.status = 'verifying'
-              task.error = locale.text('正在确认暂停后的实际结果', 'Checking the result after pausing')
-              await reconcileUploadTask(task)
-            } else {
-              task.loaded = task.file.size
-              task.status = 'succeeded'
-              completedContexts.add(`${task.storageId}\u0000${task.basePath}`)
-            }
-          } catch (error) {
-            if (task.cancelRequested) {
-              task.status = 'verifying'
-              task.loaded = 0
-              task.error = locale.text('正在确认终止后的实际结果', 'Checking the result after termination')
-              await requestCancellationAndReconcile(task)
-            } else if (task.pauseRequested) {
-              task.status = 'verifying'
-              task.loaded = 0
-              task.error = locale.text('正在确认暂停后的实际结果', 'Checking the result after pausing')
-              await reconcileUploadTask(task)
-            } else {
-              task.error = error instanceof Error ? error.message : locale.text('上传异常', 'Upload error')
-              if (error instanceof ApiError && error.blocksRetry) {
-                task.status = 'verifying'
-                task.retryBlocked = true
-                void reconcileUploadTask(task)
-              } else {
-                task.status = 'failed'
-                task.retryBlocked = false
-                task.safeToPrepare = error instanceof ApiError && (error.code === 'upload_batch_expired' || error.operation?.commit === 'not_committed')
-                context.announce(task.error)
-              }
-            }
-          } finally {
-            currentUploadController = undefined
-            currentUploadTaskId = undefined
-          }
-        }
-      }
+      // A fresh queue must enter "preparing" synchronously, as it did before
+      // this phase was extracted; avoid an extra await when no ticket exists.
+      if (tasks.some(task => task.ticket)) await verifyExistingTickets(tasks)
+      if (disposed) return
+      if (tasks.some(task => task.status === 'queued' && !task.ticket)) await prepareMissingTickets(tasks)
+      if (disposed) return
+      if (tasks.some(task => task.status === 'queued' && task.ticket)) await uploadPreparedTasks(tasks, completedContexts)
     } catch (error) {
+      if (disposed) return
       const message = error instanceof Error ? error.message : locale.text('无法开始上传', 'Unable to start the upload')
       for (const task of tasks.filter(task => task.status === 'preparing' || task.status === 'queued')) {
         task.status = 'failed'
@@ -307,7 +344,7 @@ export function useUploadQueue(context: UploadQueueContext) {
     } finally {
       uploading.value = false
       if (!disposed) {
-        if (completedContexts.has(`${context.storageId.value}\u0000${context.path.value}`)) await context.refresh()
+        if (completedContexts.has(`${context.storageId.value}\u0000${context.path.value}`)) requestContextRefresh()
         const pending = uploadTasks.value.filter(task => task.status === 'queued').map(task => task.id)
         if (pending.length) void runUploadTasks(pending)
       }
@@ -315,9 +352,10 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   function retryUpload(id: number): void {
+    if (disposed) return
     const task = uploadTasks.value.find(item => item.id === id && item.status === 'failed')
     if (!task) return
-    if (task.retryBlocked) {
+    if (!canUploadTaskAction(task, 'retry')) {
       context.announce(task.error)
       return
     }
@@ -331,6 +369,7 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   function removeFailedUpload(id: number): void {
+    if (disposed) return
     const removed = uploadTasks.value.find(task => task.id === id && task.status === 'failed')
     uploadTasks.value = uploadTasks.value.filter(task => task !== removed)
     if (removed) releaseUnusedUploadTickets([removed])
@@ -341,9 +380,10 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   function pauseUploads(taskIds: number[]): void {
+    if (disposed) return
     const selectedIds = new Set(taskIds)
     for (const task of uploadTasks.value) {
-      if (!selectedIds.has(task.id)) continue
+      if (!selectedIds.has(task.id) || !canUploadTaskAction(task, 'pause')) continue
       if (task.status === 'preparing' || task.status === 'queued') {
         task.pauseRequested = true
         task.status = 'paused'
@@ -359,10 +399,11 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   function resumeUploads(taskIds: number[]): void {
+    if (disposed) return
     const selectedIds = new Set(taskIds)
     const ids: number[] = []
     for (const task of uploadTasks.value) {
-      if (!selectedIds.has(task.id) || task.status !== 'paused') continue
+      if (!selectedIds.has(task.id) || !canUploadTaskAction(task, 'resume')) continue
       task.status = 'queued'
       task.error = ''
       task.pauseRequested = false
@@ -372,11 +413,11 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   function terminateUploads(taskIds: number[]): void {
+    if (disposed) return
     const selectedIds = new Set(taskIds)
-    const selectedTasks = uploadTasks.value.filter(task => selectedIds.has(task.id))
-    if (!selectedTasks.some(task => ['preparing', 'queued', 'uploading', 'paused'].includes(task.status))) return
+    const selectedTasks = uploadTasks.value.filter(task => selectedIds.has(task.id) && canUploadTaskAction(task, 'terminate'))
+    if (!selectedTasks.length) return
     for (const task of selectedTasks) {
-      if (!['preparing', 'queued', 'uploading', 'paused'].includes(task.status)) continue
       task.cancelRequested = true
       task.pauseRequested = false
       task.status = task.status === 'uploading' ? 'verifying' : 'cancelled'
@@ -385,153 +426,100 @@ export function useUploadQueue(context: UploadQueueContext) {
         ? locale.text('正在确认终止后的实际结果', 'Checking the result after termination')
         : locale.text('任务已终止', 'Task terminated')
     }
-    if (currentUploadTaskId !== undefined && selectedIds.has(currentUploadTaskId)) {
+    if (selectedTasks.some(task => task.id === currentUploadTaskId)) {
       currentUploadController?.abort()
     }
     cancelPendingUploadItems(selectedTasks)
   }
 
   function clearUploadTasks(taskIds: number[]): void {
+    if (disposed) return
     const selectedIds = new Set(taskIds)
     const removedTasks = uploadTasks.value.filter(task => selectedIds.has(task.id))
-    if (removedTasks.some(task => ['preparing', 'queued', 'uploading', 'paused', 'verifying'].includes(task.status))) return
+    if (!removedTasks.length || removedTasks.some(task => !canUploadTaskAction(task, 'clear'))) return
     uploadTasks.value = uploadTasks.value.filter(task => !selectedIds.has(task.id))
     releaseUnusedUploadTickets(removedTasks)
   }
 
   function releaseUnusedUploadTickets(tasks: UploadTask[]): void {
-    const tickets = new Map<string, { ticket: string; storageId: string }>()
-    for (const task of tasks) {
-      if (!task.ticket) continue
-      tickets.set(`${task.storageId}\u0000${task.ticket}`, { ticket: task.ticket, storageId: task.storageId })
+    const neededTickets = new Set<string>()
+    for (const task of uploadTasks.value) {
+      if (task.ticket && task.status !== 'succeeded' && task.status !== 'cancelled') {
+        neededTickets.add(uploadTicketKey(task.storageId, task.ticket))
+      }
     }
-    for (const { ticket, storageId } of tickets.values()) {
-      const stillNeeded = uploadTasks.value.some(task => task.storageId === storageId && task.ticket === ticket && task.status !== 'succeeded' && task.status !== 'cancelled')
-      if (!stillNeeded) void cancelUploadBatch(ticket, storageId).catch(() => undefined)
+    for (const [key, { ticket, storageId }] of groupUploadTasksByTicket(tasks)) {
+      if (!neededTickets.has(key)) void cancelUploadBatch(ticket, storageId).catch(() => undefined)
     }
   }
 
   function cancelPendingUploadItems(tasks: UploadTask[]): void {
-    const tickets = new Map<string, { ticket: string; storageId: string; paths: string[] }>()
-    for (const task of tasks) {
-      if (!task.ticket || task.status === 'verifying') continue
-      const key = `${task.storageId}\u0000${task.ticket}`
-      const group = tickets.get(key) ?? { ticket: task.ticket, storageId: task.storageId, paths: [] }
-      group.paths.push(task.targetPath)
-      tickets.set(key, group)
-    }
-    for (const { ticket, storageId, paths } of tickets.values()) {
-      void cancelUploadBatch(ticket, storageId, paths).catch(() => undefined)
+    const groups = groupUploadTasksByTicket(tasks.filter(task => task.status !== 'verifying'))
+    for (const { ticket, storageId, tasks: group } of groups.values()) {
+      void cancelUploadBatch(ticket, storageId, group.map(task => task.targetPath)).catch(() => undefined)
     }
   }
 
   async function requestCancellationAndReconcile(task: UploadTask): Promise<void> {
+    if (disposed) return
     if (!task.ticket) {
       markUnconfirmed(task)
       return
     }
     await cancelUploadBatch(task.ticket, task.storageId, [task.targetPath]).catch(() => undefined)
-    await reconcileUploadTask(task)
+    await reconciliation.reconcile(task)
   }
 
-  async function reconcileUploadTask(task: UploadTask, attempt = 0): Promise<void> {
-    if (disposed || !task.ticket || !uploadTasks.value.includes(task)) return
-    try {
-      const batch = await getUploadBatchStatus(task.ticket, task.storageId)
-      if (disposed || !uploadTasks.value.includes(task)) return
-      const item = batch.items.find(candidate => candidate.path === task.targetPath)
-      if (!item) {
-        scheduleReconcile(task, attempt)
-        return
-      }
-      applyServerUploadState(task, item.status, item.operation)
-      if (item.status === 'in_progress' || item.status === 'unknown') scheduleReconcile(task, attempt)
-    } catch {
-      scheduleReconcile(task, attempt)
-    }
-  }
-
-  function scheduleReconcile(task: UploadTask, attempt: number): void {
-    if (disposed || !uploadTasks.value.includes(task)) return
-    const delay = reconcileDelays[attempt]
-    if (delay === undefined) {
-      markUnconfirmed(task)
-      return
-    }
-    const timer = window.setTimeout(() => {
-      reconcileTimers.delete(timer)
-      void reconcileUploadTask(task, attempt + 1)
-    }, delay)
-    reconcileTimers.add(timer)
+  async function reconcileInterruptedUpload(task: UploadTask): Promise<void> {
+    task.status = 'verifying'
+    task.error = task.cancelRequested
+      ? locale.text('正在确认终止后的实际结果', 'Checking the result after termination')
+      : locale.text('正在确认暂停后的实际结果', 'Checking the result after pausing')
+    if (task.cancelRequested) await requestCancellationAndReconcile(task)
+    else await reconciliation.reconcile(task)
   }
 
   function applyServerUploadState(task: UploadTask, status: UploadBatchItemState, operation?: ApiError['operation']): void {
-    if (status === 'cancelled' && operation?.commit === 'unknown') {
-      task.status = 'cancelled'
-      task.retryBlocked = true
-      task.safeToPrepare = false
-      task.cancelRequested = false
-      task.pauseRequested = false
-      task.error = locale.text('系统正在自动确认上传结果，请稍后查看', 'The server is automatically checking the upload result; check again shortly')
-      return
-    }
-    task.retryBlocked = false
-    task.safeToPrepare = status === 'pending' || status === 'failed' || status === 'cancelled'
-    if (status === 'complete') {
-      task.loaded = task.file.size
-      task.status = 'succeeded'
-      task.error = operation?.cleanup !== 'complete'
-        ? locale.text('上传成功，临时数据仍在后台清理', 'Upload succeeded; temporary data is being cleaned up')
-        : ''
-      task.cancelRequested = false
-      task.pauseRequested = false
-      refreshTaskContext(task)
-      return
-    }
-    if (status === 'unknown') {
-      markUnconfirmed(task)
-      return
-    }
-    if (status === 'in_progress') {
-      task.status = 'verifying'
-      task.retryBlocked = true
-      task.error = locale.text('操作仍在服务端执行，正在确认结果', 'The operation is still running on the server')
-      return
-    }
-    if (status === 'cancelled' || (status === 'failed' && task.cancelRequested)) {
-      task.status = 'cancelled'
-      task.loaded = 0
-      task.error = locale.text('任务已终止，服务端确认未提交', 'Task terminated; the server confirmed it was not committed')
-      task.cancelRequested = false
-      task.pauseRequested = false
-      return
-    }
-    if ((status === 'pending' || status === 'failed') && task.pauseRequested) {
-      task.status = 'paused'
-      task.loaded = 0
-      task.error = ''
-      task.pauseRequested = false
-      return
-    }
-    task.status = 'failed'
-    task.loaded = 0
-    task.error = status === 'pending'
-      ? locale.text('服务端确认上传尚未开始，可以重试', 'The server confirmed the upload did not start; it can be retried')
-      : locale.text('服务端确认上传失败，可以重试', 'The server confirmed the upload failed; it can be retried')
-    task.cancelRequested = false
-    task.pauseRequested = false
+    if (disposed) return
+    applyUploadServerState(task, status, operation, locale.text)
+    if (status === 'complete') refreshTaskContext(task)
+    if (status === 'unknown') context.announce(task.error)
   }
 
   function markUnconfirmed(task: UploadTask): void {
-    task.status = 'verifying'
-    task.retryBlocked = true
-    task.error = locale.text('系统正在自动确认上传结果或清理临时数据，请稍后查看', 'The server is checking the upload result or cleaning temporary data; check again shortly')
+    if (disposed) return
+    markUploadUnconfirmed(task, locale.text)
     context.announce(task.error)
   }
 
   function refreshTaskContext(task: UploadTask): void {
-    if (task.storageId === context.storageId.value && task.basePath === context.path.value) {
-      void context.refresh()
+    if (!disposed && task.storageId === context.storageId.value && task.basePath === context.path.value) {
+      requestContextRefresh()
+    }
+  }
+
+  function requestContextRefresh(): void {
+    if (disposed) return
+    pendingRefresh = { storageId: context.storageId.value, basePath: context.path.value }
+    if (!refreshing) void refreshUploadContext()
+  }
+
+  async function refreshUploadContext(): Promise<void> {
+    refreshing = true
+    try {
+      while (!disposed && pendingRefresh) {
+        const destination = pendingRefresh
+        pendingRefresh = undefined
+        if (destination.storageId !== context.storageId.value || destination.basePath !== context.path.value) continue
+        try { await context.refresh() }
+        catch (error) {
+          if (!disposed && destination.storageId === context.storageId.value && destination.basePath === context.path.value) {
+            context.announce(error instanceof Error ? error.message : locale.text('目录加载失败', 'Unable to load this folder'))
+          }
+        }
+      }
+    } finally {
+      refreshing = false
     }
   }
 
@@ -539,11 +527,17 @@ export function useUploadQueue(context: UploadQueueContext) {
     uploadDragDepth = 0
     uploadDropActive.value = false
     const transfer = event.dataTransfer
-    if (!transfer || !context.requireUpload()) return
+    if (disposed || !transfer || !context.requireUpload()) return
+    const destination = { storageId: context.storageId.value, basePath: context.path.value }
+    const controller = new AbortController()
+    selectionControllers.add(controller)
     try {
-      await queueUploads(await candidatesFromDrop(transfer))
+      const candidates = await candidatesFromDrop(transfer, { signal: controller.signal })
+      await queueUploads(candidates, destination)
     } catch (error) {
-      context.announce(error instanceof Error ? error.message : locale.text('无法读取拖放内容', 'Unable to read the dropped items'))
+      announceSelectionError(error)
+    } finally {
+      selectionControllers.delete(controller)
     }
   }
 
@@ -582,15 +576,12 @@ export function useUploadQueue(context: UploadQueueContext) {
 
   function disposeUploads(): void {
     disposed = true
+    for (const controller of selectionControllers) controller.abort()
+    selectionControllers.clear()
     currentUploadController?.abort()
-    for (const timer of reconcileTimers) window.clearTimeout(timer)
-    reconcileTimers.clear()
-    const tickets = new Map<string, { ticket: string; storageId: string }>()
-    for (const task of uploadTasks.value) {
-      if (!task.ticket) continue
-      tickets.set(`${task.storageId}\u0000${task.ticket}`, { ticket: task.ticket, storageId: task.storageId })
-    }
-    for (const { ticket, storageId } of tickets.values()) {
+    reconciliation.dispose()
+    pendingRefresh = undefined
+    for (const { ticket, storageId } of groupUploadTasksByTicket(uploadTasks.value).values()) {
       void cancelUploadBatch(ticket, storageId).catch(() => undefined)
     }
   }

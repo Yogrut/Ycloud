@@ -18,6 +18,8 @@ const adminInfo = {
 }
 
 afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
   document.body.replaceChildren()
   window.history.replaceState(null, '', '/')
@@ -32,6 +34,126 @@ function mountAdmin(host: HTMLElement) {
 }
 
 describe('AdminView', () => {
+  it.each(['/admin/limits', '/admin/limits/'])('uses the normalized navigation route %s', async path => {
+    window.history.replaceState(null, '', path)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), { headers: { 'Content-Type': 'application/json' } })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountAdmin(host)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await nextTick()
+      expect(host.querySelector('#limits-title')?.textContent).toBe('传输限制')
+      expect(host.querySelector<HTMLAnchorElement>('.admin-nav-item.active')?.getAttribute('href')).toBe('/admin/limits')
+      expect(host.querySelector('.admin-nav-item.active')?.getAttribute('aria-current')).toBe('page')
+    } finally { app.unmount() }
+  })
+
+  it('keeps the settings page mounted during a confirmed save refresh and reports a read failure separately', async () => {
+    window.history.replaceState(null, '', '/admin/limits')
+    let finishRead!: (response: Response) => void
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(adminInfo), { headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        settings: {
+          total: { enabled: false, upload: 0, download: 0 }, guest: { enabled: false, upload: 0, download: 0 },
+          users_total: { enabled: false, upload: 0, download: 0 }, users: {},
+          cycle: { unit: 'months', every: 1, anchor: 0, offset_minutes: 0 },
+        },
+        total: { upload: 0, download: 0 }, guest: { upload: 0, download: 0 }, users_total: { upload: 0, download: 0 },
+        users: {}, days: {}, next_reset: 0,
+      }), { headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }))
+      .mockImplementationOnce(() => new Promise<Response>(resolve => { finishRead = resolve }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountAdmin(host)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await nextTick()
+      const page = host.querySelector('.limits-pane')
+      expect(page).not.toBeNull()
+      host.querySelectorAll<HTMLButtonElement>('.setting-row button')[4]!.click()
+      await nextTick()
+      const input = host.querySelector<HTMLInputElement>('.settings-drawer input')!
+      input.value = '1'
+      input.dispatchEvent(new Event('input'))
+      host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await nextTick()
+      expect(fetchMock).toHaveBeenCalledTimes(4)
+      expect(fetchMock.mock.calls[2]![0]).toBe('/api/admin/limits')
+      expect(JSON.parse(fetchMock.mock.calls[2]![1].body)).toMatchObject({ upload_rate_bytes_per_sec: 1024 ** 2 })
+      expect(host.querySelector('.limits-pane')).toBe(page)
+      expect(host.querySelector('#limits-title')?.textContent).toBe('传输限制')
+      expect(host.querySelector('.admin-loading')).toBeNull()
+      expect(document.querySelector('.app-toast.success')?.textContent).toContain('已保存')
+      finishRead(new Response(JSON.stringify({ error: { message: 'Refresh unavailable' } }), { status: 500, headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await nextTick()
+      expect(host.querySelector('.limits-pane')).toBe(page)
+      expect(document.querySelector('.app-toast.error')?.textContent).toContain('Refresh unavailable')
+      expect(fetchMock).toHaveBeenCalledTimes(4)
+    } finally { app.unmount() }
+  })
+
+  it('keeps a submitted login running after unmount without requesting administrator information', async () => {
+    let finishLogin!: (response: Response) => void
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'Unauthorized' } }), { status: 401, headers: { 'Content-Type': 'application/json' } }))
+      .mockImplementationOnce(() => new Promise<Response>(resolve => { finishLogin = resolve }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountAdmin(host)
+    let mounted = true
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await nextTick()
+      const username = host.querySelector<HTMLInputElement>('input[autocomplete="username"]')!
+      username.value = ' admin '
+      username.dispatchEvent(new Event('input'))
+      const password = host.querySelector<HTMLInputElement>('input[autocomplete="current-password"]')!
+      password.value = '  current-password  '
+      password.dispatchEvent(new Event('input'))
+      const form = host.querySelector('form')!
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(JSON.parse(fetchMock.mock.calls[1]![1].body)).toEqual({ username: 'admin', password: '  current-password  ' })
+      const signal = fetchMock.mock.calls[1]![1].signal as AbortSignal
+      app.unmount()
+      mounted = false
+      expect(signal.aborted).toBe(false)
+      finishLogin(new Response(JSON.stringify({ success: true, is_admin: true }), { headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(signal.aborted).toBe(false)
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(document.querySelector('.app-toast')).toBeNull()
+    } finally { if (mounted) app.unmount() }
+  })
+
+  it('shows a background configuration read error while retaining the storage page', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+    window.history.replaceState(null, '', '/admin/storage')
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(adminInfo), { headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'Configuration unavailable' } }), { status: 500, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountAdmin(host)
+    try {
+      await vi.advanceTimersByTimeAsync(0)
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(300_000)
+      await nextTick()
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(host.querySelector('#storage-title')?.textContent).toBe('存储设置')
+      expect(document.querySelector('.app-toast.error')?.textContent).toContain('Configuration unavailable')
+      expect(host.querySelector('.admin-login-shell')).toBeNull()
+    } finally { app.unmount() }
+  })
+
   it('shows the administrator login gate when the session is absent', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
       error: { message: 'Unauthorized' },

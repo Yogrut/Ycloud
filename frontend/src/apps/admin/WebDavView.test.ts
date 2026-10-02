@@ -36,6 +36,96 @@ function respondJson(body: unknown): Response {
 }
 
 describe('WebDavView', () => {
+  it('uses the same differences for button state and the revision-bound update', async () => {
+    const original = { ...mountView, revision: 'edit-revision' }
+    const fetchMock = vi.fn().mockResolvedValue(respondJson(original))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const { app, changed } = mountWebDav(host, [original])
+    try {
+      host.querySelector<HTMLButtonElement>('[aria-label="编辑 WebDAV 挂载"]')!.click()
+      await nextTick()
+      const confirm = host.querySelector<HTMLButtonElement>('.modal-actions button[type="submit"]')!
+      const form = host.querySelector('form')!
+      expect(confirm.disabled).toBe(true)
+      const path = host.querySelector<HTMLInputElement>('.webdav-path-field input')!
+      path.value = '\\files//'
+      path.dispatchEvent(new Event('input'))
+      await nextTick()
+      expect(confirm.disabled).toBe(true)
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      expect(fetchMock).not.toHaveBeenCalled()
+      const name = host.querySelector<HTMLInputElement>('.webdav-name-field input')!
+      name.value = ' photos '
+      name.dispatchEvent(new Event('input'))
+      await nextTick()
+      expect(confirm.disabled).toBe(false)
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toEqual({ expected_revision: 'edit-revision', name: 'photos' })
+      expect(changed).toHaveBeenCalledWith('WebDAV 挂载“photos”已更新')
+      expect(original.name).toBe('media')
+    } finally { app.unmount() }
+  })
+
+  it('keeps absent credentials omitted while editing a disabled mount', async () => {
+    const original = { ...mountView, revision: 'edit-revision', username: null, has_password: false, webdav_enabled: false }
+    const fetchMock = vi.fn().mockResolvedValue(respondJson(original))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const { app } = mountWebDav(host, [original])
+    try {
+      host.querySelector<HTMLButtonElement>('[aria-label="编辑 WebDAV 挂载"]')!.click()
+      await nextTick()
+      expect(host.querySelector<HTMLInputElement>('.webdav-password-field input')!.value).toBe('')
+      const readonly = host.querySelectorAll<HTMLInputElement>('.webdav-options input')[1]!
+      readonly.checked = true
+      readonly.dispatchEvent(new Event('change'))
+      host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toEqual({ expected_revision: 'edit-revision', readonly: true })
+    } finally { app.unmount() }
+  })
+
+  it('suppresses duplicate updates and retains the draft after a definite rejection for manual retry', async () => {
+    let finish!: (response: Response) => void
+    const original = { ...mountView, revision: 'edit-revision' }
+    const fetchMock = vi.fn().mockImplementationOnce(() => new Promise<Response>(resolve => { finish = resolve }))
+      .mockResolvedValueOnce(respondJson(original))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const { app, changed } = mountWebDav(host, [original])
+    try {
+      host.querySelector<HTMLButtonElement>('[aria-label="编辑 WebDAV 挂载"]')!.click()
+      await nextTick()
+      const readonly = host.querySelectorAll<HTMLInputElement>('.webdav-options input')[1]!
+      readonly.checked = true
+      readonly.dispatchEvent(new Event('change'))
+      const form = host.querySelector('form')!
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      await nextTick()
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(changed).not.toHaveBeenCalled()
+      expect(host.querySelector<HTMLButtonElement>('.modal-actions button[type="submit"]')!.disabled).toBe(true)
+      finish(new Response(JSON.stringify({ error: { code: 'access_denied', message: 'Mount edit denied' } }), { status: 403, headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(document.querySelector('.app-toast.error')?.textContent).toContain('Mount edit denied')
+      expect(host.querySelector('form')).not.toBeNull()
+      expect(changed).not.toHaveBeenCalled()
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      for (const call of fetchMock.mock.calls) expect(JSON.parse(call[1].body)).toEqual({ expected_revision: 'edit-revision', readonly: true })
+      expect(changed).toHaveBeenCalledTimes(1)
+      expect(host.querySelector('form')).toBeNull()
+    } finally { app.unmount() }
+  })
+
   it('marks credentials required only when enabling a new mount', async () => {
     const host = document.createElement('div')
     document.body.append(host)
@@ -47,6 +137,7 @@ describe('WebDavView', () => {
     expect(username.getAttribute('aria-required')).toBe('true')
     expect(password.getAttribute('aria-required')).toBe('true')
     const enabled = host.querySelector<HTMLInputElement>('.webdav-options input')!
+    expect([...host.querySelectorAll('.webdav-options [role="switch"]')].map(input => input.getAttribute('aria-label'))).toEqual(['启动', '只读'])
     enabled.checked = false
     enabled.dispatchEvent(new Event('change'))
     await nextTick()

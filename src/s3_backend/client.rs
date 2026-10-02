@@ -138,6 +138,11 @@ impl S3Backend {
     /// user traffic. The probe is confined to Ycloud's reserved prefix and
     /// is journaled before either test object can be created.
     pub async fn activation_probe(&self) -> AppResult<()> {
+        let backend = self.scoped_work(None, None);
+        Box::pin(backend.activation_probe_scoped()).await
+    }
+
+    async fn activation_probe_scoped(&self) -> AppResult<()> {
         self.probe().await.map_err(|error| {
             capability_failure(
                 capabilities::PREFIX_LIST,
@@ -145,9 +150,12 @@ impl S3Backend {
                 error,
             )
         })?;
-        let _mutation = self.mutation_gate.lock().await;
+        let _mutation = self
+            .maintenance
+            .read(async { Ok(self.mutation_gate.lock().await) })
+            .await?;
         let recovered = self
-            .recover_activation_probe_intents()
+            .recover_journal_category(super::recovery::JournalKind::ActivationProbe)
             .await
             .map_err(|error| {
                 capability_failure(

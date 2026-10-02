@@ -38,7 +38,7 @@ pub(super) fn publish(
     refresh_backup: bool,
     mut checkpoint: impl FnMut(CommitStage) -> std::io::Result<()>,
 ) -> anyhow::Result<ConfigCommit> {
-    let backup = super::persistence::config_backup_path(path);
+    let backup = config_backup_path(path);
     publish_with_backup(
         path,
         &backup,
@@ -47,6 +47,10 @@ pub(super) fn publish(
         refresh_backup,
         &mut checkpoint,
     )
+}
+
+pub(super) fn config_backup_path(path: &Path) -> PathBuf {
+    path.with_extension("json.bak")
 }
 
 pub(super) fn publish_with_backup(
@@ -165,10 +169,7 @@ mod tests {
         let result = publish(&path, b"second", true, false, |_| Ok(())).unwrap();
         assert_eq!(result.durability, ConfigDurability::Confirmed);
         assert_eq!(fs::read(&path).unwrap(), b"second");
-        assert_eq!(
-            fs::read(super::super::persistence::config_backup_path(&path)).unwrap(),
-            b"first"
-        );
+        assert_eq!(fs::read(config_backup_path(&path)).unwrap(), b"first");
     }
 
     #[test]
@@ -223,9 +224,6 @@ mod tests {
         .unwrap();
         assert_eq!(publications, 1);
         assert!(!outcome.backup_refresh_pending);
-        assert_eq!(
-            fs::read(super::super::persistence::config_backup_path(&path)).unwrap(),
-            b"current"
-        );
+        assert_eq!(fs::read(config_backup_path(&path)).unwrap(), b"current");
     }
 }

@@ -34,13 +34,110 @@ afterEach(() => {
   document.body.replaceChildren()
 })
 
-function mountUsers(host: HTMLElement) {
-  const app = createApp(UsersView, { info })
+function mountUsers(host: HTMLElement, adminInfo = info, onChanged?: (message: string) => void) {
+  const app = createApp(UsersView, { info: adminInfo, onChanged })
   app.mount(host)
   return app
 }
 
 describe('UsersView', () => {
+  it('submits only the edit revision when permission fields have a different insertion order', async () => {
+    const original = info.user_accounts![0]!
+    const permission = original.permissions[0]!
+    const reordered = {
+      delete: permission.delete, copy: permission.copy, move_items: permission.move_items,
+      rename: permission.rename, create_directory: permission.create_directory, upload: permission.upload,
+      download: permission.download, browse: permission.browse, storage_id: permission.storage_id,
+    }
+    const adminInfo = { ...info, user_accounts: [{ ...original, revision: 'edit-revision', permissions: [reordered] }] }
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(original), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountUsers(host, adminInfo)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      host.querySelector<HTMLButtonElement>('[aria-label="编辑"]')!.click()
+      await nextTick()
+      host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(fetchMock.mock.calls[0]![0]).toBe('/api/admin/users/reader')
+      expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toEqual({ expected_revision: 'edit-revision' })
+      expect(original.permissions[0]!.download).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('keeps a rejected edit as a draft and permits one explicit retry, suppressing duplicate submissions', async () => {
+    let finish!: (response: Response) => void
+    const fetchMock = vi.fn().mockImplementationOnce(() => new Promise<Response>(resolve => { finish = resolve }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(info.user_accounts![0]), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const changed = vi.fn()
+    const host = document.createElement('div')
+    document.body.append(host)
+    const adminInfo = { ...info, user_accounts: [{ ...info.user_accounts![0]!, revision: 'edit-revision' }] }
+    const app = mountUsers(host, adminInfo, changed)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      host.querySelector<HTMLButtonElement>('[aria-label="编辑"]')!.click()
+      await nextTick()
+      const username = host.querySelector<HTMLInputElement>('.user-basic-grid input')!
+      username.value = ' renamed '
+      username.dispatchEvent(new Event('input'))
+      const form = host.querySelector('form')!
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      await nextTick()
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(changed).not.toHaveBeenCalled()
+      const body = JSON.parse(fetchMock.mock.calls[0]![1].body)
+      expect(body).toEqual({ expected_revision: 'edit-revision', username: 'renamed' })
+      finish(new Response(JSON.stringify({ error: { code: 'access_denied', message: 'Edit denied' } }), { status: 403, headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(host.querySelector('.user-editor')).not.toBeNull()
+      expect(username.value).toBe(' renamed ')
+      expect(document.querySelector('.app-toast.error')?.textContent).toContain('Edit denied')
+      expect(changed).not.toHaveBeenCalled()
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      form.dispatchEvent(new Event('submit', { cancelable: true }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(JSON.parse(fetchMock.mock.calls[1]![1].body)).toEqual(body)
+      expect(changed).toHaveBeenCalledTimes(1)
+      expect(host.querySelector('.user-editor')).toBeNull()
+      expect(adminInfo.user_accounts[0]!.username).toBe('reader')
+    } finally { app.unmount() }
+  })
+
+  it('keeps permission cancellation local and reopening restores the persisted account grants', async () => {
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountUsers(host)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const edit = host.querySelector<HTMLButtonElement>('[aria-label="编辑"]')!
+      edit.click()
+      await nextTick()
+      host.querySelector<HTMLButtonElement>('.storage-grant-heading')!.click()
+      await nextTick()
+      host.querySelector<HTMLInputElement>('.storage-access-option input')!.click()
+      await nextTick()
+      expect(info.user_accounts![0]!.permissions[0]!.download).toBe(true)
+      host.querySelector<HTMLButtonElement>('.modal-actions .secondary')!.click()
+      await nextTick()
+      edit.click()
+      await nextTick()
+      host.querySelector<HTMLButtonElement>('.storage-grant-heading')!.click()
+      await nextTick()
+      expect(host.querySelector<HTMLInputElement>('.storage-access-option input')!.checked).toBe(true)
+      expect(host.querySelector<HTMLInputElement>('.storage-grant-option input')!.checked).toBe(true)
+      expect(fetchMock).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
   it('keeps switches as drafts and clears action permissions when storage access is turned off', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('{}', {headers:{'Content-Type':'application/json'}}))
     vi.stubGlobal('fetch',fetchMock)

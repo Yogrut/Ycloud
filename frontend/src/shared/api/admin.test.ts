@@ -7,6 +7,7 @@ import {
   deleteWebDavMount,
   getAdminInfo,
   getDomainBinding,
+  getTraffic,
   getLoginEvents,
   updateAccount,
   updateFolderLock,
@@ -24,6 +25,17 @@ import {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('admin API', () => {
+  it.each([
+    [{ days: 7 }, 'days=7'],
+    [{ start: '2026-09-26', end: '2026-10-02' }, 'start=2026-09-26&end=2026-10-02'],
+    [{}, ''],
+  ] as const)('serializes traffic range %j without deriving browser dates', async (range, query) => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    await getTraffic(range)
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith('/api/admin/traffic?' + query, expect.objectContaining({ credentials: 'same-origin' }))
+  })
+
   it('cancels an obsolete administrator info read through the shared client', async () => {
     const fetchMock = vi.fn().mockImplementation(() => new Promise<Response>(() => {}))
     vi.stubGlobal('fetch', fetchMock)

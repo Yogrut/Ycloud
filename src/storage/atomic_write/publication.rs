@@ -55,6 +55,9 @@ impl AtomicFileWriter {
                 "Uploaded size does not match Content-Length".into(),
             ));
         }
+        let started = std::time::Instant::now();
+        self.flush_buffer().await?;
+        let buffered = std::time::Instant::now();
         let file = self
             .file
             .as_ref()
@@ -62,8 +65,10 @@ impl AtomicFileWriter {
         file.sync_all()
             .await
             .map_err(|error| AppError::with_source("failed to flush upload", error))?;
+        let synced = std::time::Instant::now();
         self.file.take();
         let _mutation = self.mutation_gate.lock().await;
+        let admitted = std::time::Instant::now();
         let result = self
             .transactions
             .commit_file_with_operation(
@@ -81,7 +86,19 @@ impl AtomicFileWriter {
                 size: self.bytes_written,
                 previous_size,
             });
+        let published = std::time::Instant::now();
         let persisted = accounting.persist().await;
+        if started.elapsed() >= std::time::Duration::from_secs(1) {
+            tracing::info!(
+                bytes = self.bytes_written,
+                buffer_flush_ms = buffered.duration_since(started).as_millis() as u64,
+                file_sync_ms = synced.duration_since(buffered).as_millis() as u64,
+                commit_wait_ms = admitted.duration_since(synced).as_millis() as u64,
+                publication_ms = published.duration_since(admitted).as_millis() as u64,
+                capacity_ms = published.elapsed().as_millis() as u64,
+                "slow local upload completion"
+            );
+        }
         let result = result.map_err(|error| {
             error.with_operation(accounting.commit_state(), CleanupState::Pending)
         });

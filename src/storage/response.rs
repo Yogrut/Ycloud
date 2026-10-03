@@ -22,6 +22,9 @@ use tokio_util::io::ReaderStream;
 use super::{ResolvedPath, StorageService};
 use crate::error::{AppError, AppResult};
 
+// A bounded read amortizes file/thread-pool and metering work at VPS speeds.
+const DOWNLOAD_BUFFER_BYTES: usize = 256 * 1024;
+
 #[derive(Clone, Copy, Debug)]
 pub enum FileResponseMode {
     Attachment,
@@ -72,7 +75,7 @@ impl StorageService {
             .map_err(|_| AppError::ServiceUnavailable("Storage is shutting down".into()))?;
         let reader = file.take(length);
         let stream = PermitStream {
-            inner: ReaderStream::new(reader),
+            inner: ReaderStream::with_capacity(reader, DOWNLOAD_BUFFER_BYTES),
             _permit: permit,
         };
         let mut response = Response::builder()
@@ -265,6 +268,46 @@ pub(crate) fn attachment_header(path: &Path) -> HeaderValue {
 mod tests {
     use super::*;
     use crate::test_support::TestDirectory;
+
+    #[tokio::test]
+    async fn local_download_uses_bounded_large_reads_and_preserves_ranges() {
+        use futures_util::StreamExt;
+
+        let directory = TestDirectory::new("download-buffer");
+        let payload = vec![0x5a; DOWNLOAD_BUFFER_BYTES * 3 + 11];
+        std::fs::write(directory.path().join("file.bin"), &payload).unwrap();
+        let storage = StorageService::new(directory.path().into(), 1024 * 1024, 1, 100, 0)
+            .await
+            .unwrap();
+        let path = storage.resolve_existing("file.bin").await.unwrap();
+        for range in [None, Some("bytes=7-262157")] {
+            let mut headers = HeaderMap::new();
+            if let Some(range) = range {
+                headers.insert(header::RANGE, HeaderValue::from_static(range));
+            }
+            let response = storage
+                .stream_file(&path, &headers, FileResponseMode::Attachment)
+                .await
+                .unwrap();
+            let mut body = response.into_body().into_data_stream();
+            let mut received = Vec::new();
+            let mut chunks = 0;
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.unwrap();
+                assert!(chunk.len() <= DOWNLOAD_BUFFER_BYTES);
+                received.extend_from_slice(&chunk);
+                chunks += 1;
+            }
+            drop(body);
+            if range.is_some() {
+                assert_eq!(received, payload[7..=262157]);
+            } else {
+                assert_eq!(received, payload);
+                assert_eq!(chunks, 4);
+            }
+            assert_eq!(storage.stream_gate.available_permits(), 1);
+        }
+    }
 
     #[test]
     fn all_download_modes_share_the_complete_isolation_policy() {

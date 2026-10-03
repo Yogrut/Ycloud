@@ -929,7 +929,7 @@ describe('BrowserView', () => {
       const body = url.includes('/api/upload/prepare')
         ? { ticket: 'batch-controls' }
         : url.includes('/api/upload/status')
-          ? { ticket: 'batch-controls', items: [{ path: 'two.txt', size: 3, status: 'failed' }] }
+          ? { ticket: 'batch-controls', items: [{ path: 'five.txt', size: 3, status: 'failed' }] }
           : url.includes('/api/upload/cancel')
             ? { success: true }
             : listResponse([])
@@ -963,33 +963,36 @@ describe('BrowserView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
     const input = host.querySelector<HTMLInputElement>('input[type="file"]:not([webkitdirectory])')!
-    Object.defineProperty(input, 'files', { configurable: true, value: [new File(['one'], 'one.txt'), new File(['two'], 'two.txt')] })
+    Object.defineProperty(input, 'files', {
+      configurable: true,
+      value: ['one', 'two', 'three', 'four', 'five'].map(name => new File(['txt'], `${name}.txt`)),
+    })
     input.dispatchEvent(new Event('change', { bubbles: true }))
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
-    expect(ControlledXMLHttpRequest.instances).toHaveLength(1)
+    expect(ControlledXMLHttpRequest.instances).toHaveLength(4)
     host.querySelector<HTMLButtonElement>('.upload-task.is-queued button[aria-label="暂停该文件"]')?.click()
     await nextTick()
     expect(host.querySelectorAll('.upload-task.is-paused')).toHaveLength(1)
 
-    ControlledXMLHttpRequest.instances[0]?.complete()
+    for (const request of ControlledXMLHttpRequest.instances) request.complete()
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
-    expect(host.querySelectorAll('.upload-task.is-succeeded')).toHaveLength(1)
+    expect(host.querySelectorAll('.upload-task.is-succeeded')).toHaveLength(4)
     expect(host.querySelectorAll('.upload-task.is-paused')).toHaveLength(1)
 
     host.querySelector<HTMLButtonElement>('.upload-task.is-paused button[aria-label="继续该文件"]')?.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
-    expect(ControlledXMLHttpRequest.instances).toHaveLength(2)
+    expect(ControlledXMLHttpRequest.instances).toHaveLength(5)
     host.querySelector<HTMLButtonElement>('.upload-task.is-uploading button[aria-label="终止该文件"]')?.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
     expect(host.querySelectorAll('.upload-task.is-cancelled')).toHaveLength(1)
     const cancelCall = fetchMock.mock.calls.find(([input]) => String(input).includes('/api/upload/cancel'))
     expect(cancelCall?.[1]).toEqual(expect.objectContaining({
-      body: JSON.stringify({ ticket: 'batch-controls', paths: ['two.txt'] }),
+      body: JSON.stringify({ ticket: 'batch-controls', paths: ['five.txt'] }),
     }))
 
     const filters = [...host.querySelectorAll<HTMLButtonElement>('.upload-filter-tab')]

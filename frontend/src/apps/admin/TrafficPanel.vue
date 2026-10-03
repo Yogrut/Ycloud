@@ -77,22 +77,10 @@ const shareTooltipLeft = ref(80)
 const rangeMode = ref<'today' | '7' | '30' | 'custom'>('7')
 const downloadShare = computed(() => historyTotal.value ? sum.value.download / historyTotal.value * 100 : 0)
 const uploadShare = computed(() => 100 - downloadShare.value)
-const today = computed(() => {
-  const date = new Date()
-  const pad = (value: number) => String(value).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
-})
-function dateBefore(days: number): string {
-  const date = new Date()
-  date.setDate(date.getDate() - days)
-  const pad = (value: number) => String(value).padStart(2, '0')
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
-}
+const today = computed(() => info.value?.today ?? '')
 async function selectRange(mode: typeof rangeMode.value): Promise<void> {
   rangeMode.value = mode
   if (mode === 'custom') return
-  end.value = today.value
-  start.value = mode === 'today' ? today.value : dateBefore(Number(mode) - 1)
   await refresh()
 }
 function selectDay(date: string, event: Event): void {
@@ -150,11 +138,21 @@ function feedback(error: unknown): void {
 let requestId = 0
 async function refresh(): Promise<void> {
   const id = ++requestId
+  const mode = rangeMode.value
   loading.value = true
   try {
-    const result = await getTraffic(start.value || undefined, end.value || undefined)
+    // Presets use the server's accounting calendar, not the browser's timezone.
+    const range = props.mode === 'settings' ? {}
+      : mode === 'custom' ? { start: start.value || undefined, end: end.value || undefined }
+        : { days: mode === 'today' ? 1 : Number(mode) }
+    const result = await getTraffic(range)
     if (id !== requestId) return
     info.value = result
+    if (mode !== 'custom' && rangeMode.value !== 'custom') {
+      const dates = Object.keys(result.days).sort()
+      start.value = dates[0] ?? result.today
+      end.value = dates.at(-1) ?? result.today
+    }
     selected.value = undefined
     selectedShare.value = undefined
   } catch (error) {

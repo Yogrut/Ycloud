@@ -589,7 +589,7 @@ impl StorageBackend {
                     }
                 }
                 SnapshotClaim::Build(build) => {
-                    let _permit = active.directory_snapshots.acquire_build_permit().await;
+                    let permit = active.directory_snapshots.acquire_build_permit().await;
                     let mut candidate = DirectorySnapshotCandidate::new(request.clone());
                     match &active.kind {
                         StorageBackendKind::Local(storage) => {
@@ -616,11 +616,21 @@ impl StorageBackend {
                         DirectorySnapshotCandidateResult::Snapshot(entries) => entries,
                         DirectorySnapshotCandidateResult::Page(page) => return Ok(page),
                     };
-                    let entries =
-                        Arc::new(prepare_snapshot(entries, None, key.sort(), key.direction()));
-                    let page = page_from_snapshot(&entries, &request);
-                    build.publish(entries);
-                    return Ok(page);
+                    let sort = key.sort();
+                    let direction = key.direction();
+                    // The blocking owner retains both the permit and cache
+                    // build claim if its HTTP waiter disappears during sorting.
+                    let entries = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
+                        let entries = Arc::new(prepare_snapshot(entries, None, sort, direction));
+                        build.publish(entries.clone());
+                        entries
+                    })
+                    .await
+                    .map_err(|error| {
+                        AppError::with_source("directory sorting task failed", error)
+                    })?;
+                    return Ok(page_from_snapshot(&entries, &request));
                 }
             }
         }

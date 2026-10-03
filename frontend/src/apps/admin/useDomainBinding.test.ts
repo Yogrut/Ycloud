@@ -73,7 +73,6 @@ describe('domain binding editor', () => {
     const { editor } = setup()
     editor.error.value = 'old error'
     editor.message.value = 'old success'
-    editor.removing.value = true
     await editor.show()
     expect(read).toHaveBeenCalledOnce()
     expect(read.mock.calls[0]![0]).toBeInstanceOf(AbortSignal)
@@ -83,7 +82,6 @@ describe('domain binding editor', () => {
     expect(editor.url.value).toBe(bound.binding!.public_url)
     expect(editor.error.value).toBe('')
     expect(editor.message.value).toBe('')
-    expect(editor.removing.value).toBe(false)
   })
 
   it('keeps a failed read separate from known configuration and does not invent a successful read', async () => {
@@ -111,14 +109,13 @@ describe('domain binding editor', () => {
     const opening = editor.show()
     await editor.show()
     await editor.submit()
-    editor.beginRemoval()
+    editor.url.value = ''
     editor.cancel()
     current.value = empty
     await nextTick()
     expect(editor.status.value).toEqual(bound)
     expect(editor.open.value).toBe(true)
     expect(editor.busy.value).toBe(true)
-    expect(editor.removing.value).toBe(false)
     expect(read).toHaveBeenCalledOnce()
     expect(save).not.toHaveBeenCalled()
     expect(remove).not.toHaveBeenCalled()
@@ -129,25 +126,23 @@ describe('domain binding editor', () => {
     expect(editor.busy.value).toBe(false)
   })
 
-  it('discards cancelled drafts and removal confirmation without a write', async () => {
+  it('discards cancelled URL and empty drafts without a write', async () => {
     read.mockResolvedValue(bound)
     const { editor } = setup(bound)
     await editor.show()
     editor.url.value = 'https://other.example.com'
-    editor.beginRemoval()
+    editor.url.value = ''
     editor.error.value = 'old error'
     editor.message.value = 'old success'
     editor.cancel()
     expect(editor.open.value).toBe(false)
     expect(editor.url.value).toBe(bound.binding!.public_url)
-    expect(editor.removing.value).toBe(false)
     expect(editor.error.value).toBe('')
     expect(editor.message.value).toBe('')
     expect(save).not.toHaveBeenCalled()
     expect(remove).not.toHaveBeenCalled()
     await editor.show()
     expect(read).toHaveBeenCalledTimes(2)
-    expect(editor.removing.value).toBe(false)
   })
 
   it('uses the server-normalized binding and isolates response data instead of displaying the sent draft', async () => {
@@ -178,7 +173,7 @@ describe('domain binding editor', () => {
     editor.url.value = 'https://later-draft.example.com'
     await editor.submit()
     await editor.show()
-    editor.beginRemoval()
+    editor.url.value = ''
     editor.cancel()
     expect(save).toHaveBeenCalledOnce()
     expect(save).toHaveBeenCalledWith({ public_url: 'https://cloud.example.com' })
@@ -186,7 +181,6 @@ describe('domain binding editor', () => {
     expect(remove).not.toHaveBeenCalled()
     expect(editor.open.value).toBe(true)
     expect(editor.busy.value).toBe(true)
-    expect(editor.removing.value).toBe(false)
     expect(editor.message.value).toBe('')
     pending.resolve(bound)
     await saving
@@ -194,17 +188,19 @@ describe('domain binding editor', () => {
     expect(editor.busy.value).toBe(false)
   })
 
-  it('requires an open, persisted binding before entering removal confirmation', async () => {
+  it('requires an open editor before submitting an empty address', async () => {
     const { editor } = setup(bound)
-    editor.beginRemoval()
+    editor.url.value = ''
     await editor.submit()
-    expect(editor.removing.value).toBe(false)
     expect(save).not.toHaveBeenCalled()
+    expect(remove).not.toHaveBeenCalled()
     read.mockResolvedValue(empty)
     await editor.show()
-    editor.beginRemoval()
-    expect(editor.removing.value).toBe(false)
     expect(remove).not.toHaveBeenCalled()
+    remove.mockResolvedValue(empty)
+    await editor.submit()
+    expect(remove).toHaveBeenCalledOnce()
+    expect(editor.status.value).toEqual(empty)
   })
 
   it('removes only on explicit confirmation and returns the server HTTP state', async () => {
@@ -215,9 +211,9 @@ describe('domain binding editor', () => {
     await editor.show()
     editor.error.value = 'old error'
     editor.message.value = 'old success'
-    editor.beginRemoval()
-    expect(editor.error.value).toBe('')
-    expect(editor.message.value).toBe('')
+    editor.url.value = '   '
+    expect(editor.error.value).toBe('old error')
+    expect(editor.message.value).toBe('old success')
     expect(remove).not.toHaveBeenCalled()
     const removing = editor.submit()
     await editor.submit()
@@ -230,7 +226,6 @@ describe('domain binding editor', () => {
     await removing
     expect(editor.status.value).toEqual(empty)
     expect(editor.url.value).toBe('')
-    expect(editor.removing.value).toBe(false)
     expect(editor.message.value).toContain('恢复 HTTP 访问模式')
     expect(editor.busy.value).toBe(false)
   })
@@ -241,15 +236,13 @@ describe('domain binding editor', () => {
     request.mockRejectedValueOnce(new Error('Persistence rejected')).mockResolvedValueOnce(operation === 'save' ? bound : empty)
     const { editor } = setup(bound)
     await editor.show()
-    editor.url.value = 'https://edited.example.com'
-    if (operation === 'remove') editor.beginRemoval()
+    editor.url.value = operation === 'remove' ? '' : 'https://edited.example.com'
     await editor.submit()
     expect(request).toHaveBeenCalledOnce()
     expect(editor.error.value).toBe('Persistence rejected')
     expect(editor.message.value).toBe('')
-    expect(editor.url.value).toBe('https://edited.example.com')
+    expect(editor.url.value).toBe(operation === 'remove' ? '' : 'https://edited.example.com')
     expect(editor.status.value).toEqual(bound)
-    expect(editor.removing.value).toBe(operation === 'remove')
     expect(editor.busy.value).toBe(false)
     await editor.submit()
     expect(request).toHaveBeenCalledTimes(2)
@@ -263,7 +256,7 @@ describe('domain binding editor', () => {
     request.mockRejectedValue(new ApiError('Verify the operation result', 0, 'operation_result_unknown'))
     const { editor } = setup(bound)
     await editor.show()
-    if (operation === 'remove') editor.beginRemoval()
+    if (operation === 'remove') editor.url.value = ''
     await editor.submit()
     expect(request).toHaveBeenCalledOnce()
     expect(read).toHaveBeenCalledOnce()
@@ -287,7 +280,7 @@ describe('domain binding editor', () => {
       await editor.show()
       if (operation === 'remove') {
         remove.mockRejectedValue('unstructured error')
-        editor.beginRemoval()
+        editor.url.value = ''
       } else save.mockRejectedValue('unstructured error')
       await editor.submit()
     }
@@ -313,7 +306,7 @@ describe('domain binding editor', () => {
     expect(editor.message.value).toBe('')
     await editor.show()
     await editor.submit()
-    editor.beginRemoval()
+    editor.url.value = ''
     expect(read).toHaveBeenCalledOnce()
     expect(save).not.toHaveBeenCalled()
     expect(remove).not.toHaveBeenCalled()
@@ -326,8 +319,7 @@ describe('domain binding editor', () => {
     request.mockReturnValue(pending.promise)
     const { editor, scope } = setup(bound)
     await editor.show()
-    editor.url.value = 'https://new.example.com'
-    if (operation === 'remove') editor.beginRemoval()
+    editor.url.value = operation === 'remove' ? '' : 'https://new.example.com'
     const writing = editor.submit()
     expect(request).toHaveBeenCalledOnce()
     scope.stop()
@@ -337,7 +329,6 @@ describe('domain binding editor', () => {
     expect(editor.open.value).toBe(false)
     expect(editor.url.value).toBe('')
     expect(editor.message.value).toBe('')
-    expect(editor.removing.value).toBe(false)
     await editor.submit()
     await editor.show()
     expect(request).toHaveBeenCalledOnce()

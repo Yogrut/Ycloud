@@ -60,7 +60,7 @@ describe('AdminView', () => {
           cycle: { unit: 'months', every: 1, anchor: 0, offset_minutes: 0 },
         },
         total: { upload: 0, download: 0 }, guest: { upload: 0, download: 0 }, users_total: { upload: 0, download: 0 },
-        users: {}, days: {}, next_reset: 0,
+        users: {}, days: {}, next_reset: 0, today: '2026-10-02',
       }), { headers: { 'Content-Type': 'application/json' } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }))
       .mockImplementationOnce(() => new Promise<Response>(resolve => { finishRead = resolve }))

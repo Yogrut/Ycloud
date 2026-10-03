@@ -53,6 +53,8 @@ pub struct UploadBatchStore {
 }
 
 struct UploadBatch {
+    // Serialize durable transitions within this ticket, not across accounts.
+    transition: Arc<Mutex<()>>,
     recovery_backend: Option<crate::storage_backend::StorageBackend>,
     subject: Option<RequestSubject>,
     account: String,
@@ -150,6 +152,9 @@ impl Drop for UploadExecutionGuard {
         }
         let (store, token, path) = (self.store.clone(), self.token.clone(), self.path.clone());
         tokio::spawn(async move {
+            let Some(_transition) = store.lock_transition(&token).await else {
+                return;
+            };
             let mut batches = store.batches.lock().await;
             if let Some(item) = batches
                 .get_mut(&token)
@@ -159,6 +164,7 @@ impl Drop for UploadExecutionGuard {
                     let outcome = AppError::internal("upload execution owner interrupted")
                         .with_operation(CommitState::Unknown, CleanupState::Unknown)
                         .operation();
+                    drop(batches);
                     if let Some(persistence) = &store.persistence {
                         if let Err(error) = persistence
                             .update(
@@ -173,8 +179,14 @@ impl Drop for UploadExecutionGuard {
                             tracing::error!(%error, "failed to persist interrupted upload result");
                         }
                     }
-                    item.status = UploadStatus::Unknown;
-                    item.operation = outcome;
+                    let mut batches = store.batches.lock().await;
+                    if let Some(item) = batches
+                        .get_mut(&token)
+                        .and_then(|batch| batch.items.get_mut(&path))
+                    {
+                        item.status = UploadStatus::Unknown;
+                        item.operation = outcome;
+                    }
                 }
             }
         });
@@ -197,6 +209,14 @@ pub struct UploadItemStatus {
 }
 
 impl UploadBatchStore {
+    async fn lock_transition(&self, token: &str) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let mut batches = self.batches.lock().await;
+        self.prune_expired(&mut batches);
+        let gate = batches.get(token)?.transition.clone();
+        drop(batches);
+        Some(gate.lock_owned().await)
+    }
+
     fn retire_batch(&self, token: String, batch: UploadBatch) {
         if let Some(persistence) = &self.persistence {
             let persistence = persistence.clone();
@@ -255,7 +275,9 @@ impl UploadBatchStore {
         let now = Instant::now();
         let expired = batches
             .iter()
-            .filter(|(_, batch)| !batch_is_retained(batch, now))
+            .filter(|(_, batch)| {
+                !batch_is_retained(batch, now) && Arc::strong_count(&batch.transition) == 1
+            })
             .map(|(token, _)| token.clone())
             .collect::<Vec<_>>();
         for token in expired {
@@ -295,6 +317,10 @@ impl UploadBatchStore {
     }
 
     pub(crate) async fn confirm_unknown_committed(&self, review: &UnknownUpload) -> AppResult<()> {
+        let _transition = self
+            .lock_transition(&review.ticket)
+            .await
+            .ok_or(AppError::NotFound)?;
         let mut batches = self.batches.lock().await;
         let batch = batches.get_mut(&review.ticket).ok_or(AppError::NotFound)?;
         if batch.storage_id != review.storage_id {
@@ -308,6 +334,7 @@ impl UploadBatchStore {
             return Err(AppError::Conflict("任务状态已经变化，请刷新".into()));
         }
         let expires_unix = batch_expires_unix(self.result_ttl);
+        drop(batches);
         if let Some(persistence) = &self.persistence {
             persistence
                 .update(
@@ -319,6 +346,12 @@ impl UploadBatchStore {
                 )
                 .await?;
         }
+        let mut batches = self.batches.lock().await;
+        let batch = batches.get_mut(&review.ticket).ok_or(AppError::NotFound)?;
+        let item = batch
+            .items
+            .get_mut(&review.path)
+            .ok_or(AppError::NotFound)?;
         item.status = UploadStatus::Complete;
         item.operation = None;
         batch.expires_at = Instant::now() + self.result_ttl;
@@ -492,7 +525,9 @@ impl UploadBatchStore {
             // so retiring them cannot change active/account admission counts.
             let mut completed = batches
                 .iter()
-                .filter(|(_, batch)| batch_is_terminal(batch))
+                .filter(|(_, batch)| {
+                    batch_is_terminal(batch) && Arc::strong_count(&batch.transition) == 1
+                })
                 .map(|(token, batch)| (token.clone(), batch.expires_at))
                 .collect::<Vec<_>>();
             completed.sort_by_key(|(_, expires_at)| *expires_at);
@@ -512,6 +547,7 @@ impl UploadBatchStore {
         }
         let token = Uuid::new_v4().to_string();
         let batch = UploadBatch {
+            transition: Arc::new(Mutex::new(())),
             recovery_backend: None,
             subject: Some(subject),
             account,
@@ -534,10 +570,31 @@ impl UploadBatchStore {
                 })
                 .collect(),
         };
-        if let Some(persistence) = &self.persistence {
-            persistence.create(&token, &batch).await?;
-        }
+        let prepared = self
+            .persistence
+            .as_ref()
+            .map(|_| BatchPersistence::prepare(&token, &batch))
+            .transpose()?;
+        let _transition = batch.transition.clone().lock_owned().await;
+        // Reserve capacity and names before releasing the registry, so another
+        // creation cannot admit the same budget while this manifest is writing.
         batches.insert(token.clone(), batch);
+        drop(batches);
+        if let (Some(persistence), Some(prepared)) = (&self.persistence, prepared) {
+            if let Err(error) = persistence.create(&token, prepared).await {
+                self.batches.lock().await.remove(&token);
+                return Err(error);
+            }
+        }
+        let mut batches = self.batches.lock().await;
+        if self.invalidation_epoch.load(Ordering::Acquire) != expected_epoch {
+            if let Some(batch) = batches.remove(&token) {
+                self.retire_batch(token, batch);
+            }
+            return Err(AppError::Conflict(
+                "存储设置在上传准备期间已变化，请重新选择文件".into(),
+            ));
+        }
         Ok(token)
     }
 
@@ -566,6 +623,10 @@ impl UploadBatchStore {
         path: &str,
         size: u64,
     ) -> AppResult<UploadBegin> {
+        let _transition = self
+            .lock_transition(token)
+            .await
+            .ok_or(AppError::UploadBatchExpired)?;
         let mut batches = self.batches.lock().await;
         let now = Instant::now();
         self.prune_expired(&mut batches);
@@ -585,10 +646,25 @@ impl UploadBatchStore {
             completed @ UploadBegin::AlreadyComplete(_) => return Ok(completed),
         }
         let expires_unix = batch_expires_unix(self.ttl);
+        drop(batches);
         if let Some(persistence) = &self.persistence {
             persistence
                 .update(token, path, UploadStatus::InProgress, None, expires_unix)
                 .await?;
+        }
+        let mut batches = self.batches.lock().await;
+        let batch = batches.get_mut(token).ok_or(AppError::UploadBatchExpired)?;
+        let item = batch.items.get_mut(path).ok_or(AppError::NotFound)?;
+        if item.status == UploadStatus::Cancelled {
+            // Administrator edits may invalidate pending admission while its
+            // durable write is running. Never resurrect that old reservation.
+            drop(batches);
+            if let Some(persistence) = &self.persistence {
+                persistence
+                    .update(token, path, UploadStatus::Cancelled, None, expires_unix)
+                    .await?;
+            }
+            return Err(AppError::Conflict("存储设置已变化，请重新准备上传".into()));
         }
         item.status = UploadStatus::InProgress;
         item.operation = None;
@@ -604,6 +680,9 @@ impl UploadBatchStore {
         storage_id: &str,
         paths: Option<&HashSet<String>>,
     ) -> AppResult<()> {
+        let Some(_transition) = self.lock_transition(token).await else {
+            return Ok(());
+        };
         let mut batches = self.batches.lock().await;
         let now = Instant::now();
         self.prune_expired(&mut batches);
@@ -618,26 +697,35 @@ impl UploadBatchStore {
                 return Err(AppError::BadRequest("取消目标不属于该批次".into()));
             }
         }
-        for (path, item) in &mut batch.items {
-            if paths.is_some_and(|paths| !paths.contains(path)) {
-                continue;
+        let cancelled = batch
+            .items
+            .iter()
+            .filter(|(path, item)| {
+                paths.is_none_or(|paths| paths.contains(*path)) && item.status.can_cancel()
+            })
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        drop(batches);
+        for path in cancelled {
+            if let Some(persistence) = &self.persistence {
+                persistence
+                    .update(
+                        token,
+                        &path,
+                        UploadStatus::Cancelled,
+                        None,
+                        batch_expires_unix(self.result_ttl),
+                    )
+                    .await?;
             }
-            if item.status.can_cancel() {
-                if let Some(persistence) = &self.persistence {
-                    persistence
-                        .update(
-                            token,
-                            path,
-                            UploadStatus::Cancelled,
-                            None,
-                            batch_expires_unix(self.result_ttl),
-                        )
-                        .await?;
-                }
-                item.status = UploadStatus::Cancelled;
-                item.operation = None;
-            }
+            let mut batches = self.batches.lock().await;
+            let batch = batches.get_mut(token).ok_or(AppError::UploadBatchExpired)?;
+            let item = batch.items.get_mut(&path).ok_or(AppError::NotFound)?;
+            item.status = UploadStatus::Cancelled;
+            item.operation = None;
         }
+        let mut batches = self.batches.lock().await;
+        let batch = batches.get_mut(token).ok_or(AppError::UploadBatchExpired)?;
         let retention = if batch_is_terminal(batch) {
             self.result_ttl
         } else {
@@ -676,6 +764,9 @@ impl UploadBatchStore {
         status: UploadStatus,
         operation: Option<OperationOutcome>,
     ) {
+        let Some(_transition) = self.lock_transition(token).await else {
+            return;
+        };
         let mut batches = self.batches.lock().await;
         let Some(batch) = batches.get_mut(token) else {
             return;
@@ -685,11 +776,12 @@ impl UploadBatchStore {
             .iter()
             .all(|(key, value)| key == path || value.status.is_terminal())
             && status.is_terminal();
-        let Some(item) = batch.items.get_mut(path) else {
+        if !batch.items.contains_key(path) {
             return;
-        };
+        }
         let retention = if terminal { self.result_ttl } else { self.ttl };
         let expires_unix = batch_expires_unix(retention);
+        drop(batches);
         if let Some(persistence) = &self.persistence {
             if let Err(error) = persistence
                 .update(token, path, status, operation, expires_unix)
@@ -698,6 +790,13 @@ impl UploadBatchStore {
                 tracing::error!(%error, "failed to persist upload result; recovery will verify operation");
             }
         }
+        let mut batches = self.batches.lock().await;
+        let Some(batch) = batches.get_mut(token) else {
+            return;
+        };
+        let Some(item) = batch.items.get_mut(path) else {
+            return;
+        };
         item.status = status;
         item.operation = operation;
         batch.expires_at = Instant::now() + retention;
@@ -1104,6 +1203,137 @@ pub async fn upload_batch_status(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn slow_ticket_write_does_not_block_another_batch_or_status_reads() {
+        let directory = crate::test_support::TestDirectory::new("independent-upload-tickets");
+        let store = UploadBatchStore::load_persistent(
+            &directory.path().join("config.json"),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let owner = subject("owner");
+        let first = store
+            .create(owner.clone(), "local".into(), items())
+            .await
+            .unwrap();
+        let second = store
+            .create(owner.clone(), "local".into(), items())
+            .await
+            .unwrap();
+        let gate = Arc::new(Mutex::new(()));
+        let pause = gate.lock().await;
+        *store
+            .persistence
+            .as_ref()
+            .unwrap()
+            .update_pause
+            .lock()
+            .unwrap() = Some((first.clone(), gate.clone()));
+        let starting = tokio::spawn({
+            let (store, owner, first) = (store.clone(), owner.clone(), first.clone());
+            async move {
+                store
+                    .begin(&first, &owner, "local", "folder/one.txt", 11)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            store.status(&first, &owner, "local"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                store.begin(&second, &owner, "local", "folder/one.txt", 11)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            UploadBegin::Start
+        );
+        store.finish(&second, "folder/one.txt", true).await;
+        drop(pause);
+        assert_eq!(starting.await.unwrap().unwrap(), UploadBegin::Start);
+    }
+
+    #[tokio::test]
+    async fn storage_edit_during_admission_write_cannot_resurrect_old_ticket() {
+        let directory = crate::test_support::TestDirectory::new("upload-admission-edit");
+        let config_path = directory.path().join("config.json");
+        let store = UploadBatchStore::load_persistent(&config_path, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let owner = subject("owner");
+        let ticket = store
+            .create(owner.clone(), "local".into(), items())
+            .await
+            .unwrap();
+        let gate = Arc::new(Mutex::new(()));
+        let pause = gate.lock().await;
+        *store
+            .persistence
+            .as_ref()
+            .unwrap()
+            .update_pause
+            .lock()
+            .unwrap() = Some((ticket.clone(), gate.clone()));
+        let starting = tokio::spawn({
+            let (store, owner, ticket) = (store.clone(), owner.clone(), ticket.clone());
+            async move {
+                store
+                    .begin(&ticket, &owner, "local", "folder/one.txt", 11)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            store.invalidate_storage("local", None),
+        )
+        .await
+        .unwrap();
+        drop(pause);
+        assert!(matches!(
+            starting.await.unwrap(),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(store
+            .status(&ticket, &owner, "local")
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.status == UploadStatus::Cancelled));
+        drop(store);
+        let restored = UploadBatchStore::load_persistent(&config_path, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(restored
+            .status_for_account(&ticket, &subject("new-session"), "owner", "local")
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.status == UploadStatus::Cancelled));
+    }
+
     fn admission_batch(
         account: &str,
         count: usize,
@@ -1111,6 +1341,7 @@ mod tests {
         expires_at: Instant,
     ) -> UploadBatch {
         UploadBatch {
+            transition: Arc::new(Mutex::new(())),
             recovery_backend: None,
             subject: Some(subject("owner")),
             account: account.into(),
@@ -1681,15 +1912,17 @@ mod tests {
         })
         .await
         .unwrap();
+        // A reservation is visible before disk I/O; the owned creator releases
+        // the planning fence only after the durable manifest has been published.
+        let _planning = tokio::time::timeout(Duration::from_secs(2), store.prepare_gate.lock())
+            .await
+            .unwrap();
         assert!(directory
             .path()
             .join(".ycloud-system/upload-results")
             .join(ticket)
             .join("manifest.json")
             .exists());
-        let _planning = tokio::time::timeout(Duration::from_secs(2), store.prepare_gate.lock())
-            .await
-            .unwrap();
     }
 
     #[tokio::test]

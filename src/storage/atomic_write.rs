@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::{
     fs::File,
     io::AsyncWriteExt,
@@ -21,6 +21,9 @@ use crate::{
 mod publication;
 #[cfg(test)]
 mod tests;
+
+// Keep small network writes in one bounded buffer, never the entire upload.
+const UPLOAD_BUFFER_BYTES: usize = 256 * 1024;
 
 impl StorageService {
     pub async fn begin_atomic_write(&self, path: &str) -> AppResult<AtomicFileWriter> {
@@ -110,6 +113,7 @@ impl StorageService {
                     destination: destination.absolute,
                     temporary,
                     file: Some(File::from_std(file)),
+                    buffer: BytesMut::new(),
                     bytes_written: 0,
                     expected_bytes,
                     max_bytes: max_upload_bytes,
@@ -139,6 +143,7 @@ impl StorageService {
                     destination: destination.absolute,
                     temporary,
                     file: Some(File::from_std(file)),
+                    buffer: BytesMut::new(),
                     bytes_written: 0,
                     expected_bytes,
                     max_bytes: max_upload_bytes,
@@ -203,6 +208,8 @@ pub struct AtomicFileWriter {
     destination: PathBuf,
     pub(super) temporary: PathBuf,
     file: Option<File>,
+    buffer: BytesMut,
+    // Accepted bytes include the bounded tail; publish flushes it before sync.
     bytes_written: u64,
     expected_bytes: Option<u64>,
     max_bytes: u64,
@@ -228,22 +235,47 @@ impl AtomicFileWriter {
             .resources
             .as_mut()
             .ok_or_else(|| AppError::internal("upload resources already transferred"))?;
-        resources.reservation.ensure(chunk.len() as u64).await?;
+        // Buffered bytes are not on disk yet: retain their physical reservation
+        // until a completed write, including uploads without Content-Length.
+        resources
+            .reservation
+            .ensure((self.buffer.len() + chunk.len()) as u64)
+            .await?;
+        let mut remaining = chunk.as_ref();
+        while !remaining.is_empty() {
+            let length = remaining.len().min(UPLOAD_BUFFER_BYTES - self.buffer.len());
+            self.buffer.extend_from_slice(&remaining[..length]);
+            remaining = &remaining[length..];
+            if self.buffer.len() == UPLOAD_BUFFER_BYTES {
+                self.flush_buffer().await?;
+            }
+        }
+        self.bytes_written = new_size;
+        Ok(())
+    }
+
+    pub(super) async fn flush_buffer(&mut self) -> AppResult<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
         let file = self
             .file
             .as_mut()
             .ok_or_else(|| AppError::internal("temporary file is already closed"))?;
-        file.write_all(chunk)
+        file.write_all(&self.buffer)
             .await
             .map_err(|error| AppError::with_source("failed to write upload", error))?;
-        // Tokio can acknowledge a buffered write before blocking disk I/O has
-        // completed. Keep its reservation until completion, and surface late
-        // write failures here rather than counting them as uploaded bytes.
+        // Tokio may acknowledge before disk I/O finishes. Do this once per
+        // buffer, retaining the reservation and surfacing late write failures.
         file.flush()
             .await
             .map_err(|error| AppError::with_source("failed to complete upload chunk", error))?;
-        self.bytes_written = new_size;
-        resources.reservation.consume(chunk.len() as u64);
+        self.resources
+            .as_mut()
+            .ok_or_else(|| AppError::internal("upload resources already transferred"))?
+            .reservation
+            .consume(self.buffer.len() as u64);
+        self.buffer.clear();
         Ok(())
     }
 }

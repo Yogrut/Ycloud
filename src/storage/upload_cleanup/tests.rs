@@ -259,13 +259,16 @@ fn pending_file_write_keeps_its_io_and_physical_reservation_until_finished() {
             blocked.recv_timeout(Duration::from_secs(5)).unwrap();
         });
         ready.await.unwrap();
+        writer
+            .write_chunk(&bytes::Bytes::from_static(b"note"))
+            .await
+            .unwrap();
         // Cancel while the accepted chunk is still queued for blocking I/O.
-        assert!(tokio::time::timeout(
-            Duration::from_millis(30),
-            writer.write_chunk(&bytes::Bytes::from_static(b"note"))
-        )
-        .await
-        .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), writer.flush_buffer())
+                .await
+                .is_err()
+        );
         drop(writer);
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(storage.upload_cleanup_status().pending_uploads, 1);

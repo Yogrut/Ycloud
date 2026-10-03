@@ -127,6 +127,159 @@ async fn ordinary_open_failure_releases_both_budgets() {
 }
 
 #[tokio::test]
+async fn small_writes_retain_reservations_until_a_bounded_flush_and_commit() {
+    let directory = TestDirectory::new("upload-buffered-write");
+    let size = UPLOAD_BUFFER_BYTES + 13;
+    let storage = StorageService::new(directory.path().into(), size as u64, 1, 100, 0)
+        .await
+        .unwrap();
+    let mut writer = storage
+        .begin_atomic_write_with_expected("file.bin", size as u64)
+        .await
+        .unwrap();
+    let temporary = writer.temporary.clone();
+    for _ in 0..UPLOAD_BUFFER_BYTES / 4096 - 1 {
+        writer
+            .write_chunk(&Bytes::from(vec![0x5a; 4096]))
+            .await
+            .unwrap();
+    }
+    assert_eq!(std::fs::metadata(&temporary).unwrap().len(), 0);
+    assert_eq!(*storage.reserved_upload_bytes.lock().unwrap(), size as u64);
+    writer
+        .write_chunk(&Bytes::from(vec![0x5a; 4096]))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&temporary).unwrap().len(),
+        UPLOAD_BUFFER_BYTES as u64
+    );
+    assert_eq!(*storage.reserved_upload_bytes.lock().unwrap(), 13);
+    writer
+        .write_chunk(&Bytes::from(vec![0x5a; 13]))
+        .await
+        .unwrap();
+    assert_eq!(*storage.reserved_upload_bytes.lock().unwrap(), 13);
+    writer.commit().await.unwrap();
+    assert_eq!(
+        std::fs::read(directory.path().join("file.bin")).unwrap(),
+        vec![0x5a; size]
+    );
+    assert_eq!(*storage.reserved_upload_bytes.lock().unwrap(), 0);
+    close_storage(storage).await;
+}
+
+#[tokio::test]
+async fn interrupted_buffered_upload_cleans_only_staging_and_releases_reservations() {
+    let directory = TestDirectory::new("upload-buffered-cancel");
+    let storage = StorageService::new(directory.path().into(), 1024 * 1024, 1, 100, 0)
+        .await
+        .unwrap();
+    std::fs::write(directory.path().join("file.bin"), b"original").unwrap();
+    let mut writer = storage.begin_atomic_write("file.bin").await.unwrap();
+    writer
+        .write_chunk(&Bytes::from_static(b"unfinished"))
+        .await
+        .unwrap();
+    let temporary = writer.temporary.clone();
+    assert_eq!(writer.buffer.as_ref(), b"unfinished");
+    assert!(*storage.reserved_upload_bytes.lock().unwrap() >= writer.buffer.len() as u64);
+    drop(writer);
+    wait_until(|| !temporary.exists() && storage.io_gate.available_permits() == 1).await;
+    assert_eq!(*storage.reserved_upload_bytes.lock().unwrap(), 0);
+    assert_eq!(
+        std::fs::read(directory.path().join("file.bin")).unwrap(),
+        b"original"
+    );
+    close_storage(storage).await;
+}
+
+#[tokio::test]
+async fn buffered_tail_size_mismatch_never_publishes_a_file() {
+    let directory = TestDirectory::new("upload-buffered-short");
+    let storage = StorageService::new(directory.path().into(), 100, 1, 100, 0)
+        .await
+        .unwrap();
+    let mut writer = storage
+        .begin_atomic_write_with_expected("file.bin", 8)
+        .await
+        .unwrap();
+    writer
+        .write_chunk(&Bytes::from_static(b"short"))
+        .await
+        .unwrap();
+    let temporary = writer.temporary.clone();
+    assert!(writer.commit().await.is_err());
+    wait_until(|| !temporary.exists()).await;
+    assert!(!directory.path().join("file.bin").exists());
+    assert_eq!(*storage.reserved_upload_bytes.lock().unwrap(), 0);
+    close_storage(storage).await;
+}
+
+#[tokio::test]
+async fn buffered_write_error_is_reported_before_formal_publication() {
+    let directory = TestDirectory::new("upload-buffered-io-error");
+    let storage = StorageService::new(directory.path().into(), 100, 1, 100, 0)
+        .await
+        .unwrap();
+    std::fs::write(directory.path().join("file.bin"), b"original").unwrap();
+    let mut writer = storage
+        .begin_atomic_write_with_expected("file.bin", 4)
+        .await
+        .unwrap();
+    let temporary = writer.temporary.clone();
+    // A read-only file handle deterministically fails when the tail is written.
+    writer.file = Some(File::open(&temporary).await.unwrap());
+    writer
+        .write_chunk(&Bytes::from_static(b"next"))
+        .await
+        .unwrap();
+    assert!(writer.commit().await.is_err());
+    wait_until(|| !temporary.exists()).await;
+    assert_eq!(
+        std::fs::read(directory.path().join("file.bin")).unwrap(),
+        b"original"
+    );
+    assert_eq!(*storage.reserved_upload_bytes.lock().unwrap(), 0);
+    close_storage(storage).await;
+}
+
+#[tokio::test]
+#[ignore = "manual small-write local upload comparison"]
+async fn buffered_local_upload_baseline() {
+    let size = 16 * 1024 * 1024;
+    let chunk = Bytes::from(vec![0x5a; 4096]);
+    for buffered in [false, true] {
+        let directory = TestDirectory::new("upload-buffer-baseline");
+        let storage = StorageService::new(directory.path().into(), size as u64, 1, 100, 0)
+            .await
+            .unwrap();
+        let mut writer = storage
+            .begin_atomic_write_with_expected("file.bin", size as u64)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..size / chunk.len() {
+            writer.write_chunk(&chunk).await.unwrap();
+            if !buffered {
+                writer.flush_buffer().await.unwrap();
+            }
+        }
+        writer.commit().await.unwrap();
+        let elapsed = started.elapsed();
+        eprintln!(
+            "16 MiB / 4 KiB local writes, buffered={buffered}: {elapsed:?}, {:.1} MiB/s",
+            16.0 / elapsed.as_secs_f64()
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("file.bin")).unwrap(),
+            vec![0x5a; size]
+        );
+        close_storage(storage).await;
+    }
+}
+
+#[tokio::test]
 async fn cancelling_commit_waiter_keeps_upload_until_publication_finishes() {
     let directory = TestDirectory::new("upload-before-handoff");
     let storage = StorageService::new(directory.path().into(), 16, 1, 100, 0)

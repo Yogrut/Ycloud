@@ -504,6 +504,7 @@ mod response_contract_tests {
                 axum::extract::Query(crate::traffic::TrafficQuery {
                     start: None,
                     end: None,
+                    days: None,
                 }),
             )
             .await

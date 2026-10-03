@@ -700,7 +700,14 @@ pub async fn upload_file(
         }
         .await;
         if let Some(execution) = &mut execution {
+            let started = std::time::Instant::now();
             execution.finish(&upload_result).await;
+            if started.elapsed() >= std::time::Duration::from_secs(1) {
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "slow upload result persistence"
+                );
+            }
         }
         upload_result?;
         Ok(Json(

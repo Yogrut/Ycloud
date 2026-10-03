@@ -17,7 +17,7 @@ function trafficInfo(): TrafficInfo {
       cycle: { unit: 'months', every: 1, anchor: 1704079545, offset_minutes: -300 },
     },
     total: { upload: 0, download: 0 }, guest: { upload: 0, download: 0 },
-    users_total: { upload: 0, download: 0 }, users: {}, next_reset: 1790812800, days: {},
+    users_total: { upload: 0, download: 0 }, users: {}, next_reset: 1790812800, today: '2026-09-02', days: {},
   }
 }
 

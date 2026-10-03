@@ -5,6 +5,7 @@ use crate::{
     error::{AppError, AppResult},
     state::AppState,
 };
+
 use axum::{
     body::Body,
     extract::{Query, State},
@@ -13,15 +14,12 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Datelike, Months, Utc};
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    io::{Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, io::Read, path::Path, sync::Arc};
 use tokio::sync::Mutex;
+
+mod commit;
+mod stream;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -253,9 +251,12 @@ struct Record {
 }
 struct Runtime {
     ledger: Ledger,
-    journal: std::fs::File,
     records: usize,
     failed: bool,
+    #[cfg(test)]
+    commits: usize,
+    #[cfg(test)]
+    commit_pause: Arc<Mutex<()>>,
 }
 const MAX_TRAFFIC_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TRAFFIC_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
@@ -372,8 +373,8 @@ fn read_bounded(file: &std::fs::File, maximum: u64) -> anyhow::Result<Vec<u8>> {
 #[derive(Clone)]
 pub struct TrafficStore {
     inner: Arc<Mutex<Runtime>>,
-    snapshot: Arc<PathBuf>,
     config: SharedConfig,
+    charges: tokio::sync::mpsc::Sender<commit::ChargeRequest>,
 }
 
 fn failure(error: impl Into<anyhow::Error>) -> AppError {
@@ -402,7 +403,7 @@ impl TrafficStore {
             .collect();
         drop(current);
         let snapshot_for_load = snapshot.clone();
-        let runtime = tokio::task::spawn_blocking(move || -> anyhow::Result<Runtime> {
+        let (runtime, journal) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let mut ledger = match std::fs::File::open(&snapshot_for_load) {
                 Ok(file) => {
                     let bytes = read_bounded(&file, MAX_TRAFFIC_SNAPSHOT_BYTES)?;
@@ -453,20 +454,28 @@ impl TrafficStore {
             )?;
             journal.set_len(0)?;
             journal.sync_all()?;
-            Ok(Runtime {
-                ledger,
+            Ok((
+                Runtime {
+                    ledger,
+                    records: 0,
+                    failed: false,
+                    #[cfg(test)]
+                    commits: 0,
+                    #[cfg(test)]
+                    commit_pause: Arc::new(Mutex::new(())),
+                },
                 journal,
-                records: 0,
-                failed: false,
-            })
+            ))
         })
         .await
         .map_err(failure)?
         .map_err(failure)?;
+        let inner = Arc::new(Mutex::new(runtime));
+        let charges = commit::start(inner.clone(), journal, snapshot, config.clone());
         Ok(Self {
-            inner: Arc::new(Mutex::new(runtime)),
-            snapshot: Arc::new(snapshot),
+            inner,
             config,
+            charges,
         })
     }
     fn check(
@@ -516,65 +525,19 @@ impl TrafficStore {
         if bytes == 0 {
             return Ok(());
         }
-        let store = self.clone();
-        // This owner survives cancellation through fsync and memory publication.
-        tokio::spawn(async move {
-            let mut runtime = store.inner.clone().lock_owned().await;
-            let current = store.config.read().await;
-            let settings = current.traffic.clone();
-            let active_users: std::collections::BTreeSet<String> = current
-                .user_accounts
-                .iter()
-                .map(|user| user.id.clone())
-                .chain(settings.users.keys().cloned())
-                .collect();
-            drop(current);
-            tokio::task::spawn_blocking(move || -> AppResult<()> {
-                if runtime.failed {
-                    return Err(AppError::ServiceUnavailable("流量记账暂不可用".into()));
-                }
-                runtime
-                    .ledger
-                    .advance(Utc::now().timestamp(), &settings.cycle);
-                Self::check(&runtime.ledger, &settings, &subject, direction, bytes)?;
-                let record = Record {
-                    sequence: runtime.ledger.sequence + 1,
-                    time: runtime.ledger.last_time,
-                    subject,
-                    direction,
-                    bytes,
-                    cycle: settings.cycle,
-                };
-                runtime.failed = true;
-                let mut encoded = serde_json::to_vec(&record).map_err(failure)?;
-                encoded.push(b'\n');
-                runtime.journal.seek(SeekFrom::End(0)).map_err(failure)?;
-                runtime.journal.write_all(&encoded).map_err(failure)?;
-                runtime.journal.sync_data().map_err(failure)?;
-                runtime.ledger.apply(&record);
-                runtime
-                    .ledger
-                    .users
-                    .retain(|id, _| active_users.contains(id));
-                runtime.records += 1;
-                if runtime.records >= 4096 {
-                    crate::config::publish_traffic_snapshot(
-                        &store.snapshot,
-                        &serde_json::to_vec(&runtime.ledger).map_err(failure)?,
-                    )
-                    .map_err(failure)?;
-                    runtime.journal.set_len(0).map_err(failure)?;
-                    runtime.journal.sync_all().map_err(failure)?;
-                    runtime.records = 0;
-                }
-                runtime.failed = false;
-                Ok(())
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.charges
+            .send(commit::ChargeRequest {
+                subject,
+                direction,
+                bytes,
+                reply,
             })
             .await
-            .map_err(failure)?
-        })
-        .await
-        .map_err(failure)?
+            .map_err(|_| failure(anyhow::anyhow!("traffic writer stopped")))?;
+        // Once admitted, the single writer owns settlement even if this waiter
+        // disappears. Pending callers are backpressured by the bounded channel.
+        result.await.map_err(failure)?
     }
     pub fn wrap(&self, body: Body, subject: String, direction: Direction) -> Body {
         self.meter(body, subject, direction).0
@@ -583,25 +546,27 @@ impl TrafficStore {
         let store = self.clone();
         let status = StreamStatus::default();
         let failure = status.0.clone();
-        // Charge each received frame before polling another one. Do not retain an
-        // uncharged multi-frame buffer that can be discarded by cancellation.
+        // Merge only ready frames. One cancellation-safe owner durably charges
+        // the batch before any of its original byte slices are released.
         let stream = futures_util::stream::try_unfold(
-            (body.into_data_stream(), store, subject, failure),
+            (stream::ReadyBatch::new(body), store, subject, failure),
             move |(mut input, store, subject, failure)| async move {
-                let Some(chunk) = input.next().await else {
+                if let Some(chunk) = input.pop() {
+                    return Ok(Some((chunk, (input, store, subject, failure))));
+                }
+                let bytes = input.collect().await?;
+                if bytes == 0 {
                     return Ok::<_, std::io::Error>(None);
-                };
-                let chunk = chunk.map_err(std::io::Error::other)?;
-                if let Err(error) = store
-                    .charge(subject.clone(), direction, chunk.len() as u64)
-                    .await
-                {
+                }
+                if let Err(error) = store.charge(subject.clone(), direction, bytes as u64).await {
                     *failure.lock().expect("stream status") = Some(error);
                     return Err(std::io::Error::other(
                         "Traffic accounting stopped this transfer",
                     ));
                 }
-                Ok(Some((chunk, (input, store, subject, failure))))
+                Ok(input
+                    .pop()
+                    .map(|chunk| (chunk, (input, store, subject, failure))))
             },
         );
         (Body::from_stream(stream), status)
@@ -652,10 +617,48 @@ pub async fn browser_subject(state: &AppState, headers: &HeaderMap) -> String {
         None => "guest".into(),
     }
 }
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct TrafficQuery {
     pub start: Option<String>,
     pub end: Option<String>,
+    pub days: Option<u8>,
+}
+
+impl TrafficQuery {
+    fn date_range(
+        &self,
+        today: chrono::NaiveDate,
+    ) -> AppResult<(chrono::NaiveDate, chrono::NaiveDate)> {
+        if let Some(days) = self.days {
+            if !(1..=31).contains(&days) || self.start.is_some() || self.end.is_some() {
+                return Err(AppError::BadRequest(
+                    "请选择 1 至 31 天，或单独指定日期范围".into(),
+                ));
+            }
+            return Ok((today - chrono::Duration::days(i64::from(days) - 1), today));
+        }
+        let parse = |text: &str| {
+            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+                .map_err(|_| AppError::BadRequest("日期格式无效".into()))
+        };
+        let start = self
+            .start
+            .as_deref()
+            .map(parse)
+            .transpose()?
+            .unwrap_or(today.with_day(1).unwrap());
+        let end = self.end.as_deref().map(parse).transpose()?.unwrap_or(today);
+        if start > end
+            || end > today
+            || (end - start).num_days() > 30
+            || (today - start).num_days() > 62
+        {
+            return Err(AppError::BadRequest(
+                "请选择保留期内、不超过 31 天的日期范围".into(),
+            ));
+        }
+        Ok((start, end))
+    }
 }
 #[derive(Serialize)]
 pub struct UserTrafficView {
@@ -695,6 +698,7 @@ pub struct TrafficView {
     pub users_total: Usage,
     pub users: BTreeMap<String, Usage>,
     pub next_reset: i64,
+    pub today: String,
     pub days: BTreeMap<String, Usage>,
 }
 pub async fn info(
@@ -704,38 +708,12 @@ pub async fn info(
     let settings = state.config_file.read().await.traffic.clone();
     let runtime = state.traffic.inner.lock().await;
     let mut ledger = runtime.ledger.clone();
-    ledger.advance(Utc::now().timestamp(), &settings.cycle);
-    let today = DateTime::from_timestamp(
-        Utc::now().timestamp() + i64::from(settings.cycle.offset_minutes) * 60,
-        0,
-    )
-    .unwrap()
-    .date_naive();
-    let parse = |text: &str| {
-        chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
-            .map_err(|_| AppError::BadRequest("日期格式无效".into()))
-    };
-    let start = query
-        .start
-        .as_deref()
-        .map(parse)
-        .transpose()?
-        .unwrap_or(today.with_day(1).unwrap());
-    let end = query
-        .end
-        .as_deref()
-        .map(parse)
-        .transpose()?
-        .unwrap_or(today);
-    if start > end
-        || end > today
-        || (end - start).num_days() > 30
-        || (today - start).num_days() > 62
-    {
-        return Err(AppError::BadRequest(
-            "请选择保留期内、不超过 31 天的日期范围".into(),
-        ));
-    }
+    let now = Utc::now().timestamp();
+    ledger.advance(now, &settings.cycle);
+    let today = DateTime::from_timestamp(now + i64::from(settings.cycle.offset_minutes) * 60, 0)
+        .unwrap()
+        .date_naive();
+    let (start, end) = query.date_range(today)?;
     let mut days = BTreeMap::new();
     let mut day = start;
     while day <= end {
@@ -753,6 +731,7 @@ pub async fn info(
         users_total: ledger.users_total,
         users: ledger.users,
         next_reset: ledger.next_reset,
+        today: today.format("%Y-%m-%d").to_string(),
         days,
     }))
 }
@@ -793,6 +772,8 @@ pub async fn update(
 mod tests {
     use super::*;
     use crate::{config::ConfigFile, test_support::TestDirectory};
+    use futures_util::StreamExt;
+    use std::io::Write;
     use tokio::sync::RwLock;
 
     fn quota(upload: u64, download: u64) -> Quota {
@@ -801,6 +782,97 @@ mod tests {
             upload,
             download,
         }
+    }
+
+    #[test]
+    fn traffic_presets_use_the_accounting_day_across_timezones_and_month_boundaries() {
+        let now = DateTime::parse_from_rfc3339("2026-10-02T19:00:00Z")
+            .unwrap()
+            .timestamp();
+        for (offset_minutes, expected_day) in [(0, "2026-10-02"), (480, "2026-10-03")] {
+            let today = DateTime::from_timestamp(now + offset_minutes * 60, 0)
+                .unwrap()
+                .date_naive();
+            assert_eq!(today.to_string(), expected_day);
+            for days in [1, 7, 30, 31] {
+                let query = TrafficQuery {
+                    days: Some(days),
+                    ..Default::default()
+                };
+                let (start, end) = query.date_range(today).unwrap();
+                assert_eq!(end, today);
+                assert_eq!((end - start).num_days() + 1, i64::from(days));
+            }
+        }
+    }
+
+    #[test]
+    fn traffic_ranges_reject_invalid_presets_and_keep_custom_date_limits() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap();
+        for days in [0, 32, 255] {
+            let query = TrafficQuery {
+                days: Some(days),
+                ..Default::default()
+            };
+            assert!(query.date_range(today).is_err());
+        }
+        for (start, end) in [(Some("2026-09-26"), None), (None, Some("2026-10-02"))] {
+            let query = TrafficQuery {
+                start: start.map(String::from),
+                end: end.map(String::from),
+                days: Some(7),
+            };
+            assert!(query.date_range(today).is_err());
+        }
+        let query = TrafficQuery {
+            start: Some("2026-09-26".into()),
+            end: Some("2026-10-02".into()),
+            days: None,
+        };
+        let (start, end) = query.date_range(today).unwrap();
+        assert_eq!(start.to_string(), "2026-09-26");
+        assert_eq!(end, today);
+        assert_eq!(
+            TrafficQuery::default().date_range(today).unwrap().0.day(),
+            1
+        );
+        for (start, end) in [
+            ("invalid", "2026-10-02"),
+            ("2026-10-03", "2026-10-02"),
+            ("2026-10-02", "2026-10-03"),
+            ("2026-09-01", "2026-10-02"),
+            ("2026-07-01", "2026-07-02"),
+        ] {
+            let query = TrafficQuery {
+                start: Some(start.into()),
+                end: Some(end.into()),
+                days: None,
+            };
+            assert!(query.date_range(today).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn traffic_info_returns_the_server_day_and_zero_usage_for_a_new_deployment() {
+        let directory = TestDirectory::new("traffic-preset-view");
+        let mut config = ConfigFile::with_test_storage();
+        config.traffic.cycle.offset_minutes = 480;
+        let state = crate::test_support::app_state(&directory, config).await;
+        let query = TrafficQuery {
+            days: Some(7),
+            ..Default::default()
+        };
+        let view = info(State(state), Query(query)).await.unwrap().0;
+        assert_eq!(view.days.len(), 7);
+        assert_eq!(view.days.last_key_value().unwrap().0, &view.today);
+        assert!(view
+            .days
+            .values()
+            .all(|usage| usage.upload == 0 && usage.download == 0));
+        assert_eq!(view.total.upload, 0);
+        assert_eq!(view.total.download, 0);
+        let json = serde_json::to_value(view).unwrap();
+        assert!(json["today"].is_string());
     }
 
     #[tokio::test]
@@ -912,6 +984,125 @@ mod tests {
             .await
             .unwrap();
         (directory, store, config)
+    }
+
+    #[tokio::test]
+    async fn group_commit_checks_aggregate_quota_and_replays_each_accepted_record() {
+        let (directory, store, config) = fixture(TrafficSettings {
+            guest: quota(20, 0),
+            ..Default::default()
+        })
+        .await;
+        let held = store.inner.lock().await;
+        let mut replies = Vec::new();
+        for _ in 0..16 {
+            let (reply, result) = tokio::sync::oneshot::channel();
+            store
+                .charges
+                .try_send(commit::ChargeRequest {
+                    subject: "guest".into(),
+                    direction: Direction::Upload,
+                    bytes: 2,
+                    reply,
+                })
+                .unwrap_or_else(|_| panic!("bounded queue should admit this group"));
+            replies.push(result);
+        }
+        drop(held);
+        let mut accepted = 0;
+        for reply in replies {
+            match reply.await.unwrap() {
+                Ok(()) => accepted += 1,
+                Err(AppError::TrafficExhausted(_)) => {}
+                other => panic!("unexpected accounting result: {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 10);
+        let runtime = store.inner.lock().await;
+        assert_eq!(runtime.ledger.total.upload, 20);
+        assert_eq!(runtime.ledger.sequence, 10);
+        assert_eq!(runtime.commits, 1);
+        drop(runtime);
+        drop(store);
+        let restored = TrafficStore::load(&directory.path().join("config.json"), config)
+            .await
+            .unwrap();
+        assert_eq!(restored.inner.lock().await.ledger.total.upload, 20);
+    }
+
+    #[tokio::test]
+    async fn slow_commit_does_not_lock_reads_and_cancelled_waiter_still_settles() {
+        let (_directory, store, config) = fixture(TrafficSettings::default()).await;
+        let gate = store.inner.lock().await.commit_pause.clone();
+        let pause = gate.lock().await;
+        let waiter = tokio::spawn({
+            let store = store.clone();
+            async move { store.charge("guest".into(), Direction::Upload, 7).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while Arc::strong_count(&gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.preflight("guest", Direction::Upload, 1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Config updates are also independent of the disk commit wait.
+        tokio::time::timeout(std::time::Duration::from_secs(1), config.write())
+            .await
+            .unwrap()
+            .traffic
+            .total = quota(7, 0);
+        assert_eq!(store.inner.lock().await.ledger.total.upload, 0);
+        waiter.abort();
+        let _ = waiter.await;
+        drop(pause);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while store.inner.lock().await.ledger.total.upload != 7 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(store
+            .preflight("guest", Direction::Upload, 1)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn group_commit_failure_stops_admission_without_resetting_usage() {
+        let (directory, store, _) = fixture(TrafficSettings::default()).await;
+        store
+            .charge("guest".into(), Direction::Upload, 7)
+            .await
+            .unwrap();
+        store.inner.lock().await.records = 4095;
+        let snapshot = directory.path().join("traffic-usage.json");
+        // Isolated fixture: make compaction fail after the journal is synced.
+        std::fs::remove_file(&snapshot).unwrap();
+        std::fs::create_dir(&snapshot).unwrap();
+        assert!(store
+            .charge("guest".into(), Direction::Upload, 3)
+            .await
+            .is_err());
+        assert_eq!(store.inner.lock().await.ledger.total.upload, 7);
+        assert!(store
+            .preflight("guest", Direction::Upload, 1)
+            .await
+            .is_err());
+        assert!(store
+            .charge("guest".into(), Direction::Upload, 1)
+            .await
+            .is_err());
+        let records = std::fs::read(directory.path().join("traffic-usage.jsonl")).unwrap();
+        assert_eq!(records.iter().filter(|byte| **byte == b'\n').count(), 2);
     }
 
     #[test]
@@ -1325,6 +1516,234 @@ mod tests {
             .unwrap();
         drop(store.download(response, "guest".into()).await.unwrap());
         assert_eq!(store.inner.lock().await.ledger.total.download, 0);
+    }
+
+    #[tokio::test]
+    async fn ready_frames_share_durable_charges_and_survive_restart() {
+        for direction in [Direction::Upload, Direction::Download] {
+            let (directory, store, config) = fixture(TrafficSettings::default()).await;
+            let payload = bytes::Bytes::from(vec![0x5a; 1024 * 1024 + 7]);
+            let frames: Vec<_> = payload
+                .chunks(4096)
+                .map(|chunk| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(chunk)))
+                .collect();
+            let body = store.wrap(
+                Body::from_stream(futures_util::stream::iter(frames)),
+                "guest".into(),
+                direction,
+            );
+            assert_eq!(
+                axum::body::to_bytes(body, payload.len()).await.unwrap(),
+                payload
+            );
+            {
+                let runtime = store.inner.lock().await;
+                assert_eq!(runtime.records, 5, "not one fsync per 4 KiB frame");
+                assert_eq!(runtime.ledger.total.amount(direction), payload.len() as u64);
+            }
+            drop(store);
+            let reloaded = TrafficStore::load(&directory.path().join("config.json"), config)
+                .await
+                .unwrap();
+            assert_eq!(
+                reloaded.inner.lock().await.ledger.total.amount(direction),
+                payload.len() as u64
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_frame_bound_and_large_frames_preserve_every_byte() {
+        for (sizes, expected_records) in [(vec![1; 65], 2), (vec![1024 * 1024 + 3], 1)] {
+            let (_directory, store, _) = fixture(TrafficSettings::default()).await;
+            let mut expected = Vec::new();
+            let frames: Vec<_> = sizes
+                .into_iter()
+                .enumerate()
+                .map(|(index, size)| {
+                    let bytes = vec![index as u8; size];
+                    expected.extend_from_slice(&bytes);
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(bytes))
+                })
+                .collect();
+            let body = store.wrap(
+                Body::from_stream(futures_util::stream::iter(frames)),
+                "guest".into(),
+                Direction::Upload,
+            );
+            assert_eq!(
+                axum::body::to_bytes(body, expected.len())
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected.as_slice()
+            );
+            assert_eq!(
+                store.inner.lock().await.ledger.total.upload,
+                expected.len() as u64
+            );
+            assert_eq!(store.inner.lock().await.records, expected_records);
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_eof_is_not_polled_again_after_releasing_a_batch() {
+        let (_directory, store, _) = fixture(TrafficSettings::default()).await;
+        let source =
+            futures_util::stream::unfold(Some(bytes::Bytes::from_static(b"abc")), |next| async {
+                next.map(|bytes| (Ok::<_, std::io::Error>(bytes), None))
+            });
+        let body = store.wrap(Body::from_stream(source), "guest".into(), Direction::Upload);
+        assert_eq!(
+            axum::body::to_bytes(body, 3).await.unwrap().as_ref(),
+            b"abc"
+        );
+        assert_eq!(store.inner.lock().await.ledger.total.upload, 3);
+    }
+
+    #[tokio::test]
+    async fn ready_batch_charges_received_bytes_before_a_source_error() {
+        let (_directory, store, _) = fixture(TrafficSettings::default()).await;
+        let frames = vec![
+            Ok(bytes::Bytes::new()),
+            Ok(bytes::Bytes::from_static(b"abc")),
+            Err(std::io::Error::other("interrupted source")),
+        ];
+        let mut body = store
+            .wrap(
+                Body::from_stream(futures_util::stream::iter(frames)),
+                "guest".into(),
+                Direction::Upload,
+            )
+            .into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"abc");
+        assert!(body.next().await.unwrap().is_err());
+        assert_eq!(store.inner.lock().await.ledger.total.upload, 3);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_partially_consumed_batch_keeps_its_durable_charge() {
+        let (directory, store, config) = fixture(TrafficSettings::default()).await;
+        let frames = (0..64).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![0x5a; 4096])));
+        let mut body = store
+            .wrap(
+                Body::from_stream(futures_util::stream::iter(frames)),
+                "guest".into(),
+                Direction::Download,
+            )
+            .into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap().len(), 4096);
+        drop(body);
+        assert_eq!(store.inner.lock().await.ledger.total.download, 256 * 1024);
+        drop(store);
+        let reloaded = TrafficStore::load(&directory.path().join("config.json"), config)
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.inner.lock().await.ledger.total.download,
+            256 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_waiter_does_not_cancel_durable_accounting() {
+        let (_directory, store, _) = fixture(TrafficSettings::default()).await;
+        let held = store.inner.lock().await;
+        let frames = (0..64).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![0x5a; 4096])));
+        let mut body = store
+            .wrap(
+                Body::from_stream(futures_util::stream::iter(frames)),
+                "guest".into(),
+                Direction::Upload,
+            )
+            .into_data_stream();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), body.next())
+                .await
+                .is_err()
+        );
+        drop(body);
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if store.inner.lock().await.ledger.total.upload == 256 * 1024 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the accounting owner survives its waiter");
+    }
+
+    #[tokio::test]
+    async fn ready_batch_cannot_bypass_a_concurrent_quota_charge() {
+        let (_directory, store, _) = fixture(TrafficSettings {
+            total: quota(256 * 1024, 0),
+            ..Default::default()
+        })
+        .await;
+        store
+            .preflight("guest", Direction::Upload, 256 * 1024)
+            .await
+            .unwrap();
+        store
+            .charge("guest".into(), Direction::Upload, 1)
+            .await
+            .unwrap();
+        let frames = (0..64).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![0x5a; 4096])));
+        let (body, status) = store.meter(
+            Body::from_stream(futures_util::stream::iter(frames)),
+            "guest".into(),
+            Direction::Upload,
+        );
+        assert!(axum::body::to_bytes(body, 256 * 1024).await.is_err());
+        assert_eq!(
+            status
+                .finish::<()>(Err(AppError::ClientClosedRequest))
+                .unwrap_err()
+                .code(),
+            "traffic_exhausted"
+        );
+        assert_eq!(store.inner.lock().await.ledger.total.upload, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual small-frame durable metering comparison"]
+    async fn batched_frame_accounting_baseline() {
+        let total = 16 * 1024 * 1024;
+        for batched in [false, true] {
+            let (_directory, store, _) = fixture(TrafficSettings::default()).await;
+            let started = std::time::Instant::now();
+            if batched {
+                let frames = (0..total / 4096)
+                    .map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![0x5a; 4096])));
+                let body = store.wrap(
+                    Body::from_stream(futures_util::stream::iter(frames)),
+                    "admin".into(),
+                    Direction::Download,
+                );
+                let mut stream = body.into_data_stream();
+                let mut received = 0;
+                while let Some(chunk) = stream.next().await {
+                    received += chunk.unwrap().len();
+                }
+                assert_eq!(received, total);
+            } else {
+                for _ in 0..total / 4096 {
+                    store
+                        .charge("admin".into(), Direction::Download, 4096)
+                        .await
+                        .unwrap();
+                }
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "16 MiB / 4 KiB frames, batched={batched}: {elapsed:?}, {:.1} MiB/s",
+                16.0 / elapsed.as_secs_f64()
+            );
+            assert_eq!(store.inner.lock().await.ledger.total.download, total as u64);
+        }
     }
 
     #[tokio::test]

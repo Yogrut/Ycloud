@@ -14,7 +14,6 @@ export function useDomainBinding(getInitial: () => DomainBindingView | undefined
   const url = ref('')
   const error = ref('')
   const message = ref('')
-  const removing = ref(false)
   let disposed = false
   let readRequest: AbortController | undefined
 
@@ -29,7 +28,6 @@ export function useDomainBinding(getInitial: () => DomainBindingView | undefined
     open.value = true
     error.value = ''
     message.value = ''
-    removing.value = false
     busy.value = true
     const controller = new AbortController()
     readRequest = controller
@@ -45,24 +43,17 @@ export function useDomainBinding(getInitial: () => DomainBindingView | undefined
     }
   }
 
-  function beginRemoval(): void {
-    if (disposed || busy.value || !open.value || status.value.source !== 'settings') return
-    removing.value = true
-    error.value = ''
-    message.value = ''
-  }
-
   async function submit(): Promise<void> {
     if (disposed || busy.value || !open.value) return
     busy.value = true
     error.value = ''
     message.value = ''
-    const isRemoval = removing.value
+    const publicUrl = url.value.trim()
+    const isRemoval = !publicUrl
     try {
-      const result = isRemoval ? await removeDomainBinding() : await saveDomainBinding({ public_url: url.value.trim() })
+      const result = isRemoval ? await removeDomainBinding() : await saveDomainBinding({ public_url: publicUrl })
       if (disposed) return
       status.value = bindingSnapshot(result)
-      removing.value = false
       syncDraft()
       message.value = isRemoval
         ? locale.text('已解除域名绑定，Ycloud 已恢复 HTTP 访问模式。', 'Domain binding removed. Ycloud is using HTTP access again.')
@@ -80,7 +71,6 @@ export function useDomainBinding(getInitial: () => DomainBindingView | undefined
     syncDraft()
     error.value = ''
     message.value = ''
-    removing.value = false
   }
 
   onScopeDispose(() => {
@@ -90,9 +80,8 @@ export function useDomainBinding(getInitial: () => DomainBindingView | undefined
     url.value = ''
     error.value = ''
     message.value = ''
-    removing.value = false
     // Submitted writes keep running; their late results must not revive this editor.
   })
 
-  return { status, open, busy, url, error, message, removing, show, beginRemoval, submit, cancel }
+  return { status, open, busy, url, error, message, show, submit, cancel }
 }

@@ -77,7 +77,9 @@ async fn cancelled_waiter_keeps_publication_budgets_and_persists_quota() {
     assert_eq!(storage.io_gate.available_permits(), 0);
     assert_eq!(capacity.status().reserved, 4);
     assert_eq!(capacity.status().used, 0);
-    assert_eq!(*storage.reserved_upload_bytes.lock().unwrap(), physical);
+    // Commit has flushed the four buffered bytes before waiting for mutation
+    // admission; the unwritten part of the physical reservation stays owned.
+    assert_eq!(*storage.reserved_upload_bytes.lock().unwrap(), physical - 4);
     assert!(!root.join("notes.txt").exists());
     drop(mutation);
     wait_until(|| storage.io_gate.available_permits() == 1).await;

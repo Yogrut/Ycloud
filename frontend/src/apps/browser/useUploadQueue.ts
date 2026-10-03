@@ -30,6 +30,10 @@ interface UploadDestination {
   basePath: string
 }
 
+// File workers and S3's four within-file parts are separate limits. The server
+// remains authoritative for account admission and relay memory reservations.
+const MAX_PARALLEL_UPLOAD_FILES = 4
+
 export function useUploadQueue(context: UploadQueueContext) {
   const locale = useLocale()
   const fileInput = ref<HTMLInputElement>()
@@ -42,8 +46,7 @@ export function useUploadQueue(context: UploadQueueContext) {
   const uploadDropActive = ref(false)
   let uploadTaskSequence = 0
   let uploadDragDepth = 0
-  let currentUploadController: AbortController | undefined
-  let currentUploadTaskId: number | undefined
+  const uploadControllers = new Map<number, AbortController>()
   let disposed = false
   const selectionControllers = new Set<AbortController>()
   let refreshing = false
@@ -269,24 +272,26 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   async function uploadPreparedTasks(tasks: UploadTask[], completedContexts: Set<string>): Promise<void> {
-    const groups = groupUploadTasksByTicket(tasks.filter(task => task.status === 'queued'))
-    for (const { tasks: group, ticket, storageId } of groups.values()) {
-      if (!storageId) continue
-      for (const task of group) {
+    const pending = tasks.filter(task => task.status === 'queued' && task.ticket && task.storageId)
+    let next = 0
+    async function worker(): Promise<void> {
+      while (!disposed && next < pending.length) {
+        const task = pending[next++]!
+        const { ticket, storageId } = task
         if (disposed) return
-        if (task.status !== 'queued' || task.ticket !== ticket || task.storageId !== storageId) continue
+        if (task.status !== 'queued' || !ticket || !storageId) continue
         task.status = 'uploading'
         task.loaded = 0
         task.error = ''
+        const controller = new AbortController()
+        uploadControllers.set(task.id, controller)
         try {
-          currentUploadTaskId = task.id
-          currentUploadController = new AbortController()
           task.attempted = true
           task.safeToPrepare = false
-          await uploadFile(task.targetPath, task.file, loaded => { task.loaded = loaded }, task.storageId, ticket, currentUploadController.signal, task.directUpload)
+          await uploadFile(task.targetPath, task.file, loaded => { if (!disposed && task.status === 'uploading') task.loaded = loaded }, storageId, ticket, controller.signal, task.directUpload)
           if (disposed) return
           if (task.cancelRequested || task.pauseRequested) {
-            await reconcileInterruptedUpload(task)
+            void reconcileInterruptedUpload(task)
           } else {
             task.loaded = task.file.size
             task.status = 'succeeded'
@@ -296,7 +301,7 @@ export function useUploadQueue(context: UploadQueueContext) {
           if (disposed) return
           if (task.cancelRequested || task.pauseRequested) {
             task.loaded = 0
-            await reconcileInterruptedUpload(task)
+            void reconcileInterruptedUpload(task)
           } else {
             task.error = error instanceof Error ? error.message : locale.text('上传异常', 'Upload error')
             if (error instanceof ApiError && error.blocksRetry) {
@@ -311,11 +316,11 @@ export function useUploadQueue(context: UploadQueueContext) {
             }
           }
         } finally {
-          currentUploadController = undefined
-          currentUploadTaskId = undefined
+          uploadControllers.delete(task.id)
         }
       }
     }
+    await Promise.all(Array.from({ length: Math.min(MAX_PARALLEL_UPLOAD_FILES, pending.length) }, () => worker()))
   }
 
   async function runUploadTasks(taskIds: number[]): Promise<void> {
@@ -393,7 +398,7 @@ export function useUploadQueue(context: UploadQueueContext) {
         task.pauseRequested = true
         task.status = 'verifying'
         task.error = locale.text('正在确认暂停后的实际结果', 'Checking the result after pausing')
-        if (currentUploadTaskId === task.id) currentUploadController?.abort()
+        uploadControllers.get(task.id)?.abort()
       }
     }
   }
@@ -426,9 +431,7 @@ export function useUploadQueue(context: UploadQueueContext) {
         ? locale.text('正在确认终止后的实际结果', 'Checking the result after termination')
         : locale.text('任务已终止', 'Task terminated')
     }
-    if (selectedTasks.some(task => task.id === currentUploadTaskId)) {
-      currentUploadController?.abort()
-    }
+    for (const task of selectedTasks) uploadControllers.get(task.id)?.abort()
     cancelPendingUploadItems(selectedTasks)
   }
 
@@ -578,7 +581,8 @@ export function useUploadQueue(context: UploadQueueContext) {
     disposed = true
     for (const controller of selectionControllers) controller.abort()
     selectionControllers.clear()
-    currentUploadController?.abort()
+    for (const controller of uploadControllers.values()) controller.abort()
+    uploadControllers.clear()
     reconciliation.dispose()
     pendingRefresh = undefined
     for (const { ticket, storageId } of groupUploadTasksByTicket(uploadTasks.value).values()) {

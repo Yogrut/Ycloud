@@ -53,14 +53,9 @@ describe('DomainBindingSetting', () => {
     try {
       host.querySelector<HTMLButtonElement>('.setting-row button')!.click()
       await settle()
-      if (operation === 'remove') {
-        host.querySelector<HTMLButtonElement>('.domain-remove')!.click()
-        await nextTick()
-      } else {
-        const input = host.querySelector<HTMLInputElement>('input[type="url"]')!
-        input.value = 'https://other.example.com'
-        input.dispatchEvent(new Event('input'))
-      }
+      const input = host.querySelector<HTMLInputElement>('input[type="url"]')!
+      input.value = operation === 'remove' ? '' : 'https://other.example.com'
+      input.dispatchEvent(new Event('input'))
       const form = host.querySelector('form')!
       form.dispatchEvent(new Event('submit', { cancelable: true }))
       form.dispatchEvent(new Event('submit', { cancelable: true }))
@@ -68,7 +63,7 @@ describe('DomainBindingSetting', () => {
       expect(fetch).toHaveBeenCalledTimes(2)
       expect(fetch.mock.calls[1]![1].method).toBe(operation === 'save' ? 'PUT' : 'DELETE')
       expect([...host.querySelectorAll<HTMLButtonElement>('.modal-actions button')].every(button => button.disabled)).toBe(true)
-      if (operation === 'save') expect(host.querySelector<HTMLButtonElement>('.domain-remove')!.disabled).toBe(true)
+      expect(host.querySelector('.domain-remove')).toBeNull()
       const signal = fetch.mock.calls[1]![1].signal as AbortSignal
       app.unmount()
       mounted = false
@@ -108,7 +103,7 @@ describe('DomainBindingSetting', () => {
       expect(fetch).toHaveBeenLastCalledWith('/api/admin/domain-binding', expect.objectContaining({ method: 'PUT', body: JSON.stringify({ public_url: 'https://CLOUD.example.com:443/' }) }))
       expect(input.value).toBe(binding.public_url)
       expect(host.querySelector('.setting-row')?.textContent).toContain(binding.public_url)
-      expect(host.querySelector<HTMLAnchorElement>('.domain-open-link')?.href).toBe(`${binding.public_url}/admin/account`)
+      expect(host.querySelector('.domain-open-link')).toBeNull()
     } finally { app.unmount() }
   })
 
@@ -138,7 +133,7 @@ describe('DomainBindingSetting', () => {
     expect(host.querySelector('.settings-drawer-head')?.textContent).not.toContain('返回')
     expect(host.querySelector('details')).toBeNull()
     expect(host.querySelector('summary')).toBeNull()
-    expect(host.textContent).toContain('不填写则使用 HTTP')
+    expect(host.textContent).toContain('清空后确认即可解除绑定')
     expect(host.textContent).not.toContain('验证期')
     const inputs = host.querySelectorAll<HTMLInputElement>('.domain-binding-form input')
     expect(inputs).toHaveLength(1)
@@ -152,7 +147,7 @@ describe('DomainBindingSetting', () => {
     }))
     expect(document.querySelector('.app-toast.success')?.textContent).toContain('域名绑定已立即生效')
     expect(host.querySelector<HTMLInputElement>('input[type="url"]')?.value).toBe(binding.public_url)
-    expect(host.querySelector<HTMLAnchorElement>('.domain-open-link')?.href).toBe('https://cloud.example.com/admin/account')
+    expect(host.querySelector('.domain-open-link')).toBeNull()
     expect([...host.querySelectorAll('.modal-actions button')].map(button => button.textContent)).toEqual(['取消', '确认'])
     app.unmount()
   })
@@ -177,19 +172,44 @@ describe('DomainBindingSetting', () => {
     app.unmount()
   })
 
-  it('requires confirmation before removing a persisted binding', async () => {
+  it('removes a persisted binding by clearing the address and confirming once', async () => {
     const saved: DomainBindingView = { binding, source: 'settings' }
     const fetch = vi.fn().mockResolvedValueOnce(response(saved)).mockResolvedValueOnce(response(empty))
     vi.stubGlobal('fetch', fetch)
     const { app, host } = mount(saved)
     host.querySelector<HTMLButtonElement>('.setting-row button')!.click(); await settle()
-    host.querySelector<HTMLButtonElement>('.domain-remove')!.click(); await nextTick()
+    expect(host.querySelector('.domain-remove')).toBeNull()
+    const input = host.querySelector<HTMLInputElement>('input[type="url"]')!
+    expect(input.required).toBe(false)
+    input.value = '   '; input.dispatchEvent(new Event('input')); await nextTick()
     expect(fetch).toHaveBeenCalledTimes(1)
-    expect(host.textContent).toContain('恢复 HTTP 访问')
+    expect(host.querySelector('.setting-row')?.textContent).toContain(binding.public_url)
     host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true })); await settle()
     expect(fetch).toHaveBeenLastCalledWith('/api/admin/domain-binding', expect.objectContaining({ method: 'DELETE' }))
     expect(document.querySelector('.app-toast.success')?.textContent).toContain('已解除域名绑定')
+    expect(input.value).toBe('')
+    expect(host.querySelector('.setting-row')?.textContent).toContain('未设置')
+    expect(host.querySelector('.domain-open-link')).toBeNull()
     app.unmount()
+  })
+
+  it('keeps the committed binding and empty draft when removal fails', async () => {
+    const saved: DomainBindingView = { binding, source: 'settings' }
+    const fetch = vi.fn().mockResolvedValueOnce(response(saved))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: 'Removal rejected' } }), { status: 400, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetch)
+    const { app, host } = mount(saved)
+    try {
+      host.querySelector<HTMLButtonElement>('.setting-row button')!.click(); await settle()
+      const input = host.querySelector<HTMLInputElement>('input[type="url"]')!
+      input.value = ''; input.dispatchEvent(new Event('input'))
+      host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true })); await settle()
+      expect(fetch).toHaveBeenCalledTimes(2)
+      expect(input.value).toBe('')
+      expect(host.querySelector('.setting-row')?.textContent).toContain(binding.public_url)
+      expect(document.querySelector('.app-toast.error')?.textContent).toContain('Removal rejected')
+      expect(document.querySelector('.app-toast.success')).toBeNull()
+    } finally { app.unmount() }
   })
 
   it('shows failed persistence or validation without claiming the binding succeeded', async () => {

@@ -25,6 +25,14 @@ const MAX_RESERVED_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) struct BatchPersistence {
     root: PathBuf,
     reserved_bytes: std::sync::Mutex<u64>,
+    #[cfg(test)]
+    pub(super) update_pause:
+        std::sync::Mutex<Option<(String, std::sync::Arc<tokio::sync::Mutex<()>>)>>,
+}
+
+pub(super) struct PreparedBatch {
+    bytes: Vec<u8>,
+    reserved: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -289,6 +297,7 @@ impl BatchPersistence {
                 batches.insert(
                     ticket,
                     UploadBatch {
+                        transition: std::sync::Arc::new(tokio::sync::Mutex::new(())),
                         recovery_backend: None,
                         subject: None,
                         account: manifest.account,
@@ -305,6 +314,8 @@ impl BatchPersistence {
                 Self {
                     root,
                     reserved_bytes: std::sync::Mutex::new(reserved),
+                    #[cfg(test)]
+                    update_pause: std::sync::Mutex::new(None),
                 },
                 batches,
             ))
@@ -313,7 +324,7 @@ impl BatchPersistence {
         .map_err(index_error)?
     }
 
-    pub(super) async fn create(&self, ticket: &str, batch: &UploadBatch) -> AppResult<()> {
+    pub(super) fn prepare(ticket: &str, batch: &UploadBatch) -> AppResult<PreparedBatch> {
         validate_ticket(ticket)?;
         if batch
             .namespace_id
@@ -346,6 +357,12 @@ impl BatchPersistence {
             return Err(AppError::TooManyRequests);
         }
         let reserved = estimate(&manifest, bytes.len())?;
+        Ok(PreparedBatch { bytes, reserved })
+    }
+
+    pub(super) async fn create(&self, ticket: &str, prepared: PreparedBatch) -> AppResult<()> {
+        validate_ticket(ticket)?;
+        let PreparedBatch { bytes, reserved } = prepared;
         {
             let mut budget = self
                 .reserved_bytes
@@ -394,6 +411,20 @@ impl BatchPersistence {
         expires_unix: i64,
     ) -> AppResult<()> {
         validate_ticket(ticket)?;
+        #[cfg(test)]
+        let _pause = {
+            let gate = self
+                .update_pause
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|(paused, _)| paused == ticket)
+                .map(|(_, gate)| gate.clone());
+            match gate {
+                Some(gate) => Some(gate.lock_owned().await),
+                None => None,
+            }
+        };
         let item = SavedItem {
             version: VERSION,
             path: path.into(),

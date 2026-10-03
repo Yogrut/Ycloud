@@ -6,10 +6,10 @@ import TrafficPanel from './TrafficPanel.vue'
 
 vi.mock('../../shared/api/admin', () => ({ getTraffic: vi.fn(), saveTraffic: vi.fn() }))
 const usage = { upload: 1024, download: 2048 }
-const fixture = {
+const fixture: TrafficInfo = {
   settings: { total: { enabled: true, upload: 4096, download: 8192 }, guest: { enabled: false, upload: 0, download: 0 }, users_total: { enabled: true, upload: 2048, download: 4096 }, users: {}, cycle: { unit: 'months' as const, every: 1, anchor: 1704067200, offset_minutes: 0 } },
   total: usage, guest: { upload: 0, download: 1024 }, users: { a: { upload: 512, download: 512 }, b: { upload: 256, download: 256 } },
-  users_total: { upload: 768, download: 768 }, next_reset: 1790812800,
+  users_total: { upload: 768, download: 768 }, next_reset: 1790812800, today: '2026-09-02',
   days: { '2026-09-01': usage, '2026-09-02': { upload: 0, download: 0 } },
 }
 const apps: ReturnType<typeof createApp>[] = []
@@ -28,13 +28,31 @@ afterEach(() => { apps.splice(0).forEach(app => app.unmount()); document.body.re
 describe('TrafficPanel', () => {
   it('defaults to the last seven calendar days without changing quotas', async () => {
     const host = await mount()
-    const end = new Date()
-    const start = new Date(end)
-    start.setDate(start.getDate() - 6)
-    const iso = (date: Date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
-    expect(getTraffic).toHaveBeenCalledExactlyOnceWith(iso(start), iso(end))
+    expect(getTraffic).toHaveBeenCalledExactlyOnceWith({ days: 7 })
     expect(host.querySelector('.range-presets .active')?.textContent).toBe('近 7 天')
     expect(saveTraffic).not.toHaveBeenCalled()
+  })
+
+  it('uses the server calendar even when the browser has crossed into the next day', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date('2026-10-03T03:00:00+08:00'))
+      const traffic = structuredClone(fixture)
+      traffic.today = '2026-10-02'
+      traffic.days = { '2026-09-26': usage, '2026-10-02': { upload: 0, download: 0 } }
+      const host = await mount('dashboard', traffic)
+      expect(getTraffic).toHaveBeenCalledExactlyOnceWith({ days: 7 })
+      expect(host.querySelectorAll('.traffic-meter')).toHaveLength(5)
+      const presets = [...host.querySelectorAll<HTMLButtonElement>('.range-presets button')]
+      presets.find(button => button.textContent === '今日')!.click(); await flush()
+      expect(getTraffic).toHaveBeenLastCalledWith({ days: 1 })
+      presets.find(button => button.textContent === '自定义')!.click(); await nextTick()
+      const triggers = host.querySelectorAll<HTMLButtonElement>('.traffic-range .date-picker-trigger')
+      expect(triggers[1]!.textContent).toContain('2026/10/02')
+      triggers[1]!.click(); await nextTick()
+      const nextDay = [...document.querySelectorAll<HTMLButtonElement>('.calendar-grid button:not(.outside)')].find(button => button.textContent === '3')
+      expect(nextDay?.disabled).toBe(true)
+    } finally { vi.useRealTimers() }
   })
 
   it('gives only nonzero bars a visibility floor without changing proportions or tooltip values', async () => {
@@ -125,6 +143,7 @@ describe('TrafficPanel', () => {
     const host = await mount()
     ;[...host.querySelectorAll<HTMLButtonElement>('.range-presets button')].find(button => button.textContent?.includes('近 30 天'))!.click()
     await flush()
+    expect(getTraffic).toHaveBeenLastCalledWith({ days: 30 })
     ;[...host.querySelectorAll<HTMLButtonElement>('.range-presets button')].find(button => button.textContent?.includes('自定义'))!.click()
     await nextTick()
     host.querySelector<HTMLButtonElement>('.traffic-range .date-picker-trigger')!.click()
@@ -133,8 +152,7 @@ describe('TrafficPanel', () => {
     host.querySelector<HTMLButtonElement>('.traffic-range .date-picker-trigger')!.click()
     host.querySelector('.traffic-range')!.dispatchEvent(new Event('submit', { cancelable: true }))
     await flush()
-    const iso = (offset: number) => { const date = new Date(); date.setDate(date.getDate() + offset); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}` }
-    expect(getTraffic).toHaveBeenLastCalledWith(iso(-29), iso(0))
+    expect(getTraffic).toHaveBeenLastCalledWith({ start: '2026-09-01', end: '2026-09-02' })
     expect(saveTraffic).not.toHaveBeenCalled()
   })
   it('saves upload/download switches and a shared reset cycle', async () => {

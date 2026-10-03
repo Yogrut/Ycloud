@@ -57,6 +57,54 @@ function ticketedTask(id: number, storageId = 'first', status: UploadTask['statu
 }
 
 describe('upload ticket grouping and mappings', () => {
+  it('runs at most four files and replaces a finished worker without waiting for other files', async () => {
+    const { queue } = uploads()
+    const complete: Array<() => void> = []
+    let active = 0
+    let peak = 0
+    vi.mocked(uploadFile).mockImplementation(() => {
+      active++
+      peak = Math.max(peak, active)
+      return new Promise<void>(resolve => complete.push(() => { active--; resolve() }))
+    })
+    const files = Array.from({ length: 8 }, (_, index) => new File(['data'], `${index}.txt`))
+    queue.uploadFiles({ target: { files, value: '' } } as unknown as Event)
+    await settle()
+    expect(uploadFile).toHaveBeenCalledTimes(4)
+    complete[0]!()
+    await settle()
+    expect(uploadFile).toHaveBeenCalledTimes(5)
+    for (let index = 1; index < 8; index++) { complete[index]!(); await settle() }
+    expect(peak).toBe(4)
+    expect(queue.uploadTasks.value.every(task => task.status === 'succeeded')).toBe(true)
+  })
+
+  it('cancels only selected active files and frees their workers while results are being checked', async () => {
+    const { queue } = uploads()
+    const complete: Array<() => void> = []
+    let checked!: (batch: UploadBatchStatus) => void
+    vi.mocked(getUploadBatchStatus).mockImplementation(() => new Promise(resolve => { checked = resolve }))
+    vi.mocked(uploadFile).mockImplementation((_path, _file, _progress, _storage, _ticket, signal) => new Promise<void>((resolve, reject) => {
+      complete.push(resolve)
+      signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }))
+    const files = Array.from({ length: 6 }, (_, index) => new File(['data'], `${index}.txt`))
+    queue.uploadFiles({ target: { files, value: '' } } as unknown as Event)
+    await settle()
+    const signals = vi.mocked(uploadFile).mock.calls.map(call => call[5]!)
+    queue.pauseUploads([queue.uploadTasks.value[0]!.id])
+    await settle()
+    expect(uploadFile).toHaveBeenCalledTimes(5)
+    queue.terminateUploads([queue.uploadTasks.value[1]!.id])
+    await settle()
+    expect(uploadFile).toHaveBeenCalledTimes(6)
+    expect(signals.map(signal => signal.aborted)).toEqual([true, true, false, false])
+    for (const finish of complete) finish()
+    checked({ ticket: 'ticket', items: files.map((file, index) => ({ path: `original/${file.name}`, size: 4, status: index < 2 ? 'cancelled' : 'complete' })) })
+    await settle()
+    expect(queue.uploadTasks.value.slice(2).every(task => task.status === 'succeeded')).toBe(true)
+  })
+
   it('ignores repeated and unknown ids and never cancels a verification-only selection', () => {
     const { queue } = uploads()
     queue.uploadTasks.value.push(ticketedTask(1), ticketedTask(2, 'first', 'verifying'))
@@ -428,19 +476,21 @@ describe('upload input lifecycle', () => {
     expect(context.announce).not.toHaveBeenCalled()
   })
 
-  it('does not start the next file after an upload resolves on a disposed queue', async () => {
+  it('aborts every active file and does not start queued files after disposal', async () => {
     const { context, queue } = uploads()
     let complete!: () => void
-    vi.mocked(uploadFile).mockReturnValueOnce(new Promise<void>(resolve => { complete = resolve }))
-    const files = [new File(['data'], 'one.txt'), new File(['data'], 'two.txt')]
+    const pending = new Promise<void>(resolve => { complete = resolve })
+    vi.mocked(uploadFile).mockImplementation(() => pending)
+    const files = Array.from({ length: 6 }, (_, index) => new File(['data'], `${index}.txt`))
     queue.uploadFiles({ target: { files, value: '' } } as unknown as Event)
     await settle()
-    const signal = vi.mocked(uploadFile).mock.calls[0]![5]!
+    expect(uploadFile).toHaveBeenCalledTimes(4)
+    const signals = vi.mocked(uploadFile).mock.calls.map(call => call[5]!)
     queue.disposeUploads()
-    expect(signal.aborted).toBe(true)
+    expect(signals.every(signal => signal.aborted)).toBe(true)
     complete()
     await settle()
-    expect(uploadFile).toHaveBeenCalledTimes(1)
+    expect(uploadFile).toHaveBeenCalledTimes(4)
     expect(context.refresh).not.toHaveBeenCalled()
     expect(context.announce).not.toHaveBeenCalled()
   })

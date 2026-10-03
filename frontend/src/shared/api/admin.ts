@@ -8,12 +8,13 @@ export interface TrafficSettings {
 }
 export interface TrafficInfo {
   settings: TrafficSettings; total: TrafficUsage; guest: TrafficUsage; users_total: TrafficUsage
-  users: Record<string, TrafficUsage>; next_reset: number; days: Record<string, TrafficUsage>
+  users: Record<string, TrafficUsage>; next_reset: number; today: string; days: Record<string, TrafficUsage>
 }
-export function getTraffic(start?: string, end?: string): Promise<TrafficInfo> {
+export function getTraffic(range: { start?: string; end?: string; days?: number } = {}): Promise<TrafficInfo> {
   const query = new URLSearchParams()
-  if (start) query.set('start', start)
-  if (end) query.set('end', end)
+  if (range.start) query.set('start', range.start)
+  if (range.end) query.set('end', range.end)
+  if (range.days !== undefined) query.set('days', String(range.days))
   return adminRequest('/api/admin/traffic?' + query.toString())
 }
 export function saveTraffic(settings: Partial<Pick<TrafficSettings, 'total' | 'guest' | 'users_total' | 'cycle'>>): Promise<{ success: boolean }> {

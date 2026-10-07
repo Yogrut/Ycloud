@@ -97,6 +97,7 @@ impl S3Backend {
         Ok(Self {
             client: Client::from_conf(sdk_config.build()),
             provider: settings.provider,
+            conditional_publish_verified: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             bucket: settings.bucket.clone(),
             prefix: settings.prefix.clone(),
             request_gate: Arc::new(Semaphore::new(S3_REQUEST_CONCURRENCY)),

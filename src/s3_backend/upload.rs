@@ -14,6 +14,31 @@ use crate::{
 };
 
 impl S3Backend {
+    pub(crate) fn validate_write_conditions(
+        &self,
+        conditions: &crate::storage::WriteConditions,
+        content_length: u64,
+    ) -> AppResult<()> {
+        if conditions.is_conditional() && content_length > super::S3_SINGLE_COPY_LIMIT {
+            return Err(AppError::storage_capability(
+                super::capabilities::CONDITIONAL_FILE_PUBLISH,
+                "S3 条件上传目前限于单对象原子复制范围（最多 4 GiB），已拒绝分片条件发布",
+            ));
+        }
+        if conditions.is_conditional() && self.is_alibaba_oss() {
+            return Err(AppError::storage_capability(
+                "conditional_write",
+                "当前 OSS 写入路径不能原子核验这些条件，已拒绝上传",
+            ));
+        }
+        if conditions.has_date() {
+            return Err(AppError::storage_capability(
+                "conditional_write",
+                "S3 正式发布无法原子核验目标修改时间，请使用 If-Match 版本标签",
+            ));
+        }
+        Ok(())
+    }
     /// Upload directly to an inaccessible temporary object and commit with a
     /// server-side copy. The caller-provided length is enforced while the
     /// stream is consumed, so a misleading Content-Length cannot bypass the
@@ -67,6 +92,8 @@ impl S3Backend {
         content_type: Option<&str>,
         create_only: bool,
     ) -> AppResult<S3UploadResult> {
+        self.validate_write_conditions(&input.conditions, content_length)?;
+        let conditions = input.conditions.clone();
         if content_length > max_upload_bytes
             || content_length > S3_MULTIPART_MAX_PART_BYTES * S3_MULTIPART_MAX_PARTS
         {
@@ -232,6 +259,20 @@ impl S3Backend {
                     .await);
             }
         };
+        if let Err(error) = conditions.check(
+            existing.is_some(),
+            existing.as_ref().and_then(|value| value.etag.as_deref()),
+            None,
+        ) {
+            return Err(self
+                .finish_uncommitted_internal_upload(
+                    &intent_key,
+                    intent_etag.as_deref(),
+                    &intent,
+                    error,
+                )
+                .await);
+        }
         if create_only && existing.is_some() {
             return Err(self
                 .finish_uncommitted_internal_upload(
@@ -260,11 +301,32 @@ impl S3Backend {
         }
 
         let journal_key = internal_key(&self.prefix, "transactions", &upload_id);
+        let publication_guard = if conditions.is_conditional() {
+            Some(match existing.as_ref() {
+                None => super::S3UploadPublicationGuard::Absent,
+                Some(value) => super::S3UploadPublicationGuard::Matches {
+                    etag: value
+                        .etag
+                        .clone()
+                        .expect("data ETags checked before publication"),
+                },
+            })
+        } else {
+            None
+        };
         let mut transaction = S3UploadTransaction {
-            schema_version: S3_TRANSACTION_SCHEMA_VERSION,
+            schema_version: if publication_guard.is_some() {
+                super::transaction_record::S3_CONDITIONAL_UPLOAD_SCHEMA_VERSION
+            } else {
+                S3_TRANSACTION_SCHEMA_VERSION
+            },
             id: upload_id.clone(),
             relative: relative.clone(),
-            stage: S3UploadStage::Prepared,
+            stage: if publication_guard.is_some() {
+                S3UploadStage::CheckingPublication
+            } else {
+                S3UploadStage::Prepared
+            },
             temporary: S3ObjectSnapshot {
                 size: temporary.size,
                 etag: temporary.etag.clone(),
@@ -273,6 +335,7 @@ impl S3Backend {
                 size: metadata.size,
                 etag: metadata.etag.clone(),
             }),
+            publication_guard,
         };
         let mut journal_etag = match self
             .write_upload_transaction(&journal_key, &transaction, None)
@@ -299,7 +362,10 @@ impl S3Backend {
 
         let mut backup_created = false;
         let mut verified_backup_etag = None;
-        if let Some(existing) = existing.as_ref() {
+        if let Some(existing) = existing
+            .as_ref()
+            .filter(|_| transaction.publication_guard.is_none())
+        {
             let backup_etag = self
                 .copy_key(
                     &destination_key,
@@ -324,6 +390,30 @@ impl S3Backend {
                 .await?;
         }
 
+        if transaction.publication_guard.is_some() {
+            if let Err(error) = self
+                .verify_conditional_publish(&transaction, &backup_key)
+                .await
+            {
+                let cleanup = self
+                    .cleanup_uncommitted_guarded_upload(
+                        &journal_key,
+                        journal_etag.as_deref(),
+                        &transaction,
+                        &intent_key,
+                        intent_etag.as_deref(),
+                    )
+                    .await;
+                return Err(error.with_operation(CommitState::NotCommitted, cleanup));
+            }
+            transaction.stage = S3UploadStage::PublicationStarted;
+            journal_etag = self
+                .write_upload_transaction(&journal_key, &transaction, journal_etag.as_deref())
+                .await
+                .map_err(|error| {
+                    error.with_operation(CommitState::NotCommitted, CleanupState::Pending)
+                })?;
+        }
         let commit = self
             .copy_key_with_operation(
                 &temporary_key,
@@ -331,15 +421,48 @@ impl S3Backend {
                 temporary.etag.as_deref(),
                 create_only,
                 Some(&upload_id),
+                transaction.publication_guard.as_ref(),
             )
             .await;
+        if transaction.publication_guard.is_some()
+            && commit
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.status() == axum::http::StatusCode::PRECONDITION_FAILED)
+        {
+            // Persist rejection before reclaiming the journal. Restart must
+            // never restore a backup over the winner of the failed condition.
+            transaction.stage = S3UploadStage::PublicationRejected;
+            let rejected = self
+                .write_upload_transaction(&journal_key, &transaction, journal_etag.as_deref())
+                .await;
+            let cleanup = match rejected {
+                Ok(etag) => {
+                    self.cleanup_uncommitted_guarded_upload(
+                        &journal_key,
+                        etag.as_deref(),
+                        &transaction,
+                        &intent_key,
+                        intent_etag.as_deref(),
+                    )
+                    .await
+                }
+                Err(_) => CleanupState::Pending,
+            };
+            return Err(
+                AppError::PreconditionFailed.with_operation(CommitState::NotCommitted, cleanup)
+            );
+        }
         let committed = match commit {
             Ok(committed_etag) => self
                 .head_key(&destination_key)
                 .await
                 .map_err(|error| error.with_operation(CommitState::Unknown, CleanupState::Pending))?
                 .filter(|value| {
-                    value.size == content_length && value.etag.as_ref() == Some(&committed_etag)
+                    value.size == content_length
+                        && value.etag.as_ref() == Some(&committed_etag)
+                        && (transaction.publication_guard.is_none()
+                            || value.operation_id.as_deref() == Some(upload_id.as_str()))
                 }),
             Err(error) => {
                 tracing::warn!(%error, "S3 upload commit returned an ambiguous failure");
@@ -351,12 +474,23 @@ impl S3Backend {
                     .filter(|value| {
                         value.size == content_length
                             && (value.operation_id.as_deref() == Some(upload_id.as_str())
-                                || (temporary.etag.is_some() && value.etag == temporary.etag))
+                                || (transaction.publication_guard.is_none()
+                                    && temporary.etag.is_some()
+                                    && value.etag == temporary.etag))
                     })
             }
         };
 
         let Some(committed) = committed else {
+            if transaction.publication_guard.is_some() {
+                // A missing marker or an unchanged destination does not prove
+                // this upload never committed. Keep its evidence and never
+                // publish the old backup over a newer formal object.
+                return Err(AppError::ServiceUnavailable(
+                    "条件上传提交结果尚未确认；已保留临时记录，未回滚或改写正式文件".into(),
+                )
+                .with_operation(CommitState::Unknown, CleanupState::Pending));
+            }
             if backup_created {
                 let restored_etag = match self
                     .copy_key(

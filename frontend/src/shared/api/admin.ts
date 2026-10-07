@@ -60,6 +60,7 @@ export interface AdminInfo {
 
 export interface DomainBinding {
   public_url: string
+  trusted_proxy_ips?: string[]
 }
 
 export interface DomainBindingView {

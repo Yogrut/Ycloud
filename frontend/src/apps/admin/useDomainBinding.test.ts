@@ -35,6 +35,25 @@ afterEach(() => {
 })
 
 describe('domain binding editor', () => {
+  it('saves and resets trusted proxy drafts with the domain without sharing mutable arrays', async () => {
+    const ips = ['192.0.2.10']
+    const view: DomainBindingView = { binding: { public_url: bound.binding!.public_url, trusted_proxy_ips: ips }, source: 'settings' }
+    read.mockResolvedValue(view)
+    const { editor } = setup(view)
+    await editor.show()
+    expect(editor.proxyIps.value).toBe('192.0.2.10')
+    ips.push('192.0.2.99')
+    expect(editor.status.value.binding!.trusted_proxy_ips).toEqual(['192.0.2.10'])
+    editor.proxyIps.value = ' 192.0.2.11，2001:db8::10 '
+    const confirmed: DomainBindingView = { binding: { public_url: bound.binding!.public_url, trusted_proxy_ips: ['192.0.2.11', '2001:db8::10'] }, source: 'settings' }
+    save.mockResolvedValue(confirmed)
+    await editor.submit()
+    expect(save).toHaveBeenCalledWith({ public_url: bound.binding!.public_url, trusted_proxy_ips: ['192.0.2.11', '2001:db8::10'] })
+    expect(editor.proxyIps.value).toBe('192.0.2.11, 2001:db8::10')
+    editor.proxyIps.value = '192.0.2.12'
+    editor.cancel()
+    expect(editor.proxyIps.value).toBe('192.0.2.11, 2001:db8::10')
+  })
   it('starts closed without requesting configuration and isolates the initial binding', () => {
     const initial = { ...bound, binding: { ...bound.binding! } }
     const { editor } = setup(initial)
@@ -97,7 +116,7 @@ describe('domain binding editor', () => {
     save.mockResolvedValue(bound)
     editor.url.value = ' https://CLOUD.example.com:443/ '
     await editor.submit()
-    expect(save).toHaveBeenCalledWith({ public_url: 'https://CLOUD.example.com:443/' })
+    expect(save).toHaveBeenCalledWith({ public_url: 'https://CLOUD.example.com:443/', trusted_proxy_ips: [] })
     expect(editor.error.value).toBe('')
     expect(editor.message.value).toContain('域名绑定已立即生效')
   })
@@ -153,7 +172,7 @@ describe('domain binding editor', () => {
     await editor.show()
     editor.url.value = '  https://CLOUD.example.com:443/  '
     await editor.submit()
-    expect(save).toHaveBeenCalledWith({ public_url: 'https://CLOUD.example.com:443/' })
+    expect(save).toHaveBeenCalledWith({ public_url: 'https://CLOUD.example.com:443/', trusted_proxy_ips: [] })
     expect(editor.status.value).toEqual(bound)
     expect(editor.url.value).toBe(bound.binding!.public_url)
     expect(editor.message.value).toContain('域名绑定已立即生效')
@@ -176,7 +195,7 @@ describe('domain binding editor', () => {
     editor.url.value = ''
     editor.cancel()
     expect(save).toHaveBeenCalledOnce()
-    expect(save).toHaveBeenCalledWith({ public_url: 'https://cloud.example.com' })
+    expect(save).toHaveBeenCalledWith({ public_url: 'https://cloud.example.com', trusted_proxy_ips: [] })
     expect(read).toHaveBeenCalledOnce()
     expect(remove).not.toHaveBeenCalled()
     expect(editor.open.value).toBe(true)

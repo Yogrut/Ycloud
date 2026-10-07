@@ -18,7 +18,7 @@ impl ConfigFile {
         if let Some(binding) = &self.domain_binding {
             if binding.clone().normalize()? != *binding {
                 return Err(AppError::BadRequest(
-                    "域名绑定配置必须使用规范化的 HTTPS 地址和代理 IP 列表".into(),
+                    "域名绑定配置必须使用规范化的 HTTPS 地址和可信代理 IP 列表".into(),
                 ));
             }
         }

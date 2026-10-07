@@ -34,6 +34,9 @@ pub(crate) enum UploadOwnership {
 /// Synchronous notifications at the mutation boundary; publication accounting
 /// must not wait until fallible directory sync or backup cleanup has finished.
 pub(crate) trait ReplacementObserver {
+    fn check_destination(&self, _metadata: Option<&std::fs::Metadata>) -> AppResult<()> {
+        Ok(())
+    }
     fn must_create_new(&self) -> bool {
         false
     }
@@ -768,6 +771,7 @@ impl TransactionPaths {
         }
         self.validate_destination(relative).await?;
         let metadata = self.rooted_metadata(destination).await?;
+        observer.check_destination(metadata.as_ref())?;
         if observer.must_create_new() && metadata.is_some() {
             return Err(AppError::Conflict(
                 "上传目标已被占用，不能覆盖已有文件".into(),

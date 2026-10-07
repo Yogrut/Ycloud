@@ -15,6 +15,7 @@ pub(crate) struct UploadInput {
     pub body: axum::body::Body,
     pub direct: Option<DirectChannel>,
     pub operation_id: Option<String>,
+    pub conditions: crate::storage::WriteConditions,
     pub cancellation: Option<tokio_util::sync::CancellationToken>,
     pub commit_owner:
         Option<std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>>>,
@@ -26,6 +27,7 @@ impl UploadInput {
             body,
             direct: None,
             operation_id: None,
+            conditions: crate::storage::WriteConditions::default(),
             cancellation: None,
             commit_owner: None,
         }

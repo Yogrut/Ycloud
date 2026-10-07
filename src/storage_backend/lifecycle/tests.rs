@@ -358,6 +358,7 @@ async fn administrator_interrupt_cancels_download_and_revokes_old_admission() {
             "saved.bin",
             &axum::http::HeaderMap::new(),
             crate::storage::FileResponseMode::Attachment,
+            &axum::http::Method::GET,
         )
         .await
         .unwrap();

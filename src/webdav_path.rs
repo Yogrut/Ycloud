@@ -29,8 +29,29 @@ pub fn parse_destination(
     request_host: Option<&str>,
 ) -> Option<String> {
     let uri: axum::http::Uri = destination.parse().ok()?;
+    if uri.query().is_some() {
+        return None;
+    }
     if let Some(authority) = uri.authority() {
-        if Some(authority.as_str()) != request_host {
+        let default_port = match uri.scheme_str()? {
+            "https" => 443,
+            "http" => 80,
+            _ => return None,
+        };
+        let request: axum::http::uri::Authority = request_host?.parse().ok()?;
+        let port = |value: &axum::http::uri::Authority| {
+            if value.port().is_some() {
+                value.port_u16()
+            } else {
+                Some(default_port)
+            }
+        };
+        if authority.as_str().contains('@')
+            || request.as_str().contains('@')
+            || !authority.host().eq_ignore_ascii_case(request.host())
+            || port(authority).is_none()
+            || port(authority) != port(&request)
+        {
             return None;
         }
     }
@@ -136,5 +157,31 @@ mod tests {
             percent_decode(&encoded).as_deref(),
             Some("文档/计划 2026.md")
         );
+    }
+
+    #[test]
+    fn destination_normalizes_authority_without_allowing_a_different_host_or_port() {
+        for (destination, host) in [
+            ("https://CLOUD.example:443/dav/local/file", "cloud.example"),
+            ("https://cloud.example/dav/local/file", "CLOUD.example:443"),
+            ("http://cloud.example:80/dav/local/file", "cloud.example"),
+            ("https://[::1]:443/dav/local/file", "[::1]"),
+        ] {
+            assert_eq!(
+                parse_destination(destination, "local", Some(host)),
+                Some("file".into())
+            );
+        }
+        for destination in [
+            "https://cloud.example:8443/dav/local/file",
+            "https://other.example/dav/local/file",
+            "https://cloud.example/dav/locality/file",
+            "https://cloud.example/dav/local/file?query=ignored",
+        ] {
+            assert_eq!(
+                parse_destination(destination, "local", Some("cloud.example")),
+                None
+            );
+        }
     }
 }

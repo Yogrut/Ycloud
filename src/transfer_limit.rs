@@ -8,7 +8,7 @@ use std::{
 
 use axum::{body::Body, response::Response};
 use futures_util::StreamExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 #[derive(Debug)]
 struct BucketState {
@@ -24,6 +24,7 @@ struct BucketState {
 pub struct BandwidthLimiter {
     rate: Arc<AtomicU64>,
     bucket: Arc<Mutex<BucketState>>,
+    changed: Arc<Notify>,
 }
 
 impl BandwidthLimiter {
@@ -35,11 +36,14 @@ impl BandwidthLimiter {
                 last_refill: Instant::now(),
                 observed_rate: bytes_per_second,
             })),
+            changed: Arc::new(Notify::new()),
         }
     }
 
     pub fn set_rate(&self, bytes_per_second: u64) {
-        self.rate.store(bytes_per_second, Ordering::Relaxed);
+        if self.rate.swap(bytes_per_second, Ordering::Relaxed) != bytes_per_second {
+            self.changed.notify_waiters();
+        }
     }
 
     pub fn rate(&self) -> u64 {
@@ -47,8 +51,17 @@ impl BandwidthLimiter {
     }
 
     pub async fn consume(&self, bytes: usize) {
+        // Unlimited streams retain the adapter, but need no bucket lock.
+        if self.rate() == 0 {
+            return;
+        }
         let mut remaining = bytes as u64;
         while remaining > 0 {
+            // Register before inspecting the rate so a concurrent update
+            // cannot be lost between that inspection and beginning the wait.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let outcome = {
                 let mut bucket = self.bucket.lock().await;
                 let rate = self.rate();
@@ -79,17 +92,17 @@ impl BandwidthLimiter {
                 // streams re-check the budget after waking, so cancellation
                 // creates no reserved-token debt and the global cap remains
                 // authoritative.
-                Err(wait) => tokio::time::sleep(wait).await,
+                Err(wait) => tokio::select! {
+                    _ = tokio::time::sleep(wait) => {},
+                    _ = &mut changed => {},
+                },
             }
         }
     }
 
     pub fn wrap_body(&self, body: Body) -> Body {
-        // Rate changes apply to newly started unlimited responses. Avoid
-        // allocating a stream adapter on the common unlimited path.
-        if self.rate() == 0 {
-            return body;
-        }
+        // Keep the adapter even at rate zero: an already active transfer must
+        // observe later configuration changes at the next unconsumed frame.
         let limiter = self.clone();
         let stream = body.into_data_stream().then(move |result| {
             let limiter = limiter.clone();
@@ -104,9 +117,6 @@ impl BandwidthLimiter {
     }
 
     pub fn wrap_response(&self, response: Response) -> Response {
-        if self.rate() == 0 {
-            return response;
-        }
         let (parts, body) = response.into_parts();
         Response::from_parts(parts, self.wrap_body(body))
     }
@@ -142,6 +152,41 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), limiter.consume(1))
             .await
             .expect("sleeping consumer must not retain the bucket mutex");
-        waiting.abort();
+        tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .expect("disabling throttling must wake the pending consumer")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn already_wrapped_unlimited_transfers_observe_a_new_limit() {
+        use axum::{
+            body::{to_bytes, Body},
+            response::Response,
+        };
+
+        for response_mode in [false, true] {
+            let limiter = BandwidthLimiter::new(0);
+            let body = if response_mode {
+                limiter
+                    .wrap_response(Response::new(Body::from("payload")))
+                    .into_body()
+            } else {
+                limiter.wrap_body(Body::from("payload"))
+            };
+            limiter.set_rate(1);
+            let mut reading = Box::pin(to_bytes(body, 1024));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), &mut reading)
+                    .await
+                    .is_err()
+            );
+            limiter.set_rate(0);
+            let bytes = tokio::time::timeout(Duration::from_millis(100), reading)
+                .await
+                .expect("new zero rate must release the same active transfer")
+                .unwrap();
+            assert_eq!(bytes.as_ref(), b"payload");
+        }
     }
 }

@@ -66,6 +66,7 @@ export async function uploadDirectFile(
     if (!session || !Number.isSafeInteger(size) || size <= 0 || !Number.isSafeInteger(count)
       || count < 1 || count > 10_000 || count !== Math.ceil(Math.max(file.size, 1) / size)) throw stalled()
     const loaded = new Array<number>(count).fill(0)
+    let totalLoaded = 0
     let next = 0
     const concurrency = Math.min(4, Math.max(1, created.concurrency ?? 1), count)
     // All workers are settled before cancellation, so no late PUT survives local termination.
@@ -76,8 +77,9 @@ export async function uploadDirectFile(
           const index = next++
           const signed = await command<{ url: string }>('part', { session, part: index + 1 }, controller.signal)
           await putPart(signed.url, file.slice(index * size, Math.min(file.size, (index + 1) * size)), bytes => {
+            totalLoaded += bytes - loaded[index]!
             loaded[index] = bytes
-            onProgress(Math.min(file.size, loaded.reduce((total, value) => total + value, 0)))
+            onProgress(Math.min(file.size, totalLoaded))
           }, controller.signal)
         }
       } catch (error) { controller.abort(); throw error }

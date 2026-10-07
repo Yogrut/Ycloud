@@ -44,6 +44,7 @@ mod capabilities;
 mod capacity;
 mod client;
 mod committed_cleanup;
+mod conditional_publish;
 mod copy;
 mod deletion;
 mod direct;
@@ -75,8 +76,9 @@ use keyspace::{
 
 use transaction_record::{
     directory_trash_transaction_id, validate_multipart_session, validate_upload_transaction,
-    S3MultipartPurpose, S3MultipartSession, S3ObjectSnapshot, S3UploadStage, S3UploadTransaction,
-    S3_MULTIPART_SESSION_SCHEMA_VERSION, S3_TRANSACTION_SCHEMA_VERSION,
+    S3MultipartPurpose, S3MultipartSession, S3ObjectSnapshot, S3UploadPublicationGuard,
+    S3UploadStage, S3UploadTransaction, S3_MULTIPART_SESSION_SCHEMA_VERSION,
+    S3_TRANSACTION_SCHEMA_VERSION,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +149,7 @@ struct S3MultipartCopyOptions<'a> {
 pub struct S3Backend {
     client: Client,
     provider: S3Provider,
+    conditional_publish_verified: std::sync::Arc<std::sync::atomic::AtomicBool>,
     bucket: String,
     prefix: String,
     request_gate: std::sync::Arc<Semaphore>,
@@ -313,6 +316,7 @@ impl S3Backend {
             source_etag,
             destination_must_not_exist,
             None,
+            None,
         )
         .await
     }
@@ -324,9 +328,16 @@ impl S3Backend {
         source_etag: Option<&str>,
         destination_must_not_exist: bool,
         operation_id: Option<&str>,
+        publication_guard: Option<&S3UploadPublicationGuard>,
     ) -> AppResult<String> {
         let source = self.head_key(source_key).await?.ok_or(AppError::NotFound)?;
         if source.size > S3_SINGLE_COPY_LIMIT {
+            if publication_guard.is_some() {
+                return Err(AppError::storage_capability(
+                    capabilities::CONDITIONAL_FILE_PUBLISH,
+                    "当前条件发布不支持超出单对象复制范围的文件，已拒绝写入",
+                ));
+            }
             return self
                 .multipart_copy(
                     source_key,
@@ -353,6 +364,12 @@ impl S3Backend {
         if destination_must_not_exist && !self.is_alibaba_oss() {
             request = request.if_none_match("*");
         }
+        if let Some(guard) = publication_guard {
+            request = match guard {
+                S3UploadPublicationGuard::Absent => request.if_none_match("*"),
+                S3UploadPublicationGuard::Matches { etag } => request.if_match(etag),
+            };
+        }
         let result = {
             let _permit = self.acquire_request().await?;
             if destination_must_not_exist && self.is_alibaba_oss() {
@@ -366,7 +383,19 @@ impl S3Backend {
                     .send()
                     .await
             } else {
-                request.send().await
+                if publication_guard.is_some() {
+                    // Do not retry an ambiguous conditional publication: a
+                    // later 412 could hide the first attempt's successful commit.
+                    request
+                        .customize()
+                        .config_override(aws_sdk_s3::config::Builder::new().retry_config(
+                            aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
+                        ))
+                        .send()
+                        .await
+                } else {
+                    request.send().await
+                }
             }
         };
         let copy_result = match result {
@@ -376,6 +405,13 @@ impl S3Backend {
                 .map(str::to_owned)
                 .ok_or_else(|| AppError::ServiceUnavailable("对象复制未返回提交 ETag".into())),
             Err(error) => {
+                if publication_guard.is_some()
+                    && error
+                        .raw_response()
+                        .is_some_and(|response| response.status().as_u16() == 412)
+                {
+                    return Err(AppError::PreconditionFailed);
+                }
                 tracing::warn!(
                     error_kind = %error.as_service_error().map_or("transport", |_| "service"),
                     "S3 server-side copy failed"
@@ -388,7 +424,7 @@ impl S3Backend {
         let Err(error) = copy_result else {
             return copy_result;
         };
-        if !destination_must_not_exist {
+        if publication_guard.is_some() || !destination_must_not_exist {
             return Err(error);
         }
         match self.head_key(destination_key).await {

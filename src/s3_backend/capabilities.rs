@@ -10,6 +10,7 @@ pub(super) const CONDITIONAL_READ: &str = "conditional_read";
 pub(super) const SERVER_SIDE_COPY: &str = "server_side_copy";
 pub(super) const CONFIRMED_DELETE: &str = "confirmed_delete";
 pub(super) const CONDITIONAL_JOURNAL_UPDATE: &str = "conditional_journal_update";
+pub(super) const CONDITIONAL_FILE_PUBLISH: &str = "conditional_file_publish";
 pub(super) const RANGE_READ: &str = "range_read";
 pub(super) const MULTIPART_CREATE: &str = "multipart_create";
 pub(super) const MULTIPART_PART_COPY: &str = "multipart_part_copy";
@@ -26,6 +27,7 @@ const ACTIVATION_CAPABILITIES: &[&str] = &[
 ];
 
 const FIRST_USE_CAPABILITIES: &[&str] = &[
+    CONDITIONAL_FILE_PUBLISH,
     CONDITIONAL_JOURNAL_UPDATE,
     RANGE_READ,
     MULTIPART_CREATE,

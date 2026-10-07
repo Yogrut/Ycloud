@@ -21,6 +21,7 @@ class StorageRequest extends EventTarget {
       StorageRequest.active--
       if (StorageRequest.failing) this.dispatchEvent(new Event('error'))
       else {
+        this.upload.dispatchEvent(new ProgressEvent('progress', { loaded: Math.floor(bytes.size / 2), total: bytes.size, lengthComputable: true }))
         this.upload.dispatchEvent(new ProgressEvent('progress', { loaded: bytes.size, total: bytes.size, lengthComputable: true }))
         this.dispatchEvent(new Event('load'))
       }
@@ -61,6 +62,12 @@ describe('S3 browser direct upload', () => {
     expect(StorageRequest.peak).toBe(4)
     expect(StorageRequest.payloads.map(part => part.size)).toEqual([4, 4, 4, 4, 2])
     expect(progress).toHaveBeenLastCalledWith(18)
+    const reported = progress.mock.calls.map(([bytes]) => bytes as number)
+    expect(reported).toEqual([...reported].sort((a, b) => a - b))
+    expect(reported.every(bytes => bytes >= 0 && bytes <= 18)).toBe(true)
+    // Both final progress and successful load report a part's full size.
+    // They must replace its previous contribution, not count it twice.
+    expect(reported.slice(0, 4)).toEqual([2, 4, 4, 6])
     expect(fetchMock.mock.calls.filter(([url]) => url.includes('/complete'))).toHaveLength(1)
     expect(fetchMock.mock.calls.filter(([url]) => url.includes('/cancel'))).toHaveLength(0)
     expect(fetchMock.mock.calls.every(([url]) => url.startsWith('/api/upload/direct/'))).toBe(true)

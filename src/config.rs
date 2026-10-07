@@ -122,7 +122,7 @@ pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
 pub const MIN_STORAGE_CAPACITY_BYTES: u64 = 1024 * 1024;
 pub const HARD_MAX_STORAGE_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 15;
+pub const CONFIG_SCHEMA_VERSION: u32 = 16;
 pub const DEFAULT_STORAGE_ID: &str = "primary";
 pub const MAX_STORAGE_INSTANCES: usize = 16;
 pub const MAX_USER_ACCOUNTS: usize = 100;
@@ -224,6 +224,8 @@ pub struct Config {
     /// Additional exact Host authorities accepted only in local/LAN mode.
     /// Public proxy mode always uses `public_host` exclusively.
     pub allowed_hosts: HashSet<String>,
+    /// Effective trusted peers derived from the saved domain binding.
+    pub trusted_proxy_ips: HashSet<IpAddr>,
     /// Installation-local authentication key for mutating recovery records.
     /// It is derived from the protected configuration master key and must
     /// never be serialized or returned by an API.

@@ -1,24 +1,26 @@
 <script setup lang="ts">
 import AppFeedback from '../../shared/components/AppFeedback.vue'
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, onScopeDispose, ref } from 'vue'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import AdminLoginCard from '../../shared/components/AdminLoginCard.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
 import type { ThemeController } from '../../shared/composables/useTheme'
 import { useLocale } from '../../shared/i18n'
-import AccountView from './AccountView.vue'
 import AdminNavIcon from './AdminNavIcon.vue'
-import DashboardView from './DashboardView.vue'
-import LimitsView from './LimitsView.vue'
-import LocksView from './LocksView.vue'
-import ProtectionView from './ProtectionView.vue'
-import SecurityView from './SecurityView.vue'
-import StorageView from './StorageView.vue'
-import WebDavView from './WebDavView.vue'
-import UsersView from './UsersView.vue'
 import { appPath, currentAppPath } from '../../shared/routes'
 import { useAdminSession } from './useAdminSession'
+import { lazyPage } from '../../shared/lazyPage'
+
+const AccountView = lazyPage(() => import('./AccountView.vue').then(module => module.default))
+const DashboardView = lazyPage(() => import('./DashboardView.vue').then(module => module.default))
+const LimitsView = lazyPage(() => import('./LimitsView.vue').then(module => module.default))
+const LocksView = lazyPage(() => import('./LocksView.vue').then(module => module.default))
+const ProtectionView = lazyPage(() => import('./ProtectionView.vue').then(module => module.default))
+const SecurityView = lazyPage(() => import('./SecurityView.vue').then(module => module.default))
+const StorageView = lazyPage(() => import('./StorageView.vue').then(module => module.default))
+const WebDavView = lazyPage(() => import('./WebDavView.vue').then(module => module.default))
+const UsersView = lazyPage(() => import('./UsersView.vue').then(module => module.default))
 
 defineProps<{ theme: ThemeController }>()
 const locale = useLocale()
@@ -35,14 +37,40 @@ const navigation = computed(() => [
   { id: 'security', label: locale.text('访问日志', 'Access logs'), href: appPath('/admin/security') },
 ] as const)
 
-const activeSection = navigation.value.find(item => item.href === currentAppPath())?.id ?? 'dashboard'
+const sectionPath = ref(currentAppPath())
+const activeSection = computed(() => navigation.value.find(item => item.href === sectionPath.value)?.id ?? 'dashboard')
 const {
   info, loading, requiresLogin, loadError, username, password, totpCode, totpRequired,
   loginError, loggingIn, notice, noticeRevision, submitLogin, resetTotpChallenge,
-  showNotice, sessionExpired, start,
-} = useAdminSession(activeSection === 'storage')
+  showNotice, sessionExpired, start, load,
+} = useAdminSession(() => activeSection.value === 'storage')
 
-onMounted(start)
+function selectSection(event: MouseEvent, href: string): void {
+  if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return
+  event.preventDefault()
+  if (currentAppPath() === href) return
+  window.history.pushState(null, '', href)
+  sectionPath.value = href
+  // Keep the shell visible, but still revalidate server authorization/config.
+  if (info.value) void load(true)
+}
+
+function restoreSection(): void {
+  const path = currentAppPath()
+  if (path !== '/admin' && !path.startsWith('/admin/')) {
+    // Browser/preview pages keep their existing independent lifecycle.
+    window.location.reload()
+    return
+  }
+  sectionPath.value = path
+  if (info.value) void load(true)
+}
+
+onMounted(() => {
+  window.addEventListener('popstate', restoreSection)
+  start()
+})
+onScopeDispose(() => window.removeEventListener('popstate', restoreSection))
 </script>
 
 <template>
@@ -67,6 +95,7 @@ onMounted(start)
             :class="{ active: item.id === activeSection }"
             :href="item.href"
             :aria-current="item.id === activeSection ? 'page' : undefined"
+            @click="selectSection($event, item.href)"
           >
             <AdminNavIcon :name="item.id" />
             <span>{{ item.label }}</span>

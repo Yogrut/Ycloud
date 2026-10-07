@@ -12,6 +12,7 @@ use crate::{
 };
 
 pub(super) const S3_TRANSACTION_SCHEMA_VERSION: u32 = 1;
+pub(super) const S3_CONDITIONAL_UPLOAD_SCHEMA_VERSION: u32 = 2;
 pub(super) const S3_MULTIPART_SESSION_SCHEMA_VERSION: u32 = 2;
 const MAX_PROVIDER_UPLOAD_ID_BYTES: usize = 4_096;
 
@@ -21,6 +22,16 @@ pub(super) enum S3UploadStage {
     Prepared,
     BackupCreated,
     DestinationCommitted,
+    PublicationRejected,
+    CheckingPublication,
+    PublicationStarted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum S3UploadPublicationGuard {
+    Absent,
+    Matches { etag: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -39,6 +50,8 @@ pub(super) struct S3UploadTransaction {
     pub(super) stage: S3UploadStage,
     pub(super) temporary: S3ObjectSnapshot,
     pub(super) previous: Option<S3ObjectSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) publication_guard: Option<S3UploadPublicationGuard>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -157,7 +170,40 @@ pub(super) fn validate_upload_transaction(
     journal_key: &str,
     transaction: &S3UploadTransaction,
 ) -> AppResult<()> {
-    if transaction.schema_version != S3_TRANSACTION_SCHEMA_VERSION
+    let valid_guard = match (&transaction.publication_guard, transaction.schema_version) {
+        (None, S3_TRANSACTION_SCHEMA_VERSION) => {
+            matches!(
+                transaction.stage,
+                S3UploadStage::Prepared
+                    | S3UploadStage::BackupCreated
+                    | S3UploadStage::DestinationCommitted
+            )
+        }
+        (Some(S3UploadPublicationGuard::Absent), S3_CONDITIONAL_UPLOAD_SCHEMA_VERSION) => {
+            transaction.previous.is_none()
+        }
+        (
+            Some(S3UploadPublicationGuard::Matches { etag }),
+            S3_CONDITIONAL_UPLOAD_SCHEMA_VERSION,
+        ) => {
+            transaction
+                .previous
+                .as_ref()
+                .and_then(|value| value.etag.as_ref())
+                == Some(etag)
+        }
+        _ => false,
+    };
+    let valid_guard_stage = transaction.publication_guard.is_none()
+        || matches!(
+            transaction.stage,
+            S3UploadStage::CheckingPublication
+                | S3UploadStage::PublicationStarted
+                | S3UploadStage::PublicationRejected
+                | S3UploadStage::DestinationCommitted
+        );
+    if !valid_guard
+        || !valid_guard_stage
         || !valid_transaction_id(&transaction.id)
         || journal_key != internal_key(prefix, "transactions", &transaction.id)
         || transaction.temporary.etag.is_none()
@@ -201,6 +247,7 @@ mod tests {
                 size: 21,
                 etag: Some("old".into()),
             }),
+            publication_guard: None,
         };
         let key = internal_key("tenant/", "transactions", &transaction.id);
         assert!(validate_upload_transaction("tenant/", &key, &transaction).is_ok());
@@ -213,6 +260,43 @@ mod tests {
         let mut unverifiable = transaction.clone();
         unverifiable.temporary.etag = None;
         assert!(validate_upload_transaction("tenant/", &key, &unverifiable).is_err());
+    }
+
+    #[test]
+    fn guarded_upload_versions_preserve_legacy_records_and_reject_inconsistent_pins() {
+        let transaction = S3UploadTransaction {
+            schema_version: S3_CONDITIONAL_UPLOAD_SCHEMA_VERSION,
+            id: "0123456789abcdef0123456789abcdef".into(),
+            relative: "file.txt".into(),
+            stage: S3UploadStage::PublicationStarted,
+            temporary: S3ObjectSnapshot {
+                size: 7,
+                etag: Some("\"new\"".into()),
+            },
+            previous: Some(S3ObjectSnapshot {
+                size: 3,
+                etag: Some("\"old\"".into()),
+            }),
+            publication_guard: Some(S3UploadPublicationGuard::Matches {
+                etag: "\"old\"".into(),
+            }),
+        };
+        let key = internal_key("tenant/", "transactions", &transaction.id);
+        assert!(validate_upload_transaction("tenant/", &key, &transaction).is_ok());
+        let mut invalid = transaction.clone();
+        invalid.publication_guard = Some(S3UploadPublicationGuard::Absent);
+        assert!(validate_upload_transaction("tenant/", &key, &invalid).is_err());
+        invalid = transaction.clone();
+        invalid.stage = S3UploadStage::Prepared;
+        assert!(validate_upload_transaction("tenant/", &key, &invalid).is_err());
+        let mut legacy = transaction;
+        legacy.schema_version = S3_TRANSACTION_SCHEMA_VERSION;
+        legacy.publication_guard = None;
+        legacy.stage = S3UploadStage::Prepared;
+        let encoded = serde_json::to_vec(&legacy).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("publication_guard"));
+        let decoded: S3UploadTransaction = serde_json::from_slice(&encoded).unwrap();
+        assert!(validate_upload_transaction("tenant/", &key, &decoded).is_ok());
     }
 
     #[test]

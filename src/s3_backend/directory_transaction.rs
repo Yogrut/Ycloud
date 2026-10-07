@@ -47,6 +47,7 @@ impl S3Backend {
 
     /// S3 has no atomic prefix rename. The operation is therefore bounded and
     /// journaled per object. A crash resumes from the last checkpoint.
+    #[cfg(test)]
     pub async fn copy_directory(&self, source: &str, destination: &str) -> AppResult<()> {
         self.mutate_directory(Operation::Copy, source, Some(destination), None)
             .await
@@ -276,6 +277,7 @@ impl S3Backend {
                             &transaction.id,
                             &transaction.objects[index].source_key,
                         )),
+                        None,
                     )
                     .await?
                 }

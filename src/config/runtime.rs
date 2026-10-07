@@ -74,6 +74,7 @@ impl Config {
             public_base_url: None,
             public_host: None,
             allowed_hosts,
+            trusted_proxy_ips: HashSet::new(),
             // Bootstrap replaces this only after the persisted configuration
             // has been validated. This avoids creating a replacement master
             // key before an existing encrypted configuration is opened.

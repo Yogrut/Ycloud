@@ -17,6 +17,26 @@ function mount(initial = empty) {
 }
 
 describe('DomainBindingSetting', () => {
+  it('places trusted proxy IPs below the address and submits both fields together', async () => {
+    const saved = { ...binding, trusted_proxy_ips: ['192.0.2.10'] }
+    const fetch = vi.fn().mockResolvedValueOnce(response({ binding: saved, source: 'settings' }))
+      .mockResolvedValueOnce(response({ binding: saved, source: 'settings' }))
+    vi.stubGlobal('fetch', fetch)
+    const { app, host } = mount()
+    try {
+      host.querySelector<HTMLButtonElement>('.setting-row button')!.click()
+      await settle()
+      const labels = [...host.querySelectorAll('.domain-binding-form > label')]
+      expect(labels.map(label => label.textContent)).toEqual(['访问地址', '可信代理 IP'])
+      const proxy = labels[1]!.querySelector<HTMLInputElement>('input')!
+      expect(proxy.value).toBe('192.0.2.10')
+      proxy.value = ''
+      proxy.dispatchEvent(new Event('input'))
+      host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+      await settle()
+      expect(fetch).toHaveBeenLastCalledWith('/api/admin/domain-binding', expect.objectContaining({ method: 'PUT', body: JSON.stringify({ public_url: binding.public_url, trusted_proxy_ips: [] }) }))
+    } finally { app.unmount() }
+  })
   it('disables confirmation while reading and aborts only that read when unmounted', async () => {
     const fetch = vi.fn().mockImplementation(() => new Promise<Response>(() => {}))
     vi.stubGlobal('fetch', fetch)
@@ -100,7 +120,7 @@ describe('DomainBindingSetting', () => {
       form.dispatchEvent(new Event('submit', { cancelable: true }))
       await settle()
       expect(fetch).toHaveBeenCalledTimes(3)
-      expect(fetch).toHaveBeenLastCalledWith('/api/admin/domain-binding', expect.objectContaining({ method: 'PUT', body: JSON.stringify({ public_url: 'https://CLOUD.example.com:443/' }) }))
+      expect(fetch).toHaveBeenLastCalledWith('/api/admin/domain-binding', expect.objectContaining({ method: 'PUT', body: JSON.stringify({ public_url: 'https://CLOUD.example.com:443/', trusted_proxy_ips: [] }) }))
       expect(input.value).toBe(binding.public_url)
       expect(host.querySelector('.setting-row')?.textContent).toContain(binding.public_url)
       expect(host.querySelector('.domain-open-link')).toBeNull()
@@ -136,14 +156,14 @@ describe('DomainBindingSetting', () => {
     expect(host.textContent).toContain('清空后确认即可解除绑定')
     expect(host.textContent).not.toContain('验证期')
     const inputs = host.querySelectorAll<HTMLInputElement>('.domain-binding-form input')
-    expect(inputs).toHaveLength(1)
+    expect(inputs).toHaveLength(2)
     inputs[0]!.value = binding.public_url; inputs[0]!.dispatchEvent(new Event('input'))
     await nextTick()
     expect(fetch).toHaveBeenCalledTimes(1)
     host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true })); await settle()
     expect(fetch).toHaveBeenCalledTimes(2)
     expect(fetch).toHaveBeenLastCalledWith('/api/admin/domain-binding', expect.objectContaining({
-      method: 'PUT', body: JSON.stringify({ public_url: binding.public_url }),
+      method: 'PUT', body: JSON.stringify({ public_url: binding.public_url, trusted_proxy_ips: [] }),
     }))
     expect(document.querySelector('.app-toast.success')?.textContent).toContain('域名绑定已立即生效')
     expect(host.querySelector<HTMLInputElement>('input[type="url"]')?.value).toBe(binding.public_url)

@@ -49,6 +49,96 @@ fn oversized_journal() -> AppError {
     AppError::ServiceUnavailable("对象存储恢复记录超过安全上限".into())
 }
 
+#[cfg(test)]
+mod transport_tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        body::{to_bytes, Body},
+        http::{header, HeaderMap, Method, Response},
+        routing::any,
+        Router,
+    };
+    use tokio::net::TcpListener;
+
+    use crate::{config::S3Provider, s3_backend::protocol_tests::test_backend};
+
+    #[tokio::test]
+    async fn encoded_journals_share_provider_conditions_without_reencoding_bytes() {
+        for oss in [false, true] {
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let observed = writes.clone();
+            let router = Router::new().route(
+                "/{*key}",
+                any(move |method: Method, headers: HeaderMap, body: Body| {
+                    let writes = observed.clone();
+                    async move {
+                        if method == Method::HEAD {
+                            assert!(oss);
+                            return Response::builder()
+                                .header(header::ETAG, "\"old\"")
+                                .header(header::CONTENT_LENGTH, 0)
+                                .body(Body::empty())
+                                .unwrap();
+                        }
+                        assert_eq!(method, Method::PUT);
+                        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+                        let bytes = to_bytes(body, 1024).await.unwrap();
+                        let create = writes.lock().unwrap().is_empty();
+                        if oss {
+                            assert!(!headers.contains_key(header::IF_MATCH));
+                            assert!(!headers.contains_key(header::IF_NONE_MATCH));
+                            assert_eq!(
+                                headers
+                                    .get("x-oss-forbid-overwrite")
+                                    .map(|v| v.to_str().unwrap()),
+                                create.then_some("true")
+                            );
+                        } else if create {
+                            assert_eq!(headers[header::IF_NONE_MATCH], "*");
+                            assert!(!headers.contains_key(header::IF_MATCH));
+                        } else {
+                            assert_eq!(headers[header::IF_MATCH], "\"old\"");
+                            assert!(!headers.contains_key(header::IF_NONE_MATCH));
+                        }
+                        writes.lock().unwrap().push(bytes.to_vec());
+                        Response::builder()
+                            .header(header::ETAG, "\"written\"")
+                            .body(Body::empty())
+                            .unwrap()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+            if oss {
+                backend.provider = S3Provider::AlibabaOss;
+            }
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let payload = br#"{"signed":"record bytes"}"#.to_vec();
+            let key = "tenant/.ycloud-system/transactions/fixture";
+            for previous in [None, Some("\"old\"")] {
+                assert_eq!(
+                    backend
+                        .write_encoded_journal(key, payload.clone(), previous)
+                        .await
+                        .unwrap(),
+                    "\"written\""
+                );
+            }
+            if oss {
+                let error = backend
+                    .write_encoded_journal(key, payload.clone(), Some("\"different\""))
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.capability(), Some("conditional_journal_update"));
+            }
+            assert_eq!(*writes.lock().unwrap(), [payload.clone(), payload]);
+            server.abort();
+        }
+    }
+}
+
 impl S3Backend {
     pub(super) async fn write_upload_transaction(
         &self,
@@ -71,6 +161,10 @@ impl S3Backend {
         journal_etag: Option<&str>,
         transaction: &S3UploadTransaction,
     ) -> AppResult<()> {
+        if transaction.publication_guard.is_some() {
+            self.finish_guarded_upload_resources(transaction).await?;
+            return self.delete_key_confirmed(journal_key, journal_etag).await;
+        }
         let temporary_key = internal_key(&self.prefix, "uploads", &transaction.id);
         let backup_key = internal_key(&self.prefix, "backups", &transaction.id);
         self.delete_key_confirmed(&temporary_key, transaction.temporary.etag.as_deref())
@@ -101,6 +195,21 @@ impl S3Backend {
         previous_etag: Option<&str>,
     ) -> AppResult<Option<String>> {
         let data = authenticated_journal::encode(&self.transaction_auth_key, purpose, value)?;
+        self.write_encoded_journal(key, data, previous_etag)
+            .await
+            .map(Some)
+    }
+
+    /// Publish already encoded journal bytes. Authentication, schema validation
+    /// and record-specific bounds belong to the caller, not this transport.
+    /// OSS version checking preserves the single-writer compatibility path;
+    /// it is not an atomic compare-and-swap against external writers.
+    pub(super) async fn write_encoded_journal(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        previous_etag: Option<&str>,
+    ) -> AppResult<String> {
         let content_length = i64::try_from(data.len())
             .map_err(|_| AppError::ServiceUnavailable("对象存储事务记录过大".into()))?;
         if self.is_alibaba_oss() {
@@ -168,7 +277,7 @@ impl S3Backend {
         let etag = output.e_tag().map(str::to_owned).ok_or_else(|| {
             AppError::storage_capability(capability, "对象存储未返回事务记录 ETag")
         })?;
-        Ok(Some(etag))
+        Ok(etag)
     }
 
     pub(super) async fn register_multipart_intent(

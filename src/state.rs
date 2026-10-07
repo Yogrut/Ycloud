@@ -22,6 +22,9 @@ use crate::{
 
 const STORAGE_INITIALIZATION_BUDGET: Duration = Duration::from_secs(60);
 
+mod storage_update;
+use storage_update::guest_access_restricted;
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
@@ -38,6 +41,7 @@ pub struct AppState {
     pub(crate) login_attempts: Arc<LoginAttemptGates>,
     pub admin_totp_replay: crate::totp::TotpReplayStore,
     pub webdav_gate: Arc<Semaphore>,
+    pub(crate) webdav_credentials: crate::webdav::CredentialCache,
     pub(crate) directory_size_gate: Arc<Semaphore>,
     pub login_security: LoginSecurity,
     pub upload_limiter: BandwidthLimiter,
@@ -172,6 +176,7 @@ impl AppState {
             login_attempts: Arc::new(LoginAttemptGates::default()),
             admin_totp_replay: crate::totp::TotpReplayStore::default(),
             webdav_gate: Arc::new(Semaphore::new(8)),
+            webdav_credentials: crate::webdav::CredentialCache::default(),
             directory_size_gate: Arc::new(Semaphore::new(2)),
             login_security,
             upload_limiter: BandwidthLimiter::new(persisted.upload_rate_bytes_per_sec),
@@ -494,90 +499,23 @@ impl AppState {
         };
         crate::config::verify_entity_revision(instance, expected_revision.as_deref())?;
         let previous_instance = instance.clone();
-        let previous = previous.clone();
         if settings.access_key_id.is_empty() {
             settings.access_key_id = previous.access_key_id.clone();
         }
         if settings.secret_access_key.is_empty() {
             settings.secret_access_key = previous.secret_access_key.clone();
         }
-        let mut connection = settings.clone();
-        connection.capacity_limit_bytes = previous.capacity_limit_bytes;
-        connection.relay_upload = previous.relay_upload;
-        let cached = self.backends.cached(storage_id).await;
-        let reuse = connection == previous && cached.is_some();
-        let backend_config = StorageBackendConfig::S3(settings.clone());
         let candidate_instance = next
             .storage_instances
             .iter_mut()
             .find(|storage| storage.id == storage_id)
             .ok_or(AppError::NotFound)?;
         candidate_instance.name = name.trim().to_string();
-        candidate_instance.backend = backend_config.clone();
+        candidate_instance.backend = StorageBackendConfig::S3(settings);
         candidate_instance.enabled = enabled;
         candidate_instance.update_guest_access(guest_access);
-        let interrupt = !reuse
-            || !enabled
-            || settings.relay_upload != previous.relay_upload
-            || guest_access_restricted(&previous_instance, candidate_instance);
-        let reenable = enabled && !previous_instance.enabled;
-        next.validate()?;
-        // A replacement pointing at the same namespace must not recover the
-        // old generation's live journals. Stop admission and drain the old
-        // owner before any activation probe or recovery touches remote state.
-        let _edit = if reenable && reuse {
-            Some(
-                cached
-                    .as_ref()
-                    .expect("reused backend")
-                    .reenable_guard()
-                    .await?,
-            )
-        } else if interrupt {
-            match &cached {
-                Some(backend) if !reuse => Some(backend.interrupt_for_edit().await?),
-                Some(backend) => backend.interrupt_for_policy(),
-                None => None,
-            }
-        } else {
-            None
-        };
-        let prepared = if reuse {
-            cached.clone()
-        } else if enabled {
-            Some(
-                prepare_storage_backend(
-                    &self.config,
-                    &self.local_io_gate,
-                    next.max_upload_bytes,
-                    storage_id,
-                    &backend_config,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        self.persist_storage_selection(&next).await?;
-        if interrupt {
-            self.upload_batches
-                .invalidate_storage(storage_id, cached.clone())
-                .await;
-        }
-        if !reuse {
-            if let Some(backend) = &cached {
-                backend.retire();
-            }
-        }
-        if let Some(prepared) = prepared {
-            prepared.set_capacity_limit(settings.capacity_limit_bytes);
-            self.publish_backend(storage_id.to_string(), prepared).await;
-            self.backends.set_enabled(storage_id, enabled).await;
-        } else {
-            self.backends.remove(storage_id).await;
-        }
-        self.archive_tickets.clear().await;
-        Ok(())
+        self.apply_storage_edit(&next, &previous_instance, storage_id)
+            .await
     }
 
     pub async fn update_local_storage(
@@ -641,73 +579,12 @@ impl AppState {
             mount_id,
             capacity_limit_bytes,
         });
-        let cached = self.backends.cached(storage_id).await;
-        let reuse = matches!((&next.storage_instances[position].backend, &backend_config),
-            (StorageBackendConfig::Local(old), StorageBackendConfig::Local(new)) if old.mount_id == new.mount_id)
-            && cached.is_some();
         next.storage_instances[position].name = name.trim().to_string();
-        next.storage_instances[position].backend = backend_config.clone();
+        next.storage_instances[position].backend = backend_config;
         next.storage_instances[position].enabled = enabled;
         next.storage_instances[position].update_guest_access(guest_access);
-        let interrupt = !reuse
-            || !enabled
-            || guest_access_restricted(&previous_instance, &next.storage_instances[position]);
-        next.validate()?;
-        let _edit = if enabled && !previous_instance.enabled && reuse {
-            Some(
-                cached
-                    .as_ref()
-                    .expect("reused backend")
-                    .reenable_guard()
-                    .await?,
-            )
-        } else if interrupt {
-            match &cached {
-                Some(backend) if !reuse => Some(backend.interrupt_for_edit().await?),
-                Some(backend) => backend.interrupt_for_policy(),
-                None => None,
-            }
-        } else {
-            None
-        };
-        // A replacement shares the capacity-ledger identity. Prepare it only
-        // after old mutation owners have stopped updating that ledger.
-        let prepared = if reuse {
-            cached.clone()
-        } else if enabled {
-            Some(
-                prepare_storage_backend(
-                    &self.config,
-                    &self.local_io_gate,
-                    next.max_upload_bytes,
-                    storage_id,
-                    &backend_config,
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        self.persist_storage_selection(&next).await?;
-        if interrupt {
-            self.upload_batches
-                .invalidate_storage(storage_id, cached.clone())
-                .await;
-        }
-        if !reuse {
-            if let Some(backend) = &cached {
-                backend.retire();
-            }
-        }
-        if let Some(prepared) = prepared {
-            prepared.set_capacity_limit(capacity_limit_bytes);
-            self.publish_backend(storage_id.to_string(), prepared).await;
-            self.backends.set_enabled(storage_id, enabled).await;
-        } else {
-            self.backends.remove(storage_id).await;
-        }
-        self.archive_tickets.clear().await;
-        Ok(())
+        self.apply_storage_edit(&next, &previous_instance, storage_id)
+            .await
     }
 
     pub async fn discard_pending_storage(&self) -> AppResult<()> {
@@ -939,15 +816,6 @@ impl AppState {
         backend.set_local_max_upload_bytes(self.config_file.read().await.max_upload_bytes);
         self.backends.insert_ready(id, backend).await;
     }
-}
-
-fn guest_access_restricted(previous: &StorageInstanceConfig, next: &StorageInstanceConfig) -> bool {
-    if !previous.allow_guest_access {
-        return false;
-    }
-    !next.allow_guest_access
-        || (previous.allow_guest_download.unwrap_or(true)
-            && !next.allow_guest_download.unwrap_or(true))
 }
 
 async fn prepare_storage_backend(
@@ -1587,6 +1455,7 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 allowed_hosts: Default::default(),
+                trusted_proxy_ips: Default::default(),
                 transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(persisted)),
@@ -1655,6 +1524,7 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 allowed_hosts: Default::default(),
+                trusted_proxy_ips: Default::default(),
                 transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(persisted)),
@@ -1769,6 +1639,7 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 allowed_hosts: Default::default(),
+                trusted_proxy_ips: Default::default(),
                 transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(ConfigFile::with_test_storage())),
@@ -1912,6 +1783,7 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 allowed_hosts: Default::default(),
+                trusted_proxy_ips: Default::default(),
                 transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(ConfigFile::with_test_storage())),

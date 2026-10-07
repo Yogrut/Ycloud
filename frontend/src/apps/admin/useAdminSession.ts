@@ -1,4 +1,4 @@
-import { onScopeDispose, ref } from 'vue'
+import { onScopeDispose, ref, toValue, watch, type MaybeRefOrGetter } from 'vue'
 import { AdminApiError, getAdminInfo, loginAdministrator, logoutSession, type AdminInfo } from '../../shared/api/admin'
 import { appPath } from '../../shared/routes'
 import { useLocale } from '../../shared/i18n'
@@ -6,7 +6,7 @@ import { useLocale } from '../../shared/i18n'
 const STORAGE_REFRESH_MS = 300_000
 const SESSION_REDIRECT_MS = 700
 
-export function useAdminSession(refreshStorage: boolean) {
+export function useAdminSession(refreshStorage: MaybeRefOrGetter<boolean>) {
   const locale = useLocale()
   const info = ref<AdminInfo>()
   const loading = ref(true)
@@ -112,10 +112,18 @@ export function useAdminSession(refreshStorage: boolean) {
     if (disposed || started) return
     started = true
     void load()
-    if (refreshStorage) healthRefresh = setInterval(() => {
+    configureHealthRefresh()
+  }
+
+  function configureHealthRefresh(): void {
+    clearInterval(healthRefresh)
+    healthRefresh = undefined
+    if (started && !disposed && toValue(refreshStorage)) healthRefresh = setInterval(() => {
       if (!document.hidden && !requiresLogin.value && !loggingIn.value && !readRequest) void load(true)
     }, STORAGE_REFRESH_MS)
   }
+
+  watch(() => toValue(refreshStorage), configureHealthRefresh)
 
   onScopeDispose(() => {
     disposed = true

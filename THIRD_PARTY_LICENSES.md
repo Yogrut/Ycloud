@@ -141,6 +141,7 @@
 | regex-lite | 0.1.9 | MIT OR Apache-2.0 |
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 |
 | ring | 0.17.14 | Apache-2.0 AND ISC |
+| roxmltree | 0.21.1 | MIT OR Apache-2.0 |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | rustls | 0.23.45 | Apache-2.0 OR ISC OR MIT |
 | rustls-native-certs | 0.8.4 | Apache-2.0 OR ISC OR MIT |
@@ -209,10 +210,10 @@
 | zerovec-derive | 0.11.6 | Unicode-3.0 |
 | zmij | 1.0.23 | MIT |
 | @phosphor-icons/vue | 2.2.1 | MIT |
-| @vue/reactivity | 3.5.41 | MIT |
-| @vue/runtime-core | 3.5.41 | MIT |
-| @vue/runtime-dom | 3.5.41 | MIT |
-| @vue/shared | 3.5.41 | MIT |
+| @vue/reactivity | 3.5.43 | MIT |
+| @vue/runtime-core | 3.5.43 | MIT |
+| @vue/runtime-dom | 3.5.43 | MIT |
+| @vue/shared | 3.5.43 | MIT |
 | @vueuse/core | 14.4.0 | MIT |
 | @vueuse/core | 15.0.0 | MIT |
 | @vueuse/shared | 14.4.0 | MIT |
@@ -232,10 +233,10 @@
 ## License group 1
 
 - @phosphor-icons/vue 2.2.1 — LICENSE
-- @vue/reactivity 3.5.41 — LICENSE
-- @vue/runtime-core 3.5.41 — LICENSE
-- @vue/runtime-dom 3.5.41 — LICENSE
-- @vue/shared 3.5.41 — LICENSE
+- @vue/reactivity 3.5.43 — LICENSE
+- @vue/runtime-core 3.5.43 — LICENSE
+- @vue/runtime-dom 3.5.43 — LICENSE
+- @vue/shared 3.5.43 — LICENSE
 - @vueuse/core 15.0.0 — LICENSE
 - @vueuse/shared 15.0.0 — LICENSE
 - clsx 2.1.1 — license
@@ -349,6 +350,7 @@
 - regex-lite 0.1.9 — LICENSE-MIT
 - regex-syntax 0.8.11 — LICENSE-MIT
 - rustix 1.1.4 — LICENSE-MIT
+- roxmltree 0.21.1 — LICENSE-MIT
 - rustls 0.23.45 — LICENSE-MIT
 - rustls-native-certs 0.8.4 — LICENSE-MIT
 - rustls-pki-types 1.15.1 — LICENSE-MIT
@@ -404,6 +406,8 @@
 Copyright (c) 2020 Phosphor Icons
 
 Copyright (c) 2018-present, Yuxi (Evan) You
+
+Copyright (c) 2018 Yevhenii Reizner
 
 Copyright (c) 2019-PRESENT Anthony Fu<https://github.com/antfu>
 

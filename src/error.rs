@@ -59,6 +59,7 @@ pub enum AppError {
     Forbidden,
     NotFound,
     Conflict(Cow<'static, str>),
+    PreconditionFailed,
     PayloadTooLarge,
     InsufficientStorage,
     ClientClosedRequest,
@@ -130,6 +131,7 @@ impl AppError {
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
             Self::Conflict(_) => "conflict",
+            Self::PreconditionFailed => "precondition_failed",
             Self::PayloadTooLarge => "payload_too_large",
             Self::InsufficientStorage => "insufficient_storage",
             Self::ClientClosedRequest => "client_closed_request",
@@ -173,6 +175,7 @@ impl AppError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
             Self::ClientClosedRequest => {
@@ -207,6 +210,7 @@ impl AppError {
             Self::UploadBatchExpired => "上传批次已过期，请重新准备未开始的文件".into(),
             Self::Forbidden => "Access denied".into(),
             Self::NotFound => "Resource not found".into(),
+            Self::PreconditionFailed => "写入条件不满足，目标文件未被本次操作修改".into(),
             Self::PayloadTooLarge => "Payload exceeds the configured limit".into(),
             Self::InsufficientStorage => {
                 "Storage does not have enough free space for this upload".into()
@@ -239,6 +243,7 @@ impl fmt::Display for AppError {
             Self::UploadBatchExpired => formatter.write_str("upload batch expired"),
             Self::Forbidden => formatter.write_str("forbidden"),
             Self::NotFound => formatter.write_str("not found"),
+            Self::PreconditionFailed => formatter.write_str("write precondition failed"),
             Self::PayloadTooLarge => formatter.write_str("payload too large"),
             Self::InsufficientStorage => formatter.write_str("insufficient storage"),
             Self::ClientClosedRequest => formatter.write_str("client closed upload request"),
@@ -299,6 +304,7 @@ impl From<StatusCode> for AppError {
             StatusCode::FORBIDDEN => Self::Forbidden,
             StatusCode::NOT_FOUND => Self::NotFound,
             StatusCode::CONFLICT => Self::Conflict("Resource already exists".into()),
+            StatusCode::PRECONDITION_FAILED => Self::PreconditionFailed,
             StatusCode::PAYLOAD_TOO_LARGE => Self::PayloadTooLarge,
             StatusCode::INSUFFICIENT_STORAGE => Self::InsufficientStorage,
             StatusCode::REQUEST_TIMEOUT => Self::RequestTimeout,

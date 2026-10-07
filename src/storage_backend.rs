@@ -1,4 +1,8 @@
-use axum::{body::Body, http::HeaderMap, response::Response};
+use axum::{
+    body::Body,
+    http::{HeaderMap, Method},
+    response::Response,
+};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -641,14 +645,17 @@ impl StorageBackend {
         relative: &str,
         headers: &HeaderMap,
         mode: FileResponseMode,
+        method: &Method,
     ) -> AppResult<Response> {
         let active = &self.active;
         let response = match &active.kind {
             StorageBackendKind::Local(storage) => {
                 let path = storage.resolve_existing(relative).await?;
-                storage.stream_file(&path, headers, mode).await
+                storage.stream_file(&path, headers, mode, method).await
             }
-            StorageBackendKind::S3(storage) => storage.stream_file(relative, headers, mode).await,
+            StorageBackendKind::S3(storage) => {
+                storage.stream_file(relative, headers, mode, method).await
+            }
         };
         self.observe_result(&response);
         let (parts, body) = response?.into_parts();
@@ -658,6 +665,7 @@ impl StorageBackend {
         ))
     }
 
+    #[cfg(test)]
     pub async fn upload_file(
         &self,
         relative: &str,
@@ -666,9 +674,27 @@ impl StorageBackend {
         max_upload_bytes: u64,
         content_type: Option<&str>,
     ) -> AppResult<u64> {
-        self.upload_file_mode(
+        self.upload_file_conditionally(
             relative,
             crate::s3_backend::UploadInput::relay(body),
+            expected_bytes,
+            max_upload_bytes,
+            content_type,
+        )
+        .await
+    }
+
+    pub(crate) async fn upload_file_conditionally(
+        &self,
+        relative: &str,
+        input: crate::s3_backend::UploadInput,
+        expected_bytes: Option<u64>,
+        max_upload_bytes: u64,
+        content_type: Option<&str>,
+    ) -> AppResult<u64> {
+        self.upload_file_mode(
+            relative,
+            input,
             expected_bytes,
             max_upload_bytes,
             content_type,
@@ -677,7 +703,8 @@ impl StorageBackend {
         .await
     }
 
-    /// Browser uploads create a new file; a late name collision must not replace user data.
+    /// Untracked create-only fixture; production browser uploads use operation-bound receipts.
+    #[cfg(test)]
     pub async fn upload_new_file(
         &self,
         relative: &str,
@@ -727,6 +754,7 @@ impl StorageBackend {
                 body: Body::empty(),
                 direct: Some(channel),
                 operation_id: Some(operation_id),
+                conditions: crate::storage::WriteConditions::default(),
                 cancellation: None,
                 commit_owner: None,
             },
@@ -790,9 +818,15 @@ impl StorageBackend {
                             "上传目标已被占用，请重新上传以分配新编号".into(),
                         ))
                     }
-                    Ok(metadata) if metadata.is_file() => metadata.len(),
+                    Ok(metadata) if metadata.is_file() => {
+                        input.conditions.check_local(Some(&metadata))?;
+                        metadata.len()
+                    }
                     Ok(_) => return Err(AppError::Conflict("不能用文件覆盖目录".into())),
-                    Err(AppError::NotFound) => 0,
+                    Err(AppError::NotFound) => {
+                        input.conditions.check_local(None)?;
+                        0
+                    }
                     Err(error) => return Err(error),
                 };
                 let mut capacity_reservation =
@@ -808,6 +842,7 @@ impl StorageBackend {
                 if let Some(operation_id) = &input.operation_id {
                     writer.set_operation_id(operation_id.clone());
                 }
+                writer.set_write_conditions(input.conditions.clone());
                 let mut stream = input.body.into_data_stream();
                 let mut received = 0_u64;
                 while let Some(chunk) = stream.next().await {
@@ -839,15 +874,24 @@ impl StorageBackend {
                         "对象存储上传需要有效的 Content-Length，不能使用未知长度请求体".into(),
                     )
                 })?;
+                storage.validate_write_conditions(&input.conditions, content_length)?;
                 let old_size = match storage.metadata(relative).await {
                     Ok(_) if create_only => {
                         return Err(AppError::Conflict(
                             "上传目标已被占用，请重新上传以分配新编号".into(),
                         ))
                     }
-                    Ok(metadata) if !metadata.is_dir => metadata.size,
+                    Ok(metadata) if !metadata.is_dir => {
+                        input
+                            .conditions
+                            .check(true, metadata.etag.as_deref(), None)?;
+                        metadata.size
+                    }
                     Ok(_) => return Err(AppError::Conflict("不能用文件覆盖目录".into())),
-                    Err(AppError::NotFound) => 0,
+                    Err(AppError::NotFound) => {
+                        input.conditions.check(false, None, None)?;
+                        0
+                    }
                     Err(error) => return Err(error),
                 };
                 let capacity_reservation =

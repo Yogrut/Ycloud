@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::{header, HeaderMap},
+    http::{header, HeaderMap, Method},
     response::IntoResponse,
     Json,
 };
@@ -725,10 +725,11 @@ pub async fn upload_file(
 
 pub async fn download_file(
     State(state): State<AppState>,
+    method: Method,
     headers: HeaderMap,
     Query(query): Query<FileQuery>,
 ) -> AppResult<axum::response::Response> {
-    file_response(state, headers, query, FileResponseMode::Attachment).await
+    file_response(state, headers, query, FileResponseMode::Attachment, method).await
 }
 
 async fn file_response(
@@ -736,6 +737,7 @@ async fn file_response(
     headers: HeaderMap,
     query: FileQuery,
     mode: FileResponseMode,
+    method: Method,
 ) -> AppResult<axum::response::Response> {
     let share = resolve_share(&state, &headers, &query).await?;
     ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Download).await?;
@@ -749,7 +751,7 @@ async fn file_response(
     )
     .await?;
     let file = share_storage_path(&share, request_path);
-    let response = backend.stream_file(&file, &headers, mode).await?;
+    let response = backend.stream_file(&file, &headers, mode, &method).await?;
     let subject = crate::traffic::browser_subject(&state, &headers).await;
     Ok(state
         .download_limiter
@@ -826,10 +828,11 @@ pub async fn rename_file(
 
 pub async fn preview_file(
     State(state): State<AppState>,
+    method: Method,
     headers: HeaderMap,
     Query(query): Query<FileQuery>,
 ) -> AppResult<axum::response::Response> {
-    file_response(state, headers, query, FileResponseMode::Preview).await
+    file_response(state, headers, query, FileResponseMode::Preview, method).await
 }
 
 /// POST /api/folder/unlock — verify a folder lock password and return a token cookie.
@@ -1091,7 +1094,7 @@ mod response_tests {
     use axum::{
         body::to_bytes,
         extract::{Query, State},
-        http::{header, HeaderMap, HeaderValue, StatusCode},
+        http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     };
 
     #[tokio::test]
@@ -1113,20 +1116,31 @@ mod response_tests {
             batch: None,
         };
 
-        assert!(
-            download_file(State(state.clone()), HeaderMap::new(), Query(query()))
-                .await
-                .is_err()
-        );
-        assert!(
-            preview_file(State(state.clone()), HeaderMap::new(), Query(query()))
-                .await
-                .is_err()
-        );
+        assert!(download_file(
+            State(state.clone()),
+            Method::GET,
+            HeaderMap::new(),
+            Query(query())
+        )
+        .await
+        .is_err());
+        assert!(preview_file(
+            State(state.clone()),
+            Method::GET,
+            HeaderMap::new(),
+            Query(query())
+        )
+        .await
+        .is_err());
 
-        let download = download_file(State(state.clone()), headers.clone(), Query(query()))
-            .await
-            .unwrap();
+        let download = download_file(
+            State(state.clone()),
+            Method::GET,
+            headers.clone(),
+            Query(query()),
+        )
+        .await
+        .unwrap();
         assert_eq!(download.status(), StatusCode::OK);
         assert!(download.headers().contains_key(header::CONTENT_DISPOSITION));
         assert_eq!(
@@ -1134,7 +1148,7 @@ mod response_tests {
             "file content"
         );
 
-        let preview = preview_file(State(state), headers, Query(query()))
+        let preview = preview_file(State(state), Method::GET, headers, Query(query()))
             .await
             .unwrap();
         assert_eq!(preview.status(), StatusCode::OK);

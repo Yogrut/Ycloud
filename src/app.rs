@@ -1,8 +1,11 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use axum::{
     extract::{DefaultBodyLimit, Request, State},
-    http::{header, HeaderName, Method, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -28,6 +31,9 @@ use crate::{
 };
 
 const MAX_BATCH_BODY_BYTES: usize = 256 * 1024;
+
+mod frontend_assets;
+use frontend_assets::serve_asset;
 
 pub fn build_router(state: AppState) -> Router {
     let max_body_bytes = usize::try_from(state.config.max_upload_bytes)
@@ -254,9 +260,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/admin", get(serve_index))
         .route("/admin/{*rest}", get(serve_index))
         .route("/preview", get(serve_index))
-        .route("/assets/app.css", get(serve_app_css))
-        .route("/assets/app.js", get(serve_app_js))
-        .route("/assets/directUpload.js", get(serve_direct_upload_js))
+        .route("/assets/{*name}", get(serve_asset))
         .route("/favicon.svg", get(serve_favicon))
         .nest("/api/admin", admin_routes)
         .nest("/api", api_routes)
@@ -356,18 +360,57 @@ async fn request_timeout_middleware(
 
 macro_rules! embedded_handler {
     ($name:ident, $content_type:literal, $path:literal) => {
-        async fn $name() -> Response {
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, $content_type),
-                    (header::CACHE_CONTROL, "no-cache"),
-                ],
-                &include_bytes!($path)[..],
+        async fn $name(headers: HeaderMap) -> Response {
+            static ETAG: OnceLock<HeaderValue> = OnceLock::new();
+            let bytes = &include_bytes!($path)[..];
+            embedded_response(
+                bytes,
+                $content_type,
+                &headers,
+                ETAG.get_or_init(|| content_etag(bytes)),
             )
-                .into_response()
         }
     };
+}
+
+fn content_etag(bytes: &[u8]) -> HeaderValue {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let hex: String = digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    HeaderValue::from_str(&format!("\"{hex}\"")).expect("quoted hexadecimal ETag")
+}
+
+fn embedded_response(
+    bytes: &'static [u8],
+    content_type: &'static str,
+    headers: &HeaderMap,
+    etag: &HeaderValue,
+) -> Response {
+    let unchanged = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| {
+            let value = value.trim();
+            value == "*"
+                || value.strip_prefix("W/").unwrap_or(value)
+                    == etag.to_str().expect("hexadecimal ETag")
+        });
+    let mut response = if unchanged {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
+    };
+    // Fixed URLs must revalidate after deployments; never cache them immutable.
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(header::ETAG, etag.clone());
+    response
 }
 
 embedded_handler!(
@@ -375,22 +418,92 @@ embedded_handler!(
     "text/html; charset=utf-8",
     "../static/app/index.html"
 );
-embedded_handler!(
-    serve_app_css,
-    "text/css; charset=utf-8",
-    "../static/app/assets/app.css"
-);
-embedded_handler!(
-    serve_app_js,
-    "application/javascript; charset=utf-8",
-    "../static/app/assets/app.js"
-);
-embedded_handler!(
-    serve_direct_upload_js,
-    "application/javascript; charset=utf-8",
-    "../static/app/assets/directUpload.js"
-);
 embedded_handler!(serve_favicon, "image/svg+xml", "../static/favicon.svg");
+
+#[cfg(test)]
+mod embedded_cache_tests {
+    use super::*;
+    use axum::extract::Path;
+
+    #[tokio::test]
+    async fn embedded_assets_revalidate_by_content_without_retransmitting_unchanged_bytes() {
+        let original = serve_asset(Path("app.js".into()), HeaderMap::new()).await;
+        assert_eq!(original.status(), StatusCode::OK);
+        assert_eq!(original.headers()[header::CACHE_CONTROL], "no-cache");
+        let etag = original.headers()[header::ETAG].clone();
+        let body = axum::body::to_bytes(original.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(!body.is_empty());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, etag.clone());
+        let unchanged = serve_asset(Path("app.js".into()), headers.clone()).await;
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(unchanged.headers()[header::ETAG], etag);
+        assert_eq!(unchanged.headers()[header::CACHE_CONTROL], "no-cache");
+        assert!(axum::body::to_bytes(unchanged.into_body(), 0)
+            .await
+            .unwrap()
+            .is_empty());
+        // A validator for another resource must not hide updated/different bytes.
+        assert_eq!(
+            serve_asset(Path("app.css".into()), headers.clone())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&format!("\"old\", W/{}", etag.to_str().unwrap())).unwrap(),
+        );
+        assert_eq!(
+            serve_asset(Path("app.js".into()), headers.clone())
+                .await
+                .status(),
+            StatusCode::NOT_MODIFIED
+        );
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"stale\""));
+        assert_eq!(
+            serve_asset(Path("app.js".into()), headers).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn html_and_head_responses_keep_validators_without_a_stale_immutable_cache() {
+        let router = Router::new().route("/", get(serve_index));
+        use tower::ServiceExt;
+        let head = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        let etag = head.headers()[header::ETAG].clone();
+        assert!(axum::body::to_bytes(head.into_body(), 0)
+            .await
+            .unwrap()
+            .is_empty());
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .header(header::IF_NONE_MATCH, etag)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+    }
+}
 
 async fn not_found(_request: Request) -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "Not Found")
@@ -447,6 +560,7 @@ mod tests {
                 public_base_url: None,
                 public_host: None,
                 allowed_hosts: ["ycloud.test".to_string()].into_iter().collect(),
+                trusted_proxy_ips: Default::default(),
                 transaction_auth_key: [0x31; 32],
             },
             Arc::new(RwLock::new(ConfigFile {
@@ -1144,11 +1258,15 @@ mod tests {
             "application/javascript; charset=utf-8"
         );
 
+        let direct_bundle = super::frontend_assets::ASSETS
+            .iter()
+            .find(|asset| asset.name.starts_with("directUpload-"))
+            .expect("built direct upload chunk");
         let direct_upload_asset = app
             .clone()
             .oneshot(
                 test_request()
-                    .uri("/assets/directUpload.js")
+                    .uri(format!("/assets/{}", direct_bundle.name))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1165,10 +1283,7 @@ mod tests {
         let direct_upload_bytes = axum::body::to_bytes(direct_upload_asset.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(
-            direct_upload_bytes.as_ref(),
-            include_bytes!("../static/app/assets/directUpload.js")
-        );
+        assert_eq!(direct_upload_bytes.as_ref(), direct_bundle.bytes);
 
         let removed_legacy_vue = app
             .clone()

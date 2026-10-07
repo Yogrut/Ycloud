@@ -25,6 +25,45 @@ async fn close(storage: StorageService) {
 }
 
 #[tokio::test]
+async fn conditional_publication_rechecks_the_destination_before_ownership_transfer() {
+    use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+    let fixture = TestDirectory::new("conditional-publication");
+    let root = fixture.path().join("files");
+    let storage = StorageService::new(root.clone(), 16, 1, 100, 0)
+        .await
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+    let conditions = crate::storage::WriteConditions::parse(&headers).unwrap();
+    conditions.check_local(None).unwrap();
+    let capacity = CapacityTracker::new(Some(16), 0);
+    let reservation = capacity.reserve_replacement(0, 4).unwrap();
+    let mut writer = storage
+        .begin_atomic_write_with_expected("file.txt", 4)
+        .await
+        .unwrap();
+    writer.set_write_conditions(conditions);
+    writer
+        .write_chunk(&Bytes::from_static(b"data"))
+        .await
+        .unwrap();
+    fs::write(root.join("file.txt"), b"winner").await.unwrap();
+    let error = writer.commit_with_capacity(reservation).await.unwrap_err();
+    assert_eq!(error.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(error.operation().unwrap().commit, CommitState::NotCommitted);
+    assert_eq!(fs::read(root.join("file.txt")).await.unwrap(), b"winner");
+    assert_eq!(capacity.status().reserved, 0);
+    assert!(fs::read_dir(&storage.transactions.journals)
+        .await
+        .unwrap()
+        .next_entry()
+        .await
+        .unwrap()
+        .is_none());
+    close(storage).await;
+}
+
+#[tokio::test]
 async fn create_only_publication_preserves_a_late_empty_file_and_releases_quota() {
     let fixture = TestDirectory::new("new-file-collision");
     let root = fixture.path().join("files");

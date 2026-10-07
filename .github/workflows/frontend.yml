@@ -29,7 +29,13 @@ jobs:
       - run: npm run check
       - name: Verify committed frontend bundle
         working-directory: .
-        run: git diff --exit-code -- static/app
+        run: |
+          git diff --exit-code -- static/app
+          untracked_assets=$(git ls-files --others --exclude-standard -- static/app)
+          if [ -n "$untracked_assets" ]; then
+            printf 'Frontend build produced uncommitted assets:\n%s\n' "$untracked_assets"
+            exit 1
+          fi
       - run: npm audit --audit-level=moderate
 
   rust:

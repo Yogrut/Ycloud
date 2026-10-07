@@ -31,6 +31,9 @@ pub(crate) mod linux_root;
 #[cfg(test)]
 mod operation_tests;
 mod path;
+mod read_conditions;
+mod write_conditions;
+pub(crate) use write_conditions::WriteConditions;
 mod response;
 mod upload_cleanup;
 
@@ -41,8 +44,11 @@ use path::reject_root_or_descendant;
 #[cfg(any(not(target_os = "linux"), test))]
 use path::require_plain_directory;
 pub use path::ResolvedPath;
+#[cfg(test)]
+use read_conditions::parse_range;
+pub(crate) use read_conditions::FileValidators;
 pub use response::FileResponseMode;
-pub(crate) use response::{attachment_header, parse_range, FileResponsePolicy};
+pub(crate) use response::{attachment_header, FileResponsePolicy};
 pub use upload_cleanup::UploadCleanupStatus;
 
 pub(crate) struct LocalDirectoryEntry {

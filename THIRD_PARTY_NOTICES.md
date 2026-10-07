@@ -9,6 +9,7 @@ Ycloud 使用以下开源组件。准确版本由 `Cargo.lock` 和 `frontend/pac
 | Axum、Tokio、Tower、tracing、bytes、http-body、http-body-util、mime_guess、async_zip | MIT |
 | Serde、serde_json、Chrono、UUID、anyhow、Argon2、base64、rand_core、futures-util、fs4、qrcode、windows-sys | MIT 或 Apache-2.0 |
 | rustix | MIT 或 Apache-2.0（另提供 LLVM exception 选项） |
+| roxmltree | MIT 或 Apache-2.0 |
 | AWS SDK for Rust、AWS Smithy | Apache-2.0 |
 | ring | Apache-2.0 与 ISC |
 

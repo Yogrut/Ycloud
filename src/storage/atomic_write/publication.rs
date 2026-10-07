@@ -35,6 +35,7 @@ impl AtomicFileWriter {
         // One task takes both, plus quota, without an intervening await.
         let mut accounting = PublicationAccounting::new(reservation, self.bytes_written);
         accounting.create_only = create_only;
+        accounting.conditions = self.conditions.clone();
         tokio::spawn(self.publish(accounting))
             .await
             .map_err(|error| {
@@ -125,6 +126,7 @@ struct PublicationAccounting {
     was_published: bool,
     ledger_settled: bool,
     create_only: bool,
+    conditions: crate::storage::WriteConditions,
 }
 
 impl PublicationAccounting {
@@ -138,6 +140,7 @@ impl PublicationAccounting {
             was_published: false,
             ledger_settled: false,
             create_only: false,
+            conditions: crate::storage::WriteConditions::default(),
         }
     }
 
@@ -175,6 +178,9 @@ impl PublicationAccounting {
 }
 
 impl ReplacementObserver for PublicationAccounting {
+    fn check_destination(&self, metadata: Option<&std::fs::Metadata>) -> AppResult<()> {
+        self.conditions.check_local(metadata)
+    }
     fn must_create_new(&self) -> bool {
         self.create_only
     }

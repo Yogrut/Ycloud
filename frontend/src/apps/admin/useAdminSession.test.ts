@@ -1,4 +1,4 @@
-import { effectScope, type EffectScope } from 'vue'
+import { effectScope, ref, type EffectScope } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AdminApiError, getAdminInfo, loginAdministrator, logoutSession, type AdminInfo } from '../../shared/api/admin'
 import { useLocale } from '../../shared/i18n'
@@ -45,6 +45,26 @@ afterEach(() => {
 })
 
 describe('administrator session', () => {
+  it('starts and stops storage refresh when soft navigation changes the active section', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
+    read.mockResolvedValue(info)
+    const scope = effectScope()
+    scopes.push(scope)
+    const storage = ref(false)
+    const session = scope.run(() => useAdminSession(storage))!
+    session.start()
+    await vi.advanceTimersByTimeAsync(300_000)
+    expect(read).toHaveBeenCalledOnce()
+    storage.value = true
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(300_000)
+    expect(read).toHaveBeenCalledTimes(2)
+    storage.value = false
+    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(600_000)
+    expect(read).toHaveBeenCalledTimes(2)
+  })
   it('starts once and does not start network work before mounting', async () => {
     vi.useFakeTimers()
     read.mockResolvedValue(info)

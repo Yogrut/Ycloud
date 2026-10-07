@@ -293,7 +293,8 @@ defineExpose({ openEditor })
 .history-layout { display: grid; grid-template-columns: minmax(0,2fr) minmax(230px,1fr); gap: 16px; align-items: stretch; }
 .trend-panel,.share-panel { min-width: 0; padding: 0; background: transparent; border: 0; border-radius: 0; }
 .trend-panel h3,.share-panel h3 { margin: 0; color: var(--muted); font-size: 13px; font-weight: 500; }
-.bar-chart { position: relative; display: flex; gap: 10px; height: 220px; margin-top: 18px; }
+.trend-panel { display: grid; grid-template-rows: auto minmax(220px,1fr); }
+.bar-chart { position: relative; display: flex; gap: 10px; min-height: 220px; margin-top: 18px; }
 .chart-axis { display: flex; flex-direction: column; justify-content: space-between; width: 64px; padding-bottom: 22px; color: var(--muted); font-size: 10px; }
 .chart-days { flex: 1; display: flex; min-width: 0; border-bottom: 1px solid var(--line); background: repeating-linear-gradient(to top,transparent,transparent calc(50% - 1px),var(--line) 50%); }
 .chart-day { position: relative; flex: 1; min-width: 0; display: flex; flex-direction: column; }
@@ -310,7 +311,7 @@ defineExpose({ openEditor })
 .day-tooltip span,.day-tooltip em { display: flex; align-items: center; gap: 6px; min-height: 22px; font-size: 12px; font-style: normal; }
 .day-tooltip b { margin-left: auto; color: var(--text); font-weight: 600; }
 .day-tooltip em { margin-top: 3px; padding-top: 5px; border-top: 1px solid var(--line); }
-.share-panel { display: grid; align-content: start; justify-items: center; }
+.share-panel { position: relative; display: grid; align-content: start; justify-items: center; }
 .share-panel h3 { justify-self: start; }
 .share-donut { position: relative; width: min(78%,230px); aspect-ratio: 1; margin: 24px auto 10px; }
 .share-donut > svg { width: 100%; height: 100%; overflow: visible; transform: rotate(-90deg); }
@@ -323,7 +324,7 @@ defineExpose({ openEditor })
 .share-donut > div { position: absolute; z-index: 1; inset: 26%; display: grid; place-content: center; gap: 6px; text-align: center; }
 .share-donut strong { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .share-donut span { color: var(--muted); font-size: 11px; }
-.share-tooltip-slot { position: relative; width: 100%; height: 36px; }
+.share-tooltip-slot { position: absolute; bottom: 36px; width: 100%; height: 36px; }
 .share-tooltip { position: absolute; z-index: 3; top: 0; width: max-content; max-width: min(100%,180px); margin: 0; padding: 7px 10px; transform: translateX(-50%); color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; box-shadow: 0 8px 20px rgb(15 23 42 / .12); font-size: 11px; text-align: center; pointer-events: none; }
 .history-legend { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 4px; font-size: 12px; }
 .traffic-form { display: grid; gap: 24px; }

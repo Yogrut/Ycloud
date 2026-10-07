@@ -310,7 +310,12 @@ async fn verify_smoke_pattern_download(
     expected_length: u64,
 ) -> AppResult<()> {
     let response = backend
-        .stream_file(relative, &HeaderMap::new(), FileResponseMode::Attachment)
+        .stream_file(
+            relative,
+            &HeaderMap::new(),
+            FileResponseMode::Attachment,
+            &axum::http::Method::GET,
+        )
         .await?;
     let mut body = response.into_body().into_data_stream();
     let mut received = 0_u64;
@@ -573,6 +578,7 @@ async fn s3_compatibility_smoke() {
         public_base_url: None,
         public_host: None,
         allowed_hosts: HashSet::new(),
+        trusted_proxy_ips: Default::default(),
         transaction_auth_key: [0x31; 32],
     };
     let backend = S3Backend::new(&settings, &runtime).unwrap();
@@ -643,6 +649,7 @@ async fn s3_compatibility_smoke() {
                 "suite/source.bin",
                 &HeaderMap::new(),
                 FileResponseMode::Attachment,
+                &axum::http::Method::GET,
             )
             .await?;
         let downloaded = response

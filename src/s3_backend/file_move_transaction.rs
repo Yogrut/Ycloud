@@ -116,6 +116,7 @@ impl S3Backend {
                         Some(&transaction.source.etag),
                         true,
                         Some(&transaction.id),
+                        None,
                     )
                     .await?
                 }

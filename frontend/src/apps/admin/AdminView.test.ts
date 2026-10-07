@@ -25,21 +25,74 @@ afterEach(() => {
   window.history.replaceState(null, '', '/')
 })
 
-function mountAdmin(host: HTMLElement) {
+async function mountAdmin(host: HTMLElement) {
   const app = createApp(AdminView, {
     theme: { current: ref<'light' | 'dark'>('light'), toggle: vi.fn() },
   })
   app.mount(host)
+  await vi.dynamicImportSettled()
+  await nextTick()
   return app
 }
 
 describe('AdminView', () => {
+  it('switches sections without remounting the shell and revalidates configuration in the background', async () => {
+    window.history.replaceState(null, '', '/admin/dashboard')
+    let finishRead!: (response: Response) => void
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(adminInfo), { headers: { 'Content-Type': 'application/json' } }))
+      .mockImplementationOnce(() => new Promise<Response>(resolve => { finishRead = resolve }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(adminInfo), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = await mountAdmin(host)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const shell = host.querySelector('.admin-shell')
+      const link = host.querySelector<HTMLAnchorElement>('a[href="/admin/webdav"]')!
+      const click = new MouseEvent('click', { bubbles: true, cancelable: true })
+      link.dispatchEvent(click)
+      await nextTick()
+      expect(click.defaultPrevented).toBe(true)
+      expect(window.location.pathname).toBe('/admin/webdav')
+      expect(host.querySelector('.admin-shell')).toBe(shell)
+      expect(host.querySelector('.admin-loading')).toBeNull()
+      expect(host.querySelector('.admin-nav-item.active')?.getAttribute('href')).toBe('/admin/webdav')
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      finishRead(new Response(JSON.stringify(adminInfo), { headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      window.history.replaceState(null, '', '/admin/dashboard')
+      window.dispatchEvent(new PopStateEvent('popstate'))
+      await nextTick()
+      expect(host.querySelector('#dashboard-title')).not.toBeNull()
+      expect(host.querySelector('.admin-shell')).toBe(shell)
+    } finally { app.unmount() }
+    const calls = fetchMock.mock.calls.length
+    window.dispatchEvent(new PopStateEvent('popstate'))
+    expect(fetchMock).toHaveBeenCalledTimes(calls)
+  })
+
+  it('preserves modified navigation clicks for opening a separate tab', async () => {
+    window.history.replaceState(null, '', '/admin/dashboard')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), { headers: { 'Content-Type': 'application/json' } })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = await mountAdmin(host)
+    try {
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const push = vi.spyOn(window.history, 'pushState')
+      const event = new MouseEvent('click', { bubbles: true, cancelable: true, ctrlKey: true })
+      host.querySelector('a[href="/admin/webdav"]')!.dispatchEvent(event)
+      expect(event.defaultPrevented).toBe(false)
+      expect(push).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
   it.each(['/admin/limits', '/admin/limits/'])('uses the normalized navigation route %s', async path => {
     window.history.replaceState(null, '', path)
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), { headers: { 'Content-Type': 'application/json' } })))
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     try {
       await new Promise(resolve => setTimeout(resolve, 0))
       await nextTick()
@@ -67,7 +120,7 @@ describe('AdminView', () => {
     vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     try {
       await new Promise(resolve => setTimeout(resolve, 0))
       await nextTick()
@@ -104,7 +157,7 @@ describe('AdminView', () => {
     vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     let mounted = true
     try {
       await new Promise(resolve => setTimeout(resolve, 0))
@@ -141,7 +194,7 @@ describe('AdminView', () => {
     vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     try {
       await vi.advanceTimersByTimeAsync(0)
       await nextTick()
@@ -160,7 +213,7 @@ describe('AdminView', () => {
     }), { status: 401, headers: { 'Content-Type': 'application/json' } })))
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -191,7 +244,7 @@ describe('AdminView', () => {
     vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -217,7 +270,7 @@ describe('AdminView', () => {
     })))
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -243,7 +296,7 @@ describe('AdminView', () => {
     })))
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -263,7 +316,7 @@ describe('AdminView', () => {
     })))
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -279,7 +332,7 @@ describe('AdminView', () => {
     })))
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -295,7 +348,7 @@ describe('AdminView', () => {
     })))
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -311,7 +364,7 @@ describe('AdminView', () => {
     })))
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -327,7 +380,7 @@ describe('AdminView', () => {
     })))
     const host = document.createElement('div')
     document.body.append(host)
-    const app = mountAdmin(host)
+    const app = await mountAdmin(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 

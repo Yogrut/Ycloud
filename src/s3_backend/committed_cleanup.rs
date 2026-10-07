@@ -1,6 +1,7 @@
 use std::{future::Future, time::Duration};
 
 use crate::error::{AppError, AppResult, CleanupState, CommitState};
+pub(super) const FOREGROUND_CLEANUP_BUDGET: Duration = Duration::from_millis(500);
 
 /// A failed sub-step is not proof that the whole durable transaction did
 /// nothing. Recovery may already own a partially copied/deleted transaction.
@@ -38,7 +39,7 @@ impl CompletionMode {
                 error.with_operation(CommitState::Committed, CleanupState::Pending)
             }),
             Self::Foreground => {
-                match tokio::time::timeout(Duration::from_millis(500), cleanup).await {
+                match tokio::time::timeout(FOREGROUND_CLEANUP_BUDGET, cleanup).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
                         tracing::warn!(%error, "verified file change retained cleanup for recovery");

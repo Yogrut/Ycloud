@@ -8,7 +8,7 @@ use axum::{
     body::Body,
     http::{
         header::{self, HeaderMap, HeaderValue},
-        Response, StatusCode,
+        Method, Response, StatusCode,
     },
 };
 use bytes::Bytes;
@@ -19,7 +19,7 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 
-use super::{ResolvedPath, StorageService};
+use super::{FileValidators, ResolvedPath, StorageService};
 use crate::error::{AppError, AppResult};
 
 // A bounded read amortizes file/thread-pool and metering work at VPS speeds.
@@ -38,14 +38,38 @@ impl StorageService {
         path: &ResolvedPath,
         request_headers: &HeaderMap,
         mode: FileResponseMode,
+        method: &Method,
     ) -> AppResult<Response<Body>> {
-        let metadata = self.metadata(path).await?;
+        let permit = self
+            .stream_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::ServiceUnavailable("Storage is shutting down".into()))?;
+        let file = self.open_file_for_read(path).await?;
+        self.response_from_open_file(file, path, request_headers, mode, method, permit)
+            .await
+    }
+
+    async fn response_from_open_file(
+        &self,
+        mut file: tokio::fs::File,
+        path: &ResolvedPath,
+        request_headers: &HeaderMap,
+        mode: FileResponseMode,
+        method: &Method,
+        permit: OwnedSemaphorePermit,
+    ) -> AppResult<Response<Body>> {
+        let metadata = file.metadata().await.map_err(|error| {
+            AppError::with_source("failed to inspect opened download file", error)
+        })?;
         if !metadata.is_file() {
             return Err(AppError::NotFound);
         }
 
         let total_length = metadata.len();
-        let range = parse_range(request_headers, total_length);
+        let validators = FileValidators::local(&metadata);
+        let range = validators.select_range(request_headers, total_length, method);
         let (start, length, status) = match range {
             Ok(Some(range)) => range,
             Ok(None) => (0, total_length, StatusCode::OK),
@@ -60,29 +84,18 @@ impl StorageService {
                     });
             }
         };
-        let mut file = self.open_file_for_read(path).await?;
         if start > 0 {
             file.seek(std::io::SeekFrom::Start(start))
                 .await
                 .map_err(|error| AppError::with_source("failed to seek file", error))?;
         }
 
-        let permit = self
-            .stream_gate
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| AppError::ServiceUnavailable("Storage is shutting down".into()))?;
-        let reader = file.take(length);
-        let stream = PermitStream {
-            inner: ReaderStream::with_capacity(reader, DOWNLOAD_BUFFER_BYTES),
-            _permit: permit,
-        };
         let mut response = Response::builder()
             .status(status)
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::CONTENT_LENGTH, length);
         response = FileResponsePolicy::new(path.absolute(), None, mode).apply(response);
+        response = validators.apply(response);
         if status == StatusCode::PARTIAL_CONTENT {
             let end = start.saturating_add(length).saturating_sub(1);
             response = response.header(
@@ -91,8 +104,16 @@ impl StorageService {
             );
         }
 
+        let body = if method == Method::HEAD {
+            Body::empty()
+        } else {
+            Body::from_stream(PermitStream {
+                inner: ReaderStream::with_capacity(file.take(length), DOWNLOAD_BUFFER_BYTES),
+                _permit: permit,
+            })
+        };
         response
-            .body(Body::from_stream(stream))
+            .body(body)
             .map_err(|error| AppError::with_source("failed to build file response", error))
     }
 }
@@ -111,44 +132,6 @@ where
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner).poll_next(context)
     }
-}
-
-pub(crate) fn parse_range(
-    headers: &HeaderMap,
-    total_length: u64,
-) -> Result<Option<(u64, u64, StatusCode)>, ()> {
-    let Some(header_value) = headers.get(header::RANGE) else {
-        return Ok(None);
-    };
-    let raw = header_value.to_str().map_err(|_| ())?;
-    let value = raw.strip_prefix("bytes=").ok_or(())?;
-    if value.contains(',') || total_length == 0 {
-        return Err(());
-    }
-    let (start, end) = value.split_once('-').ok_or(())?;
-    let (start, end) = if start.is_empty() {
-        let suffix = end.parse::<u64>().map_err(|_| ())?;
-        if suffix == 0 {
-            return Err(());
-        }
-        let suffix = suffix.min(total_length);
-        (total_length.saturating_sub(suffix), total_length - 1)
-    } else {
-        let start = start.parse::<u64>().map_err(|_| ())?;
-        if start >= total_length {
-            return Err(());
-        }
-        let end = if end.is_empty() {
-            total_length - 1
-        } else {
-            end.parse::<u64>().map_err(|_| ())?.min(total_length - 1)
-        };
-        if end < start {
-            return Err(());
-        }
-        (start, end)
-    };
-    Ok(Some((start, end - start + 1, StatusCode::PARTIAL_CONTENT)))
 }
 
 /// The complete policy for untrusted file bodies. Backends must not override
@@ -270,6 +253,96 @@ mod tests {
     use crate::test_support::TestDirectory;
 
     #[tokio::test]
+    async fn opened_download_keeps_its_own_metadata_when_the_path_is_replaced() {
+        let directory = TestDirectory::new("download-opened-identity");
+        let original = b"original bytes";
+        std::fs::write(directory.path().join("file.bin"), original).unwrap();
+        std::fs::write(
+            directory.path().join("replacement.bin"),
+            b"different longer replacement",
+        )
+        .unwrap();
+        let storage = StorageService::new(directory.path().into(), 1024, 1, 100, 0)
+            .await
+            .unwrap();
+        let path = storage.resolve_existing("file.bin").await.unwrap();
+        let permit = storage.stream_gate.clone().acquire_owned().await.unwrap();
+        let file = storage.open_file_for_read(&path).await.unwrap();
+        tokio::fs::rename(
+            directory.path().join("file.bin"),
+            directory.path().join("previous.bin"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::rename(
+            directory.path().join("replacement.bin"),
+            directory.path().join("file.bin"),
+        )
+        .await
+        .unwrap();
+        let response = storage
+            .response_from_open_file(
+                file,
+                &path,
+                &HeaderMap::new(),
+                FileResponseMode::Attachment,
+                &Method::GET,
+                permit,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            original.len().to_string()
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            original
+        );
+        assert_eq!(storage.stream_gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn local_conditional_resume_falls_back_to_complete_bytes_without_strong_proof() {
+        let directory = TestDirectory::new("download-conditional-local");
+        let payload = b"complete file";
+        std::fs::write(directory.path().join("file.bin"), payload).unwrap();
+        let storage = StorageService::new(directory.path().into(), 1024, 1, 100, 0)
+            .await
+            .unwrap();
+        let path = storage.resolve_existing("file.bin").await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=3-5"));
+        headers.insert(
+            header::IF_RANGE,
+            HeaderValue::from_static("\"previous-version\""),
+        );
+        let response = storage
+            .stream_file(&path, &headers, FileResponseMode::WebDav, &Method::GET)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(header::CONTENT_RANGE));
+        assert!(!response.headers().contains_key(header::ETAG));
+        assert!(response.headers().contains_key(header::LAST_MODIFIED));
+        assert_eq!(
+            response.headers()[header::CONTENT_LENGTH],
+            payload.len().to_string()
+        );
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            payload
+        );
+        assert_eq!(storage.stream_gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn local_download_uses_bounded_large_reads_and_preserves_ranges() {
         use futures_util::StreamExt;
 
@@ -286,7 +359,7 @@ mod tests {
                 headers.insert(header::RANGE, HeaderValue::from_static(range));
             }
             let response = storage
-                .stream_file(&path, &headers, FileResponseMode::Attachment)
+                .stream_file(&path, &headers, FileResponseMode::Attachment, &Method::GET)
                 .await
                 .unwrap();
             let mut body = response.into_body().into_data_stream();
@@ -382,7 +455,7 @@ mod tests {
             FileResponseMode::WebDav,
         ] {
             let response = storage
-                .stream_file(&resolved, &HeaderMap::new(), mode)
+                .stream_file(&resolved, &HeaderMap::new(), mode, &Method::GET)
                 .await
                 .unwrap();
             assert_eq!(response.headers()[header::CONTENT_LENGTH], "18");
@@ -394,7 +467,7 @@ mod tests {
         let mut request = HeaderMap::new();
         request.insert(header::RANGE, HeaderValue::from_static("bytes=0-3"));
         let response = storage
-            .stream_file(&resolved, &request, FileResponseMode::WebDav)
+            .stream_file(&resolved, &request, FileResponseMode::WebDav, &Method::GET)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);

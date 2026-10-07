@@ -107,12 +107,19 @@ async fn verify_share_basic_auth(
     if username != *expected_username {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    let fingerprint = state.webdav_credentials.fingerprint(share, &password);
+    if state.webdav_credentials.contains(fingerprint).await {
+        return Ok(());
+    }
     match state
         .passwords
         .verify_with_timeout(password_hash.clone(), password, PASSWORD_VERIFY_TIMEOUT)
         .await
     {
-        Ok(true) => Ok(()),
+        Ok(true) => {
+            state.webdav_credentials.remember(fingerprint).await;
+            Ok(())
+        }
         Ok(false) => Err(StatusCode::UNAUTHORIZED),
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
@@ -140,6 +147,153 @@ mod tests {
             password_hash: Some(hash_password("mount-password")),
             readonly: true,
         }
+    }
+
+    fn credentials(password: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Basic {}", STANDARD.encode(format!("reader:{password}")))
+                .parse()
+                .unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn verified_credentials_do_not_cache_failures_or_bypass_current_access() {
+        let directory = TestDirectory::new("dav-credential-cache-access");
+        let original = readonly_mount();
+        let state = app_state(
+            &directory,
+            ConfigFile {
+                shares: vec![original.clone()],
+                ..ConfigFile::with_test_storage()
+            },
+        )
+        .await;
+        let correct = credentials("mount-password");
+        let wrong = credentials("wrong-password");
+        assert_eq!(
+            verify_share_basic_auth(&state, &original, &wrong).await,
+            Err(StatusCode::UNAUTHORIZED)
+        );
+        assert!(
+            !state
+                .webdav_credentials
+                .contains(
+                    state
+                        .webdav_credentials
+                        .fingerprint(&original, "wrong-password")
+                )
+                .await
+        );
+        verify_share_basic_auth(&state, &original, &correct)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .webdav_credentials
+                .contains(
+                    state
+                        .webdav_credentials
+                        .fingerprint(&original, "mount-password")
+                )
+                .await
+        );
+        verify_share_basic_auth(&state, &original, &correct)
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_share_basic_auth(&state, &original, &wrong).await,
+            Err(StatusCode::UNAUTHORIZED)
+        );
+
+        // Rotating the persisted password makes the previous proof unusable.
+        state.config_file.write().await.shares[0].password_hash =
+            Some(hash_password("replacement-password"));
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        assert_eq!(
+            verify_share_access(&state, "documents", &correct, &Method::GET, Some(ip))
+                .await
+                .err(),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        let replacement = credentials("replacement-password");
+        verify_share_access(&state, "documents", &replacement, &Method::GET, Some(ip))
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_share_access(
+                &state,
+                "documents/file",
+                &replacement,
+                &Method::PUT,
+                Some(ip)
+            )
+            .await
+            .err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+        state
+            .login_security
+            .restrict(LoginEntry::WebDav, ip, LoginEntry::WebDav.fixed_policy())
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_share_access(&state, "documents", &replacement, &Method::GET, Some(ip))
+                .await
+                .err(),
+            Some(StatusCode::TOO_MANY_REQUESTS)
+        );
+        state.config_file.write().await.shares[0].webdav_enabled = false;
+        assert_eq!(
+            verify_share_access(&state, "documents", &replacement, &Method::GET, Some(ip))
+                .await
+                .err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+        state.config_file.write().await.shares.clear();
+        assert_eq!(
+            verify_share_access(&state, "documents", &replacement, &Method::GET, Some(ip))
+                .await
+                .err(),
+            Some(StatusCode::NOT_FOUND)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "local authentication microbenchmark, not a network throughput test"]
+    async fn cached_webdav_authentication_baseline() {
+        let directory = TestDirectory::new("dav-authentication-baseline");
+        let share = readonly_mount();
+        let mut state = app_state(
+            &directory,
+            ConfigFile {
+                shares: vec![share.clone()],
+                ..ConfigFile::with_test_storage()
+            },
+        )
+        .await;
+        let headers = credentials("mount-password");
+        const COLD_REQUESTS: u32 = 4;
+        const CACHED_REQUESTS: u32 = 32;
+        let started = std::time::Instant::now();
+        for _ in 0..COLD_REQUESTS {
+            state.webdav_credentials = super::super::CredentialCache::default();
+            verify_share_basic_auth(&state, &share, &headers)
+                .await
+                .unwrap();
+        }
+        let cold = started.elapsed() / COLD_REQUESTS;
+        let started = std::time::Instant::now();
+        for _ in 0..CACHED_REQUESTS {
+            verify_share_basic_auth(&state, &share, &headers)
+                .await
+                .unwrap();
+        }
+        let cached = started.elapsed() / CACHED_REQUESTS;
+        eprintln!("WebDAV auth per request: cold={cold:?}, cached={cached:?}");
     }
 
     #[tokio::test]

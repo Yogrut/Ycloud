@@ -34,6 +34,8 @@ aws-smithy-http-client = { version = "1.4.0", default-features = false, features
 aws-smithy-types = { version = "1.6.2", default-features = false, features = ["http-body-1-x", "rt-tokio"] }
 http-body = "1"
 http-body-util = "0.1"
+httpdate = "1.0.3"
+roxmltree = { version = "0.21.1", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

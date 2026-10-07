@@ -127,6 +127,7 @@ impl StorageService {
                     transactions,
                     mutation_gate,
                     operation_id: None,
+                    conditions: super::WriteConditions::default(),
                 })
             })
             .await
@@ -157,6 +158,7 @@ impl StorageService {
                     transactions,
                     mutation_gate,
                     operation_id: None,
+                    conditions: super::WriteConditions::default(),
                 })
             })
             .await
@@ -220,9 +222,13 @@ pub struct AtomicFileWriter {
     transactions: Arc<TransactionPaths>,
     mutation_gate: Arc<AsyncMutex<()>>,
     operation_id: Option<String>,
+    conditions: super::WriteConditions,
 }
 
 impl AtomicFileWriter {
+    pub(crate) fn set_write_conditions(&mut self, conditions: super::WriteConditions) {
+        self.conditions = conditions;
+    }
     pub(crate) fn set_operation_id(&mut self, operation_id: String) {
         self.operation_id = Some(operation_id);
     }

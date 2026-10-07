@@ -2,10 +2,17 @@ use axum::{
     body::Body,
     extract::{Extension, Path, State},
     http::{header, HeaderMap, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 
 mod access;
+mod credential_cache;
+mod error;
+#[cfg(test)]
+mod protocol_tests;
+
+pub(crate) use credential_cache::CredentialCache;
+pub use error::DavError;
 
 use access::verify_share_access;
 
@@ -29,7 +36,7 @@ pub async fn webdav_handler(
     method: Method,
     headers: HeaderMap,
     body: Body,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, DavError> {
     let _request_permit = state
         .webdav_gate
         .clone()
@@ -38,13 +45,13 @@ pub async fn webdav_handler(
     if method == Method::OPTIONS {
         return options_response();
     }
-    let body = if method == Method::PUT {
-        body
+    let (body, control_body) = if method == Method::PUT {
+        (body, bytes::Bytes::new())
     } else {
-        axum::body::to_bytes(body, MAX_CONTROL_BODY_BYTES)
+        let bytes = axum::body::to_bytes(body, MAX_CONTROL_BODY_BYTES)
             .await
             .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
-        Body::empty()
+        (Body::empty(), bytes)
     };
 
     let dav_path = dav_path.map(|path| path.0).unwrap_or_default();
@@ -53,29 +60,42 @@ pub async fn webdav_handler(
         match verify_share_access(&state, &dav_path, &headers, &method, client_ip).await {
             Ok(access) => access,
             Err(StatusCode::UNAUTHORIZED) => return Ok(basic_auth_challenge()),
-            Err(status) => return Err(status),
+            Err(status) => return Err(status.into()),
         };
-    let backend = state
-        .storage_backend(&share.storage_id)
-        .await
-        .map_err(|error| error.status())?;
+    let backend = state.storage_backend(&share.storage_id).await?;
+    let conditions = if crate::webdav_path::is_write_method(&method) {
+        let conditions = crate::storage::WriteConditions::parse(&headers)?;
+        if headers.contains_key("if") || (method != Method::PUT && conditions.is_conditional()) {
+            return Err(StatusCode::NOT_IMPLEMENTED.into());
+        }
+        conditions
+    } else {
+        crate::storage::WriteConditions::default()
+    };
 
     if method == Method::DELETE && sub_path.trim_matches('/').is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
 
     match method.as_str() {
-        "PROPFIND" => handle_propfind(&state, &backend, &share, &sub_path, &headers).await,
+        "PROPFIND" => {
+            handle_propfind(&state, &backend, &share, &sub_path, &headers, &control_body).await
+        }
         "GET" | "HEAD" => handle_read(&state, &backend, &share, &sub_path, &method, &headers).await,
-        "PUT" => handle_put(&state, &backend, &share, &sub_path, &headers, body).await,
+        "PUT" => {
+            handle_put(
+                &state, &backend, &share, &sub_path, &headers, body, conditions,
+            )
+            .await
+        }
         "DELETE" => handle_delete(&backend, &share, &sub_path).await,
         "MKCOL" => handle_mkcol(&backend, &share, &sub_path).await,
         "MOVE" => handle_move_or_copy(&backend, &share, &sub_path, &headers, false).await,
         "COPY" => handle_move_or_copy(&backend, &share, &sub_path, &headers, true).await,
         // [稳定 + 安全] DAV class-2 locks were removed because the previous
         // implementation returned tokens without storing or enforcing them.
-        "LOCK" | "UNLOCK" | "PROPPATCH" => Err(StatusCode::NOT_IMPLEMENTED),
-        _ => Err(StatusCode::METHOD_NOT_ALLOWED),
+        "LOCK" | "UNLOCK" | "PROPPATCH" => Err(StatusCode::NOT_IMPLEMENTED.into()),
+        _ => Err(StatusCode::METHOD_NOT_ALLOWED.into()),
     }
 }
 
@@ -85,27 +105,25 @@ async fn handle_propfind(
     share: &Share,
     sub_path: &str,
     headers: &HeaderMap,
-) -> Result<Response, StatusCode> {
+    body: &[u8],
+) -> Result<Response, DavError> {
+    let depth = propfind_depth(headers)?;
+    let query = webdav_xml::PropfindQuery::parse(body)?;
     let target = share_storage_path(share, sub_path);
-    let metadata = backend
-        .metadata(&target)
-        .await
-        .map_err(|error| error.status())?;
+    let metadata = backend.metadata(&target).await?;
+    if metadata.is_dir && depth == PropfindDepth::Infinity {
+        return Err(DavError::FiniteDepth);
+    }
     let base_url = format!("/dav/{}", percent_encode(&share.name));
     let display_relative = display_relative_path(share, &target);
     let mut responses = vec![propfind_entry(&target, &metadata, display_relative)];
 
-    let depth = headers
-        .get("depth")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("1");
-    if metadata.is_dir && depth != "0" {
+    if metadata.is_dir && depth == PropfindDepth::Children {
         let (entries, truncated) = backend
             .list_directory(&target, state.config.max_list_entries)
-            .await
-            .map_err(|error| error.status())?;
+            .await?;
         if truncated {
-            return Err(StatusCode::INSUFFICIENT_STORAGE);
+            return Err(StatusCode::INSUFFICIENT_STORAGE.into());
         }
         for entry in entries {
             let child = BackendMetadata {
@@ -123,12 +141,40 @@ async fn handle_propfind(
         }
     }
 
-    let xml = webdav_xml::build_multistatus(&responses, &base_url);
+    let xml = webdav_xml::build_multistatus(&responses, &base_url, &query)?;
     Response::builder()
         .status(StatusCode::MULTI_STATUS)
         .header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
         .body(Body::from(xml))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into())
+}
+
+// Infinity (including an omitted header) is explicit, never silently depth 1.
+#[derive(Eq, PartialEq)]
+enum PropfindDepth {
+    Resource,
+    Children,
+    Infinity,
+}
+
+fn propfind_depth(headers: &HeaderMap) -> Result<PropfindDepth, DavError> {
+    let mut values = headers.get_all("depth").iter();
+    let value = values
+        .next()
+        .map(|value| value.to_str())
+        .transpose()
+        .map_err(|_| crate::error::AppError::BadRequest("Depth 必须是 0、1 或 infinity".into()))?
+        .unwrap_or("infinity")
+        .trim();
+    if values.next().is_some() {
+        return Err(crate::error::AppError::BadRequest("Depth 不能重复".into()).into());
+    }
+    match value {
+        "0" => Ok(PropfindDepth::Resource),
+        "1" => Ok(PropfindDepth::Children),
+        value if value.eq_ignore_ascii_case("infinity") => Ok(PropfindDepth::Infinity),
+        _ => Err(crate::error::AppError::BadRequest("Depth 必须是 0、1 或 infinity".into()).into()),
+    }
 }
 
 async fn handle_read(
@@ -138,25 +184,21 @@ async fn handle_read(
     sub_path: &str,
     method: &Method,
     headers: &HeaderMap,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, DavError> {
     let mut response = backend
         .stream_file(
             &share_storage_path(share, sub_path),
             headers,
             FileResponseMode::WebDav,
+            method,
         )
-        .await
-        .map_err(|error| error.status())?;
+        .await?;
     // HEAD keeps the same file headers without transferring or charging bytes.
     if method == Method::HEAD {
         *response.body_mut() = Body::empty();
         return Ok(response);
     }
-    let response = state
-        .traffic
-        .download(response, "webdav".into())
-        .await
-        .map_err(|error| error.status())?;
+    let response = state.traffic.download(response, "webdav".into()).await?;
     Ok(state.download_limiter.wrap_response(response))
 }
 
@@ -167,9 +209,10 @@ async fn handle_put(
     sub_path: &str,
     headers: &HeaderMap,
     body: Body,
-) -> Result<Response, StatusCode> {
+    conditions: crate::storage::WriteConditions,
+) -> Result<Response, DavError> {
     if sub_path.trim_matches('/').is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
     let storage_path = share_storage_path(share, sub_path);
     let expected_bytes = headers
@@ -187,16 +230,17 @@ async fn handle_put(
             crate::traffic::Direction::Upload,
             expected_bytes.unwrap_or(1),
         )
-        .await
-        .map_err(|error| error.status())?;
+        .await?;
     let (body, meter) =
         state
             .traffic
             .meter(body, "webdav".into(), crate::traffic::Direction::Upload);
+    let mut input = crate::s3_backend::UploadInput::relay(state.upload_limiter.wrap_body(body));
+    input.conditions = conditions;
     let result = backend
-        .upload_file(
+        .upload_file_conditionally(
             &storage_path,
-            state.upload_limiter.wrap_body(body),
+            input,
             expected_bytes,
             max_upload_bytes,
             content_type,
@@ -209,7 +253,7 @@ async fn handle_delete(
     backend: &StorageBackend,
     share: &Share,
     sub_path: &str,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, DavError> {
     let result = backend.remove(&share_storage_path(share, sub_path)).await;
     mutation_response(result, StatusCode::NO_CONTENT)
 }
@@ -218,9 +262,9 @@ async fn handle_mkcol(
     backend: &StorageBackend,
     share: &Share,
     sub_path: &str,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, DavError> {
     if sub_path.trim_matches('/').is_empty() {
-        return Err(StatusCode::METHOD_NOT_ALLOWED);
+        return Err(StatusCode::METHOD_NOT_ALLOWED.into());
     }
     let result = backend
         .create_directory(&share_storage_path(share, sub_path))
@@ -234,9 +278,9 @@ async fn handle_move_or_copy(
     sub_path: &str,
     headers: &HeaderMap,
     copy: bool,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, DavError> {
     if sub_path.trim_matches('/').is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
     let destination = headers
         .get("destination")
@@ -261,11 +305,10 @@ async fn handle_move_or_copy(
 fn mutation_response<T>(
     result: crate::error::AppResult<T>,
     success: StatusCode,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, DavError> {
     match result {
         Ok(_) => empty_response(success),
-        Err(error) if error.operation().is_some() => Ok(error.into_response()),
-        Err(error) => Err(error.status()),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -279,7 +322,11 @@ fn propfind_entry(
         href: if display_relative.is_empty() {
             "/".into()
         } else {
-            format!("/{}", percent_encode(&display_relative))
+            format!(
+                "/{}{}",
+                percent_encode(&display_relative),
+                if is_dir { "/" } else { "" }
+            )
         },
         displayname: path.rsplit('/').next().unwrap_or("").to_string(),
         is_dir,
@@ -305,7 +352,7 @@ fn propfind_entry(
     }
 }
 
-fn options_response() -> Result<Response, StatusCode> {
+fn options_response() -> Result<Response, DavError> {
     Response::builder()
         .status(StatusCode::OK)
         .header("DAV", "1")
@@ -315,7 +362,7 @@ fn options_response() -> Result<Response, StatusCode> {
         )
         .header("MS-Author-Via", "DAV")
         .body(Body::empty())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into())
 }
 
 fn basic_auth_challenge() -> Response {
@@ -328,17 +375,18 @@ fn basic_auth_challenge() -> Response {
     response
 }
 
-fn empty_response(status: StatusCode) -> Result<Response, StatusCode> {
+fn empty_response(status: StatusCode) -> Result<Response, DavError> {
     Response::builder()
         .status(status)
         .body(Body::empty())
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into())
 }
 
 #[cfg(test)]
 mod response_contract_tests {
     use super::*;
     use crate::error::{AppError, CleanupState, CommitState};
+    use axum::response::IntoResponse;
     use base64::Engine;
     use tower::ServiceExt;
 
@@ -368,7 +416,9 @@ mod response_contract_tests {
             ),
         ] {
             let error = AppError::internal("private").with_operation(commit, cleanup);
-            let response = mutation_response::<()>(Err(error), StatusCode::CREATED).unwrap();
+            let response = mutation_response::<()>(Err(error), StatusCode::CREATED)
+                .unwrap_err()
+                .into_response();
             assert_eq!(response.status(), status);
             let bytes = axum::body::to_bytes(response.into_body(), 4096)
                 .await
@@ -403,10 +453,99 @@ mod response_contract_tests {
             ),
         ] {
             assert_eq!(
-                mutation_response::<()>(Err(error), StatusCode::CREATED).err(),
-                Some(status)
+                mutation_response::<()>(Err(error), StatusCode::CREATED)
+                    .unwrap_err()
+                    .into_response()
+                    .status(),
+                status
             );
         }
+    }
+
+    #[tokio::test]
+    async fn local_dav_uploads_preserve_known_streamed_empty_and_overwrite_bodies() {
+        let directory = crate::test_support::TestDirectory::new("dav-upload-contract");
+        let state = crate::test_support::app_state(
+            &directory,
+            crate::config::ConfigFile {
+                shares: vec![Share {
+                    id: "upload-share".into(),
+                    storage_id: "primary".into(),
+                    name: "documents".into(),
+                    path: String::new(),
+                    username: Some("writer".into()),
+                    webdav_enabled: true,
+                    password_hash: Some(crate::config::hash_password("upload-password")),
+                    readonly: false,
+                }],
+                ..crate::config::ConfigFile::with_test_storage()
+            },
+        )
+        .await;
+        let app = crate::app::build_router(state.clone());
+        let upload = |name: &str, body: Body, length: Option<u64>| {
+            let mut request = axum::http::Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/dav/documents/{}", percent_encode(name)))
+                .header(header::HOST, "127.0.0.1:18473")
+                .header(
+                    header::AUTHORIZATION,
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD.encode("writer:upload-password")
+                    ),
+                )
+                .extension(axum::extract::ConnectInfo(
+                    "127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap(),
+                ));
+            if let Some(length) = length {
+                request = request.header(header::CONTENT_LENGTH, length);
+            }
+            app.clone().oneshot(request.body(body).unwrap())
+        };
+        let streamed = Body::from_stream(futures_util::stream::iter([
+            Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"stream-")),
+            Ok(bytes::Bytes::from_static(b"content")),
+        ]));
+        let (known, unknown, empty) = tokio::join!(
+            upload("known.bin", Body::from("known"), Some(5)),
+            upload("照片 ARW.bin", streamed, None),
+            upload("empty.bin", Body::empty(), Some(0)),
+        );
+        for response in [known, unknown, empty] {
+            assert_eq!(response.unwrap().status(), StatusCode::CREATED);
+        }
+        assert_eq!(
+            tokio::fs::read(state.config.storage_path.join("known.bin"))
+                .await
+                .unwrap(),
+            b"known"
+        );
+        assert_eq!(
+            tokio::fs::read(state.config.storage_path.join("照片 ARW.bin"))
+                .await
+                .unwrap(),
+            b"stream-content"
+        );
+        assert!(tokio::fs::read(state.config.storage_path.join("empty.bin"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            upload("known.bin", Body::from("replacement"), Some(11))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            tokio::fs::read(state.config.storage_path.join("known.bin"))
+                .await
+                .unwrap(),
+            b"replacement"
+        );
+        // DAV keeps overwrite semantics; it must not allocate the browser's numbered name.
+        assert!(!state.config.storage_path.join("known (1).bin").exists());
     }
 
     #[tokio::test]
@@ -446,8 +585,8 @@ mod response_contract_tests {
             (
                 Method::HEAD,
                 Some("bytes=9-13"),
-                StatusCode::PARTIAL_CONTENT,
-                "5",
+                StatusCode::OK,
+                "14",
                 &b""[..],
             ),
             (

@@ -377,6 +377,7 @@ async fn write_archive(
                 &file.storage_path,
                 &HeaderMap::new(),
                 FileResponseMode::WebDav,
+                &axum::http::Method::GET,
             )
             .await?;
         if !response.status().is_success() {

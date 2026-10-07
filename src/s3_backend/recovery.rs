@@ -372,14 +372,36 @@ impl S3Backend {
         journal_etag: &str,
         transaction: &S3UploadTransaction,
     ) -> AppResult<()> {
+        if transaction.publication_guard.is_some()
+            && matches!(
+                transaction.stage,
+                super::S3UploadStage::PublicationRejected
+                    | super::S3UploadStage::CheckingPublication
+            )
+        {
+            return self
+                .finish_upload_transaction(journal_key, Some(journal_etag), transaction)
+                .await;
+        }
         let destination_key = object_key(&self.prefix, &transaction.relative)?;
         let destination = self.head_key(&destination_key).await?;
 
         let committed = destination.as_ref().is_some_and(|value| {
-            snapshot_matches(value, &transaction.temporary)
+            (transaction.publication_guard.is_none()
+                && snapshot_matches(value, &transaction.temporary))
                 || (value.size == transaction.temporary.size
                     && value.operation_id.as_deref() == Some(transaction.id.as_str()))
         });
+        if transaction.publication_guard.is_some() {
+            if committed {
+                return self
+                    .finish_upload_transaction(journal_key, Some(journal_etag), transaction)
+                    .await;
+            }
+            return Err(AppError::ServiceUnavailable(
+                "条件上传缺少本次操作的提交证明；已保留恢复记录且未改写正式文件".into(),
+            ));
+        }
         let rolled_back = match transaction.previous.as_ref() {
             Some(previous) => destination
                 .as_ref()

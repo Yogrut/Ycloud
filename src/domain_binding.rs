@@ -14,14 +14,20 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub struct DomainBinding {
     pub public_url: String,
-    /// Accept the field written by older releases so existing installations
-    /// keep starting, but stop exposing or persisting proxy-specific policy.
-    #[serde(default, rename = "trusted_proxy_ips", skip_serializing)]
-    _legacy_trusted_proxy_ips: Vec<IpAddr>,
+    /// Exact reverse-proxy connection peers allowed to supply X-Real-IP.
+    #[serde(default)]
+    pub trusted_proxy_ips: Vec<IpAddr>,
 }
+
+const MAX_TRUSTED_PROXY_IPS: usize = 16;
 
 impl DomainBinding {
     pub fn validate(&self) -> AppResult<()> {
+        if self.trusted_proxy_ips.len() > MAX_TRUSTED_PROXY_IPS {
+            return Err(AppError::BadRequest(
+                format!("可信代理 IP 最多 {MAX_TRUSTED_PROXY_IPS} 个").into(),
+            ));
+        }
         let invalid = || {
             AppError::BadRequest(
                 "请输入 HTTPS 域名地址（可带端口），不包含路径、账号或查询参数".into(),
@@ -67,7 +73,11 @@ impl DomainBinding {
         if self.public_url.ends_with(":443") {
             self.public_url.truncate(self.public_url.len() - 4);
         }
-        self._legacy_trusted_proxy_ips.clear();
+        self.trusted_proxy_ips
+            .iter_mut()
+            .for_each(|ip| *ip = ip.to_canonical());
+        self.trusted_proxy_ips.sort_unstable();
+        self.trusted_proxy_ips.dedup();
         Ok(self)
     }
 
@@ -81,6 +91,7 @@ impl DomainBinding {
                 .into(),
         );
         config.secure_cookies = true;
+        config.trusted_proxy_ips = self.trusted_proxy_ips.iter().copied().collect();
         config
     }
 }
@@ -160,7 +171,7 @@ mod tests {
     fn binding() -> DomainBinding {
         DomainBinding {
             public_url: "https://cloud.example.com".into(),
-            _legacy_trusted_proxy_ips: Vec::new(),
+            trusted_proxy_ips: Vec::new(),
         }
     }
 
@@ -237,15 +248,15 @@ mod tests {
     }
 
     #[test]
-    fn accepts_but_drops_legacy_proxy_ips() {
+    fn trusted_proxy_ips_are_normalized_and_persisted_with_the_binding() {
         let value: DomainBinding = serde_json::from_value(serde_json::json!({
             "public_url": "https://cloud.example.com",
-            "trusted_proxy_ips": ["127.0.0.1"]
+            "trusted_proxy_ips": ["::ffff:127.0.0.1", "127.0.0.1"]
         }))
         .unwrap();
         assert_eq!(
             serde_json::to_value(value.normalize().unwrap()).unwrap(),
-            serde_json::json!({"public_url": "https://cloud.example.com"})
+            serde_json::json!({"public_url": "https://cloud.example.com", "trusted_proxy_ips": ["127.0.0.1"]})
         );
     }
 
@@ -267,6 +278,61 @@ mod tests {
             .domain_binding
             .is_none());
         tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trusted_proxies_apply_immediately_survive_restart_and_clear_on_unbinding() {
+        let (state, root) = fixture().await;
+        let admin = state.sessions.create().await;
+        let router = crate::app::build_router(state.clone());
+        let selected = DomainBinding {
+            trusted_proxy_ips: vec!["192.0.2.10".parse().unwrap()],
+            ..binding()
+        };
+        let saved = router
+            .oneshot(request(
+                "PUT",
+                "/api/admin/domain-binding",
+                false,
+                Some(&admin),
+                serde_json::to_value(&selected).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+        assert!(policy(&state)
+            .await
+            .trusted_proxy_ips
+            .contains(&"192.0.2.10".parse().unwrap()));
+        let persisted = config::load_config(&state.config.config_path)
+            .await
+            .unwrap();
+        assert_eq!(persisted.domain_binding, Some(selected.clone()));
+        let restarted = AppState::new(state.config.clone(), Arc::new(RwLock::new(persisted)))
+            .await
+            .unwrap();
+        assert!(policy(&restarted)
+            .await
+            .trusted_proxy_ips
+            .contains(&"192.0.2.10".parse().unwrap()));
+        let mut invalid = selected;
+        invalid
+            .trusted_proxy_ips
+            .resize(MAX_TRUSTED_PROXY_IPS + 1, "192.0.2.11".parse().unwrap());
+        assert!(save_binding(State(state.clone()), Json(invalid))
+            .await
+            .is_err());
+        assert_eq!(policy(&state).await.trusted_proxy_ips.len(), 1);
+        let _ = remove_binding(State(state.clone())).await.unwrap();
+        assert!(policy(&state).await.trusted_proxy_ips.is_empty());
+        assert!(config::load_config(&state.config.config_path)
+            .await
+            .unwrap()
+            .domain_binding
+            .is_none());
+        drop(restarted);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

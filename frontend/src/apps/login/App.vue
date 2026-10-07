@@ -1,14 +1,16 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted } from 'vue'
-import AdminView from '../admin/AdminView.vue'
-import BrowserView from '../browser/BrowserView.vue'
 import LoginView from './LoginView.vue'
-import PreviewView from '../preview/PreviewView.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import { useTheme } from '../../shared/composables/useTheme'
 import { currentAppPath } from '../../shared/routes'
+import { lazyPage } from '../../shared/lazyPage'
+
+const AdminView = lazyPage(() => import('../admin/AdminView.vue').then(module => module.default))
+const BrowserView = lazyPage(() => import('../browser/BrowserView.vue').then(module => module.default))
+const PreviewView = lazyPage(() => import('../preview/PreviewView.vue').then(module => module.default))
 
 const theme = useTheme()
 const route = computed(() => currentAppPath())

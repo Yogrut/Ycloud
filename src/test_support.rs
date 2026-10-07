@@ -58,6 +58,7 @@ pub(crate) fn runtime_config(root: &Path) -> crate::config::Config {
         public_base_url: None,
         public_host: None,
         allowed_hosts: Default::default(),
+        trusted_proxy_ips: Default::default(),
         transaction_auth_key: [0x31; 32],
     }
 }

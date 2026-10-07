@@ -16,16 +16,12 @@ pub(super) fn migrate_config(raw: &mut Value) -> anyhow::Result<bool> {
     // Work on a candidate: even a failed intermediate step leaves the input
     // untouched. Each migration describes the version it produces.
     let mut candidate = raw.clone();
-    let removed_proxy_policy = candidate
-        .get_mut("domain_binding")
-        .and_then(Value::as_object_mut)
-        .is_some_and(|binding| binding.remove("trusted_proxy_ips").is_some());
     for target in (schema_version + 1)..=u64::from(CONFIG_SCHEMA_VERSION) {
         migrate_step(&mut candidate, target)?;
         candidate["schema_version"] = Value::from(target);
     }
     *raw = candidate;
-    Ok(removed_proxy_policy || schema_version < u64::from(CONFIG_SCHEMA_VERSION))
+    Ok(schema_version < u64::from(CONFIG_SCHEMA_VERSION))
 }
 
 fn schema_version(raw: &Value) -> anyhow::Result<u64> {
@@ -64,6 +60,13 @@ fn schema_version(raw: &Value) -> anyhow::Result<u64> {
 
 fn migrate_step(raw: &mut Value, target: u64) -> anyhow::Result<()> {
     match target {
+        16 => {
+            // Old releases discarded this field. Preserve the bound domain,
+            // but do not silently reactivate an obsolete proxy trust policy.
+            if let Some(binding) = raw.get_mut("domain_binding").and_then(Value::as_object_mut) {
+                binding.insert("trusted_proxy_ips".into(), serde_json::json!([]));
+            }
+        }
         15 => {
             // Keep existing private-network installations working; new S3 settings default to direct.
             if let Some(instances) = raw
@@ -222,15 +225,35 @@ mod tests {
     }
 
     #[test]
+    fn current_schema_keeps_explicit_trusted_proxies() {
+        let mut raw = serde_json::to_value(super::super::ConfigFile::with_test_storage()).unwrap();
+        raw["domain_binding"] = serde_json::json!({ "public_url": "https://files.example.com", "trusted_proxy_ips": ["192.0.2.10"] });
+        let before = raw.clone();
+        assert!(!migrate_config(&mut raw).unwrap());
+        assert_eq!(raw, before);
+        let candidate: super::super::ConfigFile = serde_json::from_value(raw).unwrap();
+        candidate.validate().unwrap();
+    }
+
+    #[test]
     fn obsolete_proxy_policy_is_removed_before_full_config_validation() {
         let mut raw = serde_json::to_value(super::super::ConfigFile::with_test_storage()).unwrap();
         raw["domain_binding"] = serde_json::json!({
             "public_url": "https://files.example.com",
             "trusted_proxy_ips": ["127.0.0.1"]
         });
+        raw["schema_version"] = Value::from(15);
         assert!(migrate_config(&mut raw).unwrap());
         let candidate: super::super::ConfigFile = serde_json::from_value(raw.clone()).unwrap();
         candidate.validate().unwrap();
+        assert_eq!(
+            candidate.domain_binding.unwrap().public_url,
+            "https://files.example.com"
+        );
+        assert_eq!(
+            raw["domain_binding"]["trusted_proxy_ips"],
+            serde_json::json!([])
+        );
         assert!(!migrate_config(&mut raw).unwrap());
     }
 

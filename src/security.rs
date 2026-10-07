@@ -44,9 +44,10 @@ pub async fn proxy_boundary_middleware(
         .ok_or(StatusCode::FORBIDDEN)?;
     let config = crate::domain_binding::policy(&state).await;
     validate_request_host(&config, request.headers())?;
+    let client_ip = request_client_ip(&config, peer_ip, request.headers())?;
     let secure_cookies = config.secure_cookies;
     request.extensions_mut().insert(config);
-    request.extensions_mut().insert(ClientIp(peer_ip));
+    request.extensions_mut().insert(ClientIp(client_ip));
     let mut response = next.run(request).await;
     // Handlers share deployment state; HTTPS bindings must also secure cookies
     // when the deployment started in LAN mode. Never strip an existing Secure flag.
@@ -77,6 +78,23 @@ pub async fn proxy_boundary_middleware(
         }
     }
     Ok(response)
+}
+
+fn request_client_ip(
+    config: &Config,
+    peer: IpAddr,
+    headers: &axum::http::HeaderMap,
+) -> Result<IpAddr, StatusCode> {
+    let peer = peer.to_canonical();
+    if !config.trusted_proxy_ips.contains(&peer) || !headers.contains_key("x-real-ip") {
+        return Ok(peer);
+    }
+    // The configured proxy must overwrite this single header. Do not infer
+    // trust from a domain, private address, or an arbitrary forwarded chain.
+    single_header(headers, "x-real-ip")?
+        .parse::<IpAddr>()
+        .map(|ip| ip.to_canonical())
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 fn validate_request_host(
@@ -277,7 +295,8 @@ fn origin_matches(config: &Config, headers: &axum::http::HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_cookie, csrf_request_allowed, origin_matches, session_cookie, validate_request_host,
+        clear_cookie, csrf_request_allowed, origin_matches, request_client_ip, session_cookie,
+        validate_request_host,
     };
     use crate::config::Config;
     use axum::http::{header, HeaderMap, HeaderValue};
@@ -289,6 +308,123 @@ mod tests {
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Secure"));
         assert!(clear_cookie("session", false).contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn real_ip_is_used_only_for_explicitly_trusted_peers() {
+        let mut config = local_config();
+        let peer = "192.0.2.10".parse().unwrap();
+        let client = "198.51.100.25".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", HeaderValue::from_static("198.51.100.25"));
+        assert_eq!(request_client_ip(&config, peer, &headers), Ok(peer));
+        config.trusted_proxy_ips.insert(peer);
+        assert_eq!(request_client_ip(&config, peer, &headers), Ok(client));
+        headers.remove("x-real-ip");
+        headers.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.25"));
+        assert_eq!(request_client_ip(&config, peer, &headers), Ok(peer));
+    }
+
+    #[test]
+    fn trusted_real_ip_requires_one_valid_address_and_normalizes_mapped_ipv4() {
+        let mut config = local_config();
+        let peer = "192.0.2.10".parse().unwrap();
+        config.trusted_proxy_ips.insert(peer);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-real-ip",
+            HeaderValue::from_static("::ffff:198.51.100.25"),
+        );
+        assert_eq!(
+            request_client_ip(&config, "::ffff:192.0.2.10".parse().unwrap(), &headers),
+            Ok("198.51.100.25".parse().unwrap())
+        );
+        for value in [
+            "not-an-ip",
+            "198.51.100.25:8080",
+            "198.51.100.25, 192.0.2.1",
+        ] {
+            headers.insert("x-real-ip", HeaderValue::from_str(value).unwrap());
+            assert_eq!(
+                request_client_ip(&config, peer, &headers),
+                Err(axum::http::StatusCode::BAD_REQUEST)
+            );
+        }
+        headers.insert("x-real-ip", HeaderValue::from_static("2001:db8::25"));
+        assert_eq!(
+            request_client_ip(&config, peer, &headers),
+            Ok("2001:db8::25".parse().unwrap())
+        );
+        headers.append("x-real-ip", HeaderValue::from_static("198.51.100.25"));
+        assert_eq!(
+            request_client_ip(&config, peer, &headers),
+            Err(axum::http::StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(
+            request_client_ip(&config, "192.0.2.11".parse().unwrap(), &headers),
+            Ok("192.0.2.11".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_middleware_passes_the_selected_address_to_request_consumers() {
+        use axum::{
+            extract::{ConnectInfo, Extension},
+            routing::get,
+            Router,
+        };
+        use tower::ServiceExt;
+        let directory = crate::test_support::TestDirectory::new("proxy-client-address");
+        let mut state = crate::test_support::app_state(
+            &directory,
+            crate::config::ConfigFile::with_test_storage(),
+        )
+        .await;
+        state
+            .config
+            .trusted_proxy_ips
+            .insert("192.0.2.10".parse().unwrap());
+        let router = Router::new()
+            .route(
+                "/",
+                get(
+                    |Extension(super::ClientIp(ip)): Extension<super::ClientIp>| async move {
+                        ip.to_string()
+                    },
+                ),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                super::proxy_boundary_middleware,
+            ));
+        for (peer, expected) in [
+            ("192.0.2.10", "198.51.100.25"),
+            ("192.0.2.11", "192.0.2.11"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/")
+                        .header(header::HOST, "localhost:18473")
+                        .header("x-real-ip", "198.51.100.25")
+                        .extension(ConnectInfo(std::net::SocketAddr::new(
+                            peer.parse().unwrap(),
+                            12345,
+                        )))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(
+                &axum::body::to_bytes(response.into_body(), 128)
+                    .await
+                    .unwrap()[..],
+                expected.as_bytes()
+            );
+        }
     }
 
     #[test]
@@ -408,6 +544,7 @@ mod tests {
             public_base_url: None,
             public_host: None,
             allowed_hosts: Default::default(),
+            trusted_proxy_ips: Default::default(),
             transaction_auth_key: [0x31; 32],
         }
     }

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use axum::{
     body::Body,
-    http::{header, HeaderMap, Response, StatusCode},
+    http::{header, HeaderMap, Method, Response, StatusCode},
 };
 use tokio_util::io::ReaderStream;
 
@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     error::{AppError, AppResult},
-    storage::{parse_range, FileResponseMode, FileResponsePolicy, StorageService},
+    storage::{FileResponseMode, FileResponsePolicy, FileValidators, StorageService},
 };
 
 impl S3Backend {
@@ -98,17 +98,42 @@ impl S3Backend {
         relative: &str,
         request_headers: &HeaderMap,
         mode: FileResponseMode,
+        method: &Method,
     ) -> AppResult<Response<Body>> {
         let metadata = self.metadata(relative).await?;
         if metadata.is_dir {
             return Err(AppError::NotFound);
         }
-        let range = parse_range(request_headers, metadata.size);
+        let validators = FileValidators::object(metadata.etag.as_deref(), metadata.last_modified);
+        let range = validators.select_range(request_headers, metadata.size, method);
         let (start, length, status) = match range {
             Ok(Some(range)) => range,
             Ok(None) => (0, metadata.size, StatusCode::OK),
             Err(()) => return range_not_satisfiable(metadata.size),
         };
+        let mut response = Response::builder()
+            .status(status)
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CONTENT_LENGTH, length);
+        response = FileResponsePolicy::new(
+            Path::new(&metadata.relative),
+            metadata.content_type.as_deref(),
+            mode,
+        )
+        .apply(response);
+        response = validators.apply(response);
+        if status == StatusCode::PARTIAL_CONTENT {
+            let end = start.saturating_add(length).saturating_sub(1);
+            response = response.header(
+                header::CONTENT_RANGE,
+                format!("bytes {start}-{end}/{}", metadata.size),
+            );
+        }
+        if method == Method::HEAD {
+            return response
+                .body(Body::empty())
+                .map_err(|error| AppError::with_source("failed to build S3 response", error));
+        }
         let key = object_key(&self.prefix, &metadata.relative)?;
         let stream_permit = self
             .stream_gate
@@ -157,25 +182,121 @@ impl S3Backend {
             inner: ReaderStream::new(reader),
             _permit: stream_permit,
         };
-        let mut response = Response::builder()
-            .status(status)
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_LENGTH, length);
-        response = FileResponsePolicy::new(
-            Path::new(&metadata.relative),
-            metadata.content_type.as_deref(),
-            mode,
-        )
-        .apply(response);
-        if status == StatusCode::PARTIAL_CONTENT {
-            let end = start.saturating_add(length).saturating_sub(1);
-            response = response.header(
-                header::CONTENT_RANGE,
-                format!("bytes {start}-{end}/{}", metadata.size),
-            );
-        }
         response
             .body(Body::from_stream(stream))
             .map_err(|error| AppError::with_source("failed to build S3 response", error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        body::to_bytes,
+        http::{HeaderValue, Uri},
+        routing::any,
+        Router,
+    };
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::s3_backend::protocol_tests::test_backend;
+
+    #[tokio::test]
+    async fn head_skips_object_body_and_conditional_ranges_pin_the_current_version() {
+        let reads = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let observed = reads.clone();
+        let router = Router::new().route(
+            "/{*key}",
+            any(move |method: Method, uri: Uri, headers: HeaderMap| {
+                let reads = observed.clone();
+                async move {
+                    if uri.path() == "/bucket" || uri.path() == "/bucket/" {
+                        return Response::builder().header(header::CONTENT_TYPE, "application/xml")
+                            .body(Body::from("<ListBucketResult><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"))
+                            .unwrap();
+                    }
+                    assert_eq!(uri.path(), "/bucket/tenant/file.bin");
+                    let mut response = Response::builder()
+                        .header(header::ETAG, "\"current\"")
+                        .header(header::LAST_MODIFIED, "Tue, 14 Nov 2023 22:13:20 GMT");
+                    if method == Method::HEAD {
+                        return response.header(header::CONTENT_LENGTH, 10)
+                            .body(Body::empty()).unwrap();
+                    }
+                    assert_eq!(method, Method::GET);
+                    assert_eq!(headers[header::IF_MATCH], "\"current\"");
+                    let range = headers.get(header::RANGE)
+                        .map(|value| value.to_str().unwrap().to_owned());
+                    reads.lock().unwrap().push(range.clone());
+                    let payload = if let Some(range) = range {
+                        assert_eq!(range, "bytes=2-4");
+                        response = response.status(StatusCode::PARTIAL_CONTENT)
+                            .header(header::CONTENT_RANGE, "bytes 2-4/10");
+                        "234"
+                    } else {
+                        "0123456789"
+                    };
+                    response.header(header::CONTENT_LENGTH, payload.len())
+                        .body(Body::from(payload)).unwrap()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=2-4"));
+        headers.insert(header::IF_RANGE, HeaderValue::from_static("\"current\""));
+        let response = backend
+            .stream_file(
+                "file.bin",
+                &headers,
+                FileResponseMode::WebDav,
+                &Method::HEAD,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "10");
+        assert_eq!(response.headers()[header::ETAG], "\"current\"");
+        assert!(!response.headers().contains_key(header::CONTENT_RANGE));
+        assert!(to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(reads.lock().unwrap().is_empty());
+        for (expected, status, payload) in [
+            ("\"current\"", StatusCode::PARTIAL_CONTENT, "234"),
+            ("\"previous\"", StatusCode::OK, "0123456789"),
+            ("W/\"current\"", StatusCode::OK, "0123456789"),
+            (
+                "Tue, 14 Nov 2023 22:13:20 GMT",
+                StatusCode::OK,
+                "0123456789",
+            ),
+        ] {
+            headers.insert(header::IF_RANGE, HeaderValue::from_str(expected).unwrap());
+            let response = backend
+                .stream_file("file.bin", &headers, FileResponseMode::WebDav, &Method::GET)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()[header::CONTENT_LENGTH],
+                payload.len().to_string()
+            );
+            assert_eq!(response.headers()[header::ETAG], "\"current\"");
+            assert_eq!(
+                to_bytes(response.into_body(), 1024).await.unwrap().as_ref(),
+                payload.as_bytes()
+            );
+        }
+        assert_eq!(
+            *reads.lock().unwrap(),
+            [Some("bytes=2-4".into()), None, None, None]
+        );
+        server.abort();
     }
 }

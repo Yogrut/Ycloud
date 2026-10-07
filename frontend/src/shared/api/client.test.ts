@@ -4,6 +4,15 @@ import { ApiError, errorMetadata, readJson, requestJson, REQUEST_TIMEOUT_MS } fr
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('API client primitives', () => {
+  it('preserves a definite precondition failure without classifying it as an unknown commit', async () => {
+    const response = new Response(JSON.stringify({ error: { code: 'precondition_failed', message: 'Refresh the file version', operation: { commit: 'not_committed', cleanup: 'complete', retry: 'after_correction' } } }), { status: 412, headers: { 'Content-Type': 'application/json' } })
+    const metadata = errorMetadata(response, await readJson(response) ?? {})
+    const error = new ApiError(metadata.message ?? 'failed', response.status, metadata.code, undefined, metadata.operation)
+    expect(error.code).toBe('precondition_failed')
+    expect(error.status).toBe(412)
+    expect(error.blocksRetry).toBe(false)
+    expect(error.operation?.retry).toBe('after_correction')
+  })
   it('blocks repeat writes for committed and unknown results but preserves ordinary failures', () => {
     expect(new ApiError('pending', 409, 'operation_committed_pending').blocksRetry).toBe(true)
     expect(new ApiError('unknown', 0, 'operation_result_unknown').blocksRetry).toBe(true)

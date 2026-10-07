@@ -3,7 +3,9 @@ import { getDomainBinding, removeDomainBinding, saveDomainBinding, type DomainBi
 import { useLocale } from '../../shared/i18n'
 
 function bindingSnapshot(view?: DomainBindingView): DomainBindingView {
-  return { binding: view?.binding ? { ...view.binding } : null, source: view?.source ?? 'none' }
+  const binding = view?.binding ? { ...view.binding } : null
+  if (binding?.trusted_proxy_ips) binding.trusted_proxy_ips = [...binding.trusted_proxy_ips]
+  return { binding, source: view?.source ?? 'none' }
 }
 
 export function useDomainBinding(getInitial: () => DomainBindingView | undefined) {
@@ -12,6 +14,7 @@ export function useDomainBinding(getInitial: () => DomainBindingView | undefined
   const open = ref(false)
   const busy = ref(false)
   const url = ref('')
+  const proxyIps = ref('')
   const error = ref('')
   const message = ref('')
   let disposed = false
@@ -21,6 +24,7 @@ export function useDomainBinding(getInitial: () => DomainBindingView | undefined
 
   function syncDraft(): void {
     url.value = status.value.binding?.public_url ?? ''
+    proxyIps.value = (status.value.binding?.trusted_proxy_ips ?? []).join(', ')
   }
 
   async function show(): Promise<void> {
@@ -51,7 +55,10 @@ export function useDomainBinding(getInitial: () => DomainBindingView | undefined
     const publicUrl = url.value.trim()
     const isRemoval = !publicUrl
     try {
-      const result = isRemoval ? await removeDomainBinding() : await saveDomainBinding({ public_url: publicUrl })
+      const result = isRemoval ? await removeDomainBinding() : await saveDomainBinding({
+        public_url: publicUrl,
+        trusted_proxy_ips: proxyIps.value.split(/[,，\s]+/).filter(Boolean),
+      })
       if (disposed) return
       status.value = bindingSnapshot(result)
       syncDraft()
@@ -78,10 +85,11 @@ export function useDomainBinding(getInitial: () => DomainBindingView | undefined
     readRequest?.abort()
     open.value = false
     url.value = ''
+    proxyIps.value = ''
     error.value = ''
     message.value = ''
     // Submitted writes keep running; their late results must not revive this editor.
   })
 
-  return { status, open, busy, url, error, message, show, submit, cancel }
+  return { status, open, busy, url, proxyIps, error, message, show, submit, cancel }
 }

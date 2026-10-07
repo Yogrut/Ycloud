@@ -2006,6 +2006,7 @@ pub(crate) fn test_backend(endpoint: &str) -> S3Backend {
         public_base_url: None,
         public_host: None,
         allowed_hosts: HashSet::new(),
+        trusted_proxy_ips: Default::default(),
         transaction_auth_key: [0x31; 32],
     };
     S3Backend::new(&settings, &runtime).unwrap()
@@ -2129,6 +2130,7 @@ async fn multipart_complete_response_loss_uses_marker_and_preserves_content_type
             Some(SOURCE_ETAG),
             true,
             Some(operation_id),
+            None,
         )
         .await
         .unwrap();
@@ -2246,6 +2248,7 @@ async fn upload_transaction_journal_is_retained_until_internal_cleanup_is_confir
             etag: Some("\"temporary-etag\"".into()),
         },
         previous: None,
+        publication_guard: None,
     };
     let journal_key = format!("tenant/.ycloud-system/transactions/{INTERNAL_INTENT_ID}");
 

@@ -13,8 +13,4 @@ services:
       - "18473:18473"
     volumes:
       - ./data:/var/lib/ycloud
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - ./storage:/var/lib/ycloud/storage

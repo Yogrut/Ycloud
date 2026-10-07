@@ -1,18 +1,20 @@
-# 第三方开源组件
+# Third-party notices
 
-Ycloud 使用以下开源组件。准确版本由 `Cargo.lock` 和 `frontend/package-lock.json` 固定；本文件只列主要项目，不逐个介绍。
+English | [简体中文](THIRD_PARTY_NOTICES.zh-CN.md)
 
-| 项目 | 许可证 |
+Ycloud uses the open-source components below. Exact versions are pinned in `Cargo.lock` and `frontend/package-lock.json`; this is a list of the main projects, not every dependency.
+
+| Project | License |
 | --- | --- |
-| Vue、VueUse、Reka UI、Phosphor Icons、Tailwind CSS、tailwind-merge、clsx、shadcn-vue 组件 | MIT |
+| Vue, VueUse, Reka UI, Phosphor Icons, Tailwind CSS, tailwind-merge, clsx, shadcn-vue components | MIT |
 | class-variance-authority | Apache-2.0 |
-| Axum、Tokio、Tower、tracing、bytes、http-body、http-body-util、mime_guess、async_zip | MIT |
-| Serde、serde_json、Chrono、UUID、anyhow、Argon2、base64、rand_core、futures-util、fs4、qrcode、windows-sys | MIT 或 Apache-2.0 |
-| rustix | MIT 或 Apache-2.0（另提供 LLVM exception 选项） |
-| roxmltree | MIT 或 Apache-2.0 |
-| AWS SDK for Rust、AWS Smithy | Apache-2.0 |
-| ring | Apache-2.0 与 ISC |
+| Axum, Tokio, Tower, tracing, bytes, http-body, http-body-util, mime_guess, async_zip | MIT |
+| Serde, serde_json, Chrono, UUID, anyhow, Argon2, base64, rand_core, futures-util, fs4, qrcode, windows-sys | MIT or Apache-2.0 |
+| rustix | MIT or Apache-2.0, with an additional LLVM exception option |
+| roxmltree | MIT or Apache-2.0 |
+| AWS SDK for Rust, AWS Smithy | Apache-2.0 |
+| ring | Apache-2.0 and ISC |
 
-随产品分发的代码所需版权、许可文本和 NOTICE 统一保存在 [许可附录](THIRD_PARTY_LICENSES.md)，相同许可条款合并保存，并保留各组件的版权信息。附录包含实际前端产物，以及当前 x86_64 Windows/Linux 后端普通依赖的声明；测试依赖、纯构建工具不列入。
+Required copyright notices, license texts, and NOTICE files for distributed code are collected in [Third-party license texts](THIRD_PARTY_LICENSES.md). Identical license terms are included once, with each component's copyright notices retained. The appendix covers the built frontend and the current normal backend dependencies for x86_64 Windows and Linux. Test dependencies and build-only tools are not included.
 
-分发可执行文件、前端产物或容器时，应一并携带这两个声明文件。依赖、目标平台或功能发生变化后，应重新核对附录；系统库和容器操作系统组件由对应发行包的版权文件说明。这些许可证不等于 Ycloud 自身的项目许可证。
+Distribute `THIRD_PARTY_NOTICES.md` and `THIRD_PARTY_LICENSES.md` with executables, frontend bundles, and container images. Review the appendix when dependencies, target platforms, or features change. System libraries and container OS packages have their own distribution copyright files. These third-party licenses are not a license for Ycloud itself.

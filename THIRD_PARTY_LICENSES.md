@@ -1,9 +1,16 @@
 # Third-party license texts
 
-许可原文来自当前已安装的依赖包；同文条款去重，版权信息保留。shadcn-vue 组件的 MIT 版权声明来自上游 LICENSE。Rust 可选 MIT/Apache 许可在有 MIT 文本时采用 MIT 分发；复合许可保留各部分。
+License texts are taken from the installed dependency packages. Identical terms are included once; component copyright notices are kept. The MIT notice for shadcn-vue components comes from the upstream LICENSE. For Rust dependencies offered under MIT or Apache-2.0, distribution uses MIT where an MIT text is available. All parts of combined licenses are included.
 
 <details>
-<summary>组件版本与声明的许可证</summary>
+<summary>简体中文说明</summary>
+
+许可原文来自当前已安装的依赖包；同文条款去重，版权信息保留。shadcn-vue 组件的 MIT 版权声明来自上游 LICENSE。Rust 可选 MIT/Apache 许可在有 MIT 文本时采用 MIT 分发；复合许可保留各部分。
+
+</details>
+
+<details>
+<summary>Components, versions and declared licenses</summary>
 
 | Component | Version | Declared license |
 | --- | --- | --- |

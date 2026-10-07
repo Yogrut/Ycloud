@@ -368,6 +368,10 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 
 .brand { display: flex; align-items: center; gap: 11px; font-weight: 760; }
 .brand svg { width: 28px; height: 28px; color: var(--accent); }
+/* Keep file chrome, file content and administration on the same outer grid. */
+.browser-chrome,
+.browser-page,
+.admin-shell { width: min(1400px, calc(100% - 32px)); }
 .browser-shell {
   height: 100dvh;
   display: grid;
@@ -377,7 +381,6 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 .browser-chrome {
   position: relative;
   z-index: 40;
-  width: min(1280px, calc(100% - 32px));
   min-height: 64px;
   margin: 18px auto 0;
   padding: 8px 18px;
@@ -408,7 +411,6 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 .icon-btn.flat:hover { background: var(--panel-soft); border-color: var(--line); }
 
 .admin-shell {
-  width: min(1400px, calc(100% - 32px));
   height: 100dvh;
   min-height: 0;
   margin: 0 auto;
@@ -836,7 +838,7 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 .security-retention .btn { width: auto; min-width: 132px; min-height: 38px; justify-self: end; }
 .security-retention .admin-form-error { grid-column: 1 / -1; margin: 0; }
 
-.browser-page { width: min(1280px, calc(100% - 32px)); min-height: 0; height: 100%; margin: 0 auto; padding: 12px 0 34px; }
+.browser-page { min-height: 0; height: 100%; margin: 0 auto; padding: 12px 0 34px; }
 .file-toolbar {
   display: flex;
   align-items: center;
@@ -1111,7 +1113,10 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 }
 
 @media (max-width: 760px) {
-  .browser-chrome { width: calc(100% - 18px); min-height: 56px; margin-top: 8px; padding: 7px 10px; border-radius: 13px; }
+  .browser-chrome,
+  .browser-page,
+  .admin-shell { width: calc(100% - 18px); }
+  .browser-chrome { min-height: 56px; margin-top: 8px; padding: 7px 10px; border-radius: 13px; }
   .browser-chrome .brand span { display: none; }
   .browser-chrome .brand svg { width: 24px; height: 24px; }
   .browser-storage-switcher { margin-left: 0; }
@@ -1121,7 +1126,7 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
   .browser-chrome .icon-btn { width: 36px; height: 36px; }
   .top-search { width: 100%; height: 40px; padding: 0 10px; }
   .top-search svg { width: 16px; height: 16px; }
-  .browser-page { width: calc(100% - 18px); padding-top: 8px; }
+  .browser-page { padding-top: 8px; }
   .file-toolbar { align-items: stretch; flex-direction: column; gap: 12px; margin-bottom: 18px; }
   .file-toolbar-actions { width: 100%; }
   .file-toolbar-actions .btn { min-width: 0; flex: 1 1 0; justify-content: center; }
@@ -1172,7 +1177,7 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
   .menu-item svg { box-sizing: content-box; width: 21px; height: 21px; padding: 8px; background: var(--panel-soft); border-radius: 11px; }
   .menu-separator { display: none; }
 
-  .admin-shell { width: calc(100% - 18px); height: auto; min-height: 100dvh; padding: 8px 0 36px; gap: 12px; overflow: visible; }
+  .admin-shell { height: auto; min-height: 100dvh; padding: 8px 0 36px; gap: 12px; overflow: visible; }
   .admin-header { min-height: 56px; padding: 7px 10px; border-radius: 13px; }
   .admin-header .admin-nav-brand { padding: 0; }
   .admin-workspace { height: auto; grid-template-columns: 1fr; gap: 12px; }

@@ -104,9 +104,6 @@ impl SessionStore {
     pub async fn validate(&self, token: &str) -> bool {
         self.principal(token).await.is_some()
     }
-    pub async fn remove(&self, token: &str) {
-        self.sessions.write().await.remove(token);
-    }
     pub async fn clear(&self) {
         self.sessions.write().await.clear();
     }
@@ -201,9 +198,6 @@ impl AccessTokenStore {
             None => None,
         }
     }
-    pub async fn remove(&self, token: &str) {
-        self.accesses.write().await.remove(token);
-    }
     pub async fn remove_scope(&self, scope: &str) {
         self.accesses
             .write()
@@ -229,6 +223,30 @@ impl Default for AccessTokenStore {
     }
 }
 pub type SharedAccessTokenStore = Arc<AccessTokenStore>;
+
+/// Acquire every store before removing anything. Cancellation while waiting
+/// cannot revoke only part of a browser's credentials; deletion has no awaits.
+pub(super) async fn revoke_browser_credentials(
+    sessions: &SessionStore,
+    gate_access: &AccessTokenStore,
+    folder_access: &AccessTokenStore,
+    session_token: Option<&str>,
+    gate_token: Option<&str>,
+    folder_cookies: &[(String, String)],
+) {
+    let mut sessions = sessions.sessions.write().await;
+    let mut gates = gate_access.accesses.write().await;
+    let mut folders = folder_access.accesses.write().await;
+    if let Some(token) = session_token {
+        sessions.remove(token);
+    }
+    if let Some(token) = gate_token {
+        gates.remove(token);
+    }
+    for (_, token) in folder_cookies {
+        folders.remove(token);
+    }
+}
 
 fn remove_oldest_where<T>(entries: &mut HashMap<String, T>, matches: impl Fn(&T) -> bool)
 where
@@ -263,6 +281,49 @@ impl CreatedAt for AccessGrant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_logout_wait_does_not_partially_revoke_credentials() {
+        let sessions = Arc::new(SessionStore::new());
+        let gates = Arc::new(AccessTokenStore::new());
+        let folders = Arc::new(AccessTokenStore::new());
+        let session = sessions.create_user("reader".into()).await;
+        let gate = gates.create("__gate__".into()).await;
+        let folder = folders.create("locked".into()).await;
+        let blocked = folders.accesses.write().await;
+        let pending = tokio::spawn({
+            let sessions = sessions.clone();
+            let gates = gates.clone();
+            let folders = folders.clone();
+            let session = session.clone();
+            let gate = gate.clone();
+            let folder = folder.clone();
+            async move {
+                revoke_browser_credentials(
+                    &sessions,
+                    &gates,
+                    &folders,
+                    Some(&session),
+                    Some(&gate),
+                    &[("folder_key_test".into(), folder)],
+                )
+                .await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sessions.sessions.try_read().is_ok() || gates.accesses.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        drop(blocked);
+        assert!(sessions.validate(&session).await);
+        assert!(gates.get_scope(&gate).await.is_some());
+        assert!(folders.get_scope(&folder).await.is_some());
+    }
 
     #[tokio::test]
     async fn credential_change_can_revoke_all_session_classes() {

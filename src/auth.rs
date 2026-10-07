@@ -293,12 +293,8 @@ pub async fn logout_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    if let Some(token) = extract_session_token(&headers) {
-        state.sessions.remove(&token).await;
-    }
-    if let Some(token) = extract_gate_token(&headers) {
-        state.gate_access.remove(&token).await;
-    }
+    let session_token = extract_session_token(&headers);
+    let gate_token = extract_gate_token(&headers);
     let folder_cookies: Vec<(String, String)> = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
@@ -313,9 +309,15 @@ pub async fn logout_handler(
                 .collect()
         })
         .unwrap_or_default();
-    for (_, token) in &folder_cookies {
-        state.folder_access.remove(token).await;
-    }
+    session::revoke_browser_credentials(
+        &state.sessions,
+        &state.gate_access,
+        &state.folder_access,
+        session_token.as_deref(),
+        gate_token.as_deref(),
+        &folder_cookies,
+    )
+    .await;
 
     let mut response = Json(LoginResponse {
         success: true,
@@ -664,6 +666,54 @@ mod tests {
     use crate::login_security::LoginEntry;
     use crate::test_support::{app_state, TestDirectory};
     use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+
+    #[tokio::test]
+    async fn logout_revokes_only_received_credentials_and_is_idempotent() {
+        let directory = TestDirectory::new("logout-browser-credentials");
+        let state = app_state(&directory, ConfigFile::default()).await;
+        let session = state.sessions.create_user("reader".into()).await;
+        let other_session = state.sessions.create_user("reader".into()).await;
+        let gate = state.gate_access.create("__gate__".into()).await;
+        let other_gate = state.gate_access.create("__gate__".into()).await;
+        let folder = state.folder_access.create("locked".into()).await;
+        let other_folder = state.folder_access.create("locked".into()).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!(
+                "session={session}; gate_access={gate}; folder_key_test={folder}"
+            ))
+            .unwrap(),
+        );
+        for _ in 0..2 {
+            let response =
+                super::logout_handler(axum::extract::State(state.clone()), headers.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let cookies: Vec<_> = response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect();
+            for name in ["session", "gate_access", "folder_key_test"] {
+                assert!(cookies
+                    .iter()
+                    .any(|value| value.starts_with(&format!("{name}=;"))
+                        && value.contains("Max-Age=0")));
+            }
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let result: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["success"], true);
+            assert!(state.sessions.principal(&session).await.is_none());
+            assert!(state.gate_access.get_scope(&gate).await.is_none());
+            assert!(state.folder_access.get_scope(&folder).await.is_none());
+            assert!(state.sessions.principal(&other_session).await.is_some());
+            assert!(state.gate_access.get_scope(&other_gate).await.is_some());
+            assert!(state.folder_access.get_scope(&other_folder).await.is_some());
+        }
+    }
 
     #[tokio::test]
     async fn pending_login_cannot_reissue_a_session_after_password_change() {

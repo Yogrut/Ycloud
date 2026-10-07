@@ -125,6 +125,7 @@ const {
   showAdmin,
   showUnlock,
   signOut,
+  signingOut,
   submitAdmin,
   submitUnlock,
   unlockError,
@@ -139,6 +140,7 @@ const {
   openPreviewFile,
   openAccountMenu: () => userAccountMenu.value?.open(),
   disposeListing,
+  announce,
 })
 openLockedEntry = openEntry
 openRestrictedStorage = requestStorageLogin
@@ -346,11 +348,11 @@ onBeforeUnmount(() => {
         >
           <AppIcon :name="galleryMode ? 'list' : 'gallery'" />
         </button>
-        <UserAccountMenu ref="userAccountMenu" @signed-in="onUserSignedIn" @sign-out="signOut" @closed="pendingStorageId = ''" />
+        <UserAccountMenu ref="userAccountMenu" :signing-out="signingOut" @signed-in="onUserSignedIn" @sign-out="signOut" @closed="pendingStorageId = ''" />
         <button class="icon-btn flat" type="button" :title="locale.text('管理员', 'Administrator')" :aria-label="locale.text('管理员', 'Administrator')" @click="openAdmin()"><AppIcon name="administrator" /></button>
         <ThemeToggle :theme="theme.current.value" class="flat" @toggle="theme.toggle" />
         <LocaleToggle class="flat" />
-        <button class="icon-btn flat" type="button" :title="locale.text('退出登录', 'Sign out')" :aria-label="locale.text('退出登录', 'Sign out')" @click="signOut"><AppIcon name="sign-out" /></button>
+        <button class="icon-btn flat" type="button" :disabled="signingOut" :title="locale.text('退出登录', 'Sign out')" :aria-label="locale.text('退出登录', 'Sign out')" @click="signOut"><AppIcon name="sign-out" /></button>
       </div>
       <input :ref="setFileInput" class="visually-hidden" type="file" multiple @change="uploadFiles">
       <input :ref="setFolderInput" class="visually-hidden" type="file" multiple webkitdirectory directory @change="uploadFiles">

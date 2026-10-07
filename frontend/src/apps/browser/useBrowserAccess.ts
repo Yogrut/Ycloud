@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { onScopeDispose, ref } from 'vue'
 import type { Ref } from 'vue'
 import type { BrowserCapabilities, FileEntry } from '../../shared/api/browser'
 import { adminLogin, logout, unlockFolder } from '../../shared/api/browser'
@@ -15,6 +15,7 @@ interface BrowserAccessContext {
   openPreviewFile: (entry: FileEntry) => void
   openAccountMenu: () => void
   disposeListing: () => void
+  announce: (message: string) => void
 }
 
 export function useBrowserAccess(context: BrowserAccessContext) {
@@ -32,6 +33,9 @@ export function useBrowserAccess(context: BrowserAccessContext) {
   const adminError = ref('')
   const adminLoggingIn = ref(false)
   const pendingStorageId = ref('')
+  const signingOut = ref(false)
+  let disposed = false
+  onScopeDispose(() => { disposed = true })
 
   function requestStorageLogin(storageId: string): void {
     pendingStorageId.value = storageId
@@ -122,10 +126,20 @@ export function useBrowserAccess(context: BrowserAccessContext) {
   }
 
   async function signOut(): Promise<void> {
-    context.disposeListing()
-    try { await logout() } finally {
-      sessionStorage.setItem('ycloud-stay-signed-out', '1')
+    if (disposed || signingOut.value) return
+    signingOut.value = true
+    try {
+      await logout()
+      if (disposed) return
+      // The server has revoked credentials; local preference storage cannot
+      // turn that success into a failure or prevent leaving the file page.
+      try { sessionStorage.setItem('ycloud-stay-signed-out', '1') } catch { /* Optional browser preference. */ }
+      context.disposeListing()
       window.location.replace(appPath('/'))
+    } catch (error) {
+      if (!disposed) context.announce(error instanceof Error ? error.message : locale.text('退出未完成，请恢复连接后重试。', 'Sign-out was not confirmed. Restore the connection and try again.'))
+    } finally {
+      signingOut.value = false
     }
   }
 
@@ -146,6 +160,7 @@ export function useBrowserAccess(context: BrowserAccessContext) {
     showAdmin,
     showUnlock,
     signOut,
+    signingOut,
     submitAdmin,
     submitUnlock,
     unlockError,

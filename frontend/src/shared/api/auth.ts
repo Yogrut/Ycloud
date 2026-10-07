@@ -1,7 +1,8 @@
 import { useLocale } from '../i18n'
-import { requestJson } from './client'
+import { ApiError, errorMetadata, requestJson } from './client'
 
 const locale = useLocale()
+const LOGOUT_TIMEOUT_MS = 10_000
 
 export interface Identity {
   logged_in: boolean
@@ -27,6 +28,28 @@ interface GateResponse {
   message?: string
   error?: {
     message?: string
+  }
+}
+
+export async function logoutSession(): Promise<{ success: boolean }> {
+  try {
+    const { response, body } = await requestJson<GateResponse>('/api/logout', { method: 'POST' }, LOGOUT_TIMEOUT_MS)
+    if (!response.ok || body?.success !== true) {
+      const details = errorMetadata(response, body)
+      throw new ApiError(
+        details.message ?? locale.text('退出未完成，请恢复连接后重试。', 'Sign-out was not confirmed. Restore the connection and try again.'),
+        response.status, details.code, details.requestId, details.operation,
+      )
+    }
+    return { success: true }
+  } catch (error) {
+    if (error instanceof ApiError && error.code === 'operation_result_unknown') {
+      // Revocation is idempotent, unlike file writes. A later explicit sign-out
+      // is allowed, but a lost response must not be reported as confirmed.
+      throw new ApiError(locale.text('退出结果未确认，请恢复连接后再次退出。', 'Sign-out was not confirmed. Restore the connection and sign out again.'),
+        error.status, error.code, error.requestId, error.operation)
+    }
+    throw error
   }
 }
 

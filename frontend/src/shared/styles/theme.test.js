@@ -59,6 +59,22 @@ describe('interactive focus styling', () => {
     expect(themeCss).not.toContain('gap: 18px; padding-top: 64px;')
   })
 
+  it('shares file header, file content and admin outer widths on desktop and mobile', () => {
+    const sharedRule = /\.browser-chrome,\s*\.browser-page,\s*\.admin-shell\s*\{([^}]*)\}/g
+    const sharedWidths = [...themeCss.matchAll(sharedRule)]
+    expect(sharedWidths).toHaveLength(2)
+    expect(sharedWidths[0][1]).toContain('width: min(1400px, calc(100% - 32px));')
+    expect(sharedWidths[1][1]).toContain('width: calc(100% - 18px);')
+    // Individual surface rules must not override the common outer grid.
+    const individualCss = themeCss.replace(sharedRule, '')
+    for (const selector of ['browser-chrome', 'browser-page', 'admin-shell']) {
+      const individualRules = [...individualCss.matchAll(new RegExp('\\.' + selector + '\\s*\\{([^}]*)\\}', 'g'))]
+      for (const rule of individualRules) {
+        expect(rule[1]).not.toMatch(/(?:^|;)\s*width\s*:/)
+      }
+    }
+  })
+
   it('preserves Ycloud navigation colours while compacting the layout', () => {
     const layoutCss = readFileSync('src/shared/styles/settings-layout.css', 'utf8')
     expect(layoutCss).toMatch(/\.admin-nav\s*\{[^}]*background: var\(--panel\);/)

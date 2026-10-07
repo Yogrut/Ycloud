@@ -360,6 +360,4 @@ export function userLogin(username: string, password: string): Promise<{ success
   })
 }
 
-export async function logout(): Promise<void> {
-  await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' })
-}
+export { logoutSession as logout } from './auth'

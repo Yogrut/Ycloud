@@ -8,6 +8,7 @@ import AppFeedback from '../../shared/components/AppFeedback.vue'
 import { useLocale } from '../../shared/i18n'
 
 const emit = defineEmits<{ signedIn: []; signOut: []; closed: [] }>()
+defineProps<{ signingOut?: boolean }>()
 const locale = useLocale()
 const identity = ref<Identity | null>(null)
 const visible = ref(false)
@@ -139,7 +140,7 @@ defineExpose({ open, refreshIdentity })
 </script>
 
 <template>
-  <button ref="trigger" class="icon-btn flat user-account-trigger" :class="{ 'keyboard-focus': keyboardNavigation }" type="button" :title="signedIn ? locale.text('用户信息', 'User information') : locale.text('用户登录', 'User sign-in')" :aria-label="signedIn ? locale.text('用户信息', 'User information') : locale.text('用户登录', 'User sign-in')" :aria-expanded="visible" aria-haspopup="dialog" @click="open">
+  <button ref="trigger" class="icon-btn flat user-account-trigger" :disabled="signingOut" :class="{ 'keyboard-focus': keyboardNavigation }" type="button" :title="signedIn ? locale.text('用户信息', 'User information') : locale.text('用户登录', 'User sign-in')" :aria-label="signedIn ? locale.text('用户信息', 'User information') : locale.text('用户登录', 'User sign-in')" :aria-expanded="visible" aria-haspopup="dialog" @click="open">
     <AppIcon name="account" :size="24" />
   </button>
   <Teleport to="body">
@@ -148,7 +149,7 @@ defineExpose({ open, refreshIdentity })
       <UserTrafficRings v-if="traffic" :usage="traffic.usage" :quota="traffic.quota" />
       <p v-else class="user-traffic-note" role="status">{{ trafficError || locale.text('正在读取流量…', 'Loading traffic…') }}</p>
       <p v-if="traffic" class="user-traffic-note">{{ locale.text('仅计经服务器的传输，S3 直传不计；另受全站及共享额度限制。', 'Only server-relayed transfers count; direct S3 transfers are excluded. Site and shared allowances also apply.') }}</p>
-      <button class="user-account-signout" :class="{ 'keyboard-focus': keyboardNavigation }" type="button" @click="emit('signOut')"><AppIcon name="sign-out" :size="17" />{{ locale.text('退出登录', 'Sign out') }}</button>
+      <button class="user-account-signout" :disabled="signingOut" :class="{ 'keyboard-focus': keyboardNavigation }" type="button" @click="emit('signOut')"><AppIcon name="sign-out" :size="17" />{{ locale.text('退出登录', 'Sign out') }}</button>
     </section>
     <div v-else-if="visible" class="overlay active user-account-overlay" @click.self="close" @keydown.esc="close">
       <section ref="dialog" class="modal user-account-modal" role="dialog" aria-modal="true" aria-labelledby="user-account-title" @keydown="trapFocus">

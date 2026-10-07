@@ -1,1 +1,0 @@
-import{O as e}from"./client-CARLzD5L.js";var t=`••••••`;function n(t){let n=t.target;n.value===`••••••`&&e(()=>n.select())}export{n,t};

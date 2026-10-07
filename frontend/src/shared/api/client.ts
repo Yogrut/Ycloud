@@ -44,7 +44,7 @@ export async function readJson<T>(response: Response): Promise<T | undefined> {
   }
 }
 
-export async function requestWithDeadline<T>(url: string, options: RequestInit, consume: (response: Response) => Promise<T>): Promise<T> {
+export async function requestWithDeadline<T>(url: string, options: RequestInit, consume: (response: Response) => Promise<T>, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
   const locale = useLocale()
   const controller = new AbortController()
   const source = options.signal
@@ -60,7 +60,7 @@ export async function requestWithDeadline<T>(url: string, options: RequestInit, 
     timer = setTimeout(() => {
       controller.abort()
       reject(mutation ? unknown() : new ApiError(locale.text('请求等待超时，请检查网络后重试', 'Request timed out. Check the network and try again.'), 0, 'request_timeout'))
-    }, REQUEST_TIMEOUT_MS)
+    }, timeoutMs)
     source?.addEventListener('abort', abortSource, { once: true })
     if (source?.aborted) abortSource()
   })
@@ -79,7 +79,7 @@ export async function requestWithDeadline<T>(url: string, options: RequestInit, 
   }
 }
 
-export function requestJson<T>(url: string, options: RequestInit = {}): Promise<{ response: Response; body: T | undefined }> {
+export function requestJson<T>(url: string, options: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS): Promise<{ response: Response; body: T | undefined }> {
   return requestWithDeadline(url, options, async response => {
     const body = await readJson<T>(response)
     const mutation = !['GET', 'HEAD'].includes((options.method ?? 'GET').toUpperCase())
@@ -87,7 +87,7 @@ export function requestJson<T>(url: string, options: RequestInit = {}): Promise<
       throw new ApiError(useLocale().text('未收到有效的操作结果，请先核对结果，不要直接重试。', 'No valid operation result was received. Verify the result before retrying.'), response.status, 'operation_result_unknown')
     }
     return { response, body }
-  })
+  }, timeoutMs)
 }
 
 export function errorMetadata(response: Response, body: unknown) {

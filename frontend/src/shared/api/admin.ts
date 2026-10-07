@@ -404,9 +404,7 @@ export function getAdminInfo(signal?: AbortSignal): Promise<AdminInfo> {
   return adminRequest('/api/admin/info', { signal })
 }
 
-export function logoutSession(): Promise<{ success: boolean }> {
-  return adminRequest('/api/logout', { method: 'POST' })
-}
+export { logoutSession } from './auth'
 
 export function loginAdministrator(username: string, password: string, totpCode?: string): Promise<{ success: boolean; message?: string; is_admin: boolean; totp_required?: boolean }> {
   return adminRequest('/api/login', {

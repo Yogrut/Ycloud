@@ -255,9 +255,11 @@ Ycloud 统计/限制的是经过 VPS 的文件字节，不是物理网卡总流�
 
 WebDAV 的 XML 请求选择在 `webdav_xml/query.rs`，XML 响应留在 `webdav_xml.rs`，协议错误转换在 `webdav/error.rs`。PROPFIND 按 XML 命名空间解释 prop/propname/allprop/include：空正文为 allprop，重复属性按命名空间及名称去重，未知属性以独立 404 propstat 返回，不混入成功属性；propname 仅返回名称。现有五种可用属性保持，不伪造 getetag、创建时间或锁能力，未引入额外对象元数据探测。集合 href 带尾部斜线。DTD 实体不展开，也没有外部实体解析器；roxmltree 只启用 std，不自建 XML 解析器。
 
+PROPFIND 按 [RFC 4918 §14.20](https://www.rfc-editor.org/rfc/rfc4918.html#section-14.20) 使用单个 `prop`、`propname` 或 `allprop` 选择器；`include` 仅搭配 `allprop`。重复选择器（包括同级多个 `prop`）返回 400，不再合并。单个选择器内的属性仍按命名空间及名称去重。不按客户端添加解析分支，也不改写上传路径。
+
 PROPFIND 支持 UTF-8 和 UTF-16 XML。UTF-8/UTF-16 的 BOM 优先于 HTTP charset；没有 BOM 时，明确的 UTF-16LE/UTF-16BE charset 决定字节序，通用 UTF-16 必须带 BOM。其他 HTTP 字符集和 UTF-32 明确拒绝，不猜测编码；UTF-16 的不完整码元或非法代理对拒绝解码，不用替换字符掩盖错误。64 KiB 上限仍针对收到的原始字节，解码后的 UTF-16 文本最多 96 KiB，不是分配容量或进程内存的硬上限。编码选择依据 [RFC 7303](https://www.rfc-editor.org/rfc/rfc7303.html#section-3.2)，复用现有依赖。
 
-XML 查询拒绝时记录 `WebDAV PROPFIND rejected` 警告，仅包含固定原因、编码类别和输入字节数；原因区分编码、XML 语法、根命名空间/名称、选择器、结构及上限。Depth 头拒绝使用 `depth_invalid`。诊断不记录 XML 正文、客户端 MIME 值、密码、Authorization、Cookie 或完整请求头，现有 HTTP span 提供请求关联。响应保留共享错误信封及 `bad_request` 错误码。目前没有取得 Filebar 的实际 XML 正文，也未完成 iOS 真机验收；补齐 UTF-16 不等于已经证明其 400 已解决。
+XML 查询拒绝时记录 `WebDAV PROPFIND rejected` 警告，仅包含固定原因、编码类别和输入字节数；原因区分编码、XML 语法、根命名空间/名称、选择器、结构及上限。Depth 头拒绝使用 `depth_invalid`。诊断不记录 XML 正文、客户端 MIME 值、密码、Authorization、Cookie 或完整请求头，现有 HTTP span 提供请求关联。响应保留共享错误信封及 `bad_request` 错误码。
 
 PROPFIND 控制正文仍最多 64 KiB，解析最多 2048 节点、128 个请求属性（去重前），命名空间最多 1024 字节、属性本地名称最多 256 字节；生成正文最多 8 MiB，超过时明确返回 503 并提示收窄查询，不返回截断的 207。此正文上限不是进程 RSS 上限，原目录条目上限仍单独生效。Depth 仅接受 0、1、infinity：非法/重复为 400；目录 infinity 或省略头为 403，返回 DAV:propfind-finite-depth，不静默降为一层。文件的 infinity 不导致目录递归。行为依据 [RFC 4918 §9.1](https://www.rfc-editor.org/rfc/rfc4918.html#section-9.1)。
 

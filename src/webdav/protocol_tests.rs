@@ -761,6 +761,101 @@ async fn selected_properties_preserve_namespaces_and_separate_missing_values() {
 }
 
 #[tokio::test]
+async fn standard_property_requests_return_directory_results_without_fabricating_quota() {
+    let (_directory, app) = fixture().await;
+    let request = r#"<D:propfind xmlns:D="DAV:"><D:prop><D:quota-used-bytes/><D:quota-available-bytes/><D:resourcetype/></D:prop></D:propfind>"#;
+    for (depth, expected_entries) in [("0", 1), ("1", 3)] {
+        let (status, xml) = propfind(&app, "/dav/documents/", Some(depth), request).await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        let document = roxmltree::Document::parse(&xml).unwrap();
+        let responses: Vec<_> = document
+            .descendants()
+            .filter(|node| node.has_tag_name(("DAV:", "response")))
+            .collect();
+        assert_eq!(responses.len(), expected_entries);
+        for response in responses {
+            let groups: Vec<_> = response
+                .children()
+                .filter(|node| node.has_tag_name(("DAV:", "propstat")))
+                .collect();
+            assert_eq!(groups.len(), 2);
+            let success = groups
+                .iter()
+                .find(|group| {
+                    group
+                        .descendants()
+                        .any(|node| node.text() == Some("HTTP/1.1 200 OK"))
+                })
+                .unwrap();
+            assert_eq!(
+                success
+                    .descendants()
+                    .filter(|node| node.has_tag_name(("DAV:", "resourcetype")))
+                    .count(),
+                1
+            );
+            assert!(!success
+                .descendants()
+                .any(|node| node.has_tag_name(("DAV:", "quota-used-bytes"))
+                    || node.has_tag_name(("DAV:", "quota-available-bytes"))));
+            let missing = groups
+                .iter()
+                .find(|group| {
+                    group
+                        .descendants()
+                        .any(|node| node.text() == Some("HTTP/1.1 404 Not Found"))
+                })
+                .unwrap();
+            for name in ["quota-used-bytes", "quota-available-bytes"] {
+                let property = missing
+                    .descendants()
+                    .find(|node| node.has_tag_name(("DAV:", name)))
+                    .unwrap();
+                assert!(property.text().is_none());
+                assert!(!property.children().any(|node| node.is_element()));
+            }
+        }
+        let root = document
+            .descendants()
+            .find(|node| node.has_tag_name(("DAV:", "response")))
+            .unwrap();
+        let resource_type = root
+            .descendants()
+            .find(|node| node.has_tag_name(("DAV:", "resourcetype")))
+            .unwrap();
+        assert!(resource_type
+            .children()
+            .any(|node| node.has_tag_name(("DAV:", "collection"))));
+    }
+}
+
+#[tokio::test]
+async fn invalid_selectors_and_property_overflow_fail_through_http() {
+    let (_directory, app) = fixture().await;
+    let overflow = format!(
+        r#"<propfind xmlns="DAV:"><prop>{}</prop></propfind>"#,
+        "<displayname/>".repeat(129)
+    );
+    for (body, reason) in [
+        (
+            r#"<propfind xmlns="DAV:"><prop/><allprop/></propfind>"#,
+            "selector_invalid",
+        ),
+        (
+            r#"<propfind xmlns="DAV:"><prop><displayname/></prop><prop><resourcetype/></prop></propfind>"#,
+            "selector_invalid",
+        ),
+        (overflow.as_str(), "property_count_limit"),
+    ] {
+        let (status, body) = propfind(&app, "/dav/documents/", Some("0"), body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["error"]["code"], "bad_request");
+        assert!(error["error"]["message"].as_str().unwrap().contains(reason));
+    }
+}
+
+#[tokio::test]
 async fn property_names_have_no_values_and_allprop_honors_include() {
     let (_directory, app) = fixture().await;
     let request =

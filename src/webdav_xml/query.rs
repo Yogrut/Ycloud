@@ -302,6 +302,18 @@ mod tests {
     #[test]
     fn rejects_ambiguous_selectors_and_property_lists_over_the_bound() {
         for body in [
+            r#"<propfind xmlns="DAV:"><prop/><prop/></propfind>"#,
+            r#"<propfind xmlns="DAV:"><prop><displayname/></prop><prop><resourcetype/></prop></propfind>"#,
+            r#"<d:propfind xmlns:d="DAV:" xmlns:p="DAV:"><d:prop/><p:prop/></d:propfind>"#,
+            r#"<propfind xmlns="DAV:"><prop/><allprop/></propfind>"#,
+            r#"<propfind xmlns="DAV:"><allprop/><prop/></propfind>"#,
+            r#"<propfind xmlns="DAV:"><prop/><propname/></propfind>"#,
+            r#"<propfind xmlns="DAV:"><propname/><prop/></propfind>"#,
+            r#"<propfind xmlns="DAV:"><prop/><include/></propfind>"#,
+            r#"<propfind xmlns="DAV:"><include/><prop/></propfind>"#,
+            r#"<propfind xmlns="DAV:"><allprop/><allprop/></propfind>"#,
+            r#"<propfind xmlns="DAV:"><propname/><propname/></propfind>"#,
+            r#"<propfind xmlns="DAV:"><allprop/><include/><include/></propfind>"#,
             r#"<propfind xmlns="DAV:"><allprop/><propname/></propfind>"#,
             r#"<propfind xmlns="DAV:"><include><displayname/></include></propfind>"#,
             r#"<propfind xmlns="urn:other"><allprop/></propfind>"#,

@@ -39,19 +39,7 @@ pub fn parse_destination(
             _ => return None,
         };
         let request: axum::http::uri::Authority = request_host?.parse().ok()?;
-        let port = |value: &axum::http::uri::Authority| {
-            if value.port().is_some() {
-                value.port_u16()
-            } else {
-                Some(default_port)
-            }
-        };
-        if authority.as_str().contains('@')
-            || request.as_str().contains('@')
-            || !authority.host().eq_ignore_ascii_case(request.host())
-            || port(authority).is_none()
-            || port(authority) != port(&request)
-        {
+        if !crate::security::same_authority(authority, &request, default_port) {
             return None;
         }
     }

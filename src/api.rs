@@ -11,7 +11,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
 use crate::directory_listing::{
-    DirectoryEntryFilter, DirectoryListRequest, DirectorySort, EntryPosition, SortDirection,
+    normalized_search, DirectoryEntryFilter, DirectoryListRequest, DirectorySort, EntryPosition,
+    SortDirection,
 };
 use crate::error::{AppError, AppResult};
 use crate::file_access::{
@@ -114,13 +115,6 @@ struct DirectoryCursorToken {
     filter: DirectoryEntryFilter,
     delivered: usize,
     position: EntryPosition,
-}
-
-fn normalized_search(search: Option<&str>) -> Option<String> {
-    search
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_lowercase)
 }
 
 fn encode_cursor(cursor: &DirectoryCursorToken) -> AppResult<String> {

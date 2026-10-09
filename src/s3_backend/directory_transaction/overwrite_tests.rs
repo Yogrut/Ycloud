@@ -114,7 +114,7 @@ impl Fixture {
                     return response.status(412).body(Body::empty()).unwrap();
                 }
                 let copied = headers.get("x-amz-copy-source").map(|value| value.to_str().unwrap().trim_start_matches('/').strip_prefix("bucket/").unwrap().to_owned());
-                if key.starts_with("tenant/target") && copied.is_some() && fail_copy.swap(false, Ordering::Relaxed) {
+                if key.starts_with("tenant/target") && (copied.is_some() || headers.contains_key(format!("x-amz-meta-{}", crate::s3_backend::S3_OPERATION_METADATA_KEY))) && fail_copy.swap(false, Ordering::Relaxed) {
                     return response.status(403).body(Body::empty()).unwrap();
                 }
                 let content = if let Some(source) = copied.as_ref() {
@@ -173,7 +173,17 @@ async fn s3_copy_and_move_replace_files_and_directories_without_leaving_old_chil
             let fixture = Fixture::new(source_dir, target_dir).await;
             let result = fixture
                 .backend
-                .transfer_path("source", "target", copy, true, 3)
+                .transfer_path(
+                    "source",
+                    "target",
+                    if copy {
+                        crate::storage_backend::TransferKind::Copy
+                    } else {
+                        crate::storage_backend::TransferKind::Move
+                    },
+                    true,
+                    3,
+                )
                 .await
                 .unwrap();
             assert!(!result.created);
@@ -208,12 +218,96 @@ async fn s3_no_overwrite_is_a_precondition_failure_without_writes() {
         let fixture = Fixture::new(false, false).await;
         let error = fixture
             .backend
-            .transfer_path("source", "target", copy, false, 3)
+            .transfer_path(
+                "source",
+                "target",
+                if copy {
+                    crate::storage_backend::TransferKind::Copy
+                } else {
+                    crate::storage_backend::TransferKind::Move
+                },
+                false,
+                3,
+            )
             .await
             .unwrap_err();
         assert_eq!(error.status(), axum::http::StatusCode::PRECONDITION_FAILED);
         assert_eq!(fixture.bytes("tenant/target").unwrap(), b"previous");
         assert_eq!(fixture.objects.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn s3_shallow_copy_creates_a_marker_without_requiring_a_source_marker() {
+    for target_dir in [false, true] {
+        let fixture = Fixture::new(true, target_dir).await;
+        assert!(fixture.bytes("tenant/source/").is_none());
+        let result = fixture
+            .backend
+            .transfer_path(
+                "source",
+                "target",
+                crate::storage_backend::TransferKind::CopyCollection,
+                true,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(!result.created);
+        assert_eq!(result.size, 0);
+        assert_eq!(result.previous_size, 8);
+        assert_eq!(fixture.bytes("tenant/target/").unwrap(), b"");
+        assert!(fixture.bytes("tenant/target").is_none());
+        assert!(fixture.bytes("tenant/target/old-only.txt").is_none());
+        assert!(fixture.bytes("tenant/target/new.txt").is_none());
+        assert_eq!(fixture.bytes("tenant/source/new.txt").unwrap(), b"new");
+        assert!(!fixture
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|key| key.contains("/directory-transactions/")));
+    }
+}
+
+#[tokio::test]
+async fn s3_shallow_copy_recovers_publication_and_cleanup_with_its_v4_record() {
+    for fail_publication in [true, false] {
+        let fixture = Fixture::new(true, true).await;
+        fixture.fail_copy.store(fail_publication, Ordering::Relaxed);
+        fixture
+            .fail_cleanup
+            .store(!fail_publication, Ordering::Relaxed);
+        let result = fixture
+            .backend
+            .transfer_path(
+                "source",
+                "target",
+                crate::storage_backend::TransferKind::CopyCollection,
+                true,
+                0,
+            )
+            .await;
+        if fail_publication {
+            assert_eq!(
+                result.unwrap_err().operation().unwrap().commit,
+                CommitState::Unknown
+            );
+            assert!(fixture.bytes("tenant/target/").is_none());
+        } else {
+            result.unwrap();
+        }
+        let journal = fixture.journal();
+        fixture.fail_cleanup.store(false, Ordering::Relaxed);
+        fixture
+            .backend
+            .recover_directory_transaction(&journal)
+            .await
+            .unwrap();
+        assert_eq!(fixture.bytes("tenant/target/").unwrap(), b"");
+        assert!(fixture.bytes("tenant/target/old-only.txt").is_none());
+        assert_eq!(fixture.bytes("tenant/source/new.txt").unwrap(), b"new");
+        assert!(fixture.bytes(&journal).is_none());
     }
 }
 
@@ -224,7 +318,17 @@ async fn interrupted_s3_replacement_keeps_old_bytes_and_recovers_the_same_operat
         fixture.fail_copy.store(true, Ordering::Relaxed);
         let error = fixture
             .backend
-            .transfer_path("source", "target", copy, true, 3)
+            .transfer_path(
+                "source",
+                "target",
+                if copy {
+                    crate::storage_backend::TransferKind::Copy
+                } else {
+                    crate::storage_backend::TransferKind::Move
+                },
+                true,
+                3,
+            )
             .await
             .unwrap_err();
         assert_eq!(error.operation().unwrap().commit, CommitState::Unknown);
@@ -253,7 +357,13 @@ async fn s3_verified_copy_does_not_fail_due_to_old_target_cleanup() {
     fixture.fail_cleanup.store(true, Ordering::Relaxed);
     fixture
         .backend
-        .transfer_path("source", "target", true, true, 3)
+        .transfer_path(
+            "source",
+            "target",
+            crate::storage_backend::TransferKind::Copy,
+            true,
+            3,
+        )
         .await
         .unwrap();
     assert_eq!(fixture.bytes("tenant/target").unwrap(), b"new");

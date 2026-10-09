@@ -63,6 +63,30 @@ async fn repeated_concurrent_deletes_preserve_unrelated_files_and_accounting() {
 }
 
 #[tokio::test]
+async fn parent_sync_failure_reports_the_namespace_change_that_already_happened() {
+    let fixture = TestDirectory::new("committed-sync-failure");
+    let root = fixture.path().join("files");
+    let storage = StorageService::new(root.clone(), 1024, 2, 100, 0)
+        .await
+        .unwrap();
+    let directory = storage.resolve_for_write("created").await.unwrap();
+    storage.fail_parent_sync.store(true, Ordering::SeqCst);
+    let error = storage.create_directory(&directory).await.unwrap_err();
+    assert_eq!(error.operation().unwrap().commit, CommitState::Committed);
+    assert_eq!(error.operation().unwrap().cleanup, CleanupState::Pending);
+    assert!(root.join("created").is_dir());
+    fs::write(root.join("source"), b"bytes").await.unwrap();
+    let source = storage.resolve_existing("source").await.unwrap();
+    let destination = storage.resolve_for_write("moved").await.unwrap();
+    storage.fail_parent_sync.store(true, Ordering::SeqCst);
+    let error = storage.move_path(&source, &destination).await.unwrap_err();
+    assert_eq!(error.operation().unwrap().commit, CommitState::Committed);
+    assert_eq!(error.operation().unwrap().cleanup, CleanupState::Pending);
+    assert!(!root.join("source").exists());
+    assert_eq!(fs::read(root.join("moved")).await.unwrap(), b"bytes");
+}
+
+#[tokio::test]
 async fn moving_and_deleting_the_same_source_settle_without_affecting_other_files() {
     let fixture = TestDirectory::new("move-delete-race");
     let root = fixture.path().join("files");

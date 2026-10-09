@@ -42,7 +42,7 @@ pub(super) async fn verify_share_access(
         Some(
             state
                 .login_attempts
-                .for_entry(LoginEntry::WebDav)
+                .for_entry(LoginEntry::WebDav, failure_key)
                 .lock()
                 .await,
         )

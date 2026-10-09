@@ -338,6 +338,15 @@ async fn handle_mkcol(
     let result = backend
         .create_directory(&share_storage_path(share, sub_path))
         .await;
+    let result = match result {
+        Err(crate::error::AppError::DestinationExists) => {
+            return Err(StatusCode::METHOD_NOT_ALLOWED.into())
+        }
+        Err(crate::error::AppError::ParentDirectoryMissing) => {
+            return Err(StatusCode::CONFLICT.into())
+        }
+        result => result,
+    };
     mutation_response(result, StatusCode::CREATED)
 }
 
@@ -363,6 +372,22 @@ async fn handle_move_or_copy(
     let source = share_storage_path(share, sub_path);
     let target = share_storage_path(share, &destination_path);
 
+    let mut depths = headers.get_all("depth").iter();
+    let depth = depths
+        .next()
+        .map(|value| value.to_str().map(str::trim))
+        .transpose()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    if depths.next().is_some() {
+        return Err(StatusCode::BAD_REQUEST.into());
+    }
+    let kind = match (copy, depth) {
+        (true, Some("0")) => crate::storage_backend::TransferKind::CopyCollection,
+        (true, None | Some("infinity")) => crate::storage_backend::TransferKind::Copy,
+        (false, None | Some("infinity")) => crate::storage_backend::TransferKind::Move,
+        _ => return Err(StatusCode::BAD_REQUEST.into()),
+    };
+
     let mut values = headers.get_all("overwrite").iter();
     let overwrite = match values.next() {
         None => true,
@@ -374,7 +399,7 @@ async fn handle_move_or_copy(
         _ => return Err(StatusCode::BAD_REQUEST.into()),
     };
     let result = backend
-        .dav_transfer(&source, &target, copy, overwrite)
+        .dav_transfer(&source, &target, kind, overwrite)
         .await;
     let status = if result.as_ref().is_ok_and(|created| *created) {
         StatusCode::CREATED

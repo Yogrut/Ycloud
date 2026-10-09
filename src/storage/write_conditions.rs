@@ -16,7 +16,7 @@ pub(crate) struct WriteConditions {
 }
 
 #[derive(Clone, Debug)]
-enum TagCondition {
+pub(super) enum TagCondition {
     Any,
     Tags(Vec<String>),
 }
@@ -102,7 +102,7 @@ impl WriteConditions {
 }
 
 impl TagCondition {
-    fn matches(&self, exists: bool, actual: Option<&str>, weak: bool) -> bool {
+    pub(super) fn matches(&self, exists: bool, actual: Option<&str>, weak: bool) -> bool {
         if !exists {
             return false;
         }
@@ -124,7 +124,10 @@ impl TagCondition {
     }
 }
 
-fn tag_condition(headers: &HeaderMap, name: header::HeaderName) -> AppResult<Option<TagCondition>> {
+pub(super) fn tag_condition(
+    headers: &HeaderMap,
+    name: header::HeaderName,
+) -> AppResult<Option<TagCondition>> {
     let mut combined = String::new();
     for value in headers.get_all(&name).iter() {
         let value = value.to_str().map_err(|_| invalid_tags())?;

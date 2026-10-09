@@ -69,6 +69,9 @@ impl StorageService {
 
         let total_length = metadata.len();
         let validators = FileValidators::local(&metadata);
+        if let Some(response) = validators.precondition_response(request_headers, method)? {
+            return Ok(response);
+        }
         let range = validators.select_range(request_headers, total_length, method);
         let (start, length, status) = match range {
             Ok(Some(range)) => range,

@@ -28,6 +28,7 @@ const MAX_ETAG_BYTES: usize = 1_024;
 #[serde(rename_all = "snake_case")]
 pub(super) enum Operation {
     Copy,
+    CopyCollection,
     Move,
     Delete,
 }
@@ -44,7 +45,7 @@ pub(super) enum Stage {
 impl Operation {
     pub(super) fn completed_stage(self) -> Stage {
         match self {
-            Self::Copy => Stage::CopyCompleted,
+            Self::Copy | Self::CopyCollection => Stage::CopyCompleted,
             Self::Move | Self::Delete => Stage::SourcesDeleted,
         }
     }
@@ -99,11 +100,18 @@ fn validate_transaction_structure(
     journal_key: &str,
     transaction: &Transaction,
 ) -> AppResult<()> {
-    if !matches!(transaction.schema_version, 2 | 3)
+    if !matches!(transaction.schema_version, 2..=4)
         || !valid_transaction_id(&transaction.id)
         || journal_key != internal_key(prefix, JOURNAL_CATEGORY, &transaction.id)
         || transaction.objects.is_empty()
         || transaction.objects.len() > MAX_OBJECTS
+    {
+        return Err(invalid_transaction());
+    }
+    if transaction.operation == Operation::CopyCollection
+        && (transaction.schema_version != 4
+            || transaction.source_is_file
+            || transaction.objects.len() != 1)
     {
         return Err(invalid_transaction());
     }
@@ -152,7 +160,11 @@ fn validate_transaction_structure(
         if object.source_key.len() > MAX_OBJECT_KEY_BYTES
             || transaction.source_is_file && !suffix.is_empty()
             || object.target_key.len() > MAX_OBJECT_KEY_BYTES
-            || object.source_etag.is_empty()
+            || (if transaction.operation == Operation::CopyCollection {
+                !suffix.is_empty() || object.size != 0 || !object.source_etag.is_empty()
+            } else {
+                object.source_etag.is_empty()
+            })
             || object.size > MAX_SINGLE_COPY_BYTES
             || object.source_etag.len() > MAX_ETAG_BYTES
             || object
@@ -187,11 +199,13 @@ fn validate_transaction_progress(transaction: &Transaction) -> AppResult<()> {
                     .all(|object| object.target_etag.is_some() && !object.source_deleted)
         }
         Stage::DeletingSources => {
-            transaction.operation != Operation::Copy
-                && transaction
-                    .objects
-                    .iter()
-                    .all(|object| object.target_etag.is_some())
+            !matches!(
+                transaction.operation,
+                Operation::Copy | Operation::CopyCollection
+            ) && transaction
+                .objects
+                .iter()
+                .all(|object| object.target_etag.is_some())
         }
         Stage::SourcesDeleted => {
             transaction.operation.completed_stage() == transaction.stage
@@ -219,6 +233,8 @@ fn transaction_auth_bytes(transaction: &Transaction) -> AppResult<Vec<u8>> {
 fn journal_purpose(transaction: &Transaction) -> &'static str {
     if transaction.schema_version == 2 {
         JOURNAL_PURPOSE
+    } else if transaction.schema_version == 4 {
+        "directory-transaction:v4"
     } else {
         "directory-transaction:v3"
     }
@@ -251,7 +267,7 @@ fn expected_target_prefix(
     source: &str,
 ) -> AppResult<String> {
     match transaction.operation {
-        Operation::Copy | Operation::Move => {
+        Operation::Copy | Operation::CopyCollection | Operation::Move => {
             let destination = transaction
                 .destination_relative
                 .as_deref()

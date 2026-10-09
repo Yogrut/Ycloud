@@ -171,7 +171,19 @@ describe('interactive focus styling', () => {
     expect(themeCss).toContain('.page-size-select .app-select-trigger { min-height: 34px; height: 34px;')
     expect(themeCss).toContain('.page-size-select .app-select-menu { right: 0; left: auto; width: 100%; }')
     expect(themeCss).toContain('.current-page { flex: 0 0 34px; color: var(--icon-color); background: var(--accent-soft);')
+    expect(themeCss).toContain('.page-arrow { padding: 0; color: var(--text); background: transparent; border: 0;')
+    expect(themeCss).toContain('.page-arrow:hover:not(:disabled) { color: var(--text); background: transparent; }')
     expect(themeCss).toContain('.page-arrow:disabled { color: var(--muted-2); cursor: default; opacity: 1; }')
+    expect(themeCss).toContain('border-top: 2px solid currentColor; border-right: 2px solid currentColor;')
+  })
+
+  it('keeps the collapsed music button inside the wide-screen left gutter', () => {
+    const browser = readFileSync('src/apps/browser/BrowserView.vue', 'utf8')
+    expect(browser).toMatch(/\.ycloud-audio-dock\s*\{[^}]*left: 6px; width: 56px; height: 56px;/)
+    expect(browser).toContain('<AppIcon name="vinyl-record" :size="28" weight="fill" />')
+    expect(browser).toContain('@media (min-width: 1536px) { .ycloud-audio-dock { left: calc((100vw - 1400px) / 4 - 28px); } }')
+    expect(browser).toMatch(/\.ycloud-audio-dock summary\s*\{[^}]*width: 100%; height: 100%;/)
+    expect(browser).toContain('@media (max-width: 520px) { .ycloud-audio-popover { bottom: calc(100% + 10px); left: 8px; width: calc(100vw - 28px); } }')
   })
 
   it('keeps browser and security selectors compact without stretching action buttons', () => {

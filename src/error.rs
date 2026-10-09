@@ -59,6 +59,8 @@ pub enum AppError {
     Forbidden,
     NotFound,
     Conflict(Cow<'static, str>),
+    DestinationExists,
+    ParentDirectoryMissing,
     PreconditionFailed,
     PayloadTooLarge,
     InsufficientStorage,
@@ -125,12 +127,12 @@ impl AppError {
                 CommitState::Committed => "operation_committed_pending",
                 CommitState::Unknown => "operation_result_unknown",
             },
-            Self::BadRequest(_) => "bad_request",
+            Self::BadRequest(_) | Self::ParentDirectoryMissing => "bad_request",
             Self::UploadBatchExpired => "upload_batch_expired",
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
             Self::NotFound => "not_found",
-            Self::Conflict(_) => "conflict",
+            Self::Conflict(_) | Self::DestinationExists => "conflict",
             Self::PreconditionFailed => "precondition_failed",
             Self::PayloadTooLarge => "payload_too_large",
             Self::InsufficientStorage => "insufficient_storage",
@@ -169,12 +171,12 @@ impl AppError {
                     StatusCode::CONFLICT
                 }
             }
-            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::BadRequest(_) | Self::ParentDirectoryMissing => StatusCode::BAD_REQUEST,
             Self::UploadBatchExpired => StatusCode::GONE,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::Conflict(_) | Self::DestinationExists => StatusCode::CONFLICT,
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
@@ -210,6 +212,8 @@ impl AppError {
             Self::UploadBatchExpired => "上传批次已过期，请重新准备未开始的文件".into(),
             Self::Forbidden => "Access denied".into(),
             Self::NotFound => "Resource not found".into(),
+            Self::DestinationExists => "Destination already exists".into(),
+            Self::ParentDirectoryMissing => "Destination directory does not exist".into(),
             Self::PreconditionFailed => "写入条件不满足，目标文件未被本次操作修改".into(),
             Self::PayloadTooLarge => "Payload exceeds the configured limit".into(),
             Self::InsufficientStorage => {
@@ -243,6 +247,10 @@ impl fmt::Display for AppError {
             Self::UploadBatchExpired => formatter.write_str("upload batch expired"),
             Self::Forbidden => formatter.write_str("forbidden"),
             Self::NotFound => formatter.write_str("not found"),
+            Self::DestinationExists => formatter.write_str("destination already exists"),
+            Self::ParentDirectoryMissing => {
+                formatter.write_str("destination directory does not exist")
+            }
             Self::PreconditionFailed => formatter.write_str("write precondition failed"),
             Self::PayloadTooLarge => formatter.write_str("payload too large"),
             Self::InsufficientStorage => formatter.write_str("insufficient storage"),

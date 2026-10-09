@@ -163,7 +163,7 @@ async fn authenticate_account(
     let policy = snapshot.policy;
     // Serialize the admission check with its success/failure update. Without
     // this guard, parallel requests can all pass before the failure is recorded.
-    let _attempt_guard = state.login_attempts.for_entry(entry).lock().await;
+    let _attempt_guard = state.login_attempts.for_entry(entry, ip).lock().await;
     match state.login_security.is_blocked(entry, ip).await {
         Ok(true) => return limited_login_response(policy.block_seconds),
         Ok(false) => {}
@@ -408,7 +408,11 @@ pub async fn gate_handler(
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
     let web_policy = snapshot.policy;
-    let _attempt_guard = state.login_attempts.for_entry(LoginEntry::Web).lock().await;
+    let _attempt_guard = state
+        .login_attempts
+        .for_entry(LoginEntry::Web, ip)
+        .lock()
+        .await;
     match state.login_security.is_blocked(LoginEntry::Web, ip).await {
         Ok(true) => return limited_login_response(web_policy.block_seconds),
         Ok(false) => {}
@@ -752,7 +756,7 @@ mod tests {
             loop {
                 if state
                     .login_attempts
-                    .for_entry(LoginEntry::Account)
+                    .for_entry(LoginEntry::Account, std::net::IpAddr::from([127, 0, 0, 1]))
                     .try_lock()
                     .is_err()
                 {

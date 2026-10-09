@@ -62,25 +62,33 @@ pub struct LocalStorageEdit {
     pub expected_revision: Option<String>,
 }
 
-/// Failure counters are independent by login class. A burst of WebDAV Basic
-/// authentication must not hold the administrator's admission lock through
-/// its password checks.
-#[derive(Default)]
+/// Bounded admission stripes serialize each login-class/IP failure counter.
+/// Unrelated clients can authenticate concurrently; hash collisions only
+/// serialize admission and never merge their failure counters.
 pub(crate) struct LoginAttemptGates {
-    admin: Mutex<()>,
-    account: Mutex<()>,
-    web: Mutex<()>,
-    webdav: Mutex<()>,
+    stripes: [Mutex<()>; 256],
+}
+
+impl Default for LoginAttemptGates {
+    fn default() -> Self {
+        Self {
+            stripes: std::array::from_fn(|_| Mutex::new(())),
+        }
+    }
 }
 
 impl LoginAttemptGates {
-    pub(crate) fn for_entry(&self, entry: LoginEntry) -> &Mutex<()> {
-        match entry {
-            LoginEntry::Admin => &self.admin,
-            LoginEntry::Account => &self.account,
-            LoginEntry::Web => &self.web,
-            LoginEntry::WebDav => &self.webdav,
-        }
+    pub(crate) fn for_entry(&self, entry: LoginEntry, ip: std::net::IpAddr) -> &Mutex<()> {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        ip.to_canonical().hash(&mut hash);
+        let group = match entry {
+            LoginEntry::Admin => 0,
+            LoginEntry::Account => 1,
+            LoginEntry::Web => 2,
+            LoginEntry::WebDav => 3,
+        };
+        &self.stripes[group * 64 + (hash.finish() % 64) as usize]
     }
 }
 
@@ -982,17 +990,53 @@ mod tests {
     async fn webdav_login_pressure_does_not_hold_administrator_admission() {
         let gates = super::LoginAttemptGates::default();
         let _dav = gates
-            .for_entry(crate::login_security::LoginEntry::WebDav)
+            .for_entry(
+                crate::login_security::LoginEntry::WebDav,
+                std::net::IpAddr::from([127, 0, 0, 1]),
+            )
             .lock()
             .await;
         let _admin = tokio::time::timeout(
             std::time::Duration::from_millis(100),
             gates
-                .for_entry(crate::login_security::LoginEntry::Admin)
+                .for_entry(
+                    crate::login_security::LoginEntry::Admin,
+                    std::net::IpAddr::from([127, 0, 0, 1]),
+                )
                 .lock(),
         )
         .await
         .expect("WebDAV authentication blocked administrator admission");
+    }
+    #[tokio::test]
+    async fn login_admission_is_bounded_by_stripes_not_one_lock_per_entry() {
+        use crate::login_security::LoginEntry;
+        let gates = super::LoginAttemptGates::default();
+        let ip = std::net::IpAddr::from([127, 0, 0, 1]);
+        let mapped: std::net::IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(std::ptr::eq(
+            gates.for_entry(LoginEntry::WebDav, ip),
+            gates.for_entry(LoginEntry::WebDav, mapped)
+        ));
+        let _first = gates.for_entry(LoginEntry::WebDav, ip).lock().await;
+        assert!(gates
+            .for_entry(LoginEntry::WebDav, mapped)
+            .try_lock()
+            .is_err());
+        let independent = (2..=255)
+            .map(|last| std::net::IpAddr::from([127, 0, 0, last]))
+            .find(|candidate| {
+                !std::ptr::eq(
+                    gates.for_entry(LoginEntry::WebDav, ip),
+                    gates.for_entry(LoginEntry::WebDav, *candidate),
+                )
+            })
+            .unwrap();
+        assert!(gates
+            .for_entry(LoginEntry::WebDav, independent)
+            .try_lock()
+            .is_ok());
+        assert!(gates.for_entry(LoginEntry::Admin, ip).try_lock().is_ok());
     }
     use crate::config::{
         load_config, Config, ConfigFile, GuestAccess, LocalStorageConfig, S3AddressingStyle,

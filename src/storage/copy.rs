@@ -43,15 +43,25 @@ impl StorageService {
         expected: u64,
         capacity: CapacityTracker,
     ) -> AppResult<()> {
-        self.copy_owned(source, destination, expected, Some(capacity), copy_staging)
-            .await
+        reject_root_or_descendant(source, destination)?;
+        let ticket = self.upload_cleanup.reserve()?;
+        let permit = self.acquire_io().await?;
+        self.copy_admitted(
+            source,
+            destination,
+            expected,
+            Some(capacity),
+            copy_staging,
+            (ticket, permit),
+        )
+        .await
     }
 
     pub(crate) async fn transfer_with_capacity(
         &self,
         source: &ResolvedPath,
         destination: &ResolvedPath,
-        copy: bool,
+        kind: crate::storage_backend::TransferKind,
         overwrite: bool,
         capacity: CapacityTracker,
     ) -> AppResult<bool> {
@@ -67,14 +77,16 @@ impl StorageService {
         }
         let ticket = self.upload_cleanup.reserve()?;
         let permit = self.acquire_io().await?;
-        let storage = self.clone();
-        let (source, destination) = (source.clone(), destination.clone());
-        tokio::spawn(async move {
+        let storage = self;
+        {
             let _permit = permit;
             let _mutation = storage.mutation_gate.lock().await;
             storage.transactions.settle_publication().await?;
-            let metadata = storage.metadata(&source).await?;
-            let existing = match storage.metadata(&destination).await {
+            let metadata = storage.metadata(source).await?;
+            let copy = kind != crate::storage_backend::TransferKind::Move;
+            let collection_only =
+                kind == crate::storage_backend::TransferKind::CopyCollection && metadata.is_dir();
+            let existing = match storage.metadata(destination).await {
                 Ok(metadata) => Some(metadata),
                 Err(AppError::NotFound) => None,
                 Err(error) => return Err(error),
@@ -83,12 +95,12 @@ impl StorageService {
                 return Err(AppError::PreconditionFailed);
             }
             let old_size = if existing.is_some() {
-                storage.path_size(&destination).await?
+                storage.path_size(destination).await?
             } else {
                 0
             };
-            let size = if copy {
-                storage.path_size(&source).await?
+            let size = if copy && !collection_only {
+                storage.path_size(source).await?
             } else {
                 0
             };
@@ -103,22 +115,34 @@ impl StorageService {
             let mut ownership = crate::storage_transaction::UploadOwnership::Writer;
             let result = async {
                 if copy {
-                    #[cfg(all(target_os = "linux", not(test)))]
-                    storage
-                        .linux_root
-                        .copy_path(
-                            source.relative(),
-                            &storage.transactions.rooted_relative(&temporary)?,
+                    if collection_only {
+                        #[cfg(all(target_os = "linux", not(test)))]
+                        storage
+                            .linux_root
+                            .create_directory(&storage.transactions.rooted_relative(&temporary)?)
+                            .await?;
+                        #[cfg(any(not(target_os = "linux"), test))]
+                        fs::create_dir(&temporary).await.map_err(|error| {
+                            AppError::with_source("failed to stage empty collection", error)
+                        })?;
+                    } else {
+                        #[cfg(all(target_os = "linux", not(test)))]
+                        storage
+                            .linux_root
+                            .copy_path(
+                                source.relative(),
+                                &storage.transactions.rooted_relative(&temporary)?,
+                                metadata.is_dir(),
+                            )
+                            .await?;
+                        #[cfg(any(not(target_os = "linux"), test))]
+                        copy_staging(
+                            source.absolute().to_path_buf(),
+                            temporary.clone(),
                             metadata.is_dir(),
                         )
                         .await?;
-                    #[cfg(any(not(target_os = "linux"), test))]
-                    copy_staging(
-                        source.absolute().to_path_buf(),
-                        temporary.clone(),
-                        metadata.is_dir(),
-                    )
-                    .await?;
+                    }
                 }
                 storage
                     .transactions
@@ -155,19 +179,14 @@ impl StorageService {
                 }
                 (Err(error), _) => Err(error.with_operation(
                     commit,
-                    if commit == CommitState::NotCommitted {
+                    if commit == CommitState::NotCommitted && !copy {
                         CleanupState::Complete
                     } else {
                         CleanupState::Pending
                     },
                 )),
             }
-        })
-        .await
-        .map_err(|error| {
-            AppError::with_source("local transfer task failed", error)
-                .with_operation(CommitState::Unknown, CleanupState::Unknown)
-        })?
+        }
     }
 
     async fn copy_owned<F, Fut>(
@@ -191,92 +210,118 @@ impl StorageService {
         let source = source.clone();
         let destination = destination.clone();
         tokio::spawn(async move {
-            let _permit = permit;
-            let _mutation = storage.mutation_gate.lock().await;
-            storage.transactions.settle_publication().await?;
-            #[cfg(any(not(target_os = "linux"), test))]
-            {
-                require_plain_directory(destination.absolute().parent()).await?;
-                ensure_destination_absent(destination.absolute()).await?;
-            }
-            let metadata = storage.metadata(&source).await?;
-            if !metadata.is_dir() && !metadata.is_file() {
-                return Err(AppError::Forbidden);
-            }
-            let size = storage.path_size(&source).await?;
-            if size != expected {
-                return Err(AppError::Conflict(
-                    "Source changed while preparing the copy".into(),
-                ));
-            }
-            let mut accounting = CopyAccounting::reserve(capacity, size)?;
-            let _physical = storage.reserve_physical_bytes(size).await?;
-            let temporary = storage.transactions.copy_path(&TransactionId::new());
-            let result: AppResult<()> = async {
-                #[cfg(all(target_os = "linux", not(test)))]
-                {
-                    drop(copy);
-                    let temporary_relative = storage.transactions.rooted_relative(&temporary)?;
-                    storage
-                        .linux_root
-                        .copy_path(source.relative(), &temporary_relative, metadata.is_dir())
-                        .await?;
-                }
-                #[cfg(any(not(target_os = "linux"), test))]
-                copy(
-                    source.absolute().to_path_buf(),
-                    temporary.clone(),
-                    metadata.is_dir(),
+            storage
+                .copy_admitted(
+                    &source,
+                    &destination,
+                    expected,
+                    capacity,
+                    copy,
+                    (ticket, permit),
                 )
-                .await?;
-                #[cfg(any(not(target_os = "linux"), test))]
-                {
-                    require_plain_directory(destination.absolute().parent()).await?;
-                    ensure_destination_absent(destination.absolute()).await?;
-                }
-                accounting.publication_started = true;
-                storage
-                    .transactions
-                    .publish_noreplace(&temporary, destination.absolute())
-                    .await?;
-                // No await between successful publication and logical accounting.
-                accounting.published(size);
-                Ok(())
-            }
-            .await;
-            // All per-copy I/O has completed before transferring a tree for
-            // deletion. On success only the unused ticket is released.
-            if result.is_err() {
-                ticket.abandon_completed_copy(temporary);
-            }
-            let persisted = accounting.persist().await;
-            let commit = if accounting.was_published {
-                CommitState::Committed
-            } else if accounting.publication_started {
-                CommitState::Unknown
-            } else {
-                CommitState::NotCommitted
-            };
-            let result =
-                result.map_err(|error| error.with_operation(commit, CleanupState::Pending));
-            if result.is_err() {
-                tracing::warn!(
-                    "local copy failed; staging handed off and publication accounting retained"
-                );
-            }
-            match (result, persisted) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Ok(()), Err(error)) => {
-                    Err(error.with_operation(CommitState::Committed, CleanupState::Complete))
-                }
-                (Err(error), _) => Err(error),
-            }
+                .await
         })
         .await
         .map_err(|error| {
             AppError::with_source("copy execution task failed", error)
                 .with_operation(CommitState::Unknown, CleanupState::Unknown)
         })?
+    }
+
+    async fn copy_admitted<F, Fut>(
+        &self,
+        source: &ResolvedPath,
+        destination: &ResolvedPath,
+        expected: u64,
+        capacity: Option<CapacityTracker>,
+        copy: F,
+        resources: (
+            super::upload_cleanup::UploadCleanupTicket,
+            tokio::sync::OwnedSemaphorePermit,
+        ),
+    ) -> AppResult<()>
+    where
+        F: FnOnce(PathBuf, PathBuf, bool) -> Fut + Send + 'static,
+        Fut: Future<Output = AppResult<()>> + Send + 'static,
+    {
+        let (ticket, permit) = resources;
+        let _permit = permit;
+        let _mutation = self.mutation_gate.lock().await;
+        self.transactions.settle_publication().await?;
+        #[cfg(any(not(target_os = "linux"), test))]
+        {
+            require_plain_directory(destination.absolute().parent()).await?;
+            ensure_destination_absent(destination.absolute()).await?;
+        }
+        let metadata = self.metadata(source).await?;
+        if !metadata.is_dir() && !metadata.is_file() {
+            return Err(AppError::Forbidden);
+        }
+        let size = self.path_size(source).await?;
+        if size != expected {
+            return Err(AppError::Conflict(
+                "Source changed while preparing the copy".into(),
+            ));
+        }
+        let mut accounting = CopyAccounting::reserve(capacity, size)?;
+        let _physical = self.reserve_physical_bytes(size).await?;
+        let temporary = self.transactions.copy_path(&TransactionId::new());
+        let result: AppResult<()> = async {
+            #[cfg(all(target_os = "linux", not(test)))]
+            {
+                drop(copy);
+                let temporary_relative = self.transactions.rooted_relative(&temporary)?;
+                self.linux_root
+                    .copy_path(source.relative(), &temporary_relative, metadata.is_dir())
+                    .await?;
+            }
+            #[cfg(any(not(target_os = "linux"), test))]
+            copy(
+                source.absolute().to_path_buf(),
+                temporary.clone(),
+                metadata.is_dir(),
+            )
+            .await?;
+            #[cfg(any(not(target_os = "linux"), test))]
+            {
+                require_plain_directory(destination.absolute().parent()).await?;
+                ensure_destination_absent(destination.absolute()).await?;
+            }
+            accounting.publication_started = true;
+            self.transactions
+                .publish_noreplace(&temporary, destination.absolute())
+                .await?;
+            // No await between successful publication and logical accounting.
+            accounting.published(size);
+            Ok(())
+        }
+        .await;
+        // All per-copy I/O has completed before transferring a tree for
+        // deletion. On success only the unused ticket is released.
+        if result.is_err() {
+            ticket.abandon_completed_copy(temporary);
+        }
+        let persisted = accounting.persist().await;
+        let commit = if accounting.was_published {
+            CommitState::Committed
+        } else if accounting.publication_started {
+            CommitState::Unknown
+        } else {
+            CommitState::NotCommitted
+        };
+        let result = result.map_err(|error| error.with_operation(commit, CleanupState::Pending));
+        if result.is_err() {
+            tracing::warn!(
+                "local copy failed; staging handed off and publication accounting retained"
+            );
+        }
+        match (result, persisted) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(error)) => {
+                Err(error.with_operation(CommitState::Committed, CleanupState::Complete))
+            }
+            (Err(error), _) => Err(error),
+        }
     }
 }
 

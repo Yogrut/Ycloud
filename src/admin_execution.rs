@@ -64,6 +64,10 @@ async fn complete_owned(
             "administrative execution failed; inspect current state before retrying",
             error,
         )
+        .with_operation(
+            crate::error::CommitState::Unknown,
+            crate::error::CleanupState::Unknown,
+        )
         .into_response(),
     }
 }
@@ -103,5 +107,18 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_failure_keeps_unknown_commit_evidence() {
+        let gate = Arc::new(Semaphore::new(1));
+        let permit = gate.clone().acquire_owned().await.unwrap();
+        let response = complete_owned(permit, async { panic!("injected execution failure") }).await;
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["operation"]["commit"], "unknown");
+        assert_eq!(payload["error"]["operation"]["cleanup"], "unknown");
+        assert!(gate.try_acquire_owned().is_ok());
     }
 }

@@ -107,7 +107,13 @@ impl S3Backend {
         // never adopt a journal or temporary object still owned by a live
         // upload future. Cancellation releases the guard and makes the
         // already-tracked journal eligible for the worker.
-        let _recovery_owner = self.recovery_gate.read().await;
+        let cancellation = input.cancellation.clone().unwrap_or_default();
+        let _recovery_owner = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(AppError::Conflict("存储配置已变更，上传已中断，请重试".into())
+                .with_operation(CommitState::NotCommitted, CleanupState::Complete)),
+            guard = self.recovery_gate.read() => guard,
+        };
         let relative = StorageService::normalize_relative(relative)?;
         let destination_key = object_key(&self.prefix, &relative)?;
         self.ensure_parent_directory(&relative).await?;

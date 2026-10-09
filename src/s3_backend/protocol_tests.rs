@@ -395,9 +395,12 @@ async fn cancelled_upload_leaves_owned_intent_without_waiting_for_remote_cleanup
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(AtomicUsize::new(0));
     let server_requests = requests.clone();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let server_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let requests = server_requests.clone();
+            let cancellation = server_cancellation.clone();
             tokio::spawn(async move {
                 let Some((method, path, _)) = read_request(&mut stream).await else {
                     return;
@@ -405,12 +408,11 @@ async fn cancelled_upload_leaves_owned_intent_without_waiting_for_remote_cleanup
                 requests.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(method, "PUT");
                 assert!(path.contains("internal-upload-intents"));
+                cancellation.cancel();
                 let _ = stream.write_all(put_object_response().as_bytes()).await;
             });
         }
     });
-    let cancellation = tokio_util::sync::CancellationToken::new();
-    cancellation.cancel();
     let mut input = super::UploadInput::relay(Body::from("payload"));
     input.cancellation = Some(cancellation);
     let backend = test_backend(&endpoint);
@@ -432,6 +434,29 @@ async fn cancelled_upload_leaves_owned_intent_without_waiting_for_remote_cleanup
 }
 
 #[tokio::test]
+async fn cancellation_before_recovery_admission_has_no_cleanup_debt() {
+    let backend = test_backend("http://127.0.0.1:1");
+    let _recovery = backend.recovery_gate.write().await;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    cancellation.cancel();
+    let mut input = super::UploadInput::relay(Body::from("payload"));
+    input.cancellation = Some(cancellation);
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        backend.upload_file_mode("file.txt", input, 7, 1024, None, true),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.operation().unwrap().commit, CommitState::NotCommitted);
+    assert_eq!(
+        error.operation().unwrap().cleanup,
+        crate::error::CleanupState::Complete
+    );
+    assert!(!backend.recovery_has_pending());
+}
+
+#[tokio::test]
 async fn capacity_mutations_queue_on_the_same_s3_backend() {
     // No network requests: test only the shared accounting gate, not NAS throughput.
     let backend = test_backend("http://127.0.0.1:1");
@@ -445,6 +470,89 @@ async fn capacity_mutations_queue_on_the_same_s3_backend() {
     let _next = tokio::time::timeout(Duration::from_secs(2), second)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn s3_read_preconditions_return_before_payload_requests_or_stream_admission() {
+    use axum::{
+        extract::Query,
+        http::{header, HeaderMap, Method, Response, StatusCode, Uri},
+        routing::any,
+        Router,
+    };
+    let payload_gets = Arc::new(AtomicUsize::new(0));
+    let count = payload_gets.clone();
+    let router = Router::new().route("/{*key}", any(move |method: Method, uri: Uri, Query(query): Query<HashMap<String, String>>| {
+        let count = count.clone();
+        async move {
+            let response = Response::builder();
+            if method == Method::HEAD {
+                return response.header("content-length", 7).header("etag", SOURCE_ETAG)
+                    .header("last-modified", "Wed, 07 Oct 2026 00:00:00 GMT").body(Body::empty()).unwrap();
+            }
+            if query.get("list-type").map(String::as_str) == Some("2") {
+                return response.header("content-type", "application/xml")
+                    .body(Body::from("<ListBucketResult><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>")).unwrap();
+            }
+            assert_eq!(uri.path(), "/bucket/tenant/file.txt");
+            count.fetch_add(1, Ordering::Relaxed);
+            response.status(500).body(Body::empty()).unwrap()
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = test_backend(&format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let _streams = backend
+        .stream_gate
+        .clone()
+        .acquire_many_owned(backend.stream_gate.available_permits() as u32)
+        .await
+        .unwrap();
+    for method in [Method::GET, Method::HEAD] {
+        for (name, value, status) in [
+            (
+                header::IF_NONE_MATCH,
+                "W/\"source-etag\"",
+                StatusCode::NOT_MODIFIED,
+            ),
+            (
+                header::IF_MATCH,
+                "\"other\"",
+                StatusCode::PRECONDITION_FAILED,
+            ),
+            (
+                header::IF_MODIFIED_SINCE,
+                "Wed, 07 Oct 2026 00:00:00 GMT",
+                StatusCode::NOT_MODIFIED,
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, value.parse().unwrap());
+            headers.insert(header::RANGE, "bytes=999-1000".parse().unwrap());
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                backend.stream_file(
+                    "file.txt",
+                    &headers,
+                    crate::storage::FileResponseMode::Attachment,
+                    &method,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::ETAG], SOURCE_ETAG);
+            assert!(axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+    }
+    assert_eq!(payload_gets.load(Ordering::Relaxed), 0);
+    server.abort();
 }
 const SOURCE_LENGTH: usize = 7;
 const MULTIPART_ETAG: &str = "\"multipart-etag-65\"";

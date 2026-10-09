@@ -1,4 +1,5 @@
 //! Shared file validators and byte-range selection for local and S3 reads.
+use crate::error::{AppError, AppResult};
 use axum::http::{header, response::Builder, HeaderMap, HeaderValue, Method, StatusCode};
 
 #[derive(Default)]
@@ -43,6 +44,60 @@ impl FileValidators {
         response
     }
 
+    /// Evaluate request preconditions before selecting a range or reading bytes.
+    /// The opened resource exists; local files still have no invented ETag.
+    pub(crate) fn precondition_response(
+        &self,
+        headers: &HeaderMap,
+        method: &Method,
+    ) -> AppResult<Option<axum::response::Response>> {
+        let etag = self.etag.as_ref().and_then(|value| value.to_str().ok());
+        let modified = self
+            .last_modified
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| httpdate::parse_http_date(value).ok());
+        let if_match = super::write_conditions::tag_condition(headers, header::IF_MATCH)?;
+        let if_none = super::write_conditions::tag_condition(headers, header::IF_NONE_MATCH)?;
+        let status = if if_match
+            .as_ref()
+            .is_some_and(|condition| !condition.matches(true, etag, false))
+            || if_match.is_none()
+                && modified
+                    .zip(header_date(headers, header::IF_UNMODIFIED_SINCE))
+                    .is_some_and(|(actual, expected)| actual > expected)
+        {
+            Some(StatusCode::PRECONDITION_FAILED)
+        } else if if_none
+            .as_ref()
+            .is_some_and(|condition| condition.matches(true, etag, true))
+        {
+            Some(if matches!(*method, Method::GET | Method::HEAD) {
+                StatusCode::NOT_MODIFIED
+            } else {
+                StatusCode::PRECONDITION_FAILED
+            })
+        } else if if_none.is_none()
+            && matches!(*method, Method::GET | Method::HEAD)
+            && modified
+                .zip(header_date(headers, header::IF_MODIFIED_SINCE))
+                .is_some_and(|(actual, expected)| actual <= expected)
+        {
+            Some(StatusCode::NOT_MODIFIED)
+        } else {
+            None
+        };
+        status
+            .map(|status| {
+                self.apply(Builder::new().status(status))
+                    .body(axum::body::Body::empty())
+                    .map_err(|error| {
+                        AppError::with_source("failed to build file precondition response", error)
+                    })
+            })
+            .transpose()
+    }
+
     pub(crate) fn select_range(
         &self,
         headers: &HeaderMap,
@@ -80,6 +135,15 @@ impl FileValidators {
             _ => false,
         }
     }
+}
+
+fn header_date(headers: &HeaderMap, name: header::HeaderName) -> Option<std::time::SystemTime> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    httpdate::parse_http_date(value.to_str().ok()?).ok()
 }
 
 pub(super) fn is_entity_tag(value: &str) -> bool {
@@ -133,6 +197,90 @@ pub(crate) fn parse_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_preconditions_follow_http_priority_without_fabricating_local_etags() {
+        let validators = FileValidators::object(Some("\"current\""), Some(1_700_000_000));
+        for method in [Method::GET, Method::HEAD] {
+            for (name, value, expected) in [
+                (
+                    header::IF_MATCH,
+                    "\"old\"",
+                    Some(StatusCode::PRECONDITION_FAILED),
+                ),
+                (header::IF_MATCH, "*", None),
+                (
+                    header::IF_MATCH,
+                    "W/\"current\"",
+                    Some(StatusCode::PRECONDITION_FAILED),
+                ),
+                (
+                    header::IF_NONE_MATCH,
+                    "W/\"current\"",
+                    Some(StatusCode::NOT_MODIFIED),
+                ),
+                (header::IF_NONE_MATCH, "*", Some(StatusCode::NOT_MODIFIED)),
+                (
+                    header::IF_MODIFIED_SINCE,
+                    "Tue, 14 Nov 2023 22:13:20 GMT",
+                    Some(StatusCode::NOT_MODIFIED),
+                ),
+                (
+                    header::IF_UNMODIFIED_SINCE,
+                    "Tue, 14 Nov 2023 22:13:19 GMT",
+                    Some(StatusCode::PRECONDITION_FAILED),
+                ),
+            ] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name, HeaderValue::from_static(value));
+                headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-1"));
+                let response = validators.precondition_response(&headers, &method).unwrap();
+                assert_eq!(
+                    response.as_ref().map(|response| response.status()),
+                    expected
+                );
+                if let Some(response) = response {
+                    assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+                }
+            }
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"current\""));
+        headers.insert(
+            header::IF_UNMODIFIED_SINCE,
+            HeaderValue::from_static("Tue, 14 Nov 2023 22:13:19 GMT"),
+        );
+        assert!(validators
+            .precondition_response(&headers, &Method::GET)
+            .unwrap()
+            .is_none());
+        headers.clear();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"old\""));
+        headers.insert(
+            header::IF_MODIFIED_SINCE,
+            HeaderValue::from_static("Tue, 14 Nov 2023 22:13:20 GMT"),
+        );
+        assert!(validators
+            .precondition_response(&headers, &Method::GET)
+            .unwrap()
+            .is_none());
+        let local = FileValidators::object(None, Some(1_700_000_000));
+        headers.clear();
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("\"current\""));
+        assert_eq!(
+            local
+                .precondition_response(&headers, &Method::GET)
+                .unwrap()
+                .unwrap()
+                .status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        headers.insert(header::IF_MATCH, HeaderValue::from_static("*"));
+        assert!(local
+            .precondition_response(&headers, &Method::GET)
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn conditional_ranges_require_a_current_strong_object_version() {

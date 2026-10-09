@@ -957,10 +957,10 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 .pagination-controls { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .page-arrow,
 .current-page { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 8px; }
-.page-arrow { padding: 0; color: var(--muted); background: transparent; border: 0; cursor: pointer; }
+.page-arrow { padding: 0; color: var(--text); background: transparent; border: 0; cursor: pointer; }
 .page-arrow:hover:not(:disabled) { color: var(--text); background: transparent; }
 .page-arrow:disabled { color: var(--muted-2); cursor: default; opacity: 1; }
-.page-chevron { width: 8px; height: 8px; border-top: 1.5px solid currentColor; border-right: 1.5px solid currentColor; }
+.page-chevron { width: 8px; height: 8px; border-top: 2px solid currentColor; border-right: 2px solid currentColor; }
 .page-chevron.previous { transform: rotate(-135deg); }
 .page-chevron.next { transform: rotate(45deg); }
 .current-page { flex: 0 0 34px; color: var(--icon-color); background: var(--accent-soft); font-size: 14px; font-weight: 720; }

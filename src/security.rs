@@ -97,6 +97,26 @@ fn request_client_ip(
         .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
+pub(crate) fn same_authority(
+    left: &axum::http::uri::Authority,
+    right: &axum::http::uri::Authority,
+    default_port: u16,
+) -> bool {
+    let port = |value: &axum::http::uri::Authority| {
+        // Authority::port() returns None for an out-of-range explicit port
+        // as well as an absent/empty port. Only those get the scheme default.
+        value.port_u16().or_else(|| {
+            matches!(value.as_str().strip_prefix(value.host()), Some("" | ":"))
+                .then_some(default_port)
+        })
+    };
+    !left.as_str().contains('@')
+        && !right.as_str().contains('@')
+        && left.host().eq_ignore_ascii_case(right.host())
+        && port(left).is_some()
+        && port(left) == port(right)
+}
+
 fn validate_request_host(
     config: &Config,
     headers: &axum::http::HeaderMap,
@@ -104,9 +124,19 @@ fn validate_request_host(
     let raw_host = single_header(headers, header::HOST.as_str())?;
     let normalized = raw_host.to_ascii_lowercase();
     if let Some(public_host) = config.public_host.as_deref() {
-        return (normalized == public_host.to_ascii_lowercase())
-            .then_some(())
-            .ok_or(StatusCode::FORBIDDEN);
+        let expected = public_host
+            .parse::<axum::http::uri::Authority>()
+            .map_err(|_| StatusCode::FORBIDDEN)?;
+        let actual = raw_host
+            .parse::<axum::http::uri::Authority>()
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        return same_authority(
+            &expected,
+            &actual,
+            if config.secure_cookies { 443 } else { 80 },
+        )
+        .then_some(())
+        .ok_or(StatusCode::FORBIDDEN);
     }
     if config.allowed_hosts.contains(&normalized) {
         return Ok(());
@@ -308,6 +338,36 @@ mod tests {
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Secure"));
         assert!(clear_cookie("session", false).contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn bound_hosts_use_effective_ports_without_accepting_other_authorities() {
+        let mut config = local_config();
+        config.public_host = Some("cloud.example".into());
+        config.secure_cookies = true;
+        for (host, accepted) in [
+            ("cloud.example", true),
+            ("cloud.example:", true),
+            ("CLOUD.EXAMPLE:443", true),
+            ("cloud.example:80", false),
+            ("other.example:443", false),
+            ("user@cloud.example", false),
+            ("cloud.example:99999", false),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+            assert_eq!(
+                validate_request_host(&config, &headers).is_ok(),
+                accepted,
+                "{host}"
+            );
+        }
+        config.public_host = Some("cloud.example:8443".into());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("cloud.example"));
+        assert!(validate_request_host(&config, &headers).is_err());
+        headers.insert(header::HOST, HeaderValue::from_static("cloud.example:8443"));
+        assert!(validate_request_host(&config, &headers).is_ok());
     }
 
     #[test]

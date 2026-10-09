@@ -107,16 +107,16 @@ impl S3Backend {
         &self,
         source: &str,
         destination: &str,
-        copy: bool,
+        kind: crate::storage_backend::TransferKind,
         overwrite: bool,
         expected_size: u64,
     ) -> AppResult<crate::storage::AtomicWriteResult> {
         let backend = self.scoped_work(None, None);
         Box::pin(backend.mutate_path_scoped(
-            if copy {
-                Operation::Copy
-            } else {
-                Operation::Move
+            match kind {
+                crate::storage_backend::TransferKind::Copy => Operation::Copy,
+                crate::storage_backend::TransferKind::CopyCollection => Operation::CopyCollection,
+                crate::storage_backend::TransferKind::Move => Operation::Move,
             },
             source,
             Some(destination),
@@ -143,7 +143,10 @@ impl S3Backend {
         let destination = destination
             .map(StorageService::normalize_relative)
             .transpose()?;
-        if matches!(operation, Operation::Copy | Operation::Move) {
+        if matches!(
+            operation,
+            Operation::Copy | Operation::CopyCollection | Operation::Move
+        ) {
             let destination = destination
                 .as_deref()
                 .ok_or_else(|| AppError::BadRequest("目录复制或移动缺少目标路径".into()))?;
@@ -163,6 +166,11 @@ impl S3Backend {
             .read(async { Ok(self.mutation_gate.lock().await) })
             .await?;
         let source_metadata = self.metadata(&source).await?;
+        let operation = if operation == Operation::CopyCollection && !source_metadata.is_dir {
+            Operation::Copy
+        } else {
+            operation
+        };
         if !source_metadata.is_dir && !allow_files {
             return Err(AppError::Conflict("源路径不是目录".into()));
         }
@@ -185,15 +193,28 @@ impl S3Backend {
         };
 
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let objects = self
-            .snapshot_resource(
+        let objects = if operation == Operation::CopyCollection {
+            vec![ObjectRecord {
+                source_key: super::list_prefix(&self.prefix, &source)?,
+                target_key: super::list_prefix(
+                    &self.prefix,
+                    destination.as_deref().ok_or(AppError::Forbidden)?,
+                )?,
+                size: 0,
+                source_etag: String::new(),
+                target_etag: None,
+                source_deleted: false,
+            }]
+        } else {
+            self.snapshot_resource(
                 &id,
                 operation,
                 &source,
                 destination.as_deref(),
                 source_metadata.is_dir,
             )
-            .await?;
+            .await?
+        };
         let snapshot_size = objects.iter().try_fold(0_u64, |total, object| {
             total
                 .checked_add(object.size)
@@ -237,7 +258,11 @@ impl S3Backend {
         })?;
         let journal_key = internal_key(&self.prefix, JOURNAL_CATEGORY, &id);
         let mut transaction = Transaction {
-            schema_version: SCHEMA_VERSION,
+            schema_version: if operation == Operation::CopyCollection {
+                4
+            } else {
+                SCHEMA_VERSION
+            },
             id,
             operation,
             source_relative: source,
@@ -296,7 +321,11 @@ impl S3Backend {
                 .await?;
         }
 
-        if transaction.operation != Operation::Copy && transaction.stage != Stage::SourcesDeleted {
+        if !matches!(
+            transaction.operation,
+            Operation::Copy | Operation::CopyCollection
+        ) && transaction.stage != Stage::SourcesDeleted
+        {
             if transaction.stage == Stage::CopyingTargets {
                 transaction.stage = Stage::DeletingSources;
                 journal_etag = self
@@ -405,8 +434,13 @@ impl S3Backend {
         transaction: &mut Transaction,
     ) -> AppResult<String> {
         for index in 0..transaction.objects.len() {
-            self.copy_one_target(&transaction.id, &mut transaction.objects[index])
-                .await?;
+            if transaction.operation == Operation::CopyCollection {
+                self.create_collection_target(&transaction.id, &mut transaction.objects[index])
+                    .await?;
+            } else {
+                self.copy_one_target(&transaction.id, &mut transaction.objects[index])
+                    .await?;
+            }
             if should_checkpoint_progress(index, transaction.objects.len()) {
                 journal_etag = self
                     .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
@@ -429,6 +463,30 @@ impl S3Backend {
             self.delete_key_after_identity_check(&object.target_key, object.target_etag.as_deref())
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn create_collection_target(
+        &self,
+        transaction_id: &str,
+        object: &mut ObjectRecord,
+    ) -> AppResult<()> {
+        if object.target_etag.is_some() {
+            return self.verify_recorded_target(object).await;
+        }
+        let operation_id = directory_copy_id(transaction_id, &object.source_key);
+        if self.head_key(&object.target_key).await?.is_none() {
+            self.put_directory_marker(&object.target_key, Some(&operation_id))
+                .await?;
+        }
+        let target = self
+            .head_key(&object.target_key)
+            .await?
+            .ok_or_else(ambiguous_target)?;
+        if target.size != 0 || target.operation_id.as_deref() != Some(operation_id.as_str()) {
+            return Err(ambiguous_target());
+        }
+        object.target_etag = Some(target.etag.ok_or_else(ambiguous_target)?);
         Ok(())
     }
 

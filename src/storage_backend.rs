@@ -50,6 +50,13 @@ pub struct BackendMetadata {
     pub version_tag: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransferKind {
+    Move,
+    Copy,
+    CopyCollection,
+}
+
 /// One live storage boundary shared by every HTTP, WebDAV and archive entry
 /// point. Its identity is immutable after registration.
 #[derive(Clone)]
@@ -900,66 +907,45 @@ impl StorageBackend {
                 };
                 let capacity_reservation =
                     capacity.reserve_replacement(old_size, content_length)?;
-                let storage = storage.clone();
-                let relative = relative.to_owned();
-                let content_type = content_type.map(str::to_owned);
-                let failure_capacity = capacity.clone();
-                let failure_storage = storage.clone();
-                let snapshots = active.directory_snapshots.clone();
-                tokio::spawn(async move {
-                    let _snapshot_invalidation = snapshots.invalidate_on_drop();
-                    let commit_owner = if input.direct.is_some() {
-                        Some(Arc::new(tokio::sync::Mutex::new(None)))
-                    } else {
-                        None
-                    };
-                    input.commit_owner = commit_owner.clone();
-                    let _accounting = if commit_owner.is_none() {
-                        Some(storage.acquire_capacity_mutation().await)
-                    } else {
-                        None
-                    };
-                    let mut accounting = S3CapacityAccounting::new(&capacity, &storage);
-                    let result = storage
-                        .upload_file_mode(
-                            &relative,
-                            input,
-                            content_length,
-                            max_upload_bytes,
-                            content_type.as_deref(),
-                            create_only,
-                        )
-                        .await;
-                    match result {
-                        Ok(result) => {
-                            capacity_reservation.commit(result.previous_size, result.size);
-                            persist_capacity(&capacity).await;
-                            accounting.settled = true;
-                            Ok(crate::storage::AtomicWriteResult {
-                                size: result.size,
-                                previous_size: result.previous_size,
-                                created: result.created,
-                            })
-                        }
-                        Err(error) => {
-                            drop(capacity_reservation);
-                            schedule_s3_capacity_reconcile(capacity, storage);
-                            if error.operation().is_none() {
-                                Err(error.with_operation(
-                                    crate::error::CommitState::Unknown,
-                                    crate::error::CleanupState::Unknown,
-                                ))
-                            } else {
-                                Err(error)
-                            }
+                // The existing mutation owner retains quota and execution.
+                // Both relay and direct uploads acquire capacity only after
+                // their recovery lease and temporary payload are ready.
+                let commit_owner = Arc::new(tokio::sync::Mutex::new(None));
+                input.commit_owner = Some(commit_owner.clone());
+                let mut accounting = S3CapacityAccounting::new(&capacity, storage);
+                let result = storage
+                    .upload_file_mode(
+                        relative,
+                        input,
+                        content_length,
+                        max_upload_bytes,
+                        content_type,
+                        create_only,
+                    )
+                    .await;
+                match result {
+                    Ok(result) => {
+                        capacity_reservation.commit(result.previous_size, result.size);
+                        persist_capacity(&capacity).await;
+                        accounting.settled = true;
+                        Ok(crate::storage::AtomicWriteResult {
+                            size: result.size,
+                            previous_size: result.previous_size,
+                            created: result.created,
+                        })
+                    }
+                    Err(error) => {
+                        drop(capacity_reservation);
+                        if error.operation().is_none() {
+                            Err(error.with_operation(
+                                crate::error::CommitState::Unknown,
+                                crate::error::CleanupState::Unknown,
+                            ))
+                        } else {
+                            Err(error)
                         }
                     }
-                })
-                .await
-                .map_err(|error| {
-                    schedule_s3_capacity_reconcile(failure_capacity, failure_storage);
-                    AppError::with_source("S3 upload execution task failed", error)
-                })?
+                }
             }
         }
     }
@@ -1030,7 +1016,7 @@ impl StorageBackend {
         &self,
         source: &str,
         destination: &str,
-        copy: bool,
+        kind: TransferKind,
         overwrite: bool,
     ) -> AppResult<bool> {
         let (source, destination) = (source.to_owned(), destination.to_owned());
@@ -1046,7 +1032,7 @@ impl StorageBackend {
                         .transfer_with_capacity(
                             &source,
                             &destination,
-                            copy,
+                            kind,
                             overwrite,
                             capacity.clone(),
                         )
@@ -1062,22 +1048,34 @@ impl StorageBackend {
                 }
                 StorageBackendKind::S3(storage) => {
                     let _accounting = storage.acquire_capacity_mutation().await;
-                    let size = storage.path_size(&source).await?;
+                    let collection_only = kind == TransferKind::CopyCollection
+                        && storage.metadata(&source).await?.is_dir;
+                    let size = if collection_only {
+                        0
+                    } else {
+                        storage.path_size(&source).await?
+                    };
                     let previous = match storage.metadata(&destination).await {
                         Ok(_) if !overwrite => return Err(AppError::PreconditionFailed),
                         Ok(_) => storage.path_size(&destination).await?,
                         Err(AppError::NotFound) => 0,
                         Err(error) => return Err(error),
                     };
-                    let mut reservation =
-                        capacity.reserve_replacement(previous, if copy { size } else { 0 })?;
+                    let mut reservation = capacity.reserve_replacement(
+                        previous,
+                        if kind != TransferKind::Move { size } else { 0 },
+                    )?;
                     let mut accounting = S3CapacityAccounting::new(&capacity, storage);
                     let result = storage
-                        .transfer_path(&source, &destination, copy, overwrite, size)
+                        .transfer_path(&source, &destination, kind, overwrite, size)
                         .await;
                     match result {
                         Ok(result) => {
-                            let new_size = if copy { result.size } else { 0 };
+                            let new_size = if kind != TransferKind::Move {
+                                result.size
+                            } else {
+                                0
+                            };
                             reservation
                                 .rebase_replacement(result.previous_size, new_size)
                                 .map_err(|error| {
@@ -1370,6 +1368,124 @@ mod tests {
             .owned_mutation(|_| async { Ok(()) })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_s3_relay_payloads_do_not_hold_the_capacity_commit_gate() {
+        use axum::{
+            extract::Query,
+            http::{HeaderMap, Method, Response, Uri},
+            routing::any,
+            Router,
+        };
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+            time::Duration,
+        };
+        let objects = Arc::new(Mutex::new(
+            HashMap::<String, (Vec<u8>, Option<String>)>::new(),
+        ));
+        let stored = objects.clone();
+        let router = Router::new().route("/{*key}", any(move |method: Method, uri: Uri, headers: HeaderMap,
+            Query(query): Query<HashMap<String, String>>, body: Body| {
+            let objects = stored.clone();
+            async move {
+                let response = Response::builder().header("etag", "\"object-etag\"");
+                if method == Method::GET && query.get("list-type").map(String::as_str) == Some("2") {
+                    return response.header("content-type", "application/xml").body(Body::from(
+                        "<ListBucketResult><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>")).unwrap();
+                }
+                let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
+                let mut objects = objects.lock().unwrap();
+                let path = uri.path().to_owned();
+                if method == Method::HEAD {
+                    return match objects.get(&path) {
+                        Some((bytes, operation)) => {
+                            let mut response = response.header("content-length", bytes.len());
+                            if let Some(operation) = operation { response = response.header("x-amz-meta-ycloud-operation", operation); }
+                            response.body(Body::empty()).unwrap()
+                        },
+                        None => response.status(404).body(Body::empty()).unwrap(),
+                    };
+                }
+                if method == Method::DELETE {
+                    objects.remove(&path);
+                    return response.status(204).body(Body::empty()).unwrap();
+                }
+                assert_eq!(method, Method::PUT);
+                if let Some(source) = headers.get("x-amz-copy-source") {
+                    let source = format!("/{}", source.to_str().unwrap().trim_start_matches('/'));
+                    let copied = objects.get(&source).unwrap().clone();
+                    objects.insert(path, copied);
+                    response.header("content-type", "application/xml").body(Body::from(
+                        "<CopyObjectResult><ETag>\"object-etag\"</ETag></CopyObjectResult>")).unwrap()
+                } else {
+                    let operation = headers.get("x-amz-meta-ycloud-operation").map(|value| value.to_str().unwrap().to_owned());
+                    objects.insert(path, (bytes.to_vec(), operation));
+                    response.body(Body::empty()).unwrap()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s3 = crate::s3_backend::protocol_tests::test_backend(&format!(
+            "http://{}",
+            listener.local_addr().unwrap()
+        ));
+        let backend = StorageBackend {
+            lease: None,
+            transfer: None,
+            active: Arc::new(super::ActiveStorage::new(
+                super::StorageBackendKind::S3(s3.clone()),
+                crate::capacity::CapacityTracker::new(None, 0),
+                None,
+            )),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let (started, mut arrivals) = tokio::sync::mpsc::channel(2);
+        let mut releases = Vec::new();
+        let mut uploads = Vec::new();
+        for number in 0..2 {
+            let backend = backend.clone();
+            let started = started.clone();
+            let (release, wait) = tokio::sync::oneshot::channel();
+            releases.push(release);
+            let body = Body::from_stream(futures_util::stream::once(async move {
+                started.send(()).await.unwrap();
+                wait.await.unwrap();
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"payload"))
+            }));
+            uploads.push(tokio::spawn(async move {
+                backend
+                    .upload_file(&format!("file-{number}.txt"), body, Some(7), 1024, None)
+                    .await
+            }));
+        }
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(3), arrivals.recv())
+                .await
+                .expect("relay payload was serialized behind a commit gate")
+                .unwrap();
+        }
+        let commit = tokio::time::timeout(Duration::from_secs(2), s3.acquire_capacity_mutation())
+            .await
+            .expect("payload transfer retained the capacity commit gate");
+        drop(commit);
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for upload in uploads {
+            tokio::time::timeout(Duration::from_secs(5), upload)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(backend.capacity_status().used, 14);
+        assert_eq!(backend.capacity_status().reserved, 0);
+        server.abort();
     }
 
     fn directory_request(limit: usize) -> DirectoryListRequest {

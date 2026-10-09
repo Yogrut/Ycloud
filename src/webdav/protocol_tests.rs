@@ -271,7 +271,16 @@ async fn overwriting_transfers_settle_capacity_once_and_do_not_change_browser_co
             b"previous"
         );
         assert!(!backend
-            .dav_transfer("source.bin", "target.bin", copy, true)
+            .dav_transfer(
+                "source.bin",
+                "target.bin",
+                if copy {
+                    crate::storage_backend::TransferKind::Copy
+                } else {
+                    crate::storage_backend::TransferKind::Move
+                },
+                true
+            )
             .await
             .unwrap());
         assert_eq!(
@@ -279,6 +288,216 @@ async fn overwriting_transfers_settle_capacity_once_and_do_not_change_browser_co
             before - 8 + if copy { 3 } else { 0 }
         );
         assert_eq!(backend.capacity_status().reserved, 0);
+    }
+}
+
+#[tokio::test]
+async fn copy_depth_zero_replaces_with_an_empty_collection_and_preserves_source() {
+    for target_kind in ["missing", "file", "directory"] {
+        let (_directory, app, state) = fixture_with_state(false).await;
+        let backend = state.storage_backend("primary").await.unwrap();
+        backend.create_directory("source").await.unwrap();
+        backend
+            .upload_file("source/child.txt", Body::from("new"), Some(3), 1024, None)
+            .await
+            .unwrap();
+        if target_kind == "directory" {
+            backend.create_directory("target").await.unwrap();
+            backend
+                .upload_file(
+                    "target/old.txt",
+                    Body::from("previous"),
+                    Some(8),
+                    1024,
+                    None,
+                )
+                .await
+                .unwrap();
+        } else if target_kind == "file" {
+            backend
+                .upload_file("target", Body::from("previous"), Some(8), 1024, None)
+                .await
+                .unwrap();
+        }
+        let before = backend.capacity_status().used;
+        let response = app
+            .oneshot(
+                authorized_request("COPY", "/dav/documents/source")
+                    .header("Destination", "/dav/documents/target")
+                    .header("Depth", "0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if target_kind == "missing" {
+                StatusCode::CREATED
+            } else {
+                StatusCode::NO_CONTENT
+            }
+        );
+        let root = &state.config.storage_path;
+        assert!(root.join("target").is_dir());
+        assert!(tokio::fs::read_dir(root.join("target"))
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            tokio::fs::read(root.join("source/child.txt"))
+                .await
+                .unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            backend.capacity_status().used,
+            before - if target_kind == "missing" { 0 } else { 8 }
+        );
+        assert_eq!(backend.capacity_status().reserved, 0);
+    }
+}
+
+#[tokio::test]
+async fn depth_validation_is_applied_before_mutation_and_file_copy_zero_keeps_bytes() {
+    let (_directory, app, state) = fixture_with_state(false).await;
+    for (method, depth) in [
+        ("COPY", "1"),
+        ("COPY", "invalid"),
+        ("MOVE", "0"),
+        ("MOVE", "1"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                authorized_request(method, "/dav/documents/note.txt")
+                    .header("Destination", "/dav/documents/rejected.txt")
+                    .header("Depth", depth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!state.config.storage_path.join("rejected.txt").exists());
+        assert!(state.config.storage_path.join("note.txt").exists());
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            authorized_request("COPY", "/dav/documents/note.txt")
+                .header("Destination", "/dav/documents/copied.txt")
+                .header("Depth", "0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        tokio::fs::read(state.config.storage_path.join("copied.txt"))
+            .await
+            .unwrap(),
+        b"file bytes"
+    );
+    let response = app
+        .oneshot(
+            authorized_request("COPY", "/dav/documents/note.txt")
+                .header("Destination", "/dav/documents/rejected.txt")
+                .header("Depth", "0")
+                .header("Depth", "infinity")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn mkcol_reports_existing_target_and_missing_parent_by_protocol_reason() {
+    let (_directory, app, state) = fixture_with_state(false).await;
+    for (path, expected) in [
+        ("folder", StatusCode::METHOD_NOT_ALLOWED),
+        ("note.txt", StatusCode::METHOD_NOT_ALLOWED),
+        ("missing/child", StatusCode::CONFLICT),
+        ("created", StatusCode::CREATED),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                authorized_request("MKCOL", &format!("/dav/documents/{path}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+    }
+    assert!(state.config.storage_path.join("created").is_dir());
+    assert!(!state.config.storage_path.join("missing").exists());
+}
+
+#[tokio::test]
+async fn dav_get_and_head_evaluate_preconditions_before_ranges() {
+    let (_directory, app) = fixture().await;
+    let initial = app
+        .clone()
+        .oneshot(
+            authorized_request("HEAD", "/dav/documents/note.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let modified = initial
+        .headers()
+        .get(header::LAST_MODIFIED)
+        .unwrap()
+        .clone();
+    assert!(initial.headers().get(header::ETAG).is_none());
+    for method in ["GET", "HEAD"] {
+        for (name, value, expected) in [
+            (
+                header::IF_MODIFIED_SINCE,
+                modified.clone(),
+                StatusCode::NOT_MODIFIED,
+            ),
+            (
+                header::IF_NONE_MATCH,
+                axum::http::HeaderValue::from_static("*"),
+                StatusCode::NOT_MODIFIED,
+            ),
+            (
+                header::IF_MATCH,
+                axum::http::HeaderValue::from_static("\"unavailable\""),
+                StatusCode::PRECONDITION_FAILED,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    authorized_request(method, "/dav/documents/note.txt")
+                        .header(name, value)
+                        .header(header::RANGE, "bytes=999-1000")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            assert_eq!(
+                response.headers().get(header::LAST_MODIFIED).unwrap(),
+                &modified
+            );
+            assert!(to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .is_empty());
+        }
     }
 }
 

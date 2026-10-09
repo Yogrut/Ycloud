@@ -59,9 +59,7 @@ impl LinuxRoot {
         )
         .await
         .map_err(|error| match error {
-            AppError::NotFound => {
-                AppError::BadRequest("Destination directory does not exist".into())
-            }
+            AppError::NotFound => AppError::ParentDirectoryMissing,
             error => error,
         })?;
 
@@ -118,9 +116,17 @@ impl LinuxRoot {
         let descriptor = self.descriptor.clone();
         let relative = relative.to_owned();
         tokio::task::spawn_blocking(move || {
-            let (parent, name) = open_parent(&descriptor, &relative)?;
+            let (parent, name) =
+                open_parent(&descriptor, &relative).map_err(|error| match error {
+                    AppError::NotFound => AppError::ParentDirectoryMissing,
+                    error => error,
+                })?;
             mkdirat(&parent, name, Mode::from(mode)).map_err(|error| {
-                map_mutation_error("failed to create directory below local storage root", error)
+                if error == Errno::EXIST {
+                    AppError::DestinationExists
+                } else {
+                    map_mutation_error("failed to create directory below local storage root", error)
+                }
             })
         })
         .await

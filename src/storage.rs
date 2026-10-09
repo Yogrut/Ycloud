@@ -69,6 +69,8 @@ pub struct StorageService {
     mutation_gate: Arc<AsyncMutex<()>>,
     cleanup: cleanup::CleanupWorker,
     upload_cleanup: upload_cleanup::UploadCleanupWorker,
+    #[cfg(test)]
+    fail_parent_sync: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(target_os = "linux")]
     linux_root: Arc<linux_root::LinuxRoot>,
 }
@@ -232,6 +234,8 @@ impl StorageService {
             mutation_gate,
             cleanup,
             upload_cleanup,
+            #[cfg(test)]
+            fail_parent_sync: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(target_os = "linux")]
             linux_root,
         })
@@ -441,22 +445,16 @@ impl StorageService {
         let _mutation = self.mutation_gate.lock().await;
         self.transactions.settle_publication().await?;
         #[cfg(target_os = "linux")]
-        {
-            self.linux_root.create_directory(path.relative()).await?;
-            self.linux_root.sync_parent(path.relative()).await
-        }
+        self.linux_root.create_directory(path.relative()).await?;
         #[cfg(not(target_os = "linux"))]
-        {
-            fs::create_dir(path.absolute())
-                .await
-                .map_err(|error| match error.kind() {
-                    std::io::ErrorKind::AlreadyExists => {
-                        AppError::Conflict("Destination already exists".into())
-                    }
-                    _ => AppError::with_source("failed to create directory", error),
-                })?;
-            sync_parent_directory(path.absolute()).await
-        }
+        fs::create_dir(path.absolute())
+            .await
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::AlreadyExists => AppError::DestinationExists,
+                std::io::ErrorKind::NotFound => AppError::ParentDirectoryMissing,
+                _ => AppError::with_source("failed to create directory", error),
+            })?;
+        self.sync_committed_parent(path).await
     }
 
     pub async fn move_path(
@@ -469,13 +467,9 @@ impl StorageService {
         let _mutation = self.mutation_gate.lock().await;
         self.transactions.settle_publication().await?;
         #[cfg(target_os = "linux")]
-        {
-            self.linux_root
-                .rename_noreplace(source.relative(), destination.relative())
-                .await?;
-            self.linux_root.sync_parent(source.relative()).await?;
-            self.linux_root.sync_parent(destination.relative()).await
-        }
+        self.linux_root
+            .rename_noreplace(source.relative(), destination.relative())
+            .await?;
         #[cfg(not(target_os = "linux"))]
         {
             if fs::try_exists(destination.absolute())
@@ -488,9 +482,34 @@ impl StorageService {
             fs::rename(source.absolute(), destination.absolute())
                 .await
                 .map_err(|error| AppError::with_source("failed to move path", error))?;
-            sync_parent_directory(source.absolute()).await?;
-            sync_parent_directory(destination.absolute()).await
         }
+        self.sync_committed_parent(source).await?;
+        self.sync_committed_parent(destination).await
+    }
+
+    /// The namespace has already changed when this durability step starts.
+    async fn sync_committed_parent(&self, path: &ResolvedPath) -> AppResult<()> {
+        let result: AppResult<()> = async {
+            #[cfg(test)]
+            if self.fail_parent_sync.swap(false, Ordering::SeqCst) {
+                return Err(AppError::internal("injected parent sync failure"));
+            }
+            #[cfg(target_os = "linux")]
+            {
+                self.linux_root.sync_parent(path.relative()).await
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                sync_parent_directory(path.absolute()).await
+            }
+        }
+        .await;
+        result.map_err(|error| {
+            error.with_operation(
+                crate::error::CommitState::Committed,
+                crate::error::CleanupState::Pending,
+            )
+        })
     }
 
     pub async fn ready(&self) -> bool {

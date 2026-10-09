@@ -33,10 +33,12 @@ impl S3Backend {
             ));
         }
         let target_key = match operation {
-            Operation::Copy | Operation::Move => crate::s3_backend::object_key(
-                &self.prefix,
-                destination.ok_or(AppError::Forbidden)?,
-            )?,
+            Operation::Copy | Operation::CopyCollection | Operation::Move => {
+                crate::s3_backend::object_key(
+                    &self.prefix,
+                    destination.ok_or(AppError::Forbidden)?,
+                )?
+            }
             Operation::Delete => internal_key(&self.prefix, TRASH_CATEGORY, &format!("{id}/")),
         };
         Ok(vec![ObjectRecord {
@@ -72,7 +74,7 @@ impl S3Backend {
     ) -> AppResult<Vec<ObjectRecord>> {
         let source_prefix = list_prefix(&self.prefix, source)?;
         let target_prefix = match operation {
-            Operation::Copy | Operation::Move => list_prefix(
+            Operation::Copy | Operation::CopyCollection | Operation::Move => list_prefix(
                 &self.prefix,
                 destination.ok_or_else(|| AppError::BadRequest("目录事务缺少目标路径".into()))?,
             )?,

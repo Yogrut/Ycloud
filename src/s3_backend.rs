@@ -189,16 +189,29 @@ impl S3Backend {
             return Err(AppError::Conflict("存储根目录已经存在".into()));
         }
         let _mutation = self.mutation_gate.lock().await;
-        self.ensure_parent_directory(&relative).await?;
+        self.ensure_parent_directory(&relative)
+            .await
+            .map_err(|error| match error {
+                AppError::NotFound => AppError::ParentDirectoryMissing,
+                error => error,
+            })?;
         match self.metadata(&relative).await {
-            Ok(_) => return Err(AppError::Conflict("目标路径已经存在".into())),
+            Ok(_) => return Err(AppError::DestinationExists),
             Err(AppError::NotFound) => {}
             Err(error) => return Err(error),
         }
 
         let marker = list_prefix(&self.prefix, &relative)?;
+        self.put_directory_marker(&marker, None).await
+    }
+
+    async fn put_directory_marker(
+        &self,
+        marker: &str,
+        operation_id: Option<&str>,
+    ) -> AppResult<()> {
         let _permit = self.acquire_request().await?;
-        let request = self
+        let mut request = self
             .client
             .put_object()
             .bucket(&self.bucket)
@@ -206,9 +219,17 @@ impl S3Backend {
             .content_length(0)
             .content_type("application/x-directory")
             .body(ByteStream::from_static(&[]));
+        if let Some(operation_id) = operation_id {
+            request = request.metadata(S3_OPERATION_METADATA_KEY, operation_id);
+        }
+        // A retried conditional PUT can report 412 after the first attempt
+        // committed but lost its response. Preserve that ambiguity instead.
+        let retry = aws_sdk_s3::config::Builder::new()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1));
         let result = if self.is_alibaba_oss() {
             request
                 .customize()
+                .config_override(retry)
                 .mutate_request(|request| {
                     request
                         .headers_mut()
@@ -217,14 +238,51 @@ impl S3Backend {
                 .send()
                 .await
         } else {
-            request.if_none_match("*").send().await
+            request
+                .if_none_match("*")
+                .customize()
+                .config_override(retry)
+                .send()
+                .await
         };
         result.map_err(|error| {
             tracing::warn!(
                 error_kind = %error.as_service_error().map_or("transport", |_| "service"),
                 "S3 directory marker creation failed"
             );
-            AppError::ServiceUnavailable("对象存储无法创建目录".into())
+            if error
+                .as_service_error()
+                .is_some_and(|error| error.meta().code() == Some("PreconditionFailed"))
+            {
+                AppError::DestinationExists
+            } else {
+                let rejected = error.as_service_error().is_some_and(|error| {
+                    matches!(
+                        error.meta().code(),
+                        Some(
+                            "AccessDenied"
+                                | "InvalidAccessKeyId"
+                                | "SignatureDoesNotMatch"
+                                | "NoSuchBucket"
+                                | "InvalidRequest"
+                                | "InvalidArgument"
+                                | "EntityTooLarge"
+                        )
+                    )
+                });
+                AppError::ServiceUnavailable("对象存储无法创建目录".into()).with_operation(
+                    if rejected {
+                        crate::error::CommitState::NotCommitted
+                    } else {
+                        crate::error::CommitState::Unknown
+                    },
+                    if rejected {
+                        crate::error::CleanupState::Complete
+                    } else {
+                        crate::error::CleanupState::Unknown
+                    },
+                )
+            }
         })?;
         Ok(())
     }

@@ -656,6 +656,8 @@ describe('BrowserView', () => {
     expect(host.querySelector('.page-size-select [data-icon]')).toBeNull()
     expect(host.querySelectorAll('.page-chevron')).toHaveLength(2)
     const arrows = host.querySelectorAll<HTMLButtonElement>('.page-arrow')
+    expect(arrows[0]!.disabled).toBe(true)
+    expect(arrows[1]!.disabled).toBe(false)
     arrows[1]!.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
@@ -663,6 +665,8 @@ describe('BrowserView', () => {
     expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/files?storage_id=primary&limit=20&cursor=MjA&sort=name&direction=asc', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
     expect(host.textContent).toContain('second.txt')
     expect(host.querySelector('.current-page')?.textContent).toBe('2')
+    expect(arrows[0]!.disabled).toBe(false)
+    expect(arrows[1]!.disabled).toBe(true)
 
     host.querySelector<HTMLButtonElement>('.page-arrow')!.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))

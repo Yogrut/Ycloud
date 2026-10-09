@@ -9,6 +9,7 @@ use tokio::{
 mod metadata;
 mod receipts;
 mod recovery;
+mod transfer;
 pub use metadata::TransactionId;
 use metadata::{
     resource_id, DeletionJournal, ReplaceJournal, MAX_JOURNAL_BYTES, MAX_RECOVERY_ENTRIES,
@@ -34,7 +35,7 @@ pub(crate) enum UploadOwnership {
 /// Synchronous notifications at the mutation boundary; publication accounting
 /// must not wait until fallible directory sync or backup cleanup has finished.
 pub(crate) trait ReplacementObserver {
-    fn check_destination(&self, _metadata: Option<&std::fs::Metadata>) -> AppResult<()> {
+    fn check_destination(&mut self, _metadata: Option<&std::fs::Metadata>) -> AppResult<()> {
         Ok(())
     }
     fn must_create_new(&self) -> bool {
@@ -44,6 +45,7 @@ pub(crate) trait ReplacementObserver {
         Ok(())
     }
     fn recovery_owned(&mut self) {}
+    fn rollback_completed(&mut self) {}
     fn published(&mut self, _previous_size: u64) {}
 }
 
@@ -55,7 +57,6 @@ pub(crate) trait DeletionObserver {
     fn published(&mut self, _staged: &Path) {}
 }
 
-#[cfg(test)]
 impl DeletionObserver for () {}
 
 #[derive(Clone)]
@@ -365,6 +366,14 @@ impl TransactionPaths {
     }
 
     async fn validate_destination(&self, relative: &str) -> AppResult<()> {
+        self.validate_destination_kind(relative, false).await
+    }
+
+    async fn validate_destination_kind(
+        &self,
+        relative: &str,
+        allow_directory: bool,
+    ) -> AppResult<()> {
         if relative.is_empty()
             || relative.len() > 4096
             || crate::storage::StorageService::normalize_relative(relative)? != relative
@@ -386,7 +395,7 @@ impl TransactionPaths {
                 match self.linux_root.metadata(&current).await {
                     Ok(metadata)
                         if if is_leaf {
-                            metadata.is_file()
+                            metadata.is_file() || allow_directory && metadata.is_dir()
                         } else {
                             metadata.is_dir()
                         } => {}
@@ -403,7 +412,7 @@ impl TransactionPaths {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            validate_destination(&self.root, relative).await
+            validate_destination(&self.root, relative, allow_directory).await
         }
     }
 
@@ -790,7 +799,6 @@ impl TransactionPaths {
                 "upload does not belong to this transaction namespace",
             ));
         }
-        let journal_path = self.journals.join(format!("{id}.json"));
         let mut journal = ReplaceJournal::new(id.clone(), relative.to_string())?;
         if let Some((operation_id, size)) = operation {
             journal.operation_id = Some(operation_id.to_owned());
@@ -824,45 +832,24 @@ impl TransactionPaths {
                 tracing::warn!(transaction_id = %id, "local filesystem does not support upload publication anchors; retaining conservative crash recovery");
             }
         }
-        self.write_json_atomic(&journal_path, &journal).await?;
-        let backup = self.backups.join(&id);
-        if metadata.is_some() {
-            self.rooted_rename_noreplace(destination, &backup).await?;
+        let result = self
+            .publish_replacement(
+                journal,
+                temporary,
+                destination,
+                metadata.is_some(),
+                previous_size,
+                observer,
+            )
+            .await;
+        if result.as_ref().is_err_and(|error| {
+            error
+                .operation()
+                .is_some_and(|outcome| outcome.commit == crate::error::CommitState::NotCommitted)
+        }) {
+            *ownership = UploadOwnership::Writer;
         }
-        if let Err(error) = self.rooted_rename_noreplace(temporary, destination).await {
-            if self.rooted_exists(&backup).await? {
-                if let Err(restore_error) = self.rooted_rename_noreplace(&backup, destination).await
-                {
-                    tracing::warn!(transaction_id = %id, error = %restore_error, "replacement rollback pending; journal retained");
-                }
-            }
-            return Err(AppError::with_source(
-                "failed to commit uploaded file",
-                error,
-            ));
-        }
-        observer.published(previous_size);
-        *self
-            .pending_publication
-            .lock()
-            .expect("publication mutex poisoned") = Some(journal.clone());
-        self.settle_publication().await?;
-        if let (Some(operation_id), Some(size)) = (&journal.operation_id, journal.operation_size) {
-            self.ensure_receipt(operation_id, &journal.destination, size, true)
-                .await?;
-        }
-        if self.rooted_exists(&backup).await? {
-            self.rooted_remove_file(&backup).await?;
-            self.rooted_sync_parent(&backup).await?;
-        }
-        if journal.anchored {
-            let anchor = self.anchors.join(&id);
-            self.rooted_remove_file_idempotent(&anchor).await?;
-            self.rooted_sync_parent(&anchor).await?;
-        }
-        self.rooted_remove_file(&journal_path).await?;
-        self.rooted_sync_parent(&journal_path).await?;
-        Ok(previous_size)
+        result
     }
 
     /// Called under the storage mutation gate. Later mutations wait only for
@@ -879,7 +866,7 @@ impl TransactionPaths {
         };
         self.rooted_sync_parent(&self.root.join(&journal.destination))
             .await?;
-        self.rooted_sync_parent(&self.upload_path(&journal.id))
+        self.rooted_sync_parent(&self.replacement_source(&journal))
             .await?;
         journal.published = true;
         self.write_json_atomic_inner(
@@ -1247,7 +1234,7 @@ async fn decode_deletion_journal(path: &Path, file: fs::File) -> AppResult<Delet
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn validate_destination(root: &Path, relative: &str) -> AppResult<()> {
+async fn validate_destination(root: &Path, relative: &str, allow_directory: bool) -> AppResult<()> {
     if relative.is_empty()
         || relative.len() > 4096
         || crate::storage::StorageService::normalize_relative(relative)? != relative
@@ -1265,7 +1252,7 @@ async fn validate_destination(root: &Path, relative: &str) -> AppResult<()> {
             Ok(metadata)
                 if !is_link_or_reparse_point(&metadata)
                     && if is_leaf {
-                        metadata.is_file()
+                        metadata.is_file() || allow_directory && metadata.is_dir()
                     } else {
                         metadata.is_dir()
                     } => {}
@@ -1735,13 +1722,16 @@ mod tests {
         tokio::fs::write(&pending, b"pending data").await.unwrap();
         let record = paths.journals.join(format!("{id}.json"));
         let bytes = serde_json::to_vec(&ReplaceJournal {
-            version: 4,
+            version: 5,
             id,
             destination: "report.txt".into(),
             published: false,
             operation_id: None,
             operation_size: None,
             anchored: false,
+            transfer_source: None,
+            staged_copy: false,
+            replaced_bytes: 0,
         })
         .unwrap();
         tokio::fs::write(&record, &bytes).await.unwrap();
@@ -1915,6 +1905,9 @@ mod tests {
                 operation_id: None,
                 operation_size: None,
                 anchored: false,
+                transfer_source: None,
+                staged_copy: false,
+                replaced_bytes: 0,
             })
             .unwrap(),
         )
@@ -1939,6 +1932,9 @@ mod tests {
                 operation_id: None,
                 operation_size: None,
                 anchored: false,
+                transfer_source: None,
+                staged_copy: false,
+                replaced_bytes: 0,
             })
             .unwrap(),
         )

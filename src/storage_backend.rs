@@ -682,6 +682,7 @@ impl StorageBackend {
             content_type,
         )
         .await
+        .map(|result| result.size)
     }
 
     pub(crate) async fn upload_file_conditionally(
@@ -691,7 +692,7 @@ impl StorageBackend {
         expected_bytes: Option<u64>,
         max_upload_bytes: u64,
         content_type: Option<&str>,
-    ) -> AppResult<u64> {
+    ) -> AppResult<crate::storage::AtomicWriteResult> {
         self.upload_file_mode(
             relative,
             input,
@@ -722,6 +723,7 @@ impl StorageBackend {
             true,
         )
         .await
+        .map(|result| result.size)
     }
 
     pub(crate) async fn upload_tracked_new_file(
@@ -734,6 +736,7 @@ impl StorageBackend {
     ) -> AppResult<u64> {
         self.upload_file_mode(relative, input, expected_bytes, maximum, content_type, true)
             .await
+            .map(|result| result.size)
     }
 
     pub(crate) fn supports_direct_upload(&self) -> bool {
@@ -764,6 +767,7 @@ impl StorageBackend {
             true,
         )
         .await
+        .map(|result| result.size)
     }
 
     async fn upload_file_mode(
@@ -774,7 +778,7 @@ impl StorageBackend {
         max_upload_bytes: u64,
         content_type: Option<&str>,
         create_only: bool,
-    ) -> AppResult<u64> {
+    ) -> AppResult<crate::storage::AtomicWriteResult> {
         let cancellation = self.transfer_token();
         input.body = interruptible_body(input.body, cancellation.clone());
         input.cancellation = Some(cancellation);
@@ -802,7 +806,7 @@ impl StorageBackend {
         max_upload_bytes: u64,
         content_type: Option<&str>,
         create_only: bool,
-    ) -> AppResult<u64> {
+    ) -> AppResult<crate::storage::AtomicWriteResult> {
         let active = &self.active;
         let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
         let capacity = active.capacity.clone();
@@ -866,7 +870,7 @@ impl StorageBackend {
                 } else {
                     writer.commit_with_capacity(capacity_reservation).await?
                 };
-                Ok(committed.size)
+                Ok(committed)
             }
             StorageBackendKind::S3(storage) => {
                 let content_length = expected_bytes.ok_or_else(|| {
@@ -931,7 +935,11 @@ impl StorageBackend {
                             capacity_reservation.commit(result.previous_size, result.size);
                             persist_capacity(&capacity).await;
                             accounting.settled = true;
-                            Ok(result.size)
+                            Ok(crate::storage::AtomicWriteResult {
+                                size: result.size,
+                                previous_size: result.previous_size,
+                                created: result.created,
+                            })
                         }
                         Err(error) => {
                             drop(capacity_reservation);
@@ -1016,6 +1024,82 @@ impl StorageBackend {
                 Ok(())
             }
         }
+    }
+
+    pub(crate) async fn dav_transfer(
+        &self,
+        source: &str,
+        destination: &str,
+        copy: bool,
+        overwrite: bool,
+    ) -> AppResult<bool> {
+        let (source, destination) = (source.to_owned(), destination.to_owned());
+        self.owned_mutation(move |backend| async move {
+            let active = &backend.active;
+            let _snapshot_invalidation = active.directory_snapshots.invalidate_on_drop();
+            let capacity = active.capacity.clone();
+            match &active.kind {
+                StorageBackendKind::Local(storage) => {
+                    let source = storage.resolve_existing(&source).await?;
+                    let destination = storage.resolve_for_write(&destination).await?;
+                    let result = storage
+                        .transfer_with_capacity(
+                            &source,
+                            &destination,
+                            copy,
+                            overwrite,
+                            capacity.clone(),
+                        )
+                        .await;
+                    if result.as_ref().is_err_and(|error| {
+                        error.operation().is_some_and(|outcome| {
+                            outcome.commit != crate::error::CommitState::NotCommitted
+                        })
+                    }) {
+                        let _ = reconcile_local_capacity(&capacity, storage).await;
+                    }
+                    result
+                }
+                StorageBackendKind::S3(storage) => {
+                    let _accounting = storage.acquire_capacity_mutation().await;
+                    let size = storage.path_size(&source).await?;
+                    let previous = match storage.metadata(&destination).await {
+                        Ok(_) if !overwrite => return Err(AppError::PreconditionFailed),
+                        Ok(_) => storage.path_size(&destination).await?,
+                        Err(AppError::NotFound) => 0,
+                        Err(error) => return Err(error),
+                    };
+                    let mut reservation =
+                        capacity.reserve_replacement(previous, if copy { size } else { 0 })?;
+                    let mut accounting = S3CapacityAccounting::new(&capacity, storage);
+                    let result = storage
+                        .transfer_path(&source, &destination, copy, overwrite, size)
+                        .await;
+                    match result {
+                        Ok(result) => {
+                            let new_size = if copy { result.size } else { 0 };
+                            reservation
+                                .rebase_replacement(result.previous_size, new_size)
+                                .map_err(|error| {
+                                    error.with_operation(
+                                        crate::error::CommitState::Committed,
+                                        crate::error::CleanupState::Pending,
+                                    )
+                                })?;
+                            reservation.commit(result.previous_size, new_size);
+                            persist_capacity(&capacity).await;
+                            accounting.settled = true;
+                            Ok(result.created)
+                        }
+                        Err(error) => {
+                            schedule_s3_capacity_reconcile(capacity, storage.clone());
+                            Err(error)
+                        }
+                    }
+                }
+            }
+        })
+        .await
     }
 
     pub async fn move_path(&self, source: &str, destination: &str) -> AppResult<()> {

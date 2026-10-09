@@ -645,28 +645,10 @@ pub async fn upload_file(
             storage_path.clone(),
         )
     });
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(state.config.upload_timeout_secs);
-    let body = Body::from_stream(futures_util::stream::unfold(
-        (body.into_data_stream(), false),
-        move |(mut stream, finished)| async move {
-            if finished {
-                return None;
-            }
-            use futures_util::StreamExt;
-            match tokio::time::timeout_at(deadline, stream.next()).await {
-                Ok(Some(chunk)) => Some((chunk.map_err(std::io::Error::other), (stream, false))),
-                Ok(None) => None,
-                Err(_) => Some((
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "upload body deadline reached",
-                    )),
-                    (stream, true),
-                )),
-            }
-        },
-    ));
+    let body = crate::transfer_limit::upload_body_with_deadline(
+        body,
+        std::time::Duration::from_secs(state.config.upload_timeout_secs),
+    );
     // Detaching the waiter must not detach result registration from a backend
     // publication which may already own an independent commit task.
     tokio::spawn(async move {

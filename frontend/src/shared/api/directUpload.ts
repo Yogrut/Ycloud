@@ -1,4 +1,4 @@
-import { ApiError, REQUEST_TIMEOUT_MS } from './client'
+import { ApiError, requireSuccess, REQUEST_TIMEOUT_MS } from './client'
 import { apiRequest } from './browser'
 import { useLocale } from '../i18n'
 
@@ -87,7 +87,8 @@ export async function uploadDirectFile(
     const failure = results.find(result => result.status === 'rejected')
     if (failure?.status === 'rejected') throw failure.reason
     if (controller.signal.aborted) throw new DOMException('Upload aborted', 'AbortError')
-    await command('complete', { session }, controller.signal)
+    const receipt = await command('complete', { session }, controller.signal)
+    requireSuccess(receipt)
     onProgress(file.size)
     return true
   } catch (error) {

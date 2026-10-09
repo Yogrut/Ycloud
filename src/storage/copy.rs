@@ -47,6 +47,129 @@ impl StorageService {
             .await
     }
 
+    pub(crate) async fn transfer_with_capacity(
+        &self,
+        source: &ResolvedPath,
+        destination: &ResolvedPath,
+        copy: bool,
+        overwrite: bool,
+        capacity: CapacityTracker,
+    ) -> AppResult<bool> {
+        reject_root_or_descendant(source, destination)?;
+        if destination.is_root() {
+            return Err(AppError::Forbidden);
+        }
+        if source
+            .relative()
+            .starts_with(&format!("{}/", destination.relative()))
+        {
+            return Err(AppError::Forbidden);
+        }
+        let ticket = self.upload_cleanup.reserve()?;
+        let permit = self.acquire_io().await?;
+        let storage = self.clone();
+        let (source, destination) = (source.clone(), destination.clone());
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _mutation = storage.mutation_gate.lock().await;
+            storage.transactions.settle_publication().await?;
+            let metadata = storage.metadata(&source).await?;
+            let existing = match storage.metadata(&destination).await {
+                Ok(metadata) => Some(metadata),
+                Err(AppError::NotFound) => None,
+                Err(error) => return Err(error),
+            };
+            if !overwrite && existing.is_some() {
+                return Err(AppError::PreconditionFailed);
+            }
+            let old_size = if existing.is_some() {
+                storage.path_size(&destination).await?
+            } else {
+                0
+            };
+            let size = if copy {
+                storage.path_size(&source).await?
+            } else {
+                0
+            };
+            let mut accounting =
+                CopyAccounting::reserve_replacement(Some(capacity), old_size, size)?;
+            let _physical = storage.reserve_physical_bytes(size).await?;
+            let temporary = if copy {
+                storage.transactions.copy_path(&TransactionId::new())
+            } else {
+                source.absolute().to_path_buf()
+            };
+            let mut ownership = crate::storage_transaction::UploadOwnership::Writer;
+            let result = async {
+                if copy {
+                    #[cfg(all(target_os = "linux", not(test)))]
+                    storage
+                        .linux_root
+                        .copy_path(
+                            source.relative(),
+                            &storage.transactions.rooted_relative(&temporary)?,
+                            metadata.is_dir(),
+                        )
+                        .await?;
+                    #[cfg(any(not(target_os = "linux"), test))]
+                    copy_staging(
+                        source.absolute().to_path_buf(),
+                        temporary.clone(),
+                        metadata.is_dir(),
+                    )
+                    .await?;
+                }
+                storage
+                    .transactions
+                    .commit_transfer(
+                        &temporary,
+                        destination.relative(),
+                        overwrite,
+                        &mut ownership,
+                        &mut accounting,
+                        old_size,
+                    )
+                    .await
+            }
+            .await;
+            if copy
+                && result.is_err()
+                && ownership == crate::storage_transaction::UploadOwnership::Writer
+            {
+                ticket.abandon_completed_copy(temporary);
+            }
+            let persisted = accounting.persist().await;
+            storage.cleanup.notify();
+            let commit = if accounting.was_published {
+                CommitState::Committed
+            } else if accounting.publication_started {
+                CommitState::Unknown
+            } else {
+                CommitState::NotCommitted
+            };
+            match (result, persisted) {
+                (Ok(created), Ok(())) => Ok(created),
+                (Ok(_), Err(error)) => {
+                    Err(error.with_operation(CommitState::Committed, CleanupState::Pending))
+                }
+                (Err(error), _) => Err(error.with_operation(
+                    commit,
+                    if commit == CommitState::NotCommitted {
+                        CleanupState::Complete
+                    } else {
+                        CleanupState::Pending
+                    },
+                )),
+            }
+        })
+        .await
+        .map_err(|error| {
+            AppError::with_source("local transfer task failed", error)
+                .with_operation(CommitState::Unknown, CleanupState::Unknown)
+        })?
+    }
+
     async fn copy_owned<F, Fut>(
         &self,
         source: &ResolvedPath,
@@ -182,13 +305,23 @@ struct CopyAccounting {
     publication_started: bool,
     was_published: bool,
     ledger_settled: bool,
+    previous_size: u64,
+    size: u64,
 }
 
 impl CopyAccounting {
     fn reserve(capacity: Option<CapacityTracker>, size: u64) -> AppResult<Self> {
+        Self::reserve_replacement(capacity, 0, size)
+    }
+
+    fn reserve_replacement(
+        capacity: Option<CapacityTracker>,
+        previous_size: u64,
+        size: u64,
+    ) -> AppResult<Self> {
         let reservation = capacity
             .as_ref()
-            .map(|tracker| tracker.reserve_replacement(0, size))
+            .map(|tracker| tracker.reserve_replacement(previous_size, size))
             .transpose()?;
         Ok(Self {
             capacity,
@@ -196,12 +329,14 @@ impl CopyAccounting {
             publication_started: false,
             was_published: false,
             ledger_settled: false,
+            previous_size,
+            size,
         })
     }
 
     fn published(&mut self, size: u64) {
         if let Some(reservation) = self.reservation.take() {
-            reservation.commit(0, size);
+            reservation.commit(self.previous_size, size);
         }
         self.publication_started = false;
         self.was_published = true;
@@ -227,6 +362,25 @@ impl CopyAccounting {
         }
         self.ledger_settled = true;
         Ok(())
+    }
+}
+
+impl crate::storage_transaction::ReplacementObserver for CopyAccounting {
+    fn prepare(&mut self, previous_size: u64) -> AppResult<()> {
+        if let Some(reservation) = &mut self.reservation {
+            reservation.rebase_replacement(previous_size, self.size)?;
+        }
+        self.previous_size = previous_size;
+        Ok(())
+    }
+    fn recovery_owned(&mut self) {
+        self.publication_started = true;
+    }
+    fn rollback_completed(&mut self) {
+        self.publication_started = false;
+    }
+    fn published(&mut self, _: u64) {
+        self.published(self.size);
     }
 }
 

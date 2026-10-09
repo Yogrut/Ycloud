@@ -83,6 +83,9 @@ export function requestJson<T>(url: string, options: RequestInit = {}, timeoutMs
   return requestWithDeadline(url, options, async response => {
     const body = await readJson<T>(response)
     const mutation = !['GET', 'HEAD'].includes((options.method ?? 'GET').toUpperCase())
+    if (mutation && response.status === 408 && !(body as ErrorEnvelope | undefined)?.error?.operation) {
+      throw new ApiError(useLocale().text('操作超时，结果尚未确认', 'The operation timed out; its result is unconfirmed'), response.status, 'operation_result_unknown', response.headers.get('x-request-id') ?? undefined)
+    }
     if (body === undefined && mutation && ((response.ok && response.status !== 204) || response.status >= 500)) {
       throw new ApiError(useLocale().text('未收到有效的操作结果，请先核对结果，不要直接重试。', 'No valid operation result was received. Verify the result before retrying.'), response.status, 'operation_result_unknown')
     }
@@ -92,10 +95,23 @@ export function requestJson<T>(url: string, options: RequestInit = {}, timeoutMs
 
 export function errorMetadata(response: Response, body: unknown) {
   const envelope = body as ErrorEnvelope | undefined
+  const message = envelope?.error?.message ?? envelope?.message
+  const permissionDenied = response.status === 403
+    && (!message || (envelope?.error?.code === 'forbidden' && message === 'Access denied'))
   return {
     code: envelope?.error?.code,
     operation: envelope?.error?.operation,
-    message: envelope?.error?.message ?? envelope?.message,
+    message: permissionDenied ? useLocale().text('无权限执行此操作', 'Permission denied for this operation') : message,
     requestId: response.headers.get('x-request-id') ?? undefined,
   }
+}
+
+export function requireSuccess(body: unknown, status = 200, requestId?: string): asserts body is { success: true } {
+  const result = body as (ErrorEnvelope & { success?: boolean }) | undefined
+  if (result?.success === true) return
+  const locale = useLocale()
+  if (result?.success === false) {
+    throw new ApiError(result.error?.message ?? result.message ?? locale.text('操作失败', 'Operation failed'), status, result.error?.code, requestId, result.error?.operation)
+  }
+  throw new ApiError(locale.text('未收到有效的操作回执', 'No valid operation receipt was received'), status, 'operation_result_unknown', requestId)
 }

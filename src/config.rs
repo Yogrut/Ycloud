@@ -358,6 +358,28 @@ mod tests {
     }
 
     #[test]
+    fn administrator_and_dav_usernames_count_characters_not_utf8_bytes() {
+        let mut config = ConfigFile::with_test_storage();
+        config.admin_username = "中".repeat(128);
+        config.shares.push(super::Share {
+            id: "unicode-dav".into(),
+            storage_id: DEFAULT_STORAGE_ID.into(),
+            name: "documents".into(),
+            path: String::new(),
+            username: Some("文".repeat(128)),
+            webdav_enabled: true,
+            password_hash: Some(config.admin_password_hash.clone()),
+            readonly: false,
+        });
+        assert!(config.validate().is_ok());
+        config.shares[0].username = Some("文".repeat(129));
+        assert!(config.validate().is_err());
+        config.shares[0].username = Some("local".into());
+        config.admin_username = "中".repeat(129);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn webdav_and_folder_lock_paths_cannot_overlap_in_either_direction() {
         assert!(paths_overlap("", "private"));
         assert!(paths_overlap("games", "games/locked"));

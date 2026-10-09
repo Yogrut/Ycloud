@@ -77,7 +77,7 @@ pub(super) async fn verify_share_access(
     }
     state
         .login_security
-        .record_success(LoginEntry::WebDav, failure_key, user_agent)
+        .clear_webdav_failures(failure_key)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     if share.readonly && is_write_method(method) {
@@ -403,8 +403,7 @@ mod tests {
             .query_events(EventQuery::default())
             .await;
         // Authorization denials do not consume the failed-password allowance.
-        assert_eq!(events.total, 1);
-        assert!(events.events[0].event.success);
+        assert_eq!(events.total, 0);
         assert!(!state
             .login_security
             .is_blocked(LoginEntry::WebDav, ip)

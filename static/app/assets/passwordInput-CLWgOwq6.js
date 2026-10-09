@@ -1,1 +1,0 @@
-import{M as e}from"./auth-CBDeFbeG.js";var t=`••••••`;function n(t){let n=t.target;n.value===`••••••`&&e(()=>n.select())}export{n,t};

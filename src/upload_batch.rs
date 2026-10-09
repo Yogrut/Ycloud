@@ -38,6 +38,7 @@ const MAX_ACTIVE_BATCHES_PER_ACCOUNT: usize = 4;
 const MAX_ACTIVE_BATCH_ITEMS: usize = 20_000;
 const MAX_RETAINED_BATCHES: usize = 128;
 const MAX_RETAINED_BATCH_ITEMS: usize = 40_000;
+const PENDING_UPLOAD_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct UploadBatchStore {
@@ -553,8 +554,8 @@ impl UploadBatchStore {
             account,
             storage_id,
             namespace_id,
-            expires_at: now + self.ttl,
-            expires_unix: batch_expires_unix(self.ttl),
+            expires_at: now + self.ttl.min(PENDING_UPLOAD_TTL),
+            expires_unix: batch_expires_unix(self.ttl.min(PENDING_UPLOAD_TTL)),
             items: items
                 .into_iter()
                 .map(|(path, (request_path, size))| {
@@ -704,7 +705,18 @@ impl UploadBatchStore {
                 paths.is_none_or(|paths| paths.contains(*path)) && item.status.can_cancel()
             })
             .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
+            .collect::<HashSet<_>>();
+        let retention = batch_retention(
+            self.ttl,
+            self.result_ttl,
+            batch.items.iter().map(|(path, item)| {
+                if cancelled.contains(path) {
+                    UploadStatus::Cancelled
+                } else {
+                    item.status
+                }
+            }),
+        );
         drop(batches);
         for path in cancelled {
             if let Some(persistence) = &self.persistence {
@@ -714,7 +726,7 @@ impl UploadBatchStore {
                         &path,
                         UploadStatus::Cancelled,
                         None,
-                        batch_expires_unix(self.result_ttl),
+                        batch_expires_unix(retention),
                     )
                     .await?;
             }
@@ -726,11 +738,6 @@ impl UploadBatchStore {
         }
         let mut batches = self.batches.lock().await;
         let batch = batches.get_mut(token).ok_or(AppError::UploadBatchExpired)?;
-        let retention = if batch_is_terminal(batch) {
-            self.result_ttl
-        } else {
-            self.ttl
-        };
         batch.expires_at = now + retention;
         batch.expires_unix = batch_expires_unix(retention);
         Ok(())
@@ -771,15 +778,17 @@ impl UploadBatchStore {
         let Some(batch) = batches.get_mut(token) else {
             return;
         };
-        let terminal = batch
-            .items
-            .iter()
-            .all(|(key, value)| key == path || value.status.is_terminal())
-            && status.is_terminal();
         if !batch.items.contains_key(path) {
             return;
         }
-        let retention = if terminal { self.result_ttl } else { self.ttl };
+        let retention = batch_retention(
+            self.ttl,
+            self.result_ttl,
+            batch
+                .items
+                .iter()
+                .map(|(key, item)| if key == path { status } else { item.status }),
+        );
         let expires_unix = batch_expires_unix(retention);
         drop(batches);
         if let Some(persistence) = &self.persistence {
@@ -916,6 +925,25 @@ pub(crate) fn namespace_id(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+fn batch_retention(
+    upload_ttl: Duration,
+    result_ttl: Duration,
+    statuses: impl Iterator<Item = UploadStatus>,
+) -> Duration {
+    let mut terminal = true;
+    for status in statuses {
+        if status.needs_recovery() {
+            return upload_ttl;
+        }
+        terminal &= status.is_terminal();
+    }
+    if terminal {
+        result_ttl
+    } else {
+        upload_ttl.min(PENDING_UPLOAD_TTL)
+    }
 }
 
 fn batch_is_retained(batch: &UploadBatch, now: Instant) -> bool {
@@ -1202,6 +1230,28 @@ pub async fn upload_batch_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_names_expire_soon_but_running_and_unknown_results_keep_their_budget() {
+        let upload = Duration::from_secs(6 * 60 * 60);
+        let result = Duration::from_secs(24 * 60 * 60);
+        let retention =
+            |statuses: Vec<UploadStatus>| batch_retention(upload, result, statuses.into_iter());
+        assert_eq!(retention(vec![UploadStatus::Pending]), PENDING_UPLOAD_TTL);
+        assert_eq!(
+            retention(vec![UploadStatus::Complete, UploadStatus::Pending]),
+            PENDING_UPLOAD_TTL
+        );
+        assert_eq!(
+            retention(vec![UploadStatus::Pending, UploadStatus::InProgress]),
+            upload
+        );
+        assert_eq!(retention(vec![UploadStatus::Unknown]), upload);
+        assert_eq!(
+            retention(vec![UploadStatus::Complete, UploadStatus::Cancelled]),
+            result
+        );
+    }
 
     #[tokio::test]
     async fn slow_ticket_write_does_not_block_another_batch_or_status_reads() {

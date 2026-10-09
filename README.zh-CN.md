@@ -147,7 +147,7 @@ WebDAV 共用后台单文件上传大小限制、全站流量额度和上传/下
 
 HEAD 只返回文件元数据，不读取正文。条件续传（`If-Range`）只有匹配当前 S3 强 ETag 时返回分段；版本不同或无法证明一致时返回完整文件。本地文件不以大小、时间冒充强版本，因此普通 Range 可用，但带 `If-Range` 时保守返回完整文件。
 
-WebDAV 目录查询支持 `Depth: 0` 和 `Depth: 1`、指定属性、属性名及 allprop/include。目录递归查询（含省略 Depth）明确返回 403 和 `propfind-finite-depth`，不会只列一层却假报递归成功；客户端应使用 Depth 0/1。当前不支持的属性单独返回 404，未增加 WebDAV 锁或断点续写能力。
+PROPFIND 支持 UTF-8 和 UTF-16 XML。WebDAV 目录查询支持 `Depth: 0` 和 `Depth: 1`、指定属性、属性名及 allprop/include。目录递归查询（含省略 Depth）明确返回 403 和 `propfind-finite-depth`，不会只列一层却假报递归成功；客户端应使用 Depth 0/1。当前不支持的属性单独返回 404，未增加 WebDAV 锁或断点续写能力。
 
 WebDAV PUT 支持写入条件，条件失败返回 412 且不改动目标。本地支持存在性条件及修改时间核验，不提供虚假的强 ETag；S3 核验原子条件能力后使用版本条件发布，不确定结果不自动重传或回滚正式文件。其他方法的写入条件、DAV If 锁条件、OSS 条件上传及超过 4 GiB 的 S3 条件上传目前明确拒绝，不忽略条件继续写入；无条件上传保持原有规则。详细边界见 [后台设计](docs/backend-design.zh-CN.md#webdav-条件写入边界)。
 

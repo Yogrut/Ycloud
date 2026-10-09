@@ -17,6 +17,11 @@ async fn fixture() -> (TestDirectory, Router) {
 }
 
 async fn fixture_with_access(readonly: bool) -> (TestDirectory, Router) {
+    let (directory, app, _) = fixture_with_state(readonly).await;
+    (directory, app)
+}
+
+async fn fixture_with_state(readonly: bool) -> (TestDirectory, Router, crate::state::AppState) {
     let directory = TestDirectory::new("dav-protocol-query");
     let state = app_state(
         &directory,
@@ -41,7 +46,240 @@ async fn fixture_with_access(readonly: bool) -> (TestDirectory, Router) {
     tokio::fs::create_dir(state.config.storage_path.join("folder"))
         .await
         .unwrap();
-    (directory, crate::app::build_router(state))
+    (directory, crate::app::build_router(state.clone()), state)
+}
+
+#[tokio::test]
+async fn directory_result_logs_after_processing_without_counting_protocol_errors_as_bad_passwords()
+{
+    let (_directory, app, state) = fixture_with_state(true).await;
+    let (status, _) = propfind(&app, "/dav/documents/", Some("0"), "invalid XML").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let events = state
+        .login_security
+        .query_events(crate::login_security::EventQuery::default())
+        .await;
+    assert_eq!(events.total, 1);
+    assert!(!events.events[0].event.success);
+    assert_eq!(events.events[0].event.failed_attempts, 0);
+    assert!(events.events[0].event.result.contains("400"));
+    let (status, _) = propfind(&app, "/dav/documents/", Some("1"), "").await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    let events = state
+        .login_security
+        .query_events(crate::login_security::EventQuery::default())
+        .await;
+    assert_eq!(events.total, 2);
+    assert!(events.events[0].event.success);
+    assert_eq!(events.events[0].event.failed_attempts, 0);
+}
+
+#[tokio::test]
+async fn mkcol_does_not_silently_discard_an_unsupported_body() {
+    let (_directory, app, state) = fixture_with_state(false).await;
+    let response = app
+        .clone()
+        .oneshot(
+            authorized_request("MKCOL", "/dav/documents/new-folder")
+                .body(Body::from("unsupported collection payload"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert!(!state.config.storage_path.join("new-folder").exists());
+}
+
+#[tokio::test]
+async fn copy_and_move_honor_overwrite_for_files_directories_and_cross_type_replacement() {
+    for method in ["COPY", "MOVE"] {
+        for (source_directory, target_directory) in
+            [(false, false), (true, true), (false, true), (true, false)]
+        {
+            for overwrite in [None, Some("T"), Some("F"), Some("t"), Some("f")] {
+                let (_directory, app, state) = fixture_with_state(false).await;
+                let root = &state.config.storage_path;
+                if source_directory {
+                    tokio::fs::create_dir_all(root.join("source/nested"))
+                        .await
+                        .unwrap();
+                    tokio::fs::write(root.join("source/nested/新文件.txt"), b"new data")
+                        .await
+                        .unwrap();
+                } else {
+                    tokio::fs::write(root.join("source"), b"new data")
+                        .await
+                        .unwrap();
+                }
+                if target_directory {
+                    tokio::fs::create_dir(root.join("target")).await.unwrap();
+                    tokio::fs::write(root.join("target/old-only.txt"), b"old data")
+                        .await
+                        .unwrap();
+                } else {
+                    tokio::fs::write(root.join("target"), b"old data")
+                        .await
+                        .unwrap();
+                }
+                let mut request = authorized_request(method, "/dav/documents/source").header(
+                    "Destination",
+                    "https://127.0.0.1:18473/dav/documents/target",
+                );
+                if let Some(value) = overwrite {
+                    request = request.header("Overwrite", value);
+                }
+                let response = app
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                if overwrite.is_some_and(|value| value.eq_ignore_ascii_case("F")) {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::PRECONDITION_FAILED,
+                        "{method}, source dir={source_directory}, target dir={target_directory}"
+                    );
+                    let old = if target_directory {
+                        root.join("target/old-only.txt")
+                    } else {
+                        root.join("target")
+                    };
+                    assert_eq!(tokio::fs::read(old).await.unwrap(), b"old data");
+                    assert!(root.join("source").exists());
+                } else {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::NO_CONTENT,
+                        "{method}, source dir={source_directory}, target dir={target_directory}"
+                    );
+                    let new = if source_directory {
+                        root.join("target/nested/新文件.txt")
+                    } else {
+                        root.join("target")
+                    };
+                    assert_eq!(tokio::fs::read(new).await.unwrap(), b"new data");
+                    assert!(!root.join("target/old-only.txt").exists());
+                    assert_eq!(root.join("source").exists(), method == "COPY");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn copy_move_creation_and_invalid_headers_preserve_source_and_target_contracts() {
+    for method in ["COPY", "MOVE"] {
+        let (_directory, app, state) = fixture_with_state(false).await;
+        let response = app
+            .clone()
+            .oneshot(
+                authorized_request(method, "/dav/documents/note.txt")
+                    .header("Destination", "/dav/documents/new.txt")
+                    .header("Overwrite", "F")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            tokio::fs::read(state.config.storage_path.join("new.txt"))
+                .await
+                .unwrap(),
+            b"file bytes"
+        );
+        for invalid in ["true", "false", "TF", ""] {
+            let response = app
+                .clone()
+                .oneshot(
+                    authorized_request(method, "/dav/documents/new.txt")
+                        .header("Destination", "/dav/documents/rejected.txt")
+                        .header("Overwrite", invalid)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(!state.config.storage_path.join("rejected.txt").exists());
+        }
+        let response = app
+            .oneshot(
+                authorized_request(method, "/dav/documents/new.txt")
+                    .header("Destination", "/dav/documents/rejected.txt")
+                    .header("Overwrite", "T")
+                    .header("Overwrite", "F")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn failed_or_readonly_transfers_do_not_remove_the_destination() {
+    for readonly in [false, true] {
+        for method in ["COPY", "MOVE"] {
+            let (_directory, app, state) = fixture_with_state(readonly).await;
+            let response = app
+                .oneshot(
+                    authorized_request(method, "/dav/documents/missing")
+                        .header("Destination", "/dav/documents/note.txt")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if readonly {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            );
+            assert_eq!(
+                tokio::fs::read(state.config.storage_path.join("note.txt"))
+                    .await
+                    .unwrap(),
+                b"file bytes"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn overwriting_transfers_settle_capacity_once_and_do_not_change_browser_copy_rules() {
+    for copy in [false, true] {
+        let (_directory, _app, state) = fixture_with_state(false).await;
+        let backend = state.storage_backend("primary").await.unwrap();
+        backend
+            .upload_file("source.bin", Body::from("new"), Some(3), 1024, None)
+            .await
+            .unwrap();
+        backend
+            .upload_file("target.bin", Body::from("previous"), Some(8), 1024, None)
+            .await
+            .unwrap();
+        let before = backend.capacity_status().used;
+        assert!(backend.copy_path("source.bin", "target.bin").await.is_err());
+        assert_eq!(
+            tokio::fs::read(state.config.storage_path.join("target.bin"))
+                .await
+                .unwrap(),
+            b"previous"
+        );
+        assert!(!backend
+            .dav_transfer("source.bin", "target.bin", copy, true)
+            .await
+            .unwrap());
+        assert_eq!(
+            backend.capacity_status().used,
+            before - 8 + if copy { 3 } else { 0 }
+        );
+        assert_eq!(backend.capacity_status().reserved, 0);
+    }
 }
 
 async fn propfind(
@@ -116,6 +354,91 @@ fn authorized_request(method: &str, path: &str) -> axum::http::request::Builder 
         .extension(axum::extract::ConnectInfo(
             "127.0.0.1:50000".parse::<std::net::SocketAddr>().unwrap(),
         ))
+}
+
+#[tokio::test]
+async fn utf16_propfinds_work_through_authenticated_http_and_keep_utf8_responses() {
+    let (_directory, app) = fixture().await;
+    for little_endian in [true, false] {
+        for bom in [true, false] {
+            let charset = if bom {
+                "utf-16"
+            } else if little_endian {
+                "utf-16le"
+            } else {
+                "utf-16be"
+            };
+            let text = format!(
+                r#"<?xml version="1.0" encoding="{charset}"?><propfind xmlns="DAV:" xmlns:x="urn:照片📷"><prop><displayname/><x:标题/></prop></propfind>"#
+            );
+            let mut bytes = Vec::new();
+            if bom {
+                bytes.extend_from_slice(if little_endian {
+                    &[0xff, 0xfe]
+                } else {
+                    &[0xfe, 0xff]
+                });
+            }
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            let mut request = authorized_request("PROPFIND", "/dav/documents/")
+                .header("Depth", "1")
+                .body(Body::from(bytes))
+                .unwrap();
+            request.headers_mut().insert(
+                header::CONTENT_TYPE,
+                format!("application/xml; charset={charset}")
+                    .parse()
+                    .unwrap(),
+            );
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/xml; charset=utf-8"
+            );
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let xml = std::str::from_utf8(&body).unwrap();
+            let document = roxmltree::Document::parse(xml).unwrap();
+            assert_eq!(
+                document
+                    .descendants()
+                    .filter(|node| node.has_tag_name(("DAV:", "response")))
+                    .count(),
+                3
+            );
+            assert!(xml.contains("urn:照片📷"));
+            assert!(xml.contains("HTTP/1.1 404 Not Found"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn propfind_encoding_errors_keep_the_shared_safe_error_contract() {
+    let (_directory, app) = fixture().await;
+    let response = app
+        .oneshot(
+            authorized_request("PROPFIND", "/dav/documents/")
+                .header("Depth", "0")
+                .body(Body::from(vec![0xff, 0xfe, 0x3c]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "bad_request");
+    assert!(json["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("utf16_invalid"));
+    assert!(!String::from_utf8_lossy(&body).contains("protocol-password"));
 }
 
 #[tokio::test]

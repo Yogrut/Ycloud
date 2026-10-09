@@ -1,10 +1,24 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { batchOperation, cancelUploadBatch, checkDownload, createFolder, downloadUrl, fileApi, getUploadBatchStatus, isPreviewTrafficExhausted, prepareArchive, prepareUploadBatch, uploadFile } from './browser'
+import { batchOperation, cancelUploadBatch, checkDownload, createFolder, downloadUrl, fileApi, getUploadBatchStatus, isPreviewTrafficExhausted, prepareArchive, prepareUploadBatch, renameItem, uploadFile } from './browser'
 import { formatSize } from '../format'
 import { REQUEST_TIMEOUT_MS } from './client'
 
 describe('browser API paths', () => {
   afterEach(() => vi.unstubAllGlobals())
+
+  it('reports a rejected rename as permission denied instead of a generic HTTP failure', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 403 })))
+    await expect(renameItem('', 'old.txt', 'new.txt')).rejects.toMatchObject({
+      message: '无权限执行此操作', status: 403, blocksRetry: false,
+    })
+  })
+
+  it('uses the same permission fallback for an empty batch rejection', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 403 })))
+    await expect(batchOperation('delete', ['old.txt'])).rejects.toMatchObject({
+      message: '无权限执行此操作', status: 403, blocksRetry: false,
+    })
+  })
 
   it('checks download admission without consuming file content', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 429 }))
@@ -197,11 +211,13 @@ describe('mutation result transport', () => {
     class StallRequest extends EventTarget {
       static current: StallRequest
       status = 200
+      responseText = JSON.stringify({ success: true })
       withCredentials = false
       upload = new EventTarget()
       abort = vi.fn(() => this.dispatchEvent(new Event('abort')))
       constructor() { super(); StallRequest.current = this }
       open(): void {}
+      getResponseHeader(): null { return null }
       setRequestHeader(): void {}
       send(): void {}
     }
@@ -230,6 +246,19 @@ describe('mutation result transport', () => {
     request.dispatchEvent(new Event('load'))
     await pending
     expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each(['<html>proxy page</html>', '{}', '{"success":false}'])('does not complete an upload from an invalid 200 receipt: %s', async responseText => {
+    const { request, pending } = stalledUpload()
+    request.responseText = responseText
+    const rejected = expect(pending).rejects.toBeInstanceOf(Error)
+    request.dispatchEvent(new Event('load'))
+    await rejected
+  })
+
+  it('does not treat a negative rename receipt as success', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: false, message: 'rename refused' }))))
+    await expect(renameItem('', 'old.txt', 'new.txt')).rejects.toThrow('rename refused')
   })
 
   it('keeps upload commit metadata and treats lost responses as unknown', async () => {

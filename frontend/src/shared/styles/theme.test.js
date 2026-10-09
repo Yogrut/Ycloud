@@ -148,12 +148,14 @@ describe('interactive focus styling', () => {
 
   it('keeps the file browser compact and exposes mobile actions below search', () => {
     expect(themeCss).toContain('.file-row { min-height: 50px; cursor: default; user-select: none; }')
-    expect(themeCss).toContain('.file-pagination { min-height: 58px;')
+    expect(themeCss).toContain('.file-pagination { flex: 0 0 auto; min-height: 44px;')
     expect(themeCss).toContain('height: 100%; margin: 0 auto; padding: 12px 0 34px;')
-    expect(themeCss).toContain('overflow: hidden; padding: 26px 28px 30px;')
+    expect(themeCss).toContain('overflow: hidden; padding: 26px 28px 14px;')
     const mobile = themeCss.match(/@media \(max-width: 760px\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     expect(mobile).toContain('.file-toolbar-actions { width: 100%; }')
     expect(mobile).toContain('.file-row { min-height: 48px; }')
+    expect(mobile).toContain('.file-panel { padding: 18px 14px 12px;')
+    expect(mobile).toContain('.file-pagination { min-height: 44px; gap: 10px; padding: 8px 4px 0;')
   })
 
   it('keeps the folder lock indicator smaller than the file icon', () => {
@@ -163,6 +165,8 @@ describe('interactive focus styling', () => {
   })
 
   it('uses matching compact pagination controls and a soft-blue current page', () => {
+    const trafficPanel = readFileSync('src/apps/admin/TrafficPanel.vue', 'utf8')
+    expect(trafficPanel).toMatch(/\.range-presets button\s*\{[^}]*min-width: 60px; height: 28px; padding: 0 10px;[^}]*font-size: 13px;/)
     expect(themeCss).toContain('.page-size-select { width: 60px; height: 34px;')
     expect(themeCss).toContain('.page-size-select .app-select-trigger { min-height: 34px; height: 34px;')
     expect(themeCss).toContain('.page-size-select .app-select-menu { right: 0; left: auto; width: 100%; }')

@@ -114,7 +114,7 @@ impl TransactionPaths {
         let (trash, _) = self
             .inventory_page(&self.trash, InventoryKind::Tree, MAX_RECOVERY_ENTRIES)
             .await?;
-        let backups = self.inventory(&self.backups, InventoryKind::File).await?;
+        let backups = self.inventory(&self.backups, InventoryKind::Tree).await?;
         let anchors = self.inventory(&self.anchors, InventoryKind::File).await?;
         let deletion_files = self
             .inventory(&self.deletions, InventoryKind::Journal)
@@ -138,7 +138,8 @@ impl TransactionPaths {
                 }
             })?;
             if !journal.published {
-                self.validate_destination(&journal.destination).await?;
+                self.validate_destination_kind(&journal.destination, journal.version == 4)
+                    .await?;
             }
             if journal_anchors
                 .insert(journal.id.clone(), journal.anchored)
@@ -223,7 +224,7 @@ impl TransactionPaths {
     ) -> AppResult<()> {
         let destination = root.join(&journal.destination);
         let backup = self.backups.join(&journal.id);
-        let upload = self.upload_path(&journal.id);
+        let upload = self.replacement_source(&journal);
         let anchor = self.anchors.join(&journal.id);
         // Never convert inspection failures into "the destination is absent".
         let destination_exists = if journal.published {
@@ -299,12 +300,16 @@ impl TransactionPaths {
             self.rooted_sync_parent(&destination).await?;
             self.rooted_sync_parent(&backup).await?;
         } else if backup_exists {
-            self.rooted_remove_file_idempotent(&backup).await?;
-            self.rooted_sync_parent(&backup).await?;
+            self.cleanup_replacement_backup(&backup, journal.replaced_bytes)
+                .await?;
         }
         // The journal remains the recovery owner until cleanup really succeeds.
-        self.rooted_remove_file_idempotent(&upload).await?;
-        self.rooted_sync_parent(&upload).await?;
+        if journal.staged_copy {
+            self.handoff_recovered_copy(&upload).await?;
+        } else if journal.transfer_source.is_none() {
+            self.rooted_remove_file_idempotent(&upload).await?;
+            self.rooted_sync_parent(&upload).await?;
+        }
         if journal.anchored {
             self.rooted_remove_file_idempotent(&anchor).await?;
             self.rooted_sync_parent(&anchor).await?;

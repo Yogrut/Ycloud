@@ -1,9 +1,43 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, errorMetadata, readJson, requestJson, REQUEST_TIMEOUT_MS } from './client'
+import { ApiError, errorMetadata, readJson, requestJson, requireSuccess, REQUEST_TIMEOUT_MS } from './client'
+import { useLocale } from '../i18n'
 
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
 
 describe('API client primitives', () => {
+  it('validates success at runtime rather than trusting the declared type', () => {
+    expect(() => requireSuccess({ success: true })).not.toThrow()
+    expect(() => requireSuccess({ success: false, message: 'write failed' })).toThrow('write failed')
+    for (const receipt of [undefined, null, {}, '<html>proxy page</html>', { success: 1 }]) {
+      try { requireSuccess(receipt); expect.unreachable() }
+      catch (error) { expect(error).toMatchObject({ code: 'operation_result_unknown', blocksRetry: true }) }
+    }
+  })
+  it('classifies an unqualified write timeout as unknown but preserves definite non-commit evidence', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'request_timeout' } }), { status: 408 })))
+    await expect(requestJson('/write', { method: 'PUT' })).rejects.toMatchObject({ status: 408, code: 'operation_result_unknown', blocksRetry: true })
+    const operation = { commit: 'not_committed', cleanup: 'complete', retry: 'after_correction' }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'request_timeout', operation } }), { status: 408 })))
+    await expect(requestJson('/write', { method: 'PUT' })).resolves.toMatchObject({ body: { error: { operation } } })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(new Response('{}', { status: 408 })))
+    await expect(requestJson('/read')).resolves.toMatchObject({ response: { status: 408 } })
+  })
+  it.each(['zh-CN', 'en'] as const)('localizes bare and generic permission denials in %s without losing metadata', locale => {
+    const previous = useLocale().current.value
+    useLocale().set(locale)
+    try {
+      const response = new Response(null, { status: 403, headers: { 'x-request-id': 'denied-request' } })
+      const expected = locale === 'en' ? 'Permission denied for this operation' : '无权限执行此操作'
+      expect(errorMetadata(response, undefined).message).toBe(expected)
+      const operation = { commit: 'not_committed', cleanup: 'complete', retry: 'after_correction' } as const
+      expect(errorMetadata(response, { error: { code: 'forbidden', message: 'Access denied', operation } })).toEqual({
+        code: 'forbidden', message: expected, requestId: 'denied-request', operation,
+      })
+      expect(errorMetadata(response, { error: { code: 'forbidden', message: '没有创建目录的权限' } }).message).toBe('没有创建目录的权限')
+      expect(errorMetadata(new Response(null, { status: 404 }), undefined).message).toBeUndefined()
+    } finally { useLocale().set(previous) }
+  })
+
   it('preserves a definite precondition failure without classifying it as an unknown commit', async () => {
     const response = new Response(JSON.stringify({ error: { code: 'precondition_failed', message: 'Refresh the file version', operation: { commit: 'not_committed', cleanup: 'complete', retry: 'after_correction' } } }), { status: 412, headers: { 'Content-Type': 'application/json' } })
     const metadata = errorMetadata(response, await readJson(response) ?? {})

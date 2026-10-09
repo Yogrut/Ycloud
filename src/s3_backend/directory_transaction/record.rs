@@ -8,12 +8,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{AppError, AppResult},
     s3_backend::{
-        authenticated_journal, internal_key, list_prefix, valid_transaction_id, S3MultipartSession,
+        authenticated_journal, internal_key, list_prefix, object_key, valid_transaction_id,
+        S3MultipartSession,
     },
     storage::StorageService,
 };
 
-pub(super) const SCHEMA_VERSION: u32 = 2;
+pub(super) const SCHEMA_VERSION: u32 = 3;
 const JOURNAL_PURPOSE: &str = "directory-transaction:v2";
 pub(super) const MAX_OBJECTS: usize = 1_000;
 // Keep the existing conservative directory limit, not the provider's copy limit.
@@ -70,6 +71,10 @@ pub(super) struct Transaction {
     pub(super) destination_relative: Option<String>,
     pub(super) stage: Stage,
     pub(super) objects: Vec<ObjectRecord>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) source_is_file: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) replacement: Option<Box<Transaction>>,
     #[serde(default)]
     pub(super) auth_tag: String,
 }
@@ -94,7 +99,7 @@ fn validate_transaction_structure(
     journal_key: &str,
     transaction: &Transaction,
 ) -> AppResult<()> {
-    if transaction.schema_version != SCHEMA_VERSION
+    if !matches!(transaction.schema_version, 2 | 3)
         || !valid_transaction_id(&transaction.id)
         || journal_key != internal_key(prefix, JOURNAL_CATEGORY, &transaction.id)
         || transaction.objects.is_empty()
@@ -102,14 +107,40 @@ fn validate_transaction_structure(
     {
         return Err(invalid_transaction());
     }
+    if transaction.schema_version == 2
+        && (transaction.source_is_file || transaction.replacement.is_some())
+    {
+        return Err(invalid_transaction());
+    }
     let source = StorageService::normalize_relative(&transaction.source_relative)?;
     if source.is_empty() || source != transaction.source_relative {
         return Err(invalid_transaction());
     }
-    let source_prefix = list_prefix(prefix, &source)?;
+    let source_prefix = if transaction.source_is_file {
+        object_key(prefix, &source)?
+    } else {
+        list_prefix(prefix, &source)?
+    };
     let target_prefix = expected_target_prefix(prefix, transaction, &source)?;
 
     validate_transaction_progress(transaction)?;
+    if let Some(replacement) = &transaction.replacement {
+        if transaction.operation == Operation::Delete
+            || replacement.operation != Operation::Delete
+            || replacement.id != transaction.id
+            || replacement.replacement.is_some()
+            || Some(&replacement.source_relative) != transaction.destination_relative.as_ref()
+            || replacement.stage != Stage::SourcesDeleted
+                && (transaction.stage != Stage::CopyingTargets
+                    || transaction
+                        .objects
+                        .iter()
+                        .any(|object| object.target_etag.is_some() || object.source_deleted))
+        {
+            return Err(invalid_transaction());
+        }
+        validate_transaction_structure(prefix, journal_key, replacement)?;
+    }
 
     let mut source_keys = BTreeSet::new();
     let mut target_keys = BTreeSet::new();
@@ -119,6 +150,7 @@ fn validate_transaction_structure(
             .strip_prefix(&source_prefix)
             .ok_or_else(invalid_transaction)?;
         if object.source_key.len() > MAX_OBJECT_KEY_BYTES
+            || transaction.source_is_file && !suffix.is_empty()
             || object.target_key.len() > MAX_OBJECT_KEY_BYTES
             || object.source_etag.is_empty()
             || object.size > MAX_SINGLE_COPY_BYTES
@@ -184,12 +216,21 @@ fn transaction_auth_bytes(transaction: &Transaction) -> AppResult<Vec<u8>> {
     Ok(encoded)
 }
 
+fn journal_purpose(transaction: &Transaction) -> &'static str {
+    if transaction.schema_version == 2 {
+        JOURNAL_PURPOSE
+    } else {
+        "directory-transaction:v3"
+    }
+}
+
 pub(super) fn sign_transaction(
     auth_key: &[u8; 32],
     transaction: &mut Transaction,
 ) -> AppResult<()> {
     let payload = transaction_auth_bytes(transaction)?;
-    transaction.auth_tag = authenticated_journal::sign_payload(auth_key, JOURNAL_PURPOSE, &payload);
+    transaction.auth_tag =
+        authenticated_journal::sign_payload(auth_key, journal_purpose(transaction), &payload);
     Ok(())
 }
 
@@ -197,7 +238,7 @@ fn verify_transaction_auth(auth_key: &[u8; 32], transaction: &Transaction) -> Ap
     let payload = transaction_auth_bytes(transaction)?;
     authenticated_journal::verify_payload(
         auth_key,
-        JOURNAL_PURPOSE,
+        journal_purpose(transaction),
         &payload,
         &transaction.auth_tag,
     )
@@ -220,10 +261,15 @@ fn expected_target_prefix(
                 || normalized != destination
                 || normalized == source
                 || normalized.starts_with(&format!("{source}/"))
+                || source.starts_with(&format!("{normalized}/"))
             {
                 return Err(invalid_transaction());
             }
-            list_prefix(prefix, &normalized)
+            if transaction.source_is_file {
+                object_key(prefix, &normalized)
+            } else {
+                list_prefix(prefix, &normalized)
+            }
         }
         Operation::Delete => {
             if transaction.destination_relative.is_some() {
@@ -242,10 +288,14 @@ pub(super) fn directory_multipart_target_matches(
     transaction: &Transaction,
     session: &S3MultipartSession,
 ) -> bool {
-    transaction.operation == Operation::Delete
+    (transaction.operation == Operation::Delete
         && transaction.objects.iter().any(|object| {
             object.target_key == session.key && Some(object.size) == session.expected_size
-        })
+        }))
+        || transaction
+            .replacement
+            .as_ref()
+            .is_some_and(|replacement| directory_multipart_target_matches(replacement, session))
 }
 
 pub(super) fn directory_copy_id(transaction_id: &str, source_key: &str) -> String {
@@ -355,6 +405,8 @@ mod tests {
                 target_etag: None,
                 source_deleted: false,
             }],
+            source_is_file: false,
+            replacement: None,
             auth_tag: String::new(),
         };
         sign_transaction(&[0x31; 32], &mut transaction).unwrap();
@@ -423,6 +475,8 @@ mod tests {
                 target_etag: Some("trash-etag".into()),
                 source_deleted: true,
             }],
+            source_is_file: false,
+            replacement: None,
             auth_tag: String::new(),
         };
         let key = internal_key("tenant/", JOURNAL_CATEGORY, id);
@@ -555,7 +609,43 @@ mod tests {
                     source_deleted: false,
                 },
             ],
+            source_is_file: false,
+            replacement: None,
             auth_tag: String::new(),
         }
+    }
+
+    #[test]
+    fn overwrite_retains_each_existing_manifest_budget_instead_of_halving_it() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let key = internal_key("tenant/", JOURNAL_CATEGORY, id);
+        let mut transaction = copy_transaction(id);
+        let mut template = transaction.objects[0].clone();
+        template.target_etag = None;
+        transaction.objects = (0..600)
+            .map(|index| ObjectRecord {
+                source_key: format!("tenant/source/{index}.bin"),
+                target_key: format!("tenant/destination/{index}.bin"),
+                ..template.clone()
+            })
+            .collect();
+        let mut replacement = copy_transaction(id);
+        replacement.operation = Operation::Delete;
+        replacement.source_relative = "destination".into();
+        replacement.destination_relative = None;
+        replacement.objects = (0..600)
+            .map(|index| ObjectRecord {
+                source_key: format!("tenant/destination/old-{index}.bin"),
+                target_key: internal_key(
+                    "tenant/",
+                    TRASH_CATEGORY,
+                    &format!("{id}/old-{index}.bin"),
+                ),
+                ..template.clone()
+            })
+            .collect();
+        transaction.replacement = Some(Box::new(replacement));
+        sign_transaction(&[0x41; 32], &mut transaction).unwrap();
+        validate_transaction(&[0x41; 32], "tenant/", &key, &transaction).unwrap();
     }
 }

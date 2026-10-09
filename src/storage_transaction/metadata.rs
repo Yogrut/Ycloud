@@ -81,6 +81,16 @@ pub(super) struct ReplaceJournal {
     pub operation_size: Option<u64>,
     #[serde(default)]
     pub anchored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_source: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub staged_copy: bool,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replaced_bytes: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -126,16 +136,41 @@ impl ReplaceJournal {
             operation_id: None,
             operation_size: None,
             anchored: false,
+            transfer_source: None,
+            staged_copy: false,
+            replaced_bytes: 0,
         };
         journal.validate()?;
         Ok(journal)
     }
 
     pub fn validate(&self) -> AppResult<()> {
-        if self.version > 3 || (self.version < 2 && self.published) {
+        if self.version > 4 || (self.version < 2 && self.published) {
             return Err(AppError::Conflict(
                 "Unsupported transaction journal version; recovery stopped".into(),
             ));
+        }
+        if self.version == 4 && !(self.staged_copy ^ self.transfer_source.is_some()) {
+            return Err(AppError::Conflict("Invalid transfer journal".into()));
+        }
+        if self.staged_copy || self.transfer_source.is_some() {
+            if self.version != 4
+                || self.anchored
+                || self.operation_id.is_some()
+                || self.staged_copy && self.transfer_source.is_some()
+            {
+                return Err(AppError::Conflict("Invalid transfer journal".into()));
+            }
+            if let Some(source) = &self.transfer_source {
+                if source.is_empty()
+                    || StorageService::normalize_relative(source)? != *source
+                    || source == &self.destination
+                    || source.starts_with(&format!("{}/", self.destination))
+                    || self.destination.starts_with(&format!("{source}/"))
+                {
+                    return Err(AppError::Conflict("Invalid transfer source".into()));
+                }
+            }
         }
         match (&self.operation_id, self.operation_size) {
             (None, None) => {}
@@ -177,6 +212,17 @@ pub(super) fn resource_id(path: &Path) -> AppResult<TransactionId> {
 #[cfg(test)]
 mod tests {
     use super::valid_operation_id;
+
+    #[test]
+    fn ordinary_upload_records_do_not_gain_transfer_fields() {
+        let journal =
+            super::ReplaceJournal::new(super::TransactionId::new(), "file.txt".into()).unwrap();
+        let encoded = serde_json::to_value(journal).unwrap();
+        assert_eq!(encoded["version"], 3);
+        for key in ["transfer_source", "staged_copy", "replaced_bytes"] {
+            assert!(encoded.get(key).is_none());
+        }
+    }
 
     #[test]
     fn operation_id_requires_exactly_32_lowercase_hex_digits() {

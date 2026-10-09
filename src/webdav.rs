@@ -1,7 +1,8 @@
 use axum::{
     body::Body,
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Request, State},
     http::{header, HeaderMap, Method, StatusCode},
+    middleware::Next,
     response::Response,
 };
 
@@ -28,6 +29,57 @@ use crate::{
 };
 
 const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
+
+pub(crate) async fn record_request_result(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let directory_request =
+        request.method().as_str() == "PROPFIND" && request.uri().path().starts_with("/dav/");
+    let client_ip = request
+        .extensions()
+        .get::<ClientIp>()
+        .map(|client| client.0);
+    let user_agent = directory_request
+        .then(|| {
+            request
+                .headers()
+                .get(header::USER_AGENT)?
+                .to_str()
+                .ok()
+                .map(str::to_owned)
+        })
+        .flatten();
+    let response = next.run(request).await;
+    if directory_request && response.status() != StatusCode::UNAUTHORIZED {
+        if let Some(ip) = client_ip {
+            let result = if response.status() == StatusCode::MULTI_STATUS {
+                state
+                    .login_security
+                    .record_success(
+                        crate::login_security::LoginEntry::WebDav,
+                        ip,
+                        user_agent.as_deref(),
+                    )
+                    .await
+            } else {
+                state
+                    .login_security
+                    .record_webdav_request_failure(
+                        ip,
+                        user_agent.as_deref(),
+                        response.status().as_u16(),
+                    )
+                    .await
+            };
+            if let Err(error) = result {
+                tracing::warn!(%error, "failed to record WebDAV request result");
+            }
+        }
+    }
+    response
+}
 
 pub async fn webdav_handler(
     State(state): State<AppState>,
@@ -89,7 +141,12 @@ pub async fn webdav_handler(
             .await
         }
         "DELETE" => handle_delete(&backend, &share, &sub_path).await,
-        "MKCOL" => handle_mkcol(&backend, &share, &sub_path).await,
+        "MKCOL" => {
+            if !control_body.is_empty() {
+                return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE.into());
+            }
+            handle_mkcol(&backend, &share, &sub_path).await
+        }
         "MOVE" => handle_move_or_copy(&backend, &share, &sub_path, &headers, false).await,
         "COPY" => handle_move_or_copy(&backend, &share, &sub_path, &headers, true).await,
         // [稳定 + 安全] DAV class-2 locks were removed because the previous
@@ -107,8 +164,10 @@ async fn handle_propfind(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, DavError> {
-    let depth = propfind_depth(headers)?;
-    let query = webdav_xml::PropfindQuery::parse(body)?;
+    let depth = propfind_depth(headers).inspect_err(|_| {
+        tracing::warn!(reason = "depth_invalid", "WebDAV PROPFIND rejected");
+    })?;
+    let query = webdav_xml::PropfindQuery::parse(body, headers.get(header::CONTENT_TYPE))?;
     let target = share_storage_path(share, sub_path);
     let metadata = backend.metadata(&target).await?;
     if metadata.is_dir && depth == PropfindDepth::Infinity {
@@ -231,6 +290,10 @@ async fn handle_put(
             expected_bytes.unwrap_or(1),
         )
         .await?;
+    let body = crate::transfer_limit::upload_body_with_deadline(
+        body,
+        std::time::Duration::from_secs(state.config.upload_timeout_secs),
+    );
     let (body, meter) =
         state
             .traffic
@@ -246,7 +309,13 @@ async fn handle_put(
             content_type,
         )
         .await;
-    mutation_response(meter.finish(result), StatusCode::CREATED)
+    let result = meter.finish(result);
+    let status = if result.as_ref().is_ok_and(|result| result.created) {
+        StatusCode::CREATED
+    } else {
+        StatusCode::NO_CONTENT
+    };
+    mutation_response(result, status)
 }
 
 async fn handle_delete(
@@ -294,12 +363,25 @@ async fn handle_move_or_copy(
     let source = share_storage_path(share, sub_path);
     let target = share_storage_path(share, &destination_path);
 
-    let result = if copy {
-        backend.copy_path(&source, &target).await
-    } else {
-        backend.move_path(&source, &target).await
+    let mut values = headers.get_all("overwrite").iter();
+    let overwrite = match values.next() {
+        None => true,
+        Some(value) if values.next().is_none() => match value.to_str().map(str::trim) {
+            Ok(value) if value.eq_ignore_ascii_case("T") => true,
+            Ok(value) if value.eq_ignore_ascii_case("F") => false,
+            _ => return Err(StatusCode::BAD_REQUEST.into()),
+        },
+        _ => return Err(StatusCode::BAD_REQUEST.into()),
     };
-    mutation_response(result, StatusCode::CREATED)
+    let result = backend
+        .dav_transfer(&source, &target, copy, overwrite)
+        .await;
+    let status = if result.as_ref().is_ok_and(|created| *created) {
+        StatusCode::CREATED
+    } else {
+        StatusCode::NO_CONTENT
+    };
+    mutation_response(result, status)
 }
 
 fn mutation_response<T>(
@@ -536,7 +618,14 @@ mod response_contract_tests {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::CREATED
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            upload("empty.bin", Body::empty(), Some(0))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT,
         );
         assert_eq!(
             tokio::fs::read(state.config.storage_path.join("known.bin"))

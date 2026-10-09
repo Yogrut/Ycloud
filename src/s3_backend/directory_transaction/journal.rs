@@ -1,4 +1,4 @@
-//! Remote I/O for authenticated directory manifests; the wire format is unchanged.
+//! Remote I/O for authenticated manifests, including v2-compatible recovery.
 
 use super::record::{sign_transaction, validate_transaction, Transaction};
 use crate::{

@@ -290,6 +290,7 @@ impl AtomicFileWriter {
 pub struct AtomicWriteResult {
     pub size: u64,
     pub previous_size: u64,
+    pub created: bool,
 }
 
 impl Drop for AtomicFileWriter {

@@ -583,6 +583,7 @@ impl S3Backend {
             relative,
             size: committed.size,
             previous_size: existing.as_ref().map_or(0, |metadata| metadata.size),
+            created: existing.is_none(),
             etag: committed.etag,
         })
     }

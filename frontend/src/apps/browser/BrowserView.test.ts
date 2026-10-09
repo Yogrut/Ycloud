@@ -879,7 +879,7 @@ describe('BrowserView', () => {
       }))
     })
     vi.stubGlobal('fetch', fetchMock)
-    const statuses = [400, 204]
+    const statuses = [400, 200]
     class MockXMLHttpRequest {
       status = 0
       responseText = ''
@@ -893,8 +893,8 @@ describe('BrowserView', () => {
       addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
       send(file: File): void {
         this.progress?.({ lengthComputable: true, loaded: file.size } as ProgressEvent)
-        this.status = statuses.shift() ?? 204
-        this.responseText = this.status >= 400 ? JSON.stringify({ message: 'temporary failure' }) : ''
+        this.status = statuses.shift() ?? 200
+        this.responseText = this.status >= 400 ? JSON.stringify({ message: 'temporary failure' }) : JSON.stringify({ success: true })
         this.listeners.get('load')?.()
       }
     }
@@ -942,18 +942,19 @@ describe('BrowserView', () => {
     class ControlledXMLHttpRequest {
       static instances: ControlledXMLHttpRequest[] = []
       status = 0
-      responseText = ''
+      responseText = JSON.stringify({ success: true })
       withCredentials = false
       private listeners = new Map<string, () => void>()
       private progress?: (event: ProgressEvent) => void
       upload = { addEventListener: (_type: string, listener: (event: ProgressEvent) => void) => { this.progress = listener } }
       constructor() { ControlledXMLHttpRequest.instances.push(this) }
       open(): void {}
+      getResponseHeader(): null { return null }
       setRequestHeader(): void {}
       addEventListener(type: string, listener: () => void): void { this.listeners.set(type, listener) }
       send(): void { this.progress?.({ lengthComputable: true, loaded: 1 } as ProgressEvent) }
       abort(): void { this.listeners.get('abort')?.() }
-      complete(status = 204): void { this.status = status; this.listeners.get('load')?.() }
+      complete(status = 200): void { this.status = status; this.listeners.get('load')?.() }
     }
     vi.stubGlobal('XMLHttpRequest', ControlledXMLHttpRequest)
 
@@ -1083,8 +1084,8 @@ describe('BrowserView', () => {
     vi.stubGlobal('fetch', fetchMock)
     class PausableXMLHttpRequest {
       static instances: PausableXMLHttpRequest[] = []
-      status = 204
-      responseText = ''
+      status = 200
+      responseText = JSON.stringify({ success: true })
       withCredentials = false
       private listeners = new Map<string, () => void>()
       upload = { addEventListener: () => undefined }
@@ -1184,8 +1185,8 @@ describe('BrowserView', () => {
 
     class RecordingXMLHttpRequest {
       static urls: string[] = []
-      status = 204
-      responseText = ''
+      status = 200
+      responseText = JSON.stringify({ success: true })
       withCredentials = false
       private listeners = new Map<string, () => void>()
       upload = { addEventListener: () => undefined }
@@ -1272,8 +1273,8 @@ describe('BrowserView', () => {
     vi.stubGlobal('fetch', fetchMock)
     class SuccessfulXMLHttpRequest {
       static urls: string[] = []
-      status = 204
-      responseText = ''
+      status = 200
+      responseText = JSON.stringify({ success: true })
       withCredentials = false
       private listeners = new Map<string, () => void>()
       upload = { addEventListener: () => undefined }

@@ -111,6 +111,7 @@ pub struct S3UploadResult {
     pub relative: String,
     pub size: u64,
     pub previous_size: u64,
+    pub created: bool,
     pub etag: Option<String>,
 }
 

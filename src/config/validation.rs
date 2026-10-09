@@ -28,7 +28,7 @@ impl ConfigFile {
             ));
         }
         let username = self.admin_username.trim();
-        if username.is_empty() || username.len() > 128 {
+        if username.is_empty() || username.chars().count() > 128 {
             return Err(AppError::BadRequest(
                 "Administrator username must contain 1-128 characters".into(),
             ));
@@ -198,7 +198,7 @@ impl ConfigFile {
             }
             validate_relative_config_path(&share.path)?;
             if let Some(username) = share.username.as_deref() {
-                if username.trim().is_empty() || username.len() > 128 {
+                if username.trim().is_empty() || username.chars().count() > 128 {
                     return Err(AppError::BadRequest(
                         "WebDAV username must contain 1-128 characters".into(),
                     ));

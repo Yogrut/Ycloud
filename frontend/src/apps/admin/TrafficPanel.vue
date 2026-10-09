@@ -279,7 +279,7 @@ defineExpose({ openEditor })
 .history-heading { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
 .range-controls { display: grid; justify-items: end; gap: 8px; }
 .range-presets { display: inline-flex; padding: 3px; background: var(--panel-soft); border-radius: 7px; }
-.range-presets button { min-width: 66px; height: 32px; padding: 0 12px; color: var(--muted); background: transparent; border: 0; border-radius: 5px; font-size: 14px; font-weight: 400; cursor: pointer; }
+.range-presets button { min-width: 60px; height: 28px; padding: 0 10px; color: var(--muted); background: transparent; border: 0; border-radius: 5px; font-size: 13px; font-weight: 400; cursor: pointer; }
 .range-presets button.active { color: var(--text); background: var(--panel); box-shadow: 0 0 0 1px var(--line); font-weight: 500; }
 .traffic-range { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin: 0; }
 .traffic-range > span { color: var(--muted); font-size: 12px; }

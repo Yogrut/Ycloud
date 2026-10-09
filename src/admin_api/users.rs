@@ -154,6 +154,60 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn chinese_username_survives_creation_persistence_and_login() {
+        let root = crate::test_support::TestDirectory::new("chinese-account-login");
+        let state =
+            crate::test_support::app_state(&root, crate::config::ConfigFile::with_test_storage())
+                .await;
+        let body: CreateUserAccountRequest = serde_json::from_value(serde_json::json!({
+            "username": "  成都用户  ",
+            "password": "test-chinese-account-password",
+        }))
+        .unwrap();
+        let (_, Json(created)) = create_user_account(State(state.clone()), Json(body))
+            .await
+            .unwrap();
+        assert_eq!(created.username, "成都用户");
+        let persisted = crate::config::load_config(&state.config.config_path)
+            .await
+            .unwrap();
+        assert_eq!(persisted.user_accounts[0].username, created.username);
+        assert_eq!(persisted.user_accounts[0].id, created.id);
+        let login = serde_json::from_value(serde_json::json!({
+            "username": created.username,
+            "password": "test-chinese-account-password",
+        }))
+        .unwrap();
+        let response = crate::auth::user_login_handler(
+            State(state.clone()),
+            axum::Extension(crate::security::ClientIp([127, 0, 0, 1].into())),
+            axum::http::HeaderMap::new(),
+            Json(login),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response.headers()[axum::http::header::SET_COOKIE]
+            .to_str()
+            .unwrap();
+        let token = cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .strip_prefix("session=")
+            .unwrap();
+        assert_eq!(
+            state.sessions.principal(token).await,
+            Some(crate::auth::SessionPrincipal::User(created.id))
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let result: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result["success"], true);
+        assert_eq!(result["is_admin"], false);
+    }
+
+    #[tokio::test]
     async fn quota_edits_preserve_user_session_and_reject_a_stale_version() {
         let root = crate::test_support::TestDirectory::new("user-quota-session");
         let state =

@@ -10,6 +10,30 @@ use axum::{body::Body, response::Response};
 use futures_util::StreamExt;
 use tokio::sync::{Mutex, Notify};
 
+/// Bound body reception even when a storage task outlives its HTTP waiter.
+pub(crate) fn upload_body_with_deadline(body: Body, duration: Duration) -> Body {
+    let deadline = tokio::time::Instant::now() + duration;
+    Body::from_stream(futures_util::stream::unfold(
+        (body.into_data_stream(), false),
+        move |(mut stream, finished)| async move {
+            if finished {
+                return None;
+            }
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(chunk)) => Some((chunk.map_err(std::io::Error::other), (stream, false))),
+                Ok(None) => None,
+                Err(_) => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "upload body deadline reached",
+                    )),
+                    (stream, true),
+                )),
+            }
+        },
+    ))
+}
+
 #[derive(Debug)]
 struct BucketState {
     tokens: f64,
@@ -126,6 +150,26 @@ impl BandwidthLimiter {
 mod tests {
     use super::BandwidthLimiter;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn upload_deadline_ends_a_stalled_body_but_preserves_normal_bytes() {
+        use axum::body::{to_bytes, Body};
+        let stalled = Body::from_stream(futures_util::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let mut stream =
+            super::upload_body_with_deadline(stalled, Duration::from_millis(10)).into_data_stream();
+        use futures_util::StreamExt;
+        assert!(tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(stream.next().await.is_none());
+        let body =
+            super::upload_body_with_deadline(Body::from("unchanged"), Duration::from_secs(1));
+        assert_eq!(to_bytes(body, 100).await.unwrap().as_ref(), b"unchanged");
+    }
 
     #[tokio::test]
     async fn zero_rate_is_disabled_and_updates_are_visible() {

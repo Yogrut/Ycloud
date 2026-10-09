@@ -18,10 +18,10 @@ export function getTraffic(range: { start?: string; end?: string; days?: number 
   return adminRequest('/api/admin/traffic?' + query.toString())
 }
 export function saveTraffic(settings: Partial<Pick<TrafficSettings, 'total' | 'guest' | 'users_total' | 'cycle'>>): Promise<{ success: boolean }> {
-  return adminRequest('/api/admin/traffic', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) })
+  return adminRequest('/api/admin/traffic', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) }, true)
 }
 
-import { ApiError, errorMetadata, requestJson, type OperationOutcome } from './client'
+import { ApiError, errorMetadata, requestJson, requireSuccess, type OperationOutcome } from './client'
 
 const locale = useLocale()
 
@@ -314,9 +314,11 @@ export class AdminApiError extends ApiError {
   }
 }
 
-async function adminRequest<T>(url: string, options: RequestInit = {}): Promise<T> {
+async function adminRequest<T>(url: string, options: RequestInit = {}, receipt = false): Promise<T> {
   try {
-    return await rawAdminRequest<T>(url, options)
+    const result = await rawAdminRequest<T>(url, options)
+    if (receipt) requireSuccess(result)
+    return result
   } catch (error) {
     if (!(error instanceof ApiError) || !error.blocksRetry) throw error
     // Never repeat a write after losing its response. Verify observable settings
@@ -423,13 +425,13 @@ export function setupAdministratorTotp(currentPassword: string): Promise<{ secre
 export function enableAdministratorTotp(currentPassword: string, secret: string, code: string): Promise<{ success: boolean; recovery_codes: string[] }> {
   return adminRequest('/api/admin/account/totp/enable', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: currentPassword, secret, code }),
-  })
+  }, true)
 }
 
 export function disableAdministratorTotp(currentPassword: string, code: string): Promise<{ success: boolean }> {
   return adminRequest('/api/admin/account/totp', {
     method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: currentPassword, code }),
-  })
+  }, true)
 }
 
 export function createUserAccount(body: CreateUserAccountRequest): Promise<UserAccountView> {
@@ -453,7 +455,7 @@ export function updateAccount(body: UpdateAccountRequest): Promise<UpdateAccount
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  })
+  }, true)
 }
 
 export function updateTransferLimits(body: Partial<UpdateTransferLimitsRequest>): Promise<{ success: boolean }> {
@@ -461,7 +463,7 @@ export function updateTransferLimits(body: Partial<UpdateTransferLimitsRequest>)
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  })
+  }, true)
 }
 
 export function testS3Storage(body: TestS3StorageRequest): Promise<{ success: boolean; capabilities: S3CapabilityReport }> {
@@ -469,7 +471,7 @@ export function testS3Storage(body: TestS3StorageRequest): Promise<{ success: bo
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  })
+  }, true)
 }
 
 export function testLocalStorage(path: string): Promise<{ success: boolean }> {
@@ -477,7 +479,7 @@ export function testLocalStorage(path: string): Promise<{ success: boolean }> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
-  })
+  }, true)
 }
 
 export function stageS3Storage(name: string, body: TestS3StorageRequest, enabled = true, allowGuestAccess = false, allowGuestDownload?: boolean): Promise<{ success: boolean }> {
@@ -485,7 +487,7 @@ export function stageS3Storage(name: string, body: TestS3StorageRequest, enabled
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload, ...body }),
-  })
+  }, true)
 }
 
 export function updateS3Storage(storageId: string, name: string, body: TestS3StorageRequest, enabled: boolean, allowGuestAccess: boolean, allowGuestDownload?: boolean, expectedRevision?: string): Promise<{ success: boolean }> {
@@ -493,7 +495,7 @@ export function updateS3Storage(storageId: string, name: string, body: TestS3Sto
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload, ...body, expected_revision: expectedRevision }),
-  })
+  }, true)
 }
 
 export function addLocalStorage(path: string, name: string, capacityLimitBytes: number | null, enabled = true, allowGuestAccess = false, allowGuestDownload?: boolean): Promise<{ storage_id: string }> {
@@ -509,7 +511,7 @@ export function updateLocalStorage(storageId: string, name: string, path: string
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ storage_id: storageId, name, path, capacity_limit_bytes: capacityLimitBytes, enabled, allow_guest_access: allowGuestAccess, allow_guest_download: allowGuestDownload, expected_revision: expectedRevision }),
-  })
+  }, true)
 }
 
 export function deleteStorage(storageId: string): Promise<void> {
@@ -517,7 +519,7 @@ export function deleteStorage(storageId: string): Promise<void> {
 }
 
 export function activatePendingStorage(): Promise<{ success: boolean }> {
-  return adminRequest('/api/admin/storage/activate', { method: 'POST' })
+  return adminRequest('/api/admin/storage/activate', { method: 'POST' }, true)
 }
 
 export function discardPendingStorage(): Promise<void> {
@@ -529,7 +531,7 @@ export function updateLoginSecuritySettings(body: UpdateLoginSecuritySettingsReq
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  })
+  }, true)
 }
 
 export interface LoginEventQuery {
@@ -606,5 +608,5 @@ export function updateLoginRestriction(action: 'block' | 'unblock', entry: Login
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ entry, ip }),
-  })
+  }, true)
 }

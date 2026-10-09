@@ -339,7 +339,7 @@ describe('StorageView', () => {
     fetchMock.mockResolvedValue(response({ success: false }))
     button(host, '测试连接')?.click()
     await new Promise(resolve => setTimeout(resolve, 0))
-    expect(document.querySelector('[role="alert"].app-toast.error')?.textContent).toBe('测试失败：存储连接测试失败')
+    expect(document.querySelector('[role="alert"].app-toast.error')?.textContent).toBe('测试失败：操作失败')
     expect(document.querySelector('.app-toast.success')).toBeNull()
     app.unmount()
   })

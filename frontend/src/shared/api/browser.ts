@@ -11,7 +11,7 @@ export interface FileEntry {
 
 import { appPath } from '../routes'
 import { useLocale } from '../i18n'
-import { ApiError, errorMetadata, requestJson, requestWithDeadline, REQUEST_TIMEOUT_MS } from './client'
+import { ApiError, errorMetadata, requestJson, requestWithDeadline, requireSuccess, REQUEST_TIMEOUT_MS } from './client'
 import type { ErrorEnvelope, OperationOutcome } from './client'
 
 const locale = useLocale()
@@ -185,12 +185,14 @@ function actionApi(action: string, path: string, storageId?: string): string {
   return withStorage(url, storageId)
 }
 
-export function createFolder(path: string, name: string, storageId?: string): Promise<{ success?: boolean; message?: string }> {
-  return apiRequest(actionApi('mkdir', path, storageId), {
+export async function createFolder(path: string, name: string, storageId?: string): Promise<{ success?: boolean; message?: string }> {
+  const result = await apiRequest<{ success?: boolean; message?: string }>(actionApi('mkdir', path, storageId), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
   })
+  requireSuccess(result)
+  return result
 }
 
 export function downloadUrl(path: string, storageId?: string): string {
@@ -203,12 +205,14 @@ export function previewUrl(path: string, storageId?: string): string {
   return withStorage(`/api/preview?path=${encodeURIComponent(`/${clean}`)}`, storageId)
 }
 
-export function renameItem(currentPath: string, path: string, newName: string, storageId?: string): Promise<{ success?: boolean }> {
-  return apiRequest(actionApi('rename', currentPath, storageId), {
+export async function renameItem(currentPath: string, path: string, newName: string, storageId?: string): Promise<{ success?: boolean }> {
+  const result = await apiRequest<{ success?: boolean }>(actionApi('rename', currentPath, storageId), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path: `/${cleanPath(path)}`, new_name: newName }),
   })
+  requireSuccess(result)
+  return result
 }
 
 export function prepareArchive(paths: string[], storageId?: string): Promise<ArchivePrepareResponse> {
@@ -233,12 +237,14 @@ export function getUploadBatchStatus(ticket: string, storageId?: string): Promis
   return apiRequest(`/api/upload/status?${query.toString()}`)
 }
 
-export async function cancelUploadBatch(ticket: string, storageId?: string, paths: string[] = []): Promise<void> {
-  await apiRequest(withStorage('/api/upload/cancel', storageId), {
+export async function cancelUploadBatch(ticket: string, storageId?: string, paths: string[] = [], keepalive = false): Promise<void> {
+  const result = await apiRequest(withStorage('/api/upload/cancel', storageId), {
     method: 'POST',
+    keepalive,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(paths.length ? { ticket, paths } : { ticket }),
   })
+  requireSuccess(result)
 }
 
 export async function batchOperation(operation: BatchOperation, paths: string[], target = '', storageId?: string): Promise<BatchResponse> {
@@ -300,6 +306,10 @@ export async function uploadFile(path: string, file: File, onProgress: (loaded: 
       }
       if (request.status >= 200 && request.status < 300) {
         cleanup()
+        let receipt: unknown
+        try { receipt = JSON.parse(request.responseText) } catch { /* A non-JSON response is not an upload receipt. */ }
+        try { requireSuccess(receipt, request.status, request.getResponseHeader('x-request-id') ?? undefined) }
+        catch (error) { reject(error); return }
         onProgress(file.size)
         resolve()
         return
@@ -314,7 +324,7 @@ export async function uploadFile(path: string, file: File, onProgress: (loaded: 
         // Keep the status-based message for non-JSON proxy failures.
       }
       cleanup()
-      const unknown = request.status >= 500 && !details?.operation
+      const unknown = (request.status >= 500 || request.status === 408) && !details?.operation
       if (unknown) message = locale.text('系统正在自动确认上传结果，请稍后查看。', 'The server is automatically checking the upload result; check again shortly.')
       reject(new ApiError(message, request.status, unknown ? 'operation_result_unknown' : details?.code, request.getResponseHeader('x-request-id') ?? undefined, details?.operation))
     })

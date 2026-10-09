@@ -251,7 +251,7 @@ describe('upload ticket grouping and mappings', () => {
     await settle()
     expect(queue.uploadTasks.value[0]).toMatchObject({ status: 'paused', ticket: 'numbered', targetPath: 'original/paused (1).txt' })
     expect(queue.uploadTasks.value[1]).toMatchObject({ status: 'cancelled', targetPath: 'original/cancelled (1).txt' })
-    expect(queue.uploadTasks.value[1]?.ticket).toBeUndefined()
+    expect(queue.uploadTasks.value[1]?.ticket).toBe('numbered')
     expect(cancelUploadBatch).toHaveBeenCalledExactlyOnceWith('numbered', 'first', ['original/cancelled (1).txt'])
     expect(uploadFile).not.toHaveBeenCalled()
     vi.mocked(getUploadBatchStatus).mockResolvedValueOnce({ ticket: 'numbered', items: [
@@ -290,16 +290,90 @@ describe('upload ticket grouping and mappings', () => {
     queue.uploadTasks.value.push(ticketedTask(1), ticketedTask(2), ticketedTask(3, 'second'),
       { ...ticketedTask(4), ticket: undefined })
     queue.disposeUploads()
-    expect(vi.mocked(cancelUploadBatch).mock.calls).toEqual([['shared', 'first'], ['shared', 'second']])
+    expect(vi.mocked(cancelUploadBatch).mock.calls).toEqual([['shared', 'first', undefined, true], ['shared', 'second', undefined, true]])
   })
 })
 
 afterEach(() => {
   queues.splice(0).forEach(queue => queue.disposeUploads())
+  vi.restoreAllMocks()
   vi.useRealTimers()
 })
 
 describe('upload advancement and result scheduling', () => {
+  it('does not start another file after disposal while checking an old ticket', async () => {
+    const { queue } = uploads()
+    let now = 0
+    vi.spyOn(performance, 'now').mockImplementation(() => now)
+    const completed: Array<() => void> = []
+    vi.mocked(uploadFile).mockImplementation((_path, _file, _progress, _storage, _ticket, signal) => new Promise<void>((resolve, reject) => {
+      completed.push(resolve)
+      signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }))
+    let checked!: (value: UploadBatchStatus) => void
+    vi.mocked(getUploadBatchStatus).mockReturnValueOnce(new Promise(resolve => { checked = resolve }))
+    queue.uploadFiles({ target: { files: Array.from({ length: 5 }, (_, index) => new File(['data'], `${index}.txt`)), value: '' } } as unknown as Event)
+    await settle()
+    now = 180_000
+    completed[0]!()
+    await settle()
+    expect(getUploadBatchStatus).toHaveBeenCalledOnce()
+    queue.disposeUploads()
+    checked({ ticket: 'ticket', items: [{ path: 'original/4.txt', size: 4, status: 'pending' }] })
+    await settle()
+    expect(uploadFile).toHaveBeenCalledTimes(4)
+    expect(prepareUploadBatch).toHaveBeenCalledOnce()
+  })
+
+  it('renews only never-started expired reservations when a long queue advances', async () => {
+    const { queue } = uploads()
+    let now = 0
+    vi.spyOn(performance, 'now').mockImplementation(() => now)
+    const completed: Array<() => void> = []
+    vi.mocked(uploadFile).mockImplementation(() => new Promise<void>(resolve => completed.push(resolve)))
+    queue.uploadFiles({ target: { files: Array.from({ length: 8 }, (_, index) => new File(['data'], `${index}.txt`)), value: '' } } as unknown as Event)
+    await settle()
+    expect(uploadFile).toHaveBeenCalledTimes(4)
+    now = 180_000
+    vi.mocked(getUploadBatchStatus).mockRejectedValueOnce(new ApiError('expired', 410, 'upload_batch_expired'))
+    vi.mocked(prepareUploadBatch).mockResolvedValueOnce({ ticket: 'renewed' })
+    completed[0]!()
+    await settle()
+    expect(prepareUploadBatch).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(prepareUploadBatch).mock.calls[1]![0]).toHaveLength(4)
+    expect(vi.mocked(uploadFile).mock.calls[4]![4]).toBe('renewed')
+    expect(queue.uploadTasks.value[0]?.status).toBe('succeeded')
+    for (let index = 1; index < 8; index++) { completed[index]!(); await settle() }
+    expect(queue.uploadTasks.value.every(task => task.status === 'succeeded')).toBe(true)
+  })
+
+  it('page exit cancels tickets with keepalive exactly once and aborts active uploads', async () => {
+    const { queue } = uploads()
+    vi.mocked(uploadFile).mockImplementation((_path, _file, _progress, _storage, _ticket, signal) => new Promise<void>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }))
+    queue.uploadFiles({ target: { files: [new File(['data'], 'one.txt')], value: '' } } as unknown as Event)
+    await settle()
+    window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }))
+    await settle()
+    queue.disposeUploads()
+    expect(cancelUploadBatch).toHaveBeenCalledExactlyOnceWith('ticket', 'first', undefined, true)
+  })
+
+  it('retains a cancelled preparation ticket when its cancellation request fails', async () => {
+    const { context, queue } = uploads()
+    let prepared!: (value: { ticket: string }) => void
+    vi.mocked(prepareUploadBatch).mockReturnValueOnce(new Promise(resolve => { prepared = resolve }))
+    queue.uploadFiles({ target: { files: [new File(['data'], 'one.txt')], value: '' } } as unknown as Event)
+    queue.terminateUploads([1])
+    vi.mocked(cancelUploadBatch).mockRejectedValueOnce(new Error('cancel unavailable'))
+    prepared({ ticket: 'cancelled-preparation' })
+    await settle()
+    expect(queue.uploadTasks.value[0]).toMatchObject({ status: 'cancelled', ticket: 'cancelled-preparation' })
+    expect(context.announce).toHaveBeenCalledWith('cancel unavailable')
+    queue.disposeUploads()
+    expect(cancelUploadBatch).toHaveBeenLastCalledWith('cancelled-preparation', 'first', undefined, true)
+  })
   it('coalesces completed-result refreshes into one read and one pending follow-up', async () => {
     const { context, queue } = uploads()
     let refreshed!: () => void
@@ -441,7 +515,7 @@ describe('upload input lifecycle', () => {
     cancelled()
     await settle()
     expect(vi.mocked(cancelUploadBatch).mock.calls).toEqual([
-      ['late-ticket', 'first', ['original/file (1).txt']], ['late-ticket', 'first'],
+      ['late-ticket', 'first', ['original/file (1).txt']], ['late-ticket', 'first', undefined, true],
     ])
     expect(uploadFile).not.toHaveBeenCalled()
   })

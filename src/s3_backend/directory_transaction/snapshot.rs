@@ -13,6 +13,44 @@ fn directory_object_limit_error() -> AppError {
 }
 
 impl S3Backend {
+    pub(super) async fn snapshot_resource(
+        &self,
+        id: &str,
+        operation: Operation,
+        source: &str,
+        destination: Option<&str>,
+        directory: bool,
+    ) -> AppResult<Vec<ObjectRecord>> {
+        if directory {
+            return self
+                .snapshot_objects(id, operation, source, destination)
+                .await;
+        }
+        let metadata = self.metadata(source).await?;
+        if metadata.is_dir || metadata.size > MAX_SINGLE_COPY_BYTES {
+            return Err(AppError::Conflict(
+                "Source changed or exceeds the copy size limit".into(),
+            ));
+        }
+        let target_key = match operation {
+            Operation::Copy | Operation::Move => crate::s3_backend::object_key(
+                &self.prefix,
+                destination.ok_or(AppError::Forbidden)?,
+            )?,
+            Operation::Delete => internal_key(&self.prefix, TRASH_CATEGORY, &format!("{id}/")),
+        };
+        Ok(vec![ObjectRecord {
+            source_key: crate::s3_backend::object_key(&self.prefix, source)?,
+            target_key,
+            size: metadata.size,
+            source_etag: metadata
+                .etag
+                .ok_or_else(|| AppError::ServiceUnavailable("Source object has no ETag".into()))?,
+            target_etag: None,
+            source_deleted: false,
+        }])
+    }
+
     pub(super) async fn snapshot_objects(
         &self,
         id: &str,

@@ -70,6 +70,8 @@ impl CompletionFixture {
                 target_etag: Some("target-etag".into()),
                 source_deleted: completed && operation != Operation::Copy,
             }],
+            source_is_file: false,
+            replacement: None,
             auth_tag: String::new(),
         };
         sign_transaction(&[0x31; 32], &mut transaction).unwrap();
@@ -402,6 +404,8 @@ async fn directory_source_deletion_reuses_the_verified_snapshot_and_checkpoints_
                 target_etag: Some("target-etag".into()),
                 source_deleted: false,
             }],
+            source_is_file: false,
+            replacement: None,
             auth_tag: String::new(),
         };
         let key = internal_key("tenant/", JOURNAL_CATEGORY, &transaction.id);
@@ -687,6 +691,8 @@ async fn verified_directory_delete_does_not_fail_or_settle_when_trash_changed() 
             target_etag: Some("trash-etag".into()),
             source_deleted: true,
         }],
+        source_is_file: false,
+        replacement: None,
         auth_tag: String::new(),
     };
     sign_transaction(&[0x31; 32], &mut transaction).unwrap();

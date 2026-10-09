@@ -780,6 +780,7 @@ mod tests {
             AtomicWriteResult {
                 size: 12,
                 previous_size: 0,
+                created: true,
             }
         );
         assert_eq!(

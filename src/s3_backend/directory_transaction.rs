@@ -91,17 +91,51 @@ impl S3Backend {
         expected_size: Option<u64>,
     ) -> AppResult<u64> {
         let backend = self.scoped_work(None, None);
-        Box::pin(backend.mutate_directory_scoped(operation, source, destination, expected_size))
-            .await
+        Box::pin(backend.mutate_path_scoped(
+            operation,
+            source,
+            destination,
+            expected_size,
+            false,
+            false,
+        ))
+        .await
+        .map(|result| result.size)
     }
 
-    async fn mutate_directory_scoped(
+    pub(crate) async fn transfer_path(
+        &self,
+        source: &str,
+        destination: &str,
+        copy: bool,
+        overwrite: bool,
+        expected_size: u64,
+    ) -> AppResult<crate::storage::AtomicWriteResult> {
+        let backend = self.scoped_work(None, None);
+        Box::pin(backend.mutate_path_scoped(
+            if copy {
+                Operation::Copy
+            } else {
+                Operation::Move
+            },
+            source,
+            Some(destination),
+            Some(expected_size),
+            overwrite,
+            true,
+        ))
+        .await
+    }
+
+    async fn mutate_path_scoped(
         &self,
         operation: Operation,
         source: &str,
         destination: Option<&str>,
         expected_size: Option<u64>,
-    ) -> AppResult<u64> {
+        overwrite: bool,
+        allow_files: bool,
+    ) -> AppResult<crate::storage::AtomicWriteResult> {
         let source = StorageService::normalize_relative(source)?;
         if source.is_empty() {
             return Err(AppError::BadRequest("不能变更存储根目录".into()));
@@ -116,6 +150,7 @@ impl S3Backend {
             if destination.is_empty()
                 || destination == source
                 || destination.starts_with(&format!("{source}/"))
+                || source.starts_with(&format!("{destination}/"))
             {
                 return Err(AppError::BadRequest("无效的目录目标路径".into()));
             }
@@ -128,21 +163,36 @@ impl S3Backend {
             .read(async { Ok(self.mutation_gate.lock().await) })
             .await?;
         let source_metadata = self.metadata(&source).await?;
-        if !source_metadata.is_dir {
+        if !source_metadata.is_dir && !allow_files {
             return Err(AppError::Conflict("源路径不是目录".into()));
         }
-        if let Some(destination) = destination.as_deref() {
+        let existing = if let Some(destination) = destination.as_deref() {
             self.ensure_parent_directory(destination).await?;
             match self.metadata(destination).await {
-                Ok(_) => return Err(AppError::Conflict("目标路径已经存在".into())),
-                Err(AppError::NotFound) => {}
+                Ok(_) if !overwrite => {
+                    return Err(if allow_files {
+                        AppError::PreconditionFailed
+                    } else {
+                        AppError::Conflict("目标路径已经存在".into())
+                    })
+                }
+                Ok(metadata) => Some(metadata),
+                Err(AppError::NotFound) => None,
                 Err(error) => return Err(error),
             }
-        }
+        } else {
+            None
+        };
 
         let id = uuid::Uuid::new_v4().simple().to_string();
         let objects = self
-            .snapshot_objects(&id, operation, &source, destination.as_deref())
+            .snapshot_resource(
+                &id,
+                operation,
+                &source,
+                destination.as_deref(),
+                source_metadata.is_dir,
+            )
             .await?;
         let snapshot_size = objects.iter().try_fold(0_u64, |total, object| {
             total
@@ -156,6 +206,35 @@ impl S3Backend {
                 ));
             }
         }
+        let replacement = if let Some(metadata) = &existing {
+            let old_target = destination
+                .as_deref()
+                .expect("replacement has a destination");
+            let objects = self
+                .snapshot_resource(&id, Operation::Delete, old_target, None, metadata.is_dir)
+                .await?;
+            Some(Box::new(Transaction {
+                schema_version: SCHEMA_VERSION,
+                id: id.clone(),
+                operation: Operation::Delete,
+                source_relative: old_target.to_owned(),
+                destination_relative: None,
+                stage: Stage::CopyingTargets,
+                objects,
+                source_is_file: !metadata.is_dir,
+                replacement: None,
+                auth_tag: String::new(),
+            }))
+        } else {
+            None
+        };
+        let previous_size = replacement.as_ref().map_or(Ok(0), |replacement| {
+            replacement.objects.iter().try_fold(0_u64, |total, object| {
+                total
+                    .checked_add(object.size)
+                    .ok_or_else(|| AppError::internal("replacement size overflow"))
+            })
+        })?;
         let journal_key = internal_key(&self.prefix, JOURNAL_CATEGORY, &id);
         let mut transaction = Transaction {
             schema_version: SCHEMA_VERSION,
@@ -165,6 +244,8 @@ impl S3Backend {
             destination_relative: destination,
             stage: Stage::CopyingTargets,
             objects,
+            source_is_file: !source_metadata.is_dir,
+            replacement,
             auth_tag: String::new(),
         };
         let journal_etag = self
@@ -179,7 +260,11 @@ impl S3Backend {
         )
         .await
         .map_err(super::committed_cleanup::uncertain_transaction)?;
-        Ok(snapshot_size)
+        Ok(crate::storage::AtomicWriteResult {
+            size: snapshot_size,
+            previous_size,
+            created: existing.is_none(),
+        })
     }
 
     async fn execute_directory_transaction(
@@ -195,6 +280,15 @@ impl S3Backend {
             journal_key,
             transaction,
         )?;
+        if transaction
+            .replacement
+            .as_ref()
+            .is_some_and(|replacement| replacement.stage != Stage::SourcesDeleted)
+        {
+            journal_etag = self
+                .replace_destination(journal_key, journal_etag, transaction)
+                .await?;
+        }
         let final_stage = transaction.operation.completed_stage();
         if transaction.stage != final_stage {
             journal_etag = self
@@ -232,9 +326,75 @@ impl S3Backend {
                 if transaction.operation == Operation::Delete {
                     self.cleanup_delete_trash(transaction).await?;
                 }
+                if let Some(replacement) = &transaction.replacement {
+                    self.cleanup_delete_trash(replacement).await?;
+                }
                 self.delete_key_confirmed(journal_key, Some(&journal_etag))
                     .await
             })
+            .await
+    }
+
+    async fn replace_destination(
+        &self,
+        journal_key: &str,
+        mut journal_etag: String,
+        transaction: &mut Transaction,
+    ) -> AppResult<String> {
+        let replacement = transaction
+            .replacement
+            .as_ref()
+            .expect("replacement exists");
+        if replacement.stage == Stage::CopyingTargets {
+            for index in 0..replacement.objects.len() {
+                let replacement = transaction
+                    .replacement
+                    .as_mut()
+                    .expect("replacement exists");
+                self.copy_one_target(&transaction.id, &mut replacement.objects[index])
+                    .await?;
+                if should_checkpoint_progress(index, replacement.objects.len()) {
+                    journal_etag = self
+                        .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
+                        .await?;
+                }
+            }
+            transaction
+                .replacement
+                .as_mut()
+                .expect("replacement exists")
+                .stage = Stage::DeletingSources;
+            journal_etag = self
+                .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
+                .await?;
+        }
+        let total = transaction
+            .replacement
+            .as_ref()
+            .expect("replacement exists")
+            .objects
+            .len();
+        for index in 0..total {
+            let replacement = transaction
+                .replacement
+                .as_mut()
+                .expect("replacement exists");
+            self.verify_recorded_target(&replacement.objects[index])
+                .await?;
+            self.delete_one_source(&mut replacement.objects[index])
+                .await?;
+            if should_checkpoint_progress(index, total) {
+                journal_etag = self
+                    .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
+                    .await?;
+            }
+        }
+        transaction
+            .replacement
+            .as_mut()
+            .expect("replacement exists")
+            .stage = Stage::SourcesDeleted;
+        self.write_directory_transaction(journal_key, transaction, Some(&journal_etag))
             .await
     }
 
@@ -245,73 +405,8 @@ impl S3Backend {
         transaction: &mut Transaction,
     ) -> AppResult<String> {
         for index in 0..transaction.objects.len() {
-            if transaction.objects[index].target_etag.is_some() {
-                self.verify_recorded_target(&transaction.objects[index])
-                    .await?;
-                continue;
-            }
-            let source = self
-                .head_key(&transaction.objects[index].source_key)
+            self.copy_one_target(&transaction.id, &mut transaction.objects[index])
                 .await?;
-            if !source.as_ref().is_some_and(|metadata| {
-                metadata.size == transaction.objects[index].size
-                    && metadata.etag.as_deref()
-                        == Some(transaction.objects[index].source_etag.as_str())
-            }) {
-                return Err(AppError::ServiceUnavailable(
-                    "目录事务源对象已经变化；已保留事务并停止写入".into(),
-                ));
-            }
-
-            let existing_target = self
-                .head_key(&transaction.objects[index].target_key)
-                .await?;
-            let target_etag = match existing_target {
-                None => {
-                    self.copy_key_with_operation(
-                        &transaction.objects[index].source_key,
-                        &transaction.objects[index].target_key,
-                        Some(&transaction.objects[index].source_etag),
-                        true,
-                        Some(&directory_copy_id(
-                            &transaction.id,
-                            &transaction.objects[index].source_key,
-                        )),
-                        None,
-                    )
-                    .await?
-                }
-                Some(metadata)
-                    if metadata.size == transaction.objects[index].size
-                        && (metadata.etag.as_deref()
-                            == Some(transaction.objects[index].source_etag.as_str())
-                            || metadata.operation_id.as_deref()
-                                == Some(
-                                    directory_copy_id(
-                                        &transaction.id,
-                                        &transaction.objects[index].source_key,
-                                    )
-                                    .as_str(),
-                                )) =>
-                {
-                    metadata.etag.ok_or_else(|| {
-                        AppError::ServiceUnavailable("目录事务目标缺少 ETag".into())
-                    })?
-                }
-                Some(_) => return Err(ambiguous_target()),
-            };
-            let target = self
-                .head_key(&transaction.objects[index].target_key)
-                .await?;
-            if !target.as_ref().is_some_and(|metadata| {
-                metadata.size == transaction.objects[index].size
-                    && metadata.etag.as_deref() == Some(target_etag.as_str())
-            }) {
-                return Err(AppError::ServiceUnavailable(
-                    "目录事务复制结果无法验证；已保留事务并停止写入".into(),
-                ));
-            }
-            transaction.objects[index].target_etag = Some(target_etag);
             if should_checkpoint_progress(index, transaction.objects.len()) {
                 journal_etag = self
                     .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
@@ -337,6 +432,64 @@ impl S3Backend {
         Ok(())
     }
 
+    async fn copy_one_target(
+        &self,
+        transaction_id: &str,
+        object: &mut ObjectRecord,
+    ) -> AppResult<()> {
+        if object.target_etag.is_some() {
+            self.verify_recorded_target(object).await?;
+            return Ok(());
+        }
+        let source = self.head_key(&object.source_key).await?;
+        if !source.as_ref().is_some_and(|metadata| {
+            metadata.size == object.size
+                && metadata.etag.as_deref() == Some(object.source_etag.as_str())
+        }) {
+            return Err(AppError::ServiceUnavailable(
+                "目录事务源对象已经变化；已保留事务并停止写入".into(),
+            ));
+        }
+
+        let existing_target = self.head_key(&object.target_key).await?;
+        let target_etag = match existing_target {
+            None => {
+                self.copy_key_with_operation(
+                    &object.source_key,
+                    &object.target_key,
+                    Some(&object.source_etag),
+                    true,
+                    Some(&directory_copy_id(transaction_id, &object.source_key)),
+                    None,
+                )
+                .await?
+            }
+            Some(metadata)
+                if metadata.size == object.size
+                    && (metadata.etag.as_deref() == Some(object.source_etag.as_str())
+                        || metadata.operation_id.as_deref()
+                            == Some(
+                                directory_copy_id(transaction_id, &object.source_key).as_str(),
+                            )) =>
+            {
+                metadata
+                    .etag
+                    .ok_or_else(|| AppError::ServiceUnavailable("目录事务目标缺少 ETag".into()))?
+            }
+            Some(_) => return Err(ambiguous_target()),
+        };
+        let target = self.head_key(&object.target_key).await?;
+        if !target.as_ref().is_some_and(|metadata| {
+            metadata.size == object.size && metadata.etag.as_deref() == Some(target_etag.as_str())
+        }) {
+            return Err(AppError::ServiceUnavailable(
+                "目录事务复制结果无法验证；已保留事务并停止写入".into(),
+            ));
+        }
+        object.target_etag = Some(target_etag);
+        Ok(())
+    }
+
     async fn delete_sources(
         &self,
         journal_key: &str,
@@ -344,32 +497,8 @@ impl S3Backend {
         transaction: &mut Transaction,
     ) -> AppResult<String> {
         for index in 0..transaction.objects.len() {
-            if transaction.objects[index].source_deleted {
-                continue;
-            }
-            match self
-                .head_key(&transaction.objects[index].source_key)
-                .await?
-            {
-                None => {}
-                Some(metadata)
-                    if metadata.size == transaction.objects[index].size
-                        && metadata.etag.as_deref()
-                            == Some(transaction.objects[index].source_etag.as_str()) =>
-                {
-                    self.delete_key_after_identity_check(
-                        &transaction.objects[index].source_key,
-                        Some(&transaction.objects[index].source_etag),
-                    )
-                    .await?;
-                }
-                Some(_) => {
-                    return Err(AppError::ServiceUnavailable(
-                        "目录事务源对象在删除前发生变化；已停止删除".into(),
-                    ));
-                }
-            }
-            transaction.objects[index].source_deleted = true;
+            self.delete_one_source(&mut transaction.objects[index])
+                .await?;
             if should_checkpoint_progress(index, transaction.objects.len()) {
                 journal_etag = self
                     .write_directory_transaction(journal_key, transaction, Some(&journal_etag))
@@ -377,6 +506,29 @@ impl S3Backend {
             }
         }
         Ok(journal_etag)
+    }
+
+    async fn delete_one_source(&self, object: &mut ObjectRecord) -> AppResult<()> {
+        if object.source_deleted {
+            return Ok(());
+        }
+        match self.head_key(&object.source_key).await? {
+            None => {}
+            Some(metadata)
+                if metadata.size == object.size
+                    && metadata.etag.as_deref() == Some(object.source_etag.as_str()) =>
+            {
+                self.delete_key_after_identity_check(&object.source_key, Some(&object.source_etag))
+                    .await?;
+            }
+            Some(_) => {
+                return Err(AppError::ServiceUnavailable(
+                    "目录事务源对象在删除前发生变化；已停止删除".into(),
+                ));
+            }
+        }
+        object.source_deleted = true;
+        Ok(())
     }
 
     async fn verify_recorded_target(&self, object: &ObjectRecord) -> AppResult<()> {
@@ -402,5 +554,7 @@ fn ambiguous_target() -> AppError {
     AppError::ServiceUnavailable("目录事务目标状态不明确；已保留事务并停止写入".into())
 }
 
+#[cfg(test)]
+mod overwrite_tests;
 #[cfg(test)]
 mod tests;

@@ -250,6 +250,63 @@ impl LoginSecurity {
         Ok(())
     }
 
+    /// Correct credentials clear password failures, not the request result.
+    pub async fn clear_webdav_failures(&self, ip: IpAddr) -> anyhow::Result<()> {
+        let mut current = self.data.lock().await;
+        let needs_reset = find_mut(&mut current.records, LoginEntry::WebDav, ip)
+            .is_some_and(|record| record.failed_attempts != 0 || record.blocked_until.is_some());
+        if !needs_reset {
+            return Ok(());
+        }
+        let mut data = current.clone();
+        let Some(record) = find_mut(&mut data.records, LoginEntry::WebDav, ip) else {
+            return Ok(());
+        };
+        record.failed_attempts = 0;
+        record.blocked_until = None;
+        persist_state(&self.state_path, &data).await?;
+        *current = data;
+        Ok(())
+    }
+
+    /// Protocol failures must not be counted as incorrect passwords.
+    pub async fn record_webdav_request_failure(
+        &self,
+        ip: IpAddr,
+        user_agent: Option<&str>,
+        status: u16,
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let result = format!("WebDAV 请求失败 ({status})");
+        let (failed_attempts, blocked_until) = {
+            let mut current = self.data.lock().await;
+            let mut data = current.clone();
+            if let Some(record) = find_mut(&mut data.records, LoginEntry::WebDav, ip) {
+                record.last_success_at = None;
+                record.last_result = result.clone();
+                let counters = (record.failed_attempts, record.blocked_until);
+                persist_state(&self.state_path, &data).await?;
+                *current = data;
+                counters
+            } else {
+                (0, None)
+            }
+        };
+        self.record_event(LoginEvent {
+            id: 0,
+            entry: LoginEntry::WebDav,
+            success: false,
+            occurred_at: now,
+            ip: ip.to_string(),
+            result,
+            failed_attempts,
+            blocked_until,
+            user_agent: sanitize_user_agent(user_agent),
+        })
+        .await;
+        Ok(())
+    }
+
     pub async fn record_success(
         &self,
         entry: LoginEntry,
@@ -259,10 +316,9 @@ impl LoginSecurity {
         let now = chrono::Utc::now().timestamp();
         let event = {
             let mut current = self.data.lock().await;
-            let mut data = current.clone();
             if entry == LoginEntry::WebDav {
                 let recent_clean_success =
-                    find_mut(&mut data.records, entry, ip).is_some_and(|record| {
+                    find_mut(&mut current.records, entry, ip).is_some_and(|record| {
                         record.failed_attempts == 0
                             && record.blocked_until.is_none()
                             && record
@@ -273,6 +329,7 @@ impl LoginSecurity {
                     return Ok(());
                 }
             }
+            let mut data = current.clone();
             ensure_capacity(&mut data.records, entry, ip, now)?;
             let record = get_or_insert(&mut data.records, entry, ip, now);
             record.failed_attempts = 0;

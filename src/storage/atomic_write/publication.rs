@@ -86,6 +86,7 @@ impl AtomicFileWriter {
             .map(|previous_size| AtomicWriteResult {
                 size: self.bytes_written,
                 previous_size,
+                created: accounting.created,
             });
         let published = std::time::Instant::now();
         let persisted = accounting.persist().await;
@@ -126,6 +127,7 @@ struct PublicationAccounting {
     was_published: bool,
     ledger_settled: bool,
     create_only: bool,
+    created: bool,
     conditions: crate::storage::WriteConditions,
 }
 
@@ -140,6 +142,7 @@ impl PublicationAccounting {
             was_published: false,
             ledger_settled: false,
             create_only: false,
+            created: false,
             conditions: crate::storage::WriteConditions::default(),
         }
     }
@@ -178,7 +181,8 @@ impl PublicationAccounting {
 }
 
 impl ReplacementObserver for PublicationAccounting {
-    fn check_destination(&self, metadata: Option<&std::fs::Metadata>) -> AppResult<()> {
+    fn check_destination(&mut self, metadata: Option<&std::fs::Metadata>) -> AppResult<()> {
+        self.created = metadata.is_none();
         self.conditions.check_local(metadata)
     }
     fn must_create_new(&self) -> bool {
@@ -193,6 +197,9 @@ impl ReplacementObserver for PublicationAccounting {
 
     fn recovery_owned(&mut self) {
         self.awaiting_publication = true;
+    }
+    fn rollback_completed(&mut self) {
+        self.awaiting_publication = false;
     }
 
     fn published(&mut self, previous_size: u64) {

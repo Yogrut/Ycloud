@@ -47,6 +47,7 @@ export function useUploadQueue(context: UploadQueueContext) {
   let uploadTaskSequence = 0
   let uploadDragDepth = 0
   const uploadControllers = new Map<number, AbortController>()
+  const ticketCheckedAt = new Map<string, number>()
   let disposed = false
   const selectionControllers = new Set<AbortController>()
   let refreshing = false
@@ -56,6 +57,14 @@ export function useUploadQueue(context: UploadQueueContext) {
     applyResult: (task, item) => applyServerUploadState(task, item.status, item.operation),
     unconfirmed: markUnconfirmed,
   })
+  const onPageHide = (event: PageTransitionEvent): void => {
+    if (!event.persisted) disposeUploads()
+  }
+  window.addEventListener('pagehide', onPageHide)
+
+  function announceCancellationError(error: unknown): void {
+    if (!disposed) context.announce(error instanceof Error ? error.message : locale.text('取消上传请求失败', 'Unable to cancel the upload'))
+  }
 
   function chooseFiles(): void {
     if (context.requireUpload()) fileInput.value?.click()
@@ -177,6 +186,7 @@ export function useUploadQueue(context: UploadQueueContext) {
         try {
           const batch = await getUploadBatchStatus(task.ticket, task.storageId)
           if (disposed) return
+          ticketCheckedAt.set(key, performance.now())
           checkedTickets.set(key, indexUploadBatchItems(batch))
         } catch (error) {
           if (disposed) return
@@ -229,12 +239,15 @@ export function useUploadQueue(context: UploadQueueContext) {
           await cancelUploadBatch(prepared.ticket, storageId).catch(() => undefined)
           return
         }
+        ticketCheckedAt.set(uploadTicketKey(storageId, prepared.ticket), performance.now())
         const assignedPaths = new Map<string, string>()
         for (const item of prepared.items ?? []) {
           const originalPath = item.original_path
           if (!assignedPaths.has(originalPath)) assignedPaths.set(originalPath, item.path)
         }
         for (const task of group) {
+          task.ticket = prepared.ticket
+          task.directUpload = prepared.upload_mode === 'direct'
           const assignedPath = assignedPaths.get(task.targetPath)
           if (assignedPath !== undefined) {
             task.targetPath = assignedPath
@@ -246,16 +259,13 @@ export function useUploadQueue(context: UploadQueueContext) {
           .filter(task => task.status === 'cancelled')
           .map(task => task.targetPath)
         if (cancelledPaths.length) {
-          await cancelUploadBatch(prepared.ticket, storageId, cancelledPaths).catch(() => undefined)
+          await cancelUploadBatch(prepared.ticket, storageId, cancelledPaths).catch(announceCancellationError)
         }
         if (disposed) {
-          await cancelUploadBatch(prepared.ticket, storageId).catch(() => undefined)
           return
         }
         for (const task of group) {
           if (task.status === 'cancelled') continue
-          task.ticket = prepared.ticket
-          task.directUpload = prepared.upload_mode === 'direct'
           if (task.status === 'preparing') task.status = 'queued'
         }
       } catch (error) {
@@ -273,12 +283,31 @@ export function useUploadQueue(context: UploadQueueContext) {
 
   async function uploadPreparedTasks(tasks: UploadTask[], completedContexts: Set<string>): Promise<void> {
     const pending = tasks.filter(task => task.status === 'queued' && task.ticket && task.storageId)
+    const checkingTickets = new Map<string, Promise<void>>()
+    async function checkQueuedTicket(task: UploadTask): Promise<void> {
+      const key = uploadTicketKey(task.storageId, task.ticket!)
+      if (performance.now() - (ticketCheckedAt.get(key) ?? 0) < 60_000) return
+      let checking = checkingTickets.get(key)
+      if (!checking) {
+        const group = pending.filter(candidate => candidate.status === 'queued'
+          && candidate.ticket === task.ticket && candidate.storageId === task.storageId)
+        checking = (async () => {
+          await verifyExistingTickets(group)
+          if (!disposed) await prepareMissingTickets(group)
+        })()
+        checkingTickets.set(key, checking)
+      }
+      try { await checking }
+      finally { checkingTickets.delete(key) }
+    }
     let next = 0
     async function worker(): Promise<void> {
       while (!disposed && next < pending.length) {
         const task = pending[next++]!
-        const { ticket, storageId } = task
         if (disposed) return
+        if (task.status === 'queued' && task.ticket) await checkQueuedTicket(task)
+        if (disposed) return
+        const { ticket, storageId } = task
         if (task.status !== 'queued' || !ticket || !storageId) continue
         task.status = 'uploading'
         task.loaded = 0
@@ -452,14 +481,14 @@ export function useUploadQueue(context: UploadQueueContext) {
       }
     }
     for (const [key, { ticket, storageId }] of groupUploadTasksByTicket(tasks)) {
-      if (!neededTickets.has(key)) void cancelUploadBatch(ticket, storageId).catch(() => undefined)
+      if (!neededTickets.has(key)) void cancelUploadBatch(ticket, storageId).catch(announceCancellationError)
     }
   }
 
   function cancelPendingUploadItems(tasks: UploadTask[]): void {
     const groups = groupUploadTasksByTicket(tasks.filter(task => task.status !== 'verifying'))
     for (const { ticket, storageId, tasks: group } of groups.values()) {
-      void cancelUploadBatch(ticket, storageId, group.map(task => task.targetPath)).catch(() => undefined)
+      void cancelUploadBatch(ticket, storageId, group.map(task => task.targetPath)).catch(announceCancellationError)
     }
   }
 
@@ -469,7 +498,7 @@ export function useUploadQueue(context: UploadQueueContext) {
       markUnconfirmed(task)
       return
     }
-    await cancelUploadBatch(task.ticket, task.storageId, [task.targetPath]).catch(() => undefined)
+    await cancelUploadBatch(task.ticket, task.storageId, [task.targetPath]).catch(announceCancellationError)
     await reconciliation.reconcile(task)
   }
 
@@ -578,7 +607,9 @@ export function useUploadQueue(context: UploadQueueContext) {
   }
 
   function disposeUploads(): void {
+    if (disposed) return
     disposed = true
+    window.removeEventListener('pagehide', onPageHide)
     for (const controller of selectionControllers) controller.abort()
     selectionControllers.clear()
     for (const controller of uploadControllers.values()) controller.abort()
@@ -586,7 +617,7 @@ export function useUploadQueue(context: UploadQueueContext) {
     reconciliation.dispose()
     pendingRefresh = undefined
     for (const { ticket, storageId } of groupUploadTasksByTicket(uploadTasks.value).values()) {
-      void cancelUploadBatch(ticket, storageId).catch(() => undefined)
+      void cancelUploadBatch(ticket, storageId, undefined, true).catch(() => undefined)
     }
   }
 

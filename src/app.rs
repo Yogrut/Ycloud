@@ -274,6 +274,10 @@ pub fn build_router(state: AppState) -> Router {
             timeouts,
             request_timeout_middleware,
         ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            webdav::record_request_result,
+        ))
         .layer(middleware_stack)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -352,8 +356,31 @@ async fn request_timeout_middleware(
     } else {
         timeouts.regular
     };
+    let mutation = matches!(
+        request.method().as_str(),
+        "POST"
+            | "PUT"
+            | "PATCH"
+            | "DELETE"
+            | "MKCOL"
+            | "MOVE"
+            | "COPY"
+            | "PROPPATCH"
+            | "LOCK"
+            | "UNLOCK"
+    );
     match tokio::time::timeout(duration, next.run(request)).await {
         Ok(response) => response,
+        Err(_) if mutation => {
+            let mut response = crate::error::AppError::RequestTimeout
+                .with_operation(
+                    crate::error::CommitState::Unknown,
+                    crate::error::CleanupState::Unknown,
+                )
+                .into_response();
+            *response.status_mut() = StatusCode::REQUEST_TIMEOUT;
+            response
+        }
         Err(_) => crate::error::AppError::RequestTimeout.into_response(),
     }
 }
@@ -530,6 +557,44 @@ mod tests {
 
     fn test_request() -> Builder {
         axum::http::Request::builder().header(header::HOST, "ycloud.test")
+    }
+
+    #[tokio::test]
+    async fn write_timeout_keeps_unknown_commit_evidence_while_reads_remain_ordinary_timeouts() {
+        async fn delayed() {
+            std::future::pending::<()>().await;
+        }
+        let app = axum::Router::new()
+            .route("/operation", axum::routing::get(delayed).post(delayed))
+            .layer(axum::middleware::from_fn_with_state(
+                super::RequestTimeouts {
+                    regular: std::time::Duration::from_millis(1),
+                    upload: std::time::Duration::from_millis(1),
+                },
+                super::request_timeout_middleware,
+            ));
+        for method in ["GET", "POST"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/operation")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if method == "POST" {
+                assert_eq!(json["error"]["operation"]["commit"], "unknown");
+                assert_eq!(json["error"]["operation"]["retry"], "verify_first");
+            } else {
+                assert!(json["error"]["operation"].is_null());
+            }
+        }
     }
 
     #[tokio::test]

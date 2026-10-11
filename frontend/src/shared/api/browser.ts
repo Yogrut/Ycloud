@@ -80,7 +80,6 @@ export interface BrowserCapabilities {
 export interface BrowserStorage {
   id: string
   name: string
-  requires_login: boolean
   enabled?: boolean
   ready?: boolean
 }

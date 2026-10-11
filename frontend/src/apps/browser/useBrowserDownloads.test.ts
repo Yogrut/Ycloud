@@ -2,6 +2,7 @@ import { effectScope, ref, type EffectScope } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { checkDownload, downloadUrl, prepareArchive, type BrowserCapabilities } from '../../shared/api/browser'
 import { useLocale } from '../../shared/i18n'
+import { ApiError } from '../../shared/api/client'
 import { useBrowserDownloads } from './useBrowserDownloads'
 
 vi.mock('../../shared/api/browser', async importOriginal => ({
@@ -155,11 +156,10 @@ describe('browser downloads', () => {
   })
 
   it.each([
-    ['payload too large', '所选文件总大小超过 1.0 KB，请拆分选择'],
-    ['大小超出限制', '所选文件总大小超过 1.0 KB，请拆分选择'],
-    ['entry limit exceeded', '打包最多包含 10 个条目，请拆分选择'],
-    ['条目超过限制', '打包最多包含 10 个条目，请拆分选择'],
-  ])('keeps archive limit feedback bound to the requested storage: %s', async (message, expected) => {
+    [new ApiError('Payload exceeds the configured limit', 413, 'payload_too_large'), '所选文件总大小超过 1.0 KB，请拆分选择'],
+    [new ApiError('Different server wording', 413), '所选文件总大小超过 1.0 KB，请拆分选择'],
+    [new ApiError('Archive entry limit', 400, 'archive_entry_limit'), '打包最多包含 10 个条目，请拆分选择'],
+  ])('keeps archive limit feedback bound to the requested storage: %s', async (error, expected) => {
     const pending = deferred<typeof archive>()
     prepare.mockReturnValue(pending.promise)
     const { context, actions, navigate } = setup()
@@ -167,7 +167,7 @@ describe('browser downloads', () => {
     context.storageId.value = 'other'
     context.maxArchiveBytes.value = 2048
     context.maxArchiveEntries.value = 20
-    pending.reject(new Error(message))
+    pending.reject(error)
     await request
     expect(context.announce).toHaveBeenCalledExactlyOnceWith(expected)
     expect(navigate).not.toHaveBeenCalled()
@@ -179,6 +179,7 @@ describe('browser downloads', () => {
 
   it.each([
     [new Error('Storage unavailable'), 'Storage unavailable'],
+    [new ApiError('entry limit in an unrelated error', 400, 'bad_request'), 'entry limit in an unrelated error'],
     ['offline', '打包准备失败'],
   ])('preserves archive errors without navigation or automatic retry', async (error, message) => {
     prepare.mockRejectedValue(error)
@@ -195,10 +196,10 @@ describe('browser downloads', () => {
     check.mockRejectedValue('offline')
     await actions.startDownload('one.txt')
     expect(context.announce).toHaveBeenLastCalledWith('Download failed')
-    prepare.mockRejectedValueOnce(new Error('entry limit'))
+    prepare.mockRejectedValueOnce(new ApiError('entry limit', 400, 'archive_entry_limit'))
     await actions.startArchive(['one.txt'])
     expect(context.announce).toHaveBeenLastCalledWith('An archive can contain at most 10 entries; split the selection')
-    prepare.mockRejectedValueOnce(new Error('too large'))
+    prepare.mockRejectedValueOnce(new ApiError('too large', 413, 'payload_too_large'))
     await actions.startArchive(['one.txt'])
     expect(context.announce).toHaveBeenLastCalledWith('The selection exceeds 1.0 KB; split it into smaller groups')
     await actions.startArchive(['one.txt'])

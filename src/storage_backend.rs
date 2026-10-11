@@ -364,32 +364,44 @@ impl StorageBackend {
         let guard = self.edit_guard().await?;
         match &self.active.kind {
             StorageBackendKind::S3(storage) => {
-                storage
+                let result = storage
                     .scoped_work(deadline, stop)
-                    .recover_quiesced_uploads()
-                    .await?;
-                self.active.capacity.mark_uncertain();
+                    .recover_quiesced_uploads(&self.active.capacity)
+                    .await;
+                if !self.active.capacity.status().accurate {
+                    schedule_s3_capacity_reconcile(self.active.capacity.clone(), storage.clone());
+                }
+                result?;
             }
             StorageBackendKind::Local(storage) => {
-                storage.recover_quiesced_uploads().await?;
-                self.active.capacity.mark_uncertain();
+                storage
+                    .recover_quiesced_uploads(&self.active.capacity)
+                    .await?;
             }
         }
         Ok(guard)
     }
 
-    pub(crate) async fn recovered_upload_committed(
+    pub(crate) async fn recovered_upload_outcome(
         &self,
         path: &str,
         size: u64,
         operation_id: &str,
-    ) -> AppResult<bool> {
+    ) -> AppResult<Option<crate::error::OperationOutcome>> {
+        // Trusted recovery may inspect a retired original instance. Keep its
+        // lifecycle read boundary without admitting new user operations.
+        let _lease = self
+            .active
+            .lifecycle
+            .clone()
+            .try_read_owned()
+            .map_err(|_| AppError::Conflict("存储正在结算，暂不能核对结果".into()))?;
         match &self.active.kind {
             StorageBackendKind::S3(storage) => {
-                storage.upload_committed(path, size, operation_id).await
+                storage.upload_outcome(path, size, operation_id).await
             }
             StorageBackendKind::Local(storage) => {
-                storage.upload_committed(path, size, operation_id).await
+                storage.upload_outcome(path, size, operation_id).await
             }
         }
     }
@@ -516,6 +528,20 @@ impl StorageBackend {
                 })
             }
         }
+    }
+
+    /// Listing already contains local archive metadata. S3 files still need
+    /// HEAD for their version tag; directory prefixes have no content version.
+    pub(crate) fn archive_listing_metadata(&self, entry: &BackendEntry) -> Option<BackendMetadata> {
+        (matches!(&self.active.kind, StorageBackendKind::Local(_)) || entry.is_dir).then_some({
+            BackendMetadata {
+                is_dir: entry.is_dir,
+                size: entry.size,
+                modified_unix: entry.modified_unix,
+                content_type: None,
+                version_tag: None,
+            }
+        })
     }
 
     pub async fn list_directory(

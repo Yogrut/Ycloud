@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import BrowserView from './BrowserView.vue'
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.unstubAllGlobals()
   document.body.replaceChildren()
 })
@@ -133,7 +134,9 @@ describe('BrowserView', () => {
 
     expect(host.textContent).toContain('<img src=x onerror=alert(1)>.txt')
     expect(host.textContent).toContain('12 B')
-    expect(host.querySelector('img')).toBeNull()
+    expect(host.querySelector('.file-label img')).toBeNull()
+    expect(host.querySelector('img[onerror]')).toBeNull()
+    expect([...host.querySelectorAll('img')].every(image => image.closest('.file-icon'))).toBe(true)
     expect(host.querySelectorAll('.file-toolbar-actions .btn')).toHaveLength(2)
     host.querySelector<HTMLButtonElement>('.file-toolbar-actions .btn')?.click()
     await nextTick()
@@ -477,7 +480,7 @@ describe('BrowserView', () => {
       const storageId = new URL(String(input), 'http://localhost').searchParams.get('storage_id') ?? 'primary'
       return Promise.resolve(new Response(JSON.stringify({
         ...listResponse([name]), storage_id: storageId,
-        storages: [{ id: 'primary', name: 'Local', requires_login: false }, { id: 'rustfs', name: 'RustFS', requires_login: false }],
+        storages: [{ id: 'primary', name: 'Local' }, { id: 'rustfs', name: 'RustFS' }],
       })))
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -505,7 +508,7 @@ describe('BrowserView', () => {
       const storageId = new URL(String(input), 'http://localhost').searchParams.get('storage_id') ?? 'primary'
       return Promise.resolve(new Response(JSON.stringify({
         ...listResponse(['song.flac']), storage_id: storageId,
-        storages: [{ id: 'primary', name: 'Local', requires_login: false }, { id: 'rustfs', name: 'RustFS', requires_login: false }],
+        storages: [{ id: 'primary', name: 'Local' }, { id: 'rustfs', name: 'RustFS' }],
       })))
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -558,16 +561,16 @@ describe('BrowserView', () => {
         ...listResponse(['one.txt']),
         current_path: 'games',
         storages: [
-          { id: 'primary', name: 'Local', requires_login: false },
-          { id: 'rustfs', name: 'RustFS', requires_login: false },
+          { id: 'primary', name: 'Local' },
+          { id: 'rustfs', name: 'RustFS' },
         ],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         ...listResponse(['remote.txt']),
         storage_id: 'rustfs',
         storages: [
-          { id: 'primary', name: 'Local', requires_login: false },
-          { id: 'rustfs', name: 'RustFS', requires_login: false },
+          { id: 'primary', name: 'Local' },
+          { id: 'rustfs', name: 'RustFS' },
         ],
       }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
@@ -602,12 +605,11 @@ describe('BrowserView', () => {
     app.unmount()
   })
 
-  it('does not expose a restricted storage in navigation', async () => {
+  it('lists only the storages returned by the authorized server response', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
       ...listResponse(['public.txt']),
       storages: [
-        { id: 'primary', name: 'Public', requires_login: false },
-        { id: 'private', name: 'Private', requires_login: true },
+        { id: 'primary', name: 'Public' },
       ],
     }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
@@ -698,7 +700,136 @@ describe('BrowserView', () => {
     app.unmount()
   })
 
-  it('opens the mobile action panel when the header selects all entries', async () => {
+  it('selects and deselects mobile files without opening actions or starting a transfer', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }))
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      ...listResponse(['setup.exe']),
+      capabilities: { download: true, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    const checkbox = host.querySelector<HTMLButtonElement>('.file-row .select-box')!
+    checkbox.click()
+    await nextTick()
+    expect(checkbox.classList.contains('checked')).toBe(true)
+    expect(host.querySelector('.context-menu')).toBeNull()
+
+    checkbox.click()
+    await nextTick()
+    expect(checkbox.classList.contains('checked')).toBe(false)
+    expect(host.querySelector('.context-menu')).toBeNull()
+    expect(document.querySelector('.upload-queue-modal, .confirm-dialog, .ycloud-preview-dialog')).toBeNull()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    app.unmount()
+  })
+
+  it.each([
+    ['clip.mp4', true], ['setup.exe', true], ['clip.mp4', false], ['setup.exe', false],
+  ])('double-taps %s without a native dblclick (mobile layout: %s)', async (name, mobileLayout) => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: mobileLayout }))
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse([name])), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const open = vi.spyOn(window, 'open').mockImplementation(() => null)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+
+    vi.useFakeTimers()
+    const row = host.querySelector<HTMLElement>('.file-row')!
+    const tap = () => {
+      const pointer = { bubbles: true, pointerType: 'touch', pointerId: 7, isPrimary: true, clientX: 100, clientY: 120 }
+      row.dispatchEvent(new PointerEvent('pointerdown', { ...pointer, button: 0, buttons: 1 }))
+      row.dispatchEvent(new PointerEvent('pointerup', { ...pointer, button: 0, buttons: 0 }))
+      // Mobile browsers may report detail=1 for both clicks and never emit dblclick.
+      row.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }))
+    }
+    tap()
+    await nextTick()
+    expect(host.querySelector('.context-menu')).toBeNull()
+    expect(row.classList.contains('selected')).toBe(false)
+    await vi.advanceTimersByTimeAsync(150)
+    tap()
+    await nextTick()
+
+    expect(host.querySelector('.context-menu')).toBeNull()
+    expect(row.classList.contains('selected')).toBe(false)
+    await vi.advanceTimersByTimeAsync(400)
+    expect(row.classList.contains('selected')).toBe(false)
+    if (name.endsWith('.mp4')) {
+      expect(document.querySelector('.ycloud-preview-dialog video')).not.toBeNull()
+    } else {
+      expect(document.body.textContent).toContain('浏览器无法预览此文件，是否下载？')
+      expect(document.querySelector('.ycloud-preview-dialog')).toBeNull()
+    }
+    expect(open).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    app.unmount()
+  })
+
+  it('does not preview or download when a mobile checkbox is double-clicked', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }))
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['setup.exe'])), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const checkbox = host.querySelector<HTMLButtonElement>('.file-row .select-box')!
+    checkbox.click()
+    checkbox.click()
+    checkbox.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, detail: 2 }))
+    await nextTick()
+    expect(host.querySelector('.context-menu')).toBeNull()
+    expect(document.body.textContent).not.toContain('浏览器无法预览此文件，是否下载？')
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    app.unmount()
+  })
+
+  it('closes the mobile selection menu when navigating into a folder', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }))
+    const response = listResponse(['folder'])
+    response.entries[0]!.is_dir = true
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(response), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...listResponse(['inside.txt']), current_path: 'folder' }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    const row = host.querySelector<HTMLElement>('.file-row')!
+    row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2, clientX: 30, clientY: 60 }))
+    await nextTick()
+    expect(host.querySelector('.context-menu')).not.toBeNull()
+    for (let tap = 0; tap < 2; tap++) {
+      const pointer = { bubbles: true, pointerType: 'touch', pointerId: 7, isPrimary: true, clientX: 100, clientY: 120 }
+      row.dispatchEvent(new PointerEvent('pointerdown', pointer))
+      row.dispatchEvent(new PointerEvent('pointerup', pointer))
+      row.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }))
+    }
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    expect(host.querySelector('.context-menu')).toBeNull()
+    expect(host.textContent).toContain('inside.txt')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    app.unmount()
+  })
+
+  it('selects all mobile entries without opening the action menu', async () => {
     vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }))
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
       storage_id: 'primary',
@@ -726,10 +857,134 @@ describe('BrowserView', () => {
     selectAll.click()
     await nextTick()
 
-    expect(host.querySelector('.context-menu')).not.toBeNull()
-    expect(host.textContent).toContain('已选择 1 项')
-    expect(host.textContent).toContain('下载')
+    expect(host.querySelector('.context-menu')).toBeNull()
+    expect(selectAll.classList.contains('checked')).toBe(true)
+    expect(host.querySelector('.file-row.selected')).not.toBeNull()
     app.unmount()
+  })
+
+  it.each([true, false])('opens touch actions independently of the mobile layout breakpoint (%s)', async mobileLayout => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: mobileLayout }))
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt', 'two.txt'])), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    vi.useFakeTimers()
+    const row = host.querySelector<HTMLElement>('.file-row')!
+    const press = new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerType: 'touch', pointerId: 7, isPrimary: true, button: 0, clientX: 210, clientY: 160 })
+    row.dispatchEvent(press)
+    expect(press.defaultPrevented).toBe(false)
+    await vi.advanceTimersByTimeAsync(499)
+    expect(host.querySelector('.context-menu')).toBeNull()
+    await vi.advanceTimersByTimeAsync(1)
+    await nextTick()
+    expect(host.querySelector('.context-menu')).not.toBeNull()
+    expect(row.classList.contains('selected')).toBe(true)
+    expect((host.querySelector('.context-menu') as HTMLElement).style.left).toBe('210px')
+    expect((host.querySelector('.context-menu') as HTMLElement).style.top).toBe('160px')
+
+    row.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'touch', pointerId: 7, isPrimary: true }))
+    const releaseClick = new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 })
+    row.dispatchEvent(releaseClick)
+    await nextTick()
+    expect(releaseClick.defaultPrevented).toBe(true)
+    expect(row.classList.contains('selected')).toBe(true)
+    expect(host.querySelector('.context-menu')).not.toBeNull()
+    expect(document.querySelector('.ycloud-preview-dialog, .upload-queue-modal')).toBeNull()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch', isPrimary: true }))
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    await nextTick()
+    expect(host.querySelector('.context-menu')).toBeNull()
+    expect(row.classList.contains('selected')).toBe(true)
+    app.unmount()
+  })
+
+  it.each(['move', 'pointercancel', 'blur'])('cancels a pending long press on %s without preventing scroll or opening actions', async reason => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: false }))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt'])), { status: 200 })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    vi.useFakeTimers()
+    const row = host.querySelector<HTMLElement>('.file-row')!
+    row.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch', pointerId: 7, isPrimary: true, clientX: 100, clientY: 120 }))
+    await vi.advanceTimersByTimeAsync(250)
+    const cancel = reason === 'move'
+      ? new PointerEvent('pointermove', { cancelable: true, pointerType: 'touch', pointerId: 7, clientX: 100, clientY: 140 })
+      : reason === 'blur' ? new Event('blur')
+        : new PointerEvent(reason, { pointerType: 'touch', pointerId: 7 })
+    window.dispatchEvent(cancel)
+    await vi.advanceTimersByTimeAsync(600)
+    expect(cancel.defaultPrevented).toBe(false)
+    expect(host.querySelector('.context-menu')).toBeNull()
+    expect(row.classList.contains('selected')).toBe(false)
+    app.unmount()
+  })
+
+  it('retains multiple selected files when a tablet long-presses one of them', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: false }))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt', 'two.txt'])), { status: 200 })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    host.querySelectorAll<HTMLButtonElement>('.file-row .select-box').forEach(button => button.click())
+    await nextTick()
+    expect(host.querySelector('.context-menu')).toBeNull()
+    vi.useFakeTimers()
+    const row = host.querySelector<HTMLElement>('.file-row')!
+    row.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch', isPrimary: true }))
+    await vi.advanceTimersByTimeAsync(500)
+    await nextTick()
+    expect(host.querySelectorAll('.file-row.selected')).toHaveLength(2)
+    expect(host.querySelector('.context-menu')?.textContent).toContain('已选择 2 项')
+    expect(host.querySelector('.context-menu')?.textContent).toContain('打包下载')
+    app.unmount()
+  })
+
+  it('does not consume a later intentional menu tap when a long press produces no release click', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt'])), { status: 200 })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    vi.useFakeTimers()
+    const row = host.querySelector<HTMLElement>('.file-row')!
+    row.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch', isPrimary: true, pointerId: 7 }))
+    await vi.advanceTimersByTimeAsync(500)
+    row.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerType: 'touch', pointerId: 7 }))
+    await nextTick()
+    const upload = [...host.querySelectorAll<HTMLButtonElement>('.context-menu [role="menuitem"]')].find(button => button.textContent === '上传')!
+    upload.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch', isPrimary: true, pointerId: 8 }))
+    upload.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    await nextTick()
+    expect(host.querySelector('.context-menu')).toBeNull()
+    expect(document.querySelector('.upload-queue-modal')).not.toBeNull()
+    app.unmount()
+  })
+
+  it('cancels a pending touch menu when the file page unmounts', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['one.txt'])), { status: 200 })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountBrowser(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+    vi.useFakeTimers()
+    host.querySelector('.file-row')!.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch', isPrimary: true }))
+    app.unmount()
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(document.querySelector('.context-menu')).toBeNull()
   })
 
   it('selects only intersecting rows without rendering a drag rectangle', async () => {
@@ -750,15 +1005,15 @@ describe('BrowserView', () => {
     vi.spyOn(rows[0]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 70, 380, 105))
     vi.spyOn(rows[1]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 110, 380, 145))
 
-    panel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 30, clientY: 60 }))
-    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1, clientX: 360, clientY: 95 }))
+    panel.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'mouse', bubbles: true, button: 0, clientX: 30, clientY: 60 }))
+    window.dispatchEvent(new PointerEvent('pointermove', { pointerType: 'mouse', bubbles: true, buttons: 1, clientX: 360, clientY: 95 }))
     await nextTick()
 
     expect(host.querySelector('.drag-selection-box')).toBeNull()
     expect(rows[0]!.classList.contains('selected')).toBe(true)
     expect(rows[1]!.classList.contains('selected')).toBe(false)
 
-    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 360, clientY: 95 }))
+    window.dispatchEvent(new PointerEvent('pointerup', { pointerType: 'mouse', bubbles: true, clientX: 360, clientY: 95 }))
     rows[0]!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await nextTick()
     expect(host.querySelector('.drag-selection-box')).toBeNull()
@@ -785,14 +1040,14 @@ describe('BrowserView', () => {
     vi.spyOn(rows[0]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 70, 380, 105))
     vi.spyOn(rows[1]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 110, 380, 145))
 
-    const down = new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 0, buttons: 1, clientX: 30, clientY: 80 })
+    const down = new PointerEvent('pointerdown', { pointerType: 'mouse', bubbles: true, cancelable: true, button: 0, buttons: 1, clientX: 30, clientY: 80 })
     checkbox.dispatchEvent(down)
-    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, cancelable: true, buttons: 1, clientX: 360, clientY: 130 }))
+    window.dispatchEvent(new PointerEvent('pointermove', { pointerType: 'mouse', bubbles: true, cancelable: true, buttons: 1, clientX: 360, clientY: 130 }))
     await nextTick()
 
     expect(down.defaultPrevented).toBe(true)
     expect(host.querySelectorAll('.file-row.selected')).toHaveLength(2)
-    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, button: 0, clientX: 360, clientY: 130 }))
+    window.dispatchEvent(new PointerEvent('pointerup', { pointerType: 'mouse', bubbles: true, button: 0, clientX: 360, clientY: 130 }))
     app.unmount()
   })
 
@@ -809,9 +1064,9 @@ describe('BrowserView', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
     const panel = host.querySelector('.file-panel') as HTMLElement
-    panel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 20, clientY: 20 }))
-    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1, clientX: 200, clientY: 100 }))
-    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
+    panel.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'mouse', bubbles: true, button: 0, clientX: 20, clientY: 20 }))
+    window.dispatchEvent(new PointerEvent('pointermove', { pointerType: 'mouse', bubbles: true, buttons: 1, clientX: 200, clientY: 100 }))
+    window.dispatchEvent(new PointerEvent('pointerup', { pointerType: 'mouse', bubbles: true }))
     await nextTick()
 
     expect(host.querySelector('.drag-selection-box')).toBeNull()
@@ -841,9 +1096,9 @@ describe('BrowserView', () => {
     vi.spyOn(rows[0]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 70, 380, 105))
     vi.spyOn(rows[1]!, 'getBoundingClientRect').mockReturnValue(domRect(20, 110, 380, 145))
 
-    panel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0, clientX: 30, clientY: 145 }))
-    window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, buttons: 1, clientX: 360, clientY: 75 }))
-    window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, clientX: 360, clientY: 75 }))
+    panel.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'mouse', bubbles: true, button: 0, clientX: 30, clientY: 145 }))
+    window.dispatchEvent(new PointerEvent('pointermove', { pointerType: 'mouse', bubbles: true, buttons: 1, clientX: 360, clientY: 75 }))
+    window.dispatchEvent(new PointerEvent('pointerup', { pointerType: 'mouse', bubbles: true, clientX: 360, clientY: 75 }))
     await nextTick()
 
     expect(host.querySelector('.drag-selection-box')).toBeNull()
@@ -1171,8 +1426,8 @@ describe('BrowserView', () => {
     let resolvePrepare!: (response: Response) => void
     const prepareResponse = new Promise<Response>(resolve => { resolvePrepare = resolve })
     const storages = [
-      { id: 'primary', name: 'Local', requires_login: false },
-      { id: 'archive', name: 'Archive', requires_login: false },
+      { id: 'primary', name: 'Local' },
+      { id: 'archive', name: 'Archive' },
     ]
     const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
       const url = String(input)

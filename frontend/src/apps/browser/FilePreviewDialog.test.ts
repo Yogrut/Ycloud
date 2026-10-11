@@ -39,6 +39,20 @@ afterEach(() => {
 })
 
 describe('FilePreviewDialog', () => {
+  it.each(['clip.mp4', 'notes.txt'])('enters fullscreen for %s only after its fullscreen button is pressed', async name => {
+    if (name.endsWith('.txt')) vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('hello')))
+    showFile(name)
+    await nextTick()
+    const target = document.body.querySelector<HTMLElement>(name.endsWith('.mp4') ? '.ycloud-media-player.video' : '.ycloud-preview-dialog')!
+    const requestFullscreen = vi.fn().mockResolvedValue(undefined)
+    target.requestFullscreen = requestFullscreen
+    expect(document.fullscreenElement).toBeFalsy()
+    expect(requestFullscreen).not.toHaveBeenCalled()
+    target.querySelector<HTMLButtonElement>('button[aria-label="全屏"]')!.click()
+    await nextTick()
+    expect(requestFullscreen).toHaveBeenCalledOnce()
+  })
+
   it.each(['clip.mp4', 'notes.txt'])('focuses the %s dialog without initially outlining its close button', async name => {
     if (name.endsWith('.txt')) vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('hello', { status: 200 })))
     showFile(name)

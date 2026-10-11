@@ -45,7 +45,7 @@ function operations() {
 }
 
 function listingData(path: string): FileListResponse {
-  return { storage_id: 'primary', storages: [{ id: 'primary', name: 'Primary', requires_login: false }],
+  return { storage_id: 'primary', storages: [{ id: 'primary', name: 'Primary' }],
     current_path: path, parent_path: null, entries: [], page_start: 0, page_size: 20,
     next_cursor: null, can_write: true, max_upload_bytes: 0, max_archive_bytes: 0, max_archive_entries: 0 }
 }
@@ -140,7 +140,7 @@ describe('file operation resilience', () => {
     const request = actions.startArchive(['one.txt'])
     context.storageId.value = 'other-storage'
     context.maxArchiveBytes.value = 2048
-    pending.reject(new Error('payload too large'))
+    pending.reject(new ApiError('Payload exceeds the configured limit', 413, 'payload_too_large'))
     await request
     expect(prepareArchive).toHaveBeenCalledWith(['one.txt'], 'primary')
     expect(context.announce).toHaveBeenCalledWith('所选文件总大小超过 1.0 KB，请拆分选择')
@@ -285,7 +285,7 @@ describe('listing resilience', () => {
     await settle()
     expect(listStorages).toHaveBeenCalledTimes(1)
     await view.navigate('latest')
-    fallback.resolve([{ id: 'obsolete', name: 'Obsolete', requires_login: false }])
+    fallback.resolve([{ id: 'obsolete', name: 'Obsolete' }])
     await old
     expect(view.storages.value[0]?.id).toBe('primary')
     expect(context.announce).not.toHaveBeenCalled()

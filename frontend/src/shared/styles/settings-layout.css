@@ -57,7 +57,6 @@
 .setting-row-value { flex: 1; min-width: 0; padding: 9px 12px; color: var(--muted-2); overflow-wrap: anywhere; cursor: not-allowed; }
 .setting-row-control button { display: flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 0 16px; border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; }
 .setting-row-control button:hover { color: var(--accent); background: var(--accent-soft); }
-.setting-row-detail p { margin: 8px 0 0; font-size: 12px; color: var(--muted-2); }
 .form-pane:has(.settings-rows) { width: 100%; }
 .list-pane .admin-pane-head { flex-wrap: wrap; gap: 16px; min-height: 0; padding: 20px 24px 14px; border-bottom: 0; }
 .list-pane .admin-pane-body { padding: 0 24px 16px; }

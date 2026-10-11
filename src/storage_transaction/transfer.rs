@@ -135,8 +135,13 @@ impl TransactionPaths {
             .expect("publication mutex poisoned") = Some(journal.clone());
         self.settle_publication().await?;
         if let (Some(operation_id), Some(size)) = (&journal.operation_id, journal.operation_size) {
-            self.ensure_receipt(operation_id, &journal.destination, size, true)
-                .await?;
+            self.ensure_receipt(
+                operation_id,
+                &journal.destination,
+                size,
+                crate::error::CommitState::Committed,
+            )
+            .await?;
         }
         self.cleanup_replacement_backup(&backup, previous_size)
             .await?;

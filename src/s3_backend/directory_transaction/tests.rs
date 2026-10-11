@@ -608,7 +608,7 @@ async fn directory_recovery_uses_bounded_namespace_checked_listing() {
             axum::serve(listener, router).await.unwrap();
         });
         let result = backend
-            .recover_journal_category(crate::s3_backend::recovery::JournalKind::Directory)
+            .recover_journal_category(crate::s3_backend::recovery::JournalKind::Directory, None)
             .await;
         if scenario == "empty" {
             assert_eq!(result.unwrap(), 0);

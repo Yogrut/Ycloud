@@ -173,7 +173,6 @@ pub struct BrowserCapabilities {
 pub struct BrowserStorageView {
     pub id: String,
     pub name: String,
-    pub requires_login: bool,
     pub enabled: bool,
     pub ready: bool,
 }
@@ -204,7 +203,6 @@ async fn browser_storage_views(state: &AppState, headers: &HeaderMap) -> Vec<Bro
         storages.push(BrowserStorageView {
             id: storage.id,
             name: storage.name,
-            requires_login: false,
             enabled: storage.enabled,
             ready,
         });
@@ -234,19 +232,6 @@ pub struct RenameBody {
 pub struct LockBody {
     pub path: String,
     pub password: String,
-}
-
-fn sanitize_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| {
-            !matches!(
-                c,
-                '/' | '\\' | '\0' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
-            )
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
 }
 
 fn get_icon(name: &str, is_dir: bool, mime: &str) -> String {
@@ -542,11 +527,8 @@ pub async fn create_directory(
         &share_storage_path(&share, request_path),
     )
     .await?;
-    let name = sanitize_name(&body.name);
-    if name.is_empty() {
-        return Err(AppError::BadRequest("Directory name is required".into()));
-    }
-    let new_path = join_request_path(request_path, &name);
+    let name = crate::storage::StorageService::validate_name(&body.name)?;
+    let new_path = join_request_path(request_path, name);
     check_folder_locks(
         &state,
         &headers,
@@ -576,16 +558,10 @@ pub async fn upload_file(
     ensure_writable(&share)?;
     let file_request_path = query.path.as_deref().unwrap_or("").trim_matches('/');
     ensure_non_root(file_request_path)?;
-    let file_name = file_request_path
-        .rsplit('/')
-        .next()
-        .map(sanitize_name)
-        .unwrap_or_default();
-    if file_name.is_empty() || file_name != file_request_path.rsplit('/').next().unwrap_or("") {
-        return Err(AppError::BadRequest(
-            "A valid target file path is required".into(),
-        ));
-    }
+    let file_name = crate::storage::StorageService::validate_name(
+        file_request_path.rsplit('/').next().unwrap_or(""),
+    )?
+    .to_owned();
     check_folder_locks(
         &state,
         &headers,
@@ -776,16 +752,13 @@ pub async fn rename_file(
         &share_storage_path(&share, &body.path),
     )
     .await?;
-    let new_name = sanitize_name(&body.new_name);
-    if new_name.is_empty() {
-        return Err(AppError::BadRequest("File name is required".into()));
-    }
+    let new_name = crate::storage::StorageService::validate_name(&body.new_name)?;
     let destination_request_path = body
         .path
         .trim_matches('/')
         .rsplit_once('/')
-        .map(|(parent, _)| join_request_path(parent, &new_name))
-        .unwrap_or_else(|| new_name.clone());
+        .map(|(parent, _)| join_request_path(parent, new_name))
+        .unwrap_or_else(|| new_name.to_owned());
     check_folder_lock_tree(
         &state,
         &headers,

@@ -65,6 +65,8 @@ pub struct TransactionPaths {
     _ownership_lock: std::sync::Arc<std::fs::File>,
     pending_publication: std::sync::Arc<std::sync::Mutex<Option<ReplaceJournal>>>,
     receipt_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    metadata_sync_failure: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(target_os = "linux")]
     linux_root: LinuxRoot,
     pub uploads: PathBuf,
@@ -186,6 +188,8 @@ impl TransactionPaths {
             _ownership_lock: std::sync::Arc::new(lock),
             pending_publication: Default::default(),
             receipt_count: Default::default(),
+            #[cfg(test)]
+            metadata_sync_failure: Default::default(),
             linux_root,
             uploads: system.join("uploads"),
             copies: system.join("copies"),
@@ -212,7 +216,7 @@ impl TransactionPaths {
                 .await?;
         }
         paths.load_receipt_count().await?;
-        paths.recover(root).await?;
+        paths.recover(root, || {}).await?;
         Ok(paths)
     }
 
@@ -289,6 +293,8 @@ impl TransactionPaths {
             root: root.to_path_buf(),
             pending_publication: Default::default(),
             receipt_count: Default::default(),
+            #[cfg(test)]
+            metadata_sync_failure: Default::default(),
             _ownership_lock: {
                 let file =
                     crate::instance_lock::InstanceLock::acquire_file(&system.join("instance.lock"))
@@ -317,7 +323,7 @@ impl TransactionPaths {
             ensure_private_directory(directory).await?;
         }
         paths.load_receipt_count().await?;
-        paths.recover(root).await?;
+        paths.recover(root, || {}).await?;
         Ok(paths)
     }
 
@@ -555,7 +561,8 @@ impl TransactionPaths {
     }
 
     async fn write_json_atomic(&self, path: &Path, value: &impl Serialize) -> AppResult<()> {
-        self.write_json_atomic_inner(path, value, false).await
+        self.write_json_atomic_inner(path, value, false, || {})
+            .await
     }
 
     async fn write_json_atomic_inner(
@@ -563,10 +570,13 @@ impl TransactionPaths {
         path: &Path,
         value: &impl Serialize,
         replace_existing: bool,
+        on_publish: impl FnOnce(),
     ) -> AppResult<()> {
         let temporary = path.with_extension("tmp");
         if replace_existing {
-            if path.parent() != Some(self.journals.as_path()) {
+            if path.parent() != Some(self.journals.as_path())
+                && path.parent() != Some(self.receipts.as_path())
+            {
                 return Err(AppError::Forbidden);
             }
             self.rooted_remove_file_idempotent(&temporary).await?;
@@ -600,6 +610,17 @@ impl TransactionPaths {
             })?;
         } else {
             self.rooted_rename_noreplace(&temporary, path).await?;
+        }
+        on_publish();
+        #[cfg(test)]
+        if self
+            .metadata_sync_failure
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(AppError::with_source(
+                "metadata directory sync failed",
+                std::io::Error::other("injected sync failure"),
+            ));
         }
         self.rooted_sync_parent(path).await
     }
@@ -873,6 +894,7 @@ impl TransactionPaths {
             &self.journals.join(format!("{}.json", journal.id)),
             &journal,
             true,
+            || {},
         )
         .await?;
         *self
@@ -1579,6 +1601,27 @@ mod tests {
             .receipt_matches("report.txt", 7, operation)
             .await
             .unwrap());
+        assert_eq!(
+            recovered
+                .receipt_outcome("report.txt", 7, operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .commit,
+            crate::error::CommitState::NotCommitted,
+        );
+        // The rollback proof is durable before journal retirement. Reconstruct
+        // that interrupted retirement without an unrelated capacity worker.
+        tokio::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap())
+            .await
+            .unwrap();
+        let mut accounting_notified = false;
+        recovered
+            .recover(root.path(), || accounting_notified = true)
+            .await
+            .unwrap();
+        assert!(!accounting_notified);
+        assert!(!journal_path.exists());
     }
 
     #[tokio::test]
@@ -1607,6 +1650,39 @@ mod tests {
             .receipt_matches("report.txt", 3, operation)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn recovery_notifies_accounting_before_restoring_a_formal_destination() {
+        let root = TestDirectory::new("recovery-formal-accounting");
+        let paths = TransactionPaths::initialize(root.path()).await.unwrap();
+        let id = TransactionId::new();
+        let journal = ReplaceJournal::new(id.clone(), "file.txt".into()).unwrap();
+        tokio::fs::write(
+            paths.journals.join(format!("{id}.json")),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(paths.upload_path(&id), b"pending")
+            .await
+            .unwrap();
+        tokio::fs::write(paths.backups.join(&id), b"original")
+            .await
+            .unwrap();
+        let mut notices = 0;
+        paths
+            .recover(root.path(), || {
+                assert!(!root.path().join("file.txt").exists());
+                notices += 1;
+            })
+            .await
+            .unwrap();
+        assert_eq!(notices, 1);
+        assert_eq!(
+            tokio::fs::read(root.path().join("file.txt")).await.unwrap(),
+            b"original"
+        );
     }
 
     #[tokio::test]

@@ -2,11 +2,12 @@
 
 English | [简体中文](THIRD_PARTY_NOTICES.zh-CN.md)
 
-Ycloud uses the open-source components below. Exact versions are pinned in `Cargo.lock` and `frontend/package-lock.json`; this is a list of the main projects, not every dependency.
+Ycloud uses the open-source components below. Dependency versions are pinned in `Cargo.lock` and `frontend/package-lock.json`; vendored Material Icon Theme assets are pinned to commit `a7ffd480d308a153b95cf241999dbaaa58bf4992` (5.39.0). This is a list of the main projects, not every dependency.
 
 | Project | License |
 | --- | --- |
 | Vue, VueUse, Reka UI, Phosphor Icons, Tailwind CSS, tailwind-merge, clsx, shadcn-vue components | MIT |
+| Material Icon Theme — selected file and folder SVGs | MIT |
 | class-variance-authority | Apache-2.0 |
 | Axum, Tokio, Tower, tracing, bytes, http-body, http-body-util, mime_guess, async_zip | MIT |
 | Serde, serde_json, Chrono, UUID, anyhow, Argon2, base64, rand_core, futures-util, fs4, qrcode, windows-sys | MIT or Apache-2.0 |

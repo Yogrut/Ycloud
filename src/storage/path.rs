@@ -33,6 +33,22 @@ impl ResolvedPath {
 }
 
 impl StorageService {
+    /// Validate one new path component without silently changing its spelling.
+    pub(crate) fn validate_name(name: &str) -> AppResult<&str> {
+        if name.is_empty()
+            || name.trim() != name
+            || matches!(name, "." | "..")
+            || name.chars().any(|c| {
+                c.is_control() || matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+            })
+        {
+            return Err(AppError::BadRequest(
+                "Invalid file or directory name".into(),
+            ));
+        }
+        Ok(name)
+    }
+
     pub fn normalize_relative(path: &str) -> AppResult<String> {
         normalize_relative(path)
     }
@@ -178,5 +194,22 @@ pub(crate) fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
     #[cfg(not(windows))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::StorageService;
+
+    #[test]
+    fn names_are_validated_without_rewriting_user_input() {
+        for name in ["photo.jpg", "文件目录", "a b", ".gitkeep"] {
+            assert_eq!(StorageService::validate_name(name).unwrap(), name);
+        }
+        for name in [
+            "", ".", "..", " report ", "a/b", "a\\b", "a:b", "a?b", "a*b", "a\0b", "a\nb",
+        ] {
+            assert!(StorageService::validate_name(name).is_err(), "{name:?}");
+        }
     }
 }

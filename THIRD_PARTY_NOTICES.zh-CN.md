@@ -2,11 +2,12 @@
 
 [English](THIRD_PARTY_NOTICES.md) | 简体中文
 
-Ycloud 使用以下开源组件。准确版本由 `Cargo.lock` 和 `frontend/package-lock.json` 固定；本文件只列主要项目，不逐个介绍。
+Ycloud 使用以下开源组件。依赖版本由 `Cargo.lock` 和 `frontend/package-lock.json` 固定；随源码收录的 Material Icon Theme 图标固定为提交 `a7ffd480d308a153b95cf241999dbaaa58bf4992`（5.39.0）。本文件只列主要项目，不逐个介绍。
 
 | 项目 | 许可证 |
 | --- | --- |
 | Vue、VueUse、Reka UI、Phosphor Icons、Tailwind CSS、tailwind-merge、clsx、shadcn-vue 组件 | MIT |
+| Material Icon Theme — 选用的文件和文件夹 SVG 图标 | MIT |
 | class-variance-authority | Apache-2.0 |
 | Axum、Tokio、Tower、tracing、bytes、http-body、http-body-util、mime_guess、async_zip | MIT |
 | Serde、serde_json、Chrono、UUID、anyhow、Argon2、base64、rand_core、futures-util、fs4、qrcode、windows-sys | MIT 或 Apache-2.0 |

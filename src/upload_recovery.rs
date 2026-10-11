@@ -66,6 +66,7 @@ impl UploadRecovery {
                 Ok(guard) => guard,
                 Err(_) => continue, // Live owner or unavailable storage: retry later.
             };
+            drop(_exclusive);
             let next_offset = self.next_offsets.entry(backend.instance_key()).or_default();
             *next_offset %= group.len();
             for item in confirmation_window(group, *next_offset) {
@@ -78,17 +79,20 @@ impl UploadRecovery {
                 // storage errors, so one failing item cannot pin the next window.
                 *next_offset = (*next_offset + 1) % group.len();
                 match backend
-                    .recovered_upload_committed(
+                    .recovered_upload_outcome(
                         &item.path,
                         item.size,
                         &operation_id(&item.ticket, &item.path),
                     )
                     .await
                 {
-                    Ok(true) => {
-                        let _ = state.upload_batches.confirm_unknown_committed(item).await;
+                    Ok(Some(outcome)) if outcome.commit != crate::error::CommitState::Unknown => {
+                        let _ = state
+                            .upload_batches
+                            .confirm_unknown_outcome(item, outcome)
+                            .await;
                     }
-                    Ok(false) => continue, // Missing proof cannot establish that publication never happened.
+                    Ok(_) => continue, // Missing or unconfirmed proof cannot establish a final result.
                     Err(crate::error::AppError::Conflict(_)) => continue, // One operation remains uncertain; do not starve the others.
                     Err(_) => break, // Keep cleanup ownership until storage returns.
                 }
@@ -972,5 +976,76 @@ mod tests {
             state.upload_batches.ensure_storage_idle("primary").await,
             Err(AppError::Conflict(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn proven_rollback_settles_unknown() {
+        let directory = TestDirectory::new("upload-recovery-proven-rollback");
+        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
+        let owner = RequestSubject::Session("owner".into());
+        let ticket = state
+            .upload_batches
+            .create(
+                owner.clone(),
+                "primary".into(),
+                HashMap::from([("report.txt".into(), ("report.txt".into(), 7))]),
+            )
+            .await
+            .unwrap();
+        state
+            .upload_batches
+            .begin(&ticket, &owner, "primary", "report.txt", 7)
+            .await
+            .unwrap();
+        state
+            .upload_batches
+            .finish_result::<()>(
+                &ticket,
+                "report.txt",
+                &Err(AppError::internal("interrupted")
+                    .with_operation(CommitState::Unknown, CleanupState::Unknown)),
+            )
+            .await;
+        let id = uuid::Uuid::new_v4().to_string();
+        let system = state.config.storage_path.join(".ycloud-system");
+        tokio::fs::write(system.join("uploads").join(&id), b"pending")
+            .await
+            .unwrap();
+        tokio::fs::write(system.join("backups").join(&id), b"original")
+            .await
+            .unwrap();
+        let journal_path = system.join("transactions").join(format!("{id}.json"));
+        let journal = serde_json::to_vec(&serde_json::json!({
+            "version": 2, "id": id, "destination": "report.txt", "published": false,
+            "operation_id": operation_id(&ticket, "report.txt"), "operation_size": 7
+        }))
+        .unwrap();
+        tokio::fs::write(&journal_path, &journal).await.unwrap();
+        UploadRecovery::default().recover(&state).await;
+        let status = state
+            .upload_batches
+            .status(&ticket, &owner, "primary")
+            .await
+            .unwrap();
+        assert_eq!(status.items[0].status, UploadStatus::Failed);
+        assert_eq!(
+            status.items[0].operation.unwrap().commit,
+            CommitState::NotCommitted
+        );
+        assert!(state.upload_batches.unknown_items().await.is_empty());
+        assert_eq!(
+            tokio::fs::read(state.config.storage_path.join("report.txt"))
+                .await
+                .unwrap(),
+            b"original"
+        );
+        assert!(!journal_path.exists());
+        let backend = state.backends.cached("primary").await.unwrap();
+        let outcome = backend
+            .recovered_upload_outcome("report.txt", 7, &operation_id(&ticket, "report.txt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.commit, CommitState::NotCommitted);
     }
 }

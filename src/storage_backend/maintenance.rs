@@ -248,6 +248,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_transaction_recovery_does_not_dirty_known_capacity() {
+        let (_fixture, backend) = local_fixture("maintenance-empty-recovery").await;
+        for _ in 0..2 {
+            let guard = backend
+                .recover_abandoned_uploads_before(None, None)
+                .await
+                .unwrap();
+            assert!(backend.capacity_status().accurate);
+            assert!(!backend.capacity_status().reconciling);
+            drop(guard);
+        }
+    }
+
+    #[tokio::test]
     async fn duplicate_local_scan_does_not_settle_the_current_owner() {
         let (fixture, backend) = local_fixture("maintenance-scan-owner").await;
         let blocker = fixture.path().join("blocked-ledger");

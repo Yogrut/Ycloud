@@ -113,6 +113,8 @@ BIND_ADDRESS=0.0.0.0 ./target/release/ycloud
 
 默认配置和存储目录为当前目录下的 `config.json`、`storage/`。
 
+`config.example.json` 仅展示配置格式，不能直接作为运行配置，其中的密码哈希是占位说明。首次安装时，让 `CONFIG_PATH` 指定的文件保持不存在，启动 Ycloud 后会生成配置和 `initial-credentials.json`。通过后台修改设置，不要用示例覆盖已有配置。
+
 ## 部署配置
 
 | 变量 | 用途 |

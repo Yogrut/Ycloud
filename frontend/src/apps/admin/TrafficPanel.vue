@@ -197,9 +197,9 @@ defineExpose({ openEditor })
               <button type="button" :class="{ active: rangeMode === 'custom' }" @click="selectRange('custom')">{{ locale.text('自定义', 'Custom') }}</button>
             </div>
             <form v-if="rangeMode === 'custom'" class="traffic-range" @submit.prevent="refresh">
-              <AppDatePicker v-model="start" :label="locale.text('开始日期', 'Start date')" :max="end || today" :show-footer="false" />
+              <AppDatePicker v-model="start" :label="locale.text('开始日期', 'Start date')" :max="end || today" />
               <span aria-hidden="true">至</span>
-              <AppDatePicker v-model="end" :label="locale.text('结束日期', 'End date')" :min="start" :max="today" :show-footer="false" />
+              <AppDatePicker v-model="end" :label="locale.text('结束日期', 'End date')" :min="start" :max="today" />
               <button class="btn secondary" type="submit" :disabled="loading || !start || !end">{{ locale.text('查看', 'View') }}</button>
             </form>
           </div>
@@ -247,7 +247,7 @@ defineExpose({ openEditor })
         <fieldset class="cycle-fields">
           <legend>{{ locale.text('统一重置周期', 'Shared reset schedule') }}</legend>
           <div><label>{{ locale.text('每隔', 'Every') }}<input v-model.number="every" class="input" type="number" min="1" max="120" required></label><div class="cycle-unit"><span>{{ locale.text('周期单位', 'Unit') }}</span><AppSelect :model-value="unit" :label="locale.text('周期单位', 'Unit')" :options="[{ value: 'hours', label: locale.text('小时', 'Hours') }, { value: 'days', label: locale.text('天', 'Days') }, { value: 'months', label: locale.text('月', 'Months') }]" @update:model-value="unit = $event as typeof unit" /></div></div>
-          <label>{{ locale.text('起始日期（本地日期）', 'Start date (local date)') }}<AppDatePicker v-model="anchor" placement="top" :show-footer="false" :label="locale.text('起始日期（本地日期）', 'Start date (local date)')" min="2000-01-01" max="2100-01-01" /></label>
+          <label>{{ locale.text('起始日期（本地日期）', 'Start date (local date)') }}<AppDatePicker v-model="anchor" placement="top" :label="locale.text('起始日期（本地日期）', 'Start date (local date)')" min="2000-01-01" max="2100-01-01" /></label>
           <small>{{ locale.text('访客、用户和全站统一重置；修改周期不会立即清除用量，历史统计保留。', 'Guests, users and site reset together. Changing the schedule does not clear usage or history.') }}</small>
         </fieldset>
         <div class="modal-actions"><button class="btn secondary" type="button" :disabled="saving" @click="editing = false">{{ locale.t('common.cancel') }}</button><button class="btn" type="submit" :disabled="saving">{{ locale.text('确认', 'Confirm') }}</button></div>

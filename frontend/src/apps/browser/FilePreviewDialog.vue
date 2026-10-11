@@ -95,11 +95,11 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .ycloud-preview-overlay { position: fixed; z-index: 240; inset: 0; display: grid; place-items: center; padding: 24px; background: rgb(6 8 12 / 72%); backdrop-filter: blur(4px); }
-.ycloud-preview-dialog { width: min(1180px, 100%); max-height: calc(100vh - 48px); display: flex; flex-direction: column; overflow: hidden; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; box-shadow: 0 22px 75px rgb(0 0 0 / 25%); }
+.ycloud-preview-dialog { width: min(1180px, 100%); max-height: calc(100dvh - 48px); display: flex; flex-direction: column; overflow: hidden; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; box-shadow: 0 22px 75px rgb(0 0 0 / 25%); }
 .ycloud-preview-dialog:focus { outline: none; }
-.ycloud-preview-dialog.video, .ycloud-preview-dialog.document { width: min(1040px, 100%); height: min(630px, calc(100vh - 48px)); }
+.ycloud-preview-dialog.video, .ycloud-preview-dialog.document { width: min(1040px, 100%); height: min(630px, calc(100dvh - 48px)); }
 .ycloud-preview-dialog.video { border: 0; }
-.ycloud-preview-head { display: flex; align-items: center; gap: 14px; min-height: 62px; padding: 10px 20px; border-bottom: 1px solid var(--line); }
+.ycloud-preview-head { display: flex; flex-shrink: 0; align-items: center; gap: 14px; min-height: 62px; padding: 10px 20px; border-bottom: 1px solid var(--line); }
 .ycloud-preview-dialog.video .ycloud-preview-head { box-sizing: border-box; min-height: 0; height: 48px; flex: 0 0 48px; gap: 10px; padding: 4px 14px; border-bottom: 0; }
 .ycloud-preview-dialog.video .ycloud-preview-icon { width: 32px; height: 32px; }
 .ycloud-preview-head > .app-icon { flex: 0 0 auto; color: var(--accent); }
@@ -127,5 +127,10 @@ onBeforeUnmount(() => {
 .ycloud-preview-fallback strong { color: var(--text); }
 .ycloud-preview-fallback .btn { text-decoration: none; }
 .ycloud-preview-error { margin: 0; padding: 8px 20px 16px; color: var(--danger); font-size: 13px; }
-@media (max-width: 640px) { .ycloud-preview-overlay { padding: 8px; } .ycloud-preview-dialog { max-height: calc(100vh - 16px); } .ycloud-preview-dialog.video, .ycloud-preview-dialog.document { height: calc(100vh - 16px); } .ycloud-preview-head { gap: 8px; padding: 10px; } .ycloud-preview-heading span { display: none; } .ycloud-preview-body { padding: 10px; } .ycloud-preview-dialog.audio .ycloud-preview-body { padding: 12px; } .ycloud-preview-dialog.document .ycloud-preview-body pre { padding: 16px; } .ycloud-document-modes button { padding: 6px 8px; } }
+@media (max-width: 1024px), (pointer: coarse) {
+  .ycloud-preview-overlay { padding: 16px; }
+  .ycloud-preview-dialog.video, .ycloud-preview-dialog.document { height: min(630px, 78dvh); max-height: 78dvh; }
+}
+@media (max-width: 640px) { .ycloud-preview-head { gap: 8px; padding: 10px; } .ycloud-preview-heading span { display: none; } .ycloud-preview-body { padding: 10px; } .ycloud-preview-dialog.audio .ycloud-preview-body { padding: 12px; } .ycloud-preview-dialog.document .ycloud-preview-body pre { padding: 16px; } .ycloud-document-modes button { padding: 6px 8px; } }
+.ycloud-preview-dialog:fullscreen { width: 100%; height: 100%; max-height: none; border: 0; border-radius: 0; }
 </style>

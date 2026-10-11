@@ -3,11 +3,12 @@ export function renderEmbeddedAssets(paths: readonly string[]): string {
   const sorted = [...paths].sort()
   if (new Set(sorted).size !== sorted.length) throw new Error('Duplicate embedded asset')
   const entries = sorted.map(path => {
-    if (!/^assets\/[a-zA-Z0-9._-]+\.(js|css)$/.test(path)) {
+    if (!/^assets\/[a-zA-Z0-9._-]+\.(js|css|svg)$/.test(path)) {
       throw new Error(`Unsupported frontend asset: ${path}`)
     }
     const name = path.slice('assets/'.length)
-    const mime = path.endsWith('.css') ? 'text/css; charset=utf-8' : 'application/javascript; charset=utf-8'
+    const mime = path.endsWith('.svg') ? 'image/svg+xml'
+      : path.endsWith('.css') ? 'text/css; charset=utf-8' : 'application/javascript; charset=utf-8'
     return `    EmbeddedAsset::new(${JSON.stringify(name)}, ${JSON.stringify(mime)}, include_bytes!(${JSON.stringify(path)})),`
   })
   if (!sorted.includes('assets/app.js') || !sorted.includes('assets/app.css')) {

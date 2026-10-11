@@ -52,8 +52,8 @@ export function useBrowserEntryEditor(context: EntryEditorContext) {
 
   async function submitEntry(): Promise<void> {
     const request = edit.value
-    const name = entryName.value.trim()
-    if (disposed || !request || !name || entrySaving.value || entryRetryBlocked.value) return
+    const name = entryName.value
+    if (disposed || !request || !name.trim() || entrySaving.value || entryRetryBlocked.value) return
     entrySaving.value = true
     entryError.value = ''
     try {

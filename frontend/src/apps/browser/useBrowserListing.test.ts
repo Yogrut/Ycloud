@@ -4,7 +4,7 @@ import type { BrowserCapabilities, BrowserStorage, FileEntry, FileListResponse }
 import { ApiError } from '../../shared/api/client'
 import { useBrowserListing } from './useBrowserListing'
 
-const storages: BrowserStorage[] = ['first', 'second'].map(id => ({ id, name: id, enabled: true, ready: true, requires_login: false }))
+const storages: BrowserStorage[] = ['first', 'second'].map(id => ({ id, name: id, enabled: true, ready: true }))
 function response(id = 'first', scope = 'guest', items = storages): FileListResponse {
   return { storage_id: id, selection_scope: scope, storages: items, current_path: '', parent_path: null, entries: [], page_start: 0, page_size: 20, next_cursor: null, can_write: false, max_upload_bytes: 1, max_archive_bytes: 1, max_archive_entries: 1 }
 }
@@ -44,6 +44,17 @@ describe('storage selection', () => {
     await state.resetAfterSignIn('')
     expect(state.currentStorageId.value).toBe('first')
   })
+  it('opens account login for a storage missing from the authorized list', async () => {
+    const requestStorageLogin = vi.fn()
+    const state = useBrowserListing({ announce: vi.fn(), resetSelection: vi.fn(), openLockedEntry: vi.fn(), requestStorageLogin })
+    const request = vi.spyOn(api, 'listFiles').mockResolvedValue(response())
+    await state.refresh()
+    await state.switchStorage('private')
+    expect(requestStorageLogin).toHaveBeenCalledWith('private')
+    expect(request).toHaveBeenCalledTimes(1)
+    state.disposeListing()
+  })
+
   it('keeps a temporarily unavailable preference but drops a revoked one', async () => {
     localStorage.setItem('ycloud:storage:guest', 'second')
     const request = vi.spyOn(api, 'listFiles').mockResolvedValue(response('first', 'guest', [storages[0]!, { ...storages[1]!, ready: false }]))

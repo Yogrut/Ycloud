@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { BrowserStorage } from '../../shared/api/browser'
 import { isStorageUsable, rememberedStorage, rememberStorage, shouldForgetStorage } from './storageSelection'
 
-const storage: BrowserStorage = { id: 'primary', name: 'Primary', requires_login: false }
+const storage: BrowserStorage = { id: 'primary', name: 'Primary' }
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -16,7 +16,6 @@ describe('storage selection policy', () => {
     { name: 'enabled and ready', value: { ...storage, enabled: true, ready: true }, usable: true, forget: false },
     { name: 'temporarily unavailable', value: { ...storage, ready: false }, usable: false, forget: false },
     { name: 'disabled', value: { ...storage, enabled: false }, usable: false, forget: true },
-    { name: 'requires login', value: { ...storage, requires_login: true }, usable: false, forget: true },
     { name: 'disabled and unavailable', value: { ...storage, enabled: false, ready: false }, usable: false, forget: true },
   ])('handles $name separately for selection and preference retention', ({ value, usable, forget }) => {
     expect(isStorageUsable(value)).toBe(usable)

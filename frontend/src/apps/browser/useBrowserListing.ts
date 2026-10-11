@@ -67,7 +67,7 @@ export function useBrowserListing(context: BrowserListingContext) {
 
   const visibleEntries = computed(() => entries.value)
   const pageNumber = computed(() => cursorHistory.value.length + 1)
-  const storageOptions = computed(() => storages.value.filter(storage => !storage.requires_login).map(storage => ({
+  const storageOptions = computed(() => storages.value.map(storage => ({
     value: storage.id,
     label: `${storage.name}${storage.enabled === false ? locale.text('（停用）', ' (disabled)') : storage.ready === false ? locale.text('（异常）', ' (unavailable)') : ''}`,
     disabled: !isStorageUsable(storage),
@@ -248,8 +248,8 @@ export function useBrowserListing(context: BrowserListingContext) {
   async function switchStorage(value: string | number): Promise<void> {
     const nextStorageId = String(value)
     const nextStorage = storages.value.find(storage => storage.id === nextStorageId)
-    if (nextStorage && !isStorageUsable(nextStorage) && !nextStorage.requires_login) return
-    if (!nextStorage || nextStorage.requires_login) {
+    if (nextStorage && !isStorageUsable(nextStorage)) return
+    if (!nextStorage) {
       context.requestStorageLogin(nextStorageId)
       return
     }
@@ -315,7 +315,7 @@ export function useBrowserListing(context: BrowserListingContext) {
     const available = await listStorages(controller.signal).catch(() => [])
     if (sequence !== refreshSequence) return
     storages.value = available
-    const requested = available.find(storage => storage.id === requestedStorageId && !storage.requires_login)
+    const requested = available.find(storage => storage.id === requestedStorageId)
     restoreSelection = true
     selectionScope = ''
     rememberNextSelection = false

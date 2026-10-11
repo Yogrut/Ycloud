@@ -245,8 +245,12 @@ impl LinuxRoot {
         source: &str,
         destination: &str,
     ) -> AppResult<()> {
-        if !source.starts_with(".ycloud-system/transactions/")
-            || !destination.starts_with(".ycloud-system/transactions/")
+        if ![
+            ".ycloud-system/transactions/",
+            ".ycloud-system/upload-receipts/",
+        ]
+        .into_iter()
+        .any(|prefix| source.starts_with(prefix) && destination.starts_with(prefix))
         {
             return Err(AppError::Forbidden);
         }

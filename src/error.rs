@@ -63,6 +63,7 @@ pub enum AppError {
     ParentDirectoryMissing,
     PreconditionFailed,
     PayloadTooLarge,
+    ArchiveEntryLimit,
     InsufficientStorage,
     ClientClosedRequest,
     RequestTimeout,
@@ -135,6 +136,7 @@ impl AppError {
             Self::Conflict(_) | Self::DestinationExists => "conflict",
             Self::PreconditionFailed => "precondition_failed",
             Self::PayloadTooLarge => "payload_too_large",
+            Self::ArchiveEntryLimit => "archive_entry_limit",
             Self::InsufficientStorage => "insufficient_storage",
             Self::ClientClosedRequest => "client_closed_request",
             Self::RequestTimeout => "request_timeout",
@@ -179,6 +181,7 @@ impl AppError {
             Self::Conflict(_) | Self::DestinationExists => StatusCode::CONFLICT,
             Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::ArchiveEntryLimit => StatusCode::BAD_REQUEST,
             Self::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
             Self::ClientClosedRequest => {
                 StatusCode::from_u16(499).expect("499 is a valid client error status")
@@ -216,6 +219,7 @@ impl AppError {
             Self::ParentDirectoryMissing => "Destination directory does not exist".into(),
             Self::PreconditionFailed => "写入条件不满足，目标文件未被本次操作修改".into(),
             Self::PayloadTooLarge => "Payload exceeds the configured limit".into(),
+            Self::ArchiveEntryLimit => "Archive exceeds the configured entry limit".into(),
             Self::InsufficientStorage => {
                 "Storage does not have enough free space for this upload".into()
             }
@@ -253,6 +257,7 @@ impl fmt::Display for AppError {
             }
             Self::PreconditionFailed => formatter.write_str("write precondition failed"),
             Self::PayloadTooLarge => formatter.write_str("payload too large"),
+            Self::ArchiveEntryLimit => formatter.write_str("archive entry limit exceeded"),
             Self::InsufficientStorage => formatter.write_str("insufficient storage"),
             Self::ClientClosedRequest => formatter.write_str("client closed upload request"),
             Self::RequestTimeout => formatter.write_str("request timeout"),
@@ -329,6 +334,15 @@ impl From<StatusCode> for AppError {
 mod tests {
     use super::AppError;
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+
+    #[tokio::test]
+    async fn archive_entry_limit_has_a_stable_code_independent_of_message() {
+        let response = AppError::ArchiveEntryLimit.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "archive_entry_limit");
+    }
 
     #[tokio::test]
     async fn operation_results_preserve_commit_cleanup_and_retry_without_internal_details() {

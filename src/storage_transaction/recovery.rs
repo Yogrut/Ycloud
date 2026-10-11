@@ -29,7 +29,7 @@ struct RecoveryInventory {
 }
 
 impl TransactionPaths {
-    pub(crate) async fn recover(&self, root: &Path) -> AppResult<()> {
+    pub(crate) async fn recover(&self, root: &Path, mut on_change: impl FnMut()) -> AppResult<()> {
         self.settle_publication().await?;
         let RecoveryInventory {
             journals,
@@ -42,7 +42,8 @@ impl TransactionPaths {
             pending_deletion_records,
         } = self.read_recovery_inventory().await?;
         for (path, journal) in journals {
-            self.recover_replacement(root, path, journal).await?;
+            self.recover_replacement(root, path, journal, &mut on_change)
+                .await?;
         }
         for path in pending_files.into_iter().chain(uploads) {
             self.rooted_remove_file_idempotent(&path).await?;
@@ -221,7 +222,21 @@ impl TransactionPaths {
         root: &Path,
         path: PathBuf,
         journal: ReplaceJournal,
+        on_change: &mut impl FnMut(),
     ) -> AppResult<()> {
+        if let (Some(operation_id), Some(size)) = (&journal.operation_id, journal.operation_size) {
+            if self
+                .receipt_outcome(&journal.destination, size, operation_id)
+                .await?
+                .is_some_and(|outcome| outcome.commit == crate::error::CommitState::NotCommitted)
+            {
+                // All payload/backup cleanup preceded this durable rollback
+                // proof. Only journal retirement may have been interrupted.
+                self.rooted_remove_file_idempotent(&path).await?;
+                self.rooted_sync_parent(&path).await?;
+                return Ok(());
+            }
+        }
         let destination = root.join(&journal.destination);
         let backup = self.backups.join(&journal.id);
         let upload = self.replacement_source(&journal);
@@ -281,7 +296,11 @@ impl TransactionPaths {
                     operation_id,
                     &journal.destination,
                     size,
-                    journal.published || anchored_publication,
+                    if journal.published || anchored_publication {
+                        crate::error::CommitState::Committed
+                    } else {
+                        crate::error::CommitState::Unknown
+                    },
                 )
                 .await?;
             }
@@ -296,6 +315,9 @@ impl TransactionPaths {
             ));
         }
         if !destination_exists && backup_exists && !journal.published {
+            // Notify the accounting owner before a formal mutation, including
+            // cases where publication succeeds but its later sync fails.
+            on_change();
             self.rooted_rename_noreplace(&backup, &destination).await?;
             self.rooted_sync_parent(&destination).await?;
             self.rooted_sync_parent(&backup).await?;
@@ -313,6 +335,21 @@ impl TransactionPaths {
         if journal.anchored {
             self.rooted_remove_file_idempotent(&anchor).await?;
             self.rooted_sync_parent(&anchor).await?;
+        }
+        // Preserve a proven rollback before destroying its only transaction
+        // evidence. A missing receipt alone never establishes a rollback.
+        if !was_committed {
+            if let (Some(operation_id), Some(size)) =
+                (&journal.operation_id, journal.operation_size)
+            {
+                self.ensure_receipt(
+                    operation_id,
+                    &journal.destination,
+                    size,
+                    crate::error::CommitState::NotCommitted,
+                )
+                .await?;
+            }
         }
         self.rooted_remove_file_idempotent(&path).await?;
         self.rooted_sync_parent(&path).await?;
@@ -398,7 +435,7 @@ mod tests {
             .deletions
             .join(format!("{}.json", resource_id(&trash).unwrap()));
 
-        paths.recover(root.path()).await.unwrap();
+        paths.recover(root.path(), || {}).await.unwrap();
         assert!(
             trash.exists(),
             "one recovery must not drain the whole large tree"
@@ -422,7 +459,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        paths.recover(root.path()).await.unwrap();
+        paths.recover(root.path(), || {}).await.unwrap();
         let mut remaining = fs::read_dir(&paths.trash).await.unwrap();
         let mut count = 0;
         while remaining.next_entry().await.unwrap().is_some() {
@@ -432,7 +469,7 @@ mod tests {
             count, 2,
             "the budget applies to the recovery, not each entry"
         );
-        paths.recover(root.path()).await.unwrap();
+        paths.recover(root.path(), || {}).await.unwrap();
         assert!(paths.staged_deletions().await.unwrap().0.is_empty());
     }
 
@@ -450,7 +487,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        paths.recover(root.path()).await.unwrap();
+        paths.recover(root.path(), || {}).await.unwrap();
         // 4096 + 257 - 256 entries remain, exceeding one startup trash page.
         let inventory = paths.read_recovery_inventory().await.unwrap();
         assert_eq!(inventory.trash.len(), MAX_RECOVERY_ENTRIES);
@@ -502,10 +539,10 @@ mod tests {
                 .unwrap();
         }
         fs::write(&record, b"incomplete record").await.unwrap();
-        paths.recover(root.path()).await.unwrap();
+        paths.recover(root.path(), || {}).await.unwrap();
         assert!(trash.exists());
         assert!(record.exists());
-        paths.recover(root.path()).await.unwrap();
+        paths.recover(root.path(), || {}).await.unwrap();
         assert!(!trash.exists());
         assert!(!record.exists());
     }
@@ -531,7 +568,7 @@ mod tests {
             fs::write(&conflict, &contents).await.unwrap();
             let unrelated = paths.upload_path(&TransactionId::new());
             fs::write(&unrelated, b"unrelated upload").await.unwrap();
-            let error = paths.recover(root.path()).await.unwrap_err();
+            let error = paths.recover(root.path(), || {}).await.unwrap_err();
             assert!(matches!(error, AppError::Conflict(ref message)
                 if message == "Ambiguous copy cleanup ownership; recovery stopped"));
             assert_eq!(fs::read(&copy).await.unwrap(), b"copy data");
@@ -651,7 +688,7 @@ mod tests {
             fs::write(&upload, b"pending").await.unwrap();
             resources.push((journal_path, upload));
         }
-        let error = paths.recover(root.path()).await.unwrap_err();
+        let error = paths.recover(root.path(), || {}).await.unwrap_err();
         assert!(matches!(error, AppError::Conflict(ref message)
             if message == "Ambiguous transaction journals; recovery stopped"));
         for (journal_path, upload) in resources {
@@ -684,7 +721,7 @@ mod tests {
             .join(format!("{}.json", resource_id(&trash).unwrap()));
         assert!(deletion_path.exists());
 
-        paths.recover(root.path()).await.unwrap();
+        paths.recover(root.path(), || {}).await.unwrap();
         assert!(!copy.exists());
         assert!(paths.trash.join(resource_id(&copy).unwrap()).exists());
         assert!(trash.exists());
@@ -692,11 +729,11 @@ mod tests {
         assert!(deletion_path.exists());
         // Two 259-node trees require three aggregate 256-node passes.
         for _ in 0..2 {
-            paths.recover(root.path()).await.unwrap();
+            paths.recover(root.path(), || {}).await.unwrap();
         }
         assert!(!trash.exists());
         assert!(!deletion_path.exists());
         assert!(paths.staged_deletions().await.unwrap().0.is_empty());
-        paths.recover(root.path()).await.unwrap();
+        paths.recover(root.path(), || {}).await.unwrap();
     }
 }

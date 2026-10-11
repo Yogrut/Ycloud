@@ -156,7 +156,7 @@ impl S3Backend {
             .read(async { Ok(self.mutation_gate.lock().await) })
             .await?;
         let recovered = self
-            .recover_journal_category(super::recovery::JournalKind::ActivationProbe)
+            .recover_journal_category(super::recovery::JournalKind::ActivationProbe, None)
             .await
             .map_err(|error| {
                 capability_failure(

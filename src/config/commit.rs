@@ -25,13 +25,13 @@ pub struct ConfigCommit {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum CommitStage {
+pub(crate) enum CommitStage {
     BeforePublish,
     SyncPublished,
     RefreshBackup,
 }
 
-pub(super) fn publish(
+pub(crate) fn publish(
     path: &Path,
     bytes: &[u8],
     rotate_previous: bool,

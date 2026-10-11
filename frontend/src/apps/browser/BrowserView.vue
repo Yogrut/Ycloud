@@ -189,28 +189,30 @@ const {
 
 const {
   allSelected,
-  cancelDragSelection,
+  cancelPointerSelection,
   clearSelection,
   closeContextMenu,
   contextEntry,
   contextVisible,
   contextX,
   contextY,
+  consumeTouchClick,
   disposeSelection,
   dragSelecting,
-  finishDragSelection,
+  finishPointerSelection,
   handleDocumentClick,
   handleRowClick,
+  handleRowDoubleClick,
   openBackgroundMenu,
   openRowMenu,
   selected,
   selectedPaths,
-  startDragSelection,
+  startPointerSelection,
   toggleSelectAll,
   toggleSelection,
-  updateDragSelection,
-} = useBrowserSelection({ entries, visibleEntries, loading, capabilities, filePanel })
-resetListingSelection = () => { selected.value = new Set() }
+  updatePointerSelection,
+} = useBrowserSelection({ entries, visibleEntries, loading, capabilities, filePanel, openEntry })
+resetListingSelection = clearSelection
 
 const {
   batchResult,
@@ -305,22 +307,28 @@ function closeAudioNavOnOutsideClick(event: MouseEvent): void {
 
 onMounted(() => {
   void refresh()
+  document.addEventListener('pointerdown', startPointerSelection, true)
+  document.addEventListener('click', consumeTouchClick, true)
   document.addEventListener('click', handleDocumentClick)
   document.addEventListener('click', closeAudioNavOnOutsideClick)
   document.addEventListener('keydown', handleEscape)
-  window.addEventListener('mousemove', updateDragSelection, { passive: false })
-  window.addEventListener('mouseup', finishDragSelection)
-  window.addEventListener('blur', cancelDragSelection)
+  window.addEventListener('pointermove', updatePointerSelection, { passive: false })
+  window.addEventListener('pointerup', finishPointerSelection)
+  window.addEventListener('pointercancel', cancelPointerSelection)
+  window.addEventListener('blur', cancelPointerSelection)
   window.addEventListener('dragover', blockExternalFileDrop)
   window.addEventListener('drop', blockExternalFileDrop)
 })
 onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', startPointerSelection, true)
+  document.removeEventListener('click', consumeTouchClick, true)
   document.removeEventListener('click', handleDocumentClick)
   document.removeEventListener('click', closeAudioNavOnOutsideClick)
   document.removeEventListener('keydown', handleEscape)
-  window.removeEventListener('mousemove', updateDragSelection)
-  window.removeEventListener('mouseup', finishDragSelection)
-  window.removeEventListener('blur', cancelDragSelection)
+  window.removeEventListener('pointermove', updatePointerSelection)
+  window.removeEventListener('pointerup', finishPointerSelection)
+  window.removeEventListener('pointercancel', cancelPointerSelection)
+  window.removeEventListener('blur', cancelPointerSelection)
   window.removeEventListener('dragover', blockExternalFileDrop)
   window.removeEventListener('drop', blockExternalFileDrop)
   disposeUploads()
@@ -358,13 +366,12 @@ onBeforeUnmount(() => {
       <input :ref="setFolderInput" class="visually-hidden" type="file" multiple webkitdirectory directory @change="uploadFiles">
     </header>
 
-    <main class="browser-page" :class="{ 'selection-active': selected.size > 0 }">
+    <main class="browser-page">
       <section
         ref="filePanel"
         class="file-panel glass"
         :class="{ 'drag-selecting': dragSelecting, 'upload-drop-active': uploadDropActive, 'gallery-mode': galleryMode }"
         :aria-busy="loading"
-        @mousedown="!galleryMode && startDragSelection($event)"
         @contextmenu="openBackgroundMenu"
         @dragenter="handleUploadDragEnter"
         @dragover="handleUploadDragOver"
@@ -410,10 +417,10 @@ onBeforeUnmount(() => {
             :class="{ selected: selected.has(entry.path) }"
             :data-entry-path="entry.path"
             @click="handleRowClick(entry.path)"
-            @dblclick="openEntry(entry)"
+            @dblclick="handleRowDoubleClick(entry)"
             @contextmenu.stop="openRowMenu($event, entry)"
           >
-            <button class="select-box" :class="{ checked: selected.has(entry.path) }" type="button" :aria-label="locale.text(`选择 ${entry.name}`, `Select ${entry.name}`)" @click.stop="toggleSelection(entry.path)"><span class="visually-hidden">{{ locale.text('选择', 'Select') }} {{ entry.name }}</span></button>
+            <button class="select-box" :class="{ checked: selected.has(entry.path) }" type="button" :aria-label="locale.text(`选择 ${entry.name}`, `Select ${entry.name}`)" @click.stop="toggleSelection(entry.path)" @dblclick.stop><span class="visually-hidden">{{ locale.text('选择', 'Select') }} {{ entry.name }}</span></button>
             <div class="file-name"><FileIcon :entry="entry" /><span class="file-label">{{ entry.name }}</span><span v-if="entry.locked" class="file-lock-indicator" :title="locale.t('file.lockedFolder')"><AppIcon name="lock" :size="12" /></span></div>
             <div class="cell right">
               <button

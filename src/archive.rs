@@ -252,19 +252,20 @@ async fn collect_files(
     max_archive_bytes: u64,
     max_archive_entries: usize,
 ) -> AppResult<()> {
-    let mut pending = vec![(storage_path, request_path)];
-    while let Some((storage_relative, request_relative)) = pending.pop() {
+    let mut pending = vec![(storage_path, request_path, None)];
+    while let Some((storage_relative, request_relative, listed_metadata)) = pending.pop() {
         if !seen.insert(storage_relative.clone()) {
             continue;
         }
         *entry_count = entry_count.saturating_add(1);
         if *entry_count > max_archive_entries {
-            return Err(AppError::BadRequest(
-                format!("Archive exceeds the configured {max_archive_entries} entry limit").into(),
-            ));
+            return Err(AppError::ArchiveEntryLimit);
         }
         authorizer.ensure_access(&storage_relative)?;
-        let metadata = backend.metadata(&storage_relative).await?;
+        let metadata = match listed_metadata {
+            Some(metadata) => metadata,
+            None => backend.metadata(&storage_relative).await?,
+        };
         if metadata.is_dir {
             let (entries, truncated) = backend
                 .list_directory(&storage_relative, state.config.max_list_entries)
@@ -275,7 +276,12 @@ async fn collect_files(
                 ));
             }
             for entry in entries {
-                pending.push((entry.relative, join_path(&request_relative, &entry.name)));
+                let metadata = backend.archive_listing_metadata(&entry);
+                pending.push((
+                    entry.relative,
+                    join_path(&request_relative, &entry.name),
+                    metadata,
+                ));
             }
             continue;
         }

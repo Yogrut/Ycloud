@@ -42,6 +42,16 @@ afterEach(() => {
 })
 
 describe('browser sign out', () => {
+  it('reports denied file preview without calling preview handlers or changing directory access', () => {
+    const { access, context } = setup()
+    context.capabilities.value.download = false
+    access.openEntry({ name: 'file.txt', path: 'file.txt', is_dir: false, size: 1, modified: '', mime: 'text/plain', icon: 'text', locked: false })
+    expect(context.announce).toHaveBeenCalledWith('无权限执行此操作')
+    expect(context.openPreviewImage).not.toHaveBeenCalled()
+    expect(context.openPreviewFile).not.toHaveBeenCalled()
+    access.openEntry({ name: 'folder', path: 'folder', is_dir: true, size: 0, modified: '', mime: '', icon: 'folder', locked: false })
+    expect(context.navigate).toHaveBeenCalledWith('folder')
+  })
   it('waits for confirmation and ignores duplicate clicks before disposing or redirecting', async () => {
     let resolve!: (value: { success: boolean }) => void
     logoutMock.mockImplementationOnce(() => new Promise(done => { resolve = done }))

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { useEventListener } from '@vueuse/core'
 import type { BrowserCapabilities, FileEntry } from '../../shared/api/browser'
 import { useLocale } from '../../shared/i18n'
 import BrowserActionIcon from './BrowserActionIcon.vue'
@@ -8,8 +9,7 @@ import type { BrowserAction } from './BrowserActionIcon.vue'
 const props = defineProps<{
   entry: FileEntry | null
   paths: string[]
-  capabilities?: BrowserCapabilities
-  canWrite?: boolean
+  capabilities: BrowserCapabilities
   x: number
   y: number
 }>()
@@ -23,43 +23,44 @@ const locale = useLocale()
 const menu = ref<HTMLElement>()
 const left = ref(8)
 const top = ref(8)
+const maxWidth = ref(window.innerWidth - 16)
+const maxHeight = ref(window.innerHeight - 16)
 const count = computed(() => props.paths.length)
 const multiple = computed(() => count.value > 1)
 const selectionMenu = computed(() => count.value > 0)
-const rights = computed<BrowserCapabilities>(() => props.capabilities ?? {
-  download: true,
-  upload: Boolean(props.canWrite),
-  create_directory: Boolean(props.canWrite),
-  rename: Boolean(props.canWrite),
-  move_items: Boolean(props.canWrite),
-  copy: Boolean(props.canWrite),
-  delete: Boolean(props.canWrite),
-})
+const rights = computed(() => props.capabilities)
 const hasReadActions = computed(() => selectionMenu.value && (rights.value.download || (!multiple.value && props.entry?.is_dir)))
 const hasEditActions = computed(() => selectionMenu.value && (
   (!multiple.value && rights.value.rename) || rights.value.move_items || rights.value.copy || rights.value.delete
 ))
 
 async function place(): Promise<void> {
-  left.value = props.x
-  top.value = props.y
+  const viewport = window.visualViewport
+  const viewportLeft = viewport?.offsetLeft ?? 0
+  const viewportTop = viewport?.offsetTop ?? 0
+  const width = viewport?.width ?? window.innerWidth
+  const height = viewport?.height ?? window.innerHeight
+  maxWidth.value = Math.max(0, width - 16)
+  maxHeight.value = Math.max(0, height - 16)
   await nextTick()
   const bounds = menu.value?.getBoundingClientRect()
-  if (!bounds || window.matchMedia('(max-width: 760px)').matches) return
-  left.value = Math.max(8, Math.min(props.x, window.innerWidth - bounds.width - 8))
-  top.value = Math.max(8, Math.min(props.y, window.innerHeight - bounds.height - 8))
+  if (!bounds) return
+  left.value = Math.max(viewportLeft + 8, Math.min(props.x, viewportLeft + width - bounds.width - 8))
+  top.value = Math.max(viewportTop + 8, Math.min(props.y, viewportTop + height - bounds.height - 8))
 }
 
 function choose(action: BrowserAction): void {
   emit('action', action)
 }
 
-watch(() => [props.x, props.y], place)
+watch(() => [props.x, props.y, props.paths.length], place)
+useEventListener(window, 'resize', place)
+useEventListener(window.visualViewport, ['resize', 'scroll'], place)
 onMounted(place)
 </script>
 
 <template>
-  <aside ref="menu" class="context-menu active" :style="{ left: `${left}px`, top: `${top}px` }" role="menu" :aria-label="locale.t('menu.fileActions')" @click.stop>
+  <aside ref="menu" class="context-menu active" :style="{ left: `${left}px`, top: `${top}px`, maxWidth: `${maxWidth}px`, maxHeight: `${maxHeight}px` }" role="menu" :aria-label="locale.t('menu.fileActions')" @click.stop>
     <div v-if="selectionMenu" class="menu-caption" :class="{ 'mobile-only': count === 1 }">
       <span>{{ locale.t('menu.selected', { count }) }}</span>
       <button class="menu-clear" type="button" @click="$emit('clear')">{{ locale.t('menu.clear') }}</button>

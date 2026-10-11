@@ -69,16 +69,38 @@ impl S3Backend {
         let capacity = self.capacity_gate.clone().lock_owned().await;
         (recovery, capacity)
     }
+    pub(crate) async fn upload_outcome(
+        &self,
+        relative: &str,
+        size: u64,
+        operation_id: &str,
+    ) -> AppResult<Option<crate::error::OperationOutcome>> {
+        let key = object_key(&self.prefix, relative)?;
+        Ok(self
+            .head_key(&key)
+            .await?
+            .filter(|object| {
+                object.size == size && object.operation_id.as_deref() == Some(operation_id)
+            })
+            .map(|_| {
+                crate::error::OperationOutcome::new(
+                    crate::error::CommitState::Committed,
+                    crate::error::CleanupState::Complete,
+                )
+            }))
+    }
+
+    #[cfg(test)]
     pub(crate) async fn upload_committed(
         &self,
         relative: &str,
         size: u64,
         operation_id: &str,
     ) -> AppResult<bool> {
-        let key = object_key(&self.prefix, relative)?;
-        Ok(self.head_key(&key).await?.is_some_and(|object| {
-            object.size == size && object.operation_id.as_deref() == Some(operation_id)
-        }))
+        Ok(self
+            .upload_outcome(relative, size, operation_id)
+            .await?
+            .is_some_and(|outcome| outcome.commit == crate::error::CommitState::Committed))
     }
     pub(crate) async fn quiesce_for_edit(
         &self,
@@ -111,7 +133,7 @@ impl S3Backend {
             .maintenance
             .read(async { Ok(backend.mutation_gate.lock().await) })
             .await?;
-        backend.recover_transactions_locked().await
+        backend.recover_transactions_locked(None).await
     }
 
     pub(crate) async fn recover_runtime_transactions(
@@ -171,19 +193,26 @@ impl S3Backend {
         Ok(Some(1))
     }
 
-    pub(crate) async fn recover_quiesced_uploads(&self) -> AppResult<usize> {
+    pub(crate) async fn recover_quiesced_uploads(
+        &self,
+        capacity: &crate::capacity::CapacityTracker,
+    ) -> AppResult<usize> {
         let backend = self.scoped_work(None, None);
         let _mutation = backend
             .maintenance
             .read(async { Ok(backend.mutation_gate.lock().await) })
             .await?;
-        backend.recover_transactions_locked().await
+        backend.recover_transactions_locked(Some(capacity)).await
     }
 
-    async fn recover_transactions_locked(&self) -> AppResult<usize> {
+    async fn recover_transactions_locked(
+        &self,
+        capacity: Option<&crate::capacity::CapacityTracker>,
+    ) -> AppResult<usize> {
         let mut recovered = 0_usize;
         for kind in JournalKind::ORDERED {
-            recovered = recovered.saturating_add(self.recover_journal_category(kind).await?);
+            recovered =
+                recovered.saturating_add(self.recover_journal_category(kind, capacity).await?);
         }
         self.inspect_internal_orphans().await?;
         Ok(recovered)
@@ -191,8 +220,17 @@ impl S3Backend {
 
     /// Recover one bounded category while the caller holds the mutation gate.
     /// Used by full recovery and the activation probe's own-resource cleanup.
-    pub(super) async fn recover_journal_category(&self, kind: JournalKind) -> AppResult<usize> {
+    pub(super) async fn recover_journal_category(
+        &self,
+        kind: JournalKind,
+        capacity: Option<&crate::capacity::CapacityTracker>,
+    ) -> AppResult<usize> {
         let keys = self.list_recovery_journal_keys(kind.category()).await?;
+        if !keys.is_empty() {
+            if let Some(capacity) = capacity {
+                capacity.mark_uncertain();
+            }
+        }
         for key in &keys {
             self.recover_journal(kind, key).await?;
         }

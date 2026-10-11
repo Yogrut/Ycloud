@@ -84,8 +84,8 @@ describe('interactive focus styling', () => {
     expect(layoutCss).not.toContain('.admin-nav-item .app-icon')
   })
 
-  it('uses the administrator login typography for every masked password input', () => {
-    expect(themeCss).toMatch(/input\[type="password"\]\s*\{[^}]*font-family: var\(--font\);[^}]*font-size: 12px;[^}]*font-weight: 700;[^}]*letter-spacing: -\.18em;/s)
+  it('keeps normal spacing for masked password glyphs across browsers', () => {
+    expect(themeCss).toMatch(/input\[type="password"\]\s*\{[^}]*font-family: var\(--font\);[^}]*font-size: 12px;[^}]*font-weight: 700;[^}]*letter-spacing: normal;/s)
     expect(themeCss).toMatch(/input\[type="password"\]::placeholder\s*\{[^}]*letter-spacing: normal;/s)
     expect(themeCss.match(/input\[type="password"\]\s*\{/g)).toHaveLength(1)
   })
@@ -147,19 +147,29 @@ describe('interactive focus styling', () => {
   })
 
   it('keeps the file browser compact and exposes mobile actions below search', () => {
-    expect(themeCss).toContain('.file-row { min-height: 50px; cursor: default; user-select: none; }')
+    expect(themeCss).toContain('.file-row { min-height: 44px; cursor: default; user-select: none; touch-action: manipulation; }')
     expect(themeCss).toContain('.file-pagination { flex: 0 0 auto; min-height: 44px;')
     expect(themeCss).toContain('height: 100%; margin: 0 auto; padding: 12px 0 34px;')
-    expect(themeCss).toContain('overflow: hidden; padding: 26px 28px 14px;')
+    expect(themeCss).toContain('overflow: hidden; padding: 14px 28px 14px;')
+    expect(themeCss).toMatch(/\.file-toolbar\s*\{[^}]*margin-bottom: 12px;/)
+    expect(themeCss).toMatch(/\.breadcrumb\s*\{[^}]*min-height: 32px;[^}]*margin-bottom: 6px;/)
     const mobile = themeCss.match(/@media \(max-width: 760px\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     expect(mobile).toContain('.file-toolbar-actions { width: 100%; }')
-    expect(mobile).toContain('.file-row { min-height: 48px; }')
-    expect(mobile).toContain('.file-panel { padding: 18px 14px 12px;')
+    expect(mobile).toContain('.file-toolbar { align-items: stretch; flex-direction: column; gap: 8px; margin-bottom: 8px; }')
+    expect(mobile).toContain('.breadcrumb { min-height: 32px; margin-bottom: 6px; }')
+    expect(mobile).toContain('.file-panel { padding: 10px 14px 12px;')
     expect(mobile).toContain('.file-pagination { min-height: 44px; gap: 10px; padding: 8px 4px 0;')
   })
 
+  it('uses the desktop context menu on every viewport without a bottom sheet or reserved list space', () => {
+    const mobile = themeCss.match(/@media \(max-width: 760px\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(themeCss).toMatch(/\.context-menu\s*\{[^}]*position: fixed;[^}]*z-index: 90;[^}]*width: 168px;/)
+    expect(themeCss).toContain('max-height: calc(100dvh - 16px); overflow: auto;')
+    expect(mobile).not.toMatch(/\.context-menu|\.menu-item|\.menu-actions|context-open|selection-active/)
+  })
+
   it('keeps the folder lock indicator smaller than the file icon', () => {
-    expect(themeCss).toContain('.file-icon svg { width: 23px; height: 23px; }')
+    expect(themeCss).toContain('.file-icon img { width: 23px; height: 23px; object-fit: contain; }')
     expect(themeCss).toContain('.file-lock-indicator svg { width: 12px; height: 12px; }')
     expect(themeCss).not.toContain('.lock-dot')
   })

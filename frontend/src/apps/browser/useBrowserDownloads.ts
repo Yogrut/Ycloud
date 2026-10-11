@@ -1,6 +1,7 @@
 import { onScopeDispose, type Ref } from 'vue'
 import { checkDownload, downloadUrl, prepareArchive, type BrowserCapabilities } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
+import { ApiError } from '../../shared/api/client'
 import { useLocale } from '../../shared/i18n'
 
 interface BrowserDownloadsContext {
@@ -50,12 +51,12 @@ export function useBrowserDownloads(context: BrowserDownloadsContext) {
     } catch (error) {
       if (disposed) return
       const message = error instanceof Error ? error.message : locale.text('打包准备失败', 'Unable to prepare the archive')
-      if (/payload too large|too large|大小/i.test(message)) {
+      if (error instanceof ApiError && (error.code === 'payload_too_large' || error.status === 413)) {
         context.announce(locale.text(
           `所选文件总大小超过 ${formatSize(maxBytes)}，请拆分选择`,
           `The selection exceeds ${formatSize(maxBytes)}; split it into smaller groups`,
         ))
-      } else if (/entry limit|条目/i.test(message)) {
+      } else if (error instanceof ApiError && error.code === 'archive_entry_limit') {
         context.announce(locale.text(
           `打包最多包含 ${maxEntries} 个条目，请拆分选择`,
           `An archive can contain at most ${maxEntries} entries; split the selection`,

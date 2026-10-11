@@ -24,7 +24,11 @@ const MAX_RESERVED_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) struct BatchPersistence {
     root: PathBuf,
-    reserved_bytes: std::sync::Mutex<u64>,
+    pub(super) reservations: std::sync::Mutex<HashMap<String, u64>>,
+    #[cfg(test)]
+    pub(super) sync_failure: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pub(super) remove_failure: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(super) update_pause:
         std::sync::Mutex<Option<(String, std::sync::Arc<tokio::sync::Mutex<()>>)>>,
@@ -195,6 +199,7 @@ impl BatchPersistence {
             create_private_dir(&root)?;
             let mut batches = HashMap::new();
             let mut reserved = 0_u64;
+            let mut reservations = HashMap::new();
             let mut total_items = 0_usize;
             let now = now_unix();
             for entry in std::fs::read_dir(&root).map_err(index_error)? {
@@ -287,9 +292,11 @@ impl BatchPersistence {
                 if total_items > MAX_RETAINED_BATCH_ITEMS {
                     return Err(AppError::TooManyRequests);
                 }
+                let charged = estimate(&manifest, bytes.len())?;
                 reserved = reserved
-                    .checked_add(estimate(&manifest, bytes.len())?)
+                    .checked_add(charged)
                     .ok_or(AppError::TooManyRequests)?;
+                reservations.insert(ticket.clone(), charged);
                 if reserved > MAX_RESERVED_BYTES || batches.len() >= MAX_RETAINED_BATCHES {
                     return Err(AppError::TooManyRequests);
                 }
@@ -298,6 +305,7 @@ impl BatchPersistence {
                     ticket,
                     UploadBatch {
                         transition: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                        retirement: super::BatchRetirement::Active,
                         recovery_backend: None,
                         subject: None,
                         account: manifest.account,
@@ -313,7 +321,11 @@ impl BatchPersistence {
             Ok((
                 Self {
                     root,
-                    reserved_bytes: std::sync::Mutex::new(reserved),
+                    reservations: std::sync::Mutex::new(reservations),
+                    #[cfg(test)]
+                    sync_failure: Default::default(),
+                    #[cfg(test)]
+                    remove_failure: Default::default(),
                     #[cfg(test)]
                     update_pause: std::sync::Mutex::new(None),
                 },
@@ -364,42 +376,74 @@ impl BatchPersistence {
         validate_ticket(ticket)?;
         let PreparedBatch { bytes, reserved } = prepared;
         {
-            let mut budget = self
-                .reserved_bytes
+            let mut reservations = self
+                .reservations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if budget.saturating_add(reserved) > MAX_RESERVED_BYTES {
-                return Err(AppError::TooManyRequests);
-            }
-            *budget += reserved;
-        }
-        let root = self.root.clone();
-        let ticket = ticket.to_owned();
-        let result = tokio::task::spawn_blocking(move || {
-            let directory = root.join(ticket);
-            if directory.exists() {
+            if reservations.contains_key(ticket) {
                 return Err(AppError::Conflict(
-                    "upload result ticket already exists".into(),
+                    "upload result ticket already reserved".into(),
                 ));
             }
-            create_private_dir(&directory)?;
-            let result =
-                crate::config::publish_traffic_snapshot(&directory.join("manifest.json"), &bytes)
-                    .map_err(index_error);
-            if result.is_err() {
-                let _ = std::fs::remove_dir_all(&directory);
+            if reservations.values().sum::<u64>().saturating_add(reserved) > MAX_RESERVED_BYTES {
+                return Err(AppError::TooManyRequests);
             }
-            result
+            reservations.insert(ticket.to_owned(), reserved);
+        }
+        let root = self.root.clone();
+        let token = ticket.to_owned();
+        #[cfg(test)]
+        let sync_failure = self.sync_failure.load(std::sync::atomic::Ordering::Relaxed);
+        let result = tokio::task::spawn_blocking(move || {
+            let directory = root.join(token);
+            let builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            let builder = {
+                let mut builder = builder;
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+                builder
+            };
+            if let Err(error) = builder.create(&directory) {
+                return (false, Err(index_error(error)));
+            }
+            let result = validate_private_dir(&directory).and_then(|()| {
+                let commit = crate::config::commit::publish(
+                    &directory.join("manifest.json"),
+                    &bytes,
+                    false,
+                    false,
+                    |_stage| {
+                        #[cfg(test)]
+                        if sync_failure
+                            && _stage == crate::config::commit::CommitStage::SyncPublished
+                        {
+                            return Err(std::io::Error::other("injected directory sync failure"));
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(index_error)?;
+                if commit.durability == crate::config::ConfigDurability::Unconfirmed {
+                    return Err(index_error(anyhow::anyhow!(
+                        "upload index publication durability is unconfirmed"
+                    )));
+                }
+                Ok(())
+            });
+            (true, result)
         })
         .await
-        .map_err(index_error);
-        if !matches!(result, Ok(Ok(()))) {
-            *self
-                .reserved_bytes
+        .map_err(index_error)?;
+        if !result.0 {
+            self.reservations
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) -= reserved;
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(ticket);
         }
-        result?
+        // A created directory remains owned and charged even if publication
+        // failed. The batch lifecycle, not this error path, destroys it.
+        result.1
     }
 
     pub(super) async fn update(
@@ -409,7 +453,7 @@ impl BatchPersistence {
         status: UploadStatus,
         operation: Option<OperationOutcome>,
         expires_unix: i64,
-    ) -> AppResult<()> {
+    ) -> AppResult<crate::config::ConfigCommit> {
         validate_ticket(ticket)?;
         #[cfg(test)]
         let _pause = {
@@ -440,30 +484,151 @@ impl BatchPersistence {
             .root
             .join(ticket)
             .join(format!("{}.json", operation_id(ticket, path)));
+        #[cfg(test)]
+        let sync_failure = self.sync_failure.load(std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(move || {
-            crate::config::publish_traffic_snapshot(&target, &bytes).map_err(index_error)
+            crate::config::commit::publish(&target, &bytes, false, false, |_stage| {
+                #[cfg(test)]
+                if sync_failure && _stage == crate::config::commit::CommitStage::SyncPublished {
+                    return Err(std::io::Error::other("injected directory sync failure"));
+                }
+                Ok(())
+            })
+            .map_err(index_error)
         })
         .await
         .map_err(index_error)?
     }
 
-    pub(super) async fn remove(&self, ticket: &str, batch: &UploadBatch) -> AppResult<()> {
+    pub(super) async fn remove(&self, ticket: &str) -> AppResult<()> {
         validate_ticket(ticket)?;
-        let path = self.root.join(ticket);
-        let bytes = read_bounded(&path.join("manifest.json"), MAX_MANIFEST_BYTES)?;
-        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(index_error)?;
-        if manifest.ticket != ticket || manifest.account != batch.account {
-            return Err(AppError::Forbidden);
+        #[cfg(test)]
+        if self
+            .remove_failure
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(index_error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected removal failure",
+            )));
         }
-        let reserved = estimate(&manifest, bytes.len())?;
-        tokio::task::spawn_blocking(move || std::fs::remove_dir_all(path).map_err(index_error))
-            .await
-            .map_err(index_error)??;
-        let mut budget = self
-            .reserved_bytes
+        if !self
+            .reservations
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *budget = budget.saturating_sub(reserved);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(ticket)
+        {
+            return Ok(());
+        }
+        let root = self.root.clone();
+        let path = root.join(ticket);
+        tokio::task::spawn_blocking(move || {
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(index_error(error)),
+                Ok(_) => {
+                    validate_private_dir(&path)?;
+                    std::fs::remove_dir_all(&path).map_err(index_error)?;
+                }
+            }
+            #[cfg(unix)]
+            std::fs::File::open(root)
+                .and_then(|file| file.sync_all())
+                .map_err(index_error)?;
+            Ok::<(), AppError>(())
+        })
+        .await
+        .map_err(index_error)??;
+        self.reservations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(ticket);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn failed_creation_keeps_owned_disk_budget_until_destroyed() {
+        let directory = crate::test_support::TestDirectory::new("index-create-durability");
+        let (persistence, _) = BatchPersistence::load(
+            &directory.path().join("config.json"),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let ticket = uuid::Uuid::new_v4().to_string();
+        persistence.sync_failure.store(true, Ordering::Relaxed);
+        assert!(persistence
+            .create(
+                &ticket,
+                PreparedBatch {
+                    bytes: b"{}".to_vec(),
+                    reserved: 100
+                }
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            persistence.reservations.lock().unwrap().get(&ticket),
+            Some(&100)
+        );
+        assert!(persistence
+            .root
+            .join(&ticket)
+            .join("manifest.json")
+            .exists());
+        persistence.remove(&ticket).await.unwrap();
+        assert!(persistence.reservations.lock().unwrap().is_empty());
+        assert!(!persistence.root.join(ticket).exists());
+    }
+
+    #[tokio::test]
+    async fn retirement_does_not_need_a_manifest_and_settles_only_once() {
+        let directory = crate::test_support::TestDirectory::new("index-partial-retirement");
+        let (persistence, _) = BatchPersistence::load(
+            &directory.path().join("config.json"),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let first = uuid::Uuid::new_v4().to_string();
+        let second = uuid::Uuid::new_v4().to_string();
+        for ticket in [&first, &second] {
+            persistence
+                .create(
+                    ticket,
+                    PreparedBatch {
+                        bytes: b"{}".to_vec(),
+                        reserved: 100,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        tokio::fs::remove_file(persistence.root.join(&first).join("manifest.json"))
+            .await
+            .unwrap();
+        persistence.remove(&first).await.unwrap();
+        persistence.remove(&first).await.unwrap();
+        assert_eq!(
+            persistence
+                .reservations
+                .lock()
+                .unwrap()
+                .values()
+                .sum::<u64>(),
+            100
+        );
+        // A directory already gone must also settle its still-owned reservation.
+        tokio::fs::remove_dir_all(persistence.root.join(&second))
+            .await
+            .unwrap();
+        persistence.remove(&second).await.unwrap();
+        assert!(persistence.reservations.lock().unwrap().is_empty());
     }
 }

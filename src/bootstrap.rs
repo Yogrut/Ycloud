@@ -202,17 +202,20 @@ async fn settle_retired_uploads(state: &AppState, entry: &config::RetiredStorage
         let operation = crate::upload_batch::operation_id(&item.ticket, &item.path);
         let result = if let Some(runtime) = &entry.runtime {
             runtime
-                .recovered_upload_committed(&item.path, item.size, &operation)
+                .recovered_upload_outcome(&item.path, item.size, &operation)
                 .await
         } else {
             detached
                 .as_ref()
                 .expect("detached connection was constructed")
-                .upload_committed(&item.path, item.size, &operation)
+                .upload_outcome(&item.path, item.size, &operation)
                 .await
         };
-        if matches!(result, Ok(true)) {
-            let _ = state.upload_batches.confirm_unknown_committed(&item).await;
+        if let Ok(Some(outcome)) = result {
+            let _ = state
+                .upload_batches
+                .confirm_unknown_outcome(&item, outcome)
+                .await;
         }
     }
     !state

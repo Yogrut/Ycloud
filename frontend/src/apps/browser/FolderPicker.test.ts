@@ -11,6 +11,26 @@ function mountPicker(host: HTMLElement, onConfirm?: (path: string) => void) {
 }
 
 describe('FolderPicker', () => {
+  it('shows the first page while a later page is still loading', async () => {
+    let resolveNext!: (value: Response) => void
+    const nextPage = new Promise<Response>(resolve => { resolveNext = resolve })
+    const reply = (entries: object[], cursor: string | null) => new Response(JSON.stringify({
+      current_path: '', entries, next_cursor: cursor,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(reply([{ name: 'visible', path: 'visible', is_dir: true, locked: false }], 'next'))
+      .mockReturnValueOnce(nextPage))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountPicker(host)
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    expect(host.querySelector('.picker-row')?.textContent).toContain('visible')
+    expect(host.querySelector('.picker-state')).not.toBeNull()
+    resolveNext(reply([], null))
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    expect(host.querySelector('.picker-state')).toBeNull()
+    app.unmount()
+  })
   it('keeps the latest destination when directory responses arrive out of order', async () => {
     const response = (path: string, entries: object[] = []) => new Response(JSON.stringify({
       storage_id: 'archive', storages: [], current_path: path, parent_path: null,

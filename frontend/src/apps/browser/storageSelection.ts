@@ -2,14 +2,13 @@ import type { BrowserStorage } from '../../shared/api/browser'
 
 export function isStorageUsable(storage: BrowserStorage | undefined): boolean {
   return storage !== undefined
-    && !storage.requires_login
     && storage.enabled !== false
     && storage.ready !== false
 }
 
 export function shouldForgetStorage(storage: BrowserStorage | undefined): boolean {
   // A temporary health failure must not erase the account's preference.
-  return storage === undefined || storage.enabled === false || storage.requires_login
+  return storage === undefined || storage.enabled === false
 }
 
 export function rememberedStorage(scope: string): string {

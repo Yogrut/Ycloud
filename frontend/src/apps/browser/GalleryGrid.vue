@@ -74,6 +74,7 @@ onBeforeUnmount(() => {
         v-for="item in row.items"
         :key="item.entry.path"
         class="gallery-card"
+        :data-entry-path="item.entry.path"
         :class="{ selected: selected?.has(item.entry.path) }"
         :style="{ width: `${item.width}px`, height: `${row.height}px` }"
         @contextmenu.stop="emit('contextMenu', $event, item.entry)"
@@ -108,7 +109,7 @@ onBeforeUnmount(() => {
   isolation: isolate;
 }
 .gallery-card.selected::after { position: absolute; z-index: 2; inset: 0; content: ''; border: 2px solid var(--accent); pointer-events: none; }
-.gallery-card-open { width: 100%; height: 100%; display: block; padding: 0; background: transparent; border: 0; cursor: zoom-in; }
+.gallery-card-open { width: 100%; height: 100%; display: block; padding: 0; background: transparent; border: 0; cursor: zoom-in; -webkit-touch-callout: none; }
 .gallery-card-open img {
   position: relative;
   z-index: 1;

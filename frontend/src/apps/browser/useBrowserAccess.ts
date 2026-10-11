@@ -52,7 +52,10 @@ export function useBrowserAccess(context: BrowserAccessContext) {
       } else void context.navigate(entry.path)
       return
     }
-    if (!context.capabilities.value.download) return
+    if (!context.capabilities.value.download) {
+      context.announce(locale.text('无权限执行此操作', 'Permission denied for this operation'))
+      return
+    }
     if (context.openPreviewImage(entry)) return
     context.openPreviewFile(entry)
   }

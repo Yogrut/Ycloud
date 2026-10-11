@@ -23,6 +23,18 @@ afterEach(() => {
 })
 
 describe('GalleryLightbox', () => {
+  it('contains image controls inside the preview panel rather than the backdrop', async () => {
+    showGallery()
+    await nextTick()
+    const overlay = document.body.querySelector('.gallery-lightbox')!
+    const panel = overlay.querySelector('.gallery-lightbox-panel')!
+    expect(panel.querySelector('.gallery-lightbox-stage img')).not.toBeNull()
+    expect(panel.querySelector('.gallery-lightbox-close')).not.toBeNull()
+    expect(panel.querySelector('.gallery-lightbox-toolbar')).not.toBeNull()
+    expect(panel.querySelectorAll('.gallery-lightbox-nav')).toHaveLength(2)
+    expect(overlay.children).toHaveLength(1)
+  })
+
   it('explains exhausted preview traffic without suggesting a download', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 429 }))
     vi.stubGlobal('fetch', fetchMock)

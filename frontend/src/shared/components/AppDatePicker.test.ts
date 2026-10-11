@@ -33,31 +33,24 @@ describe('AppDatePicker', () => {
       .find(button => button.textContent === '2' && !button.classList.contains('outside'))!
     day.click(); await nextTick()
     expect(value.value).toBe('2026-09-02')
+    expect(document.querySelector('[role="dialog"]')).toBeNull()
+    expect(document.activeElement).toBe(host.querySelector('.date-picker-trigger'))
   })
 
-  it('keeps time selection inside the custom popup', async () => {
-    const value = ref('2026-09-15T08:00')
-    const host = mount({
-      modelValue: value.value,
-      datetime: true,
-      label: '起始时间',
-      'onUpdate:modelValue': (next: string) => { value.value = next },
-    })
+  it('limits selectable dates to the requested range', async () => {
+    const host = mount({ modelValue: '2026-09-15', label: '开始日期', min: '2026-09-10', max: '2026-09-20' })
     host.querySelector<HTMLButtonElement>('.date-picker-trigger')!.click()
     await nextTick()
-    expect(host.querySelector('input[type="datetime-local"]')).toBeNull()
-    expect(document.querySelectorAll('.time-row .app-select')).toHaveLength(2)
-  })
-
-  it('can hide clear and today actions for range selection', async () => {
-    const host = mount({ modelValue: '2026-09-15', label: '开始日期', showFooter: false })
-    host.querySelector<HTMLButtonElement>('.date-picker-trigger')!.click()
-    await nextTick()
+    const days = [...document.querySelectorAll<HTMLButtonElement>('.calendar-grid button')]
+      .filter(button => !button.classList.contains('outside'))
+    expect(days.filter(button => !button.disabled).map(button => button.textContent)).toEqual(
+      Array.from({ length: 11 }, (_, index) => String(index + 10)),
+    )
     expect(document.querySelector('.date-picker-popover footer')).toBeNull()
   })
 
   it('teleports the popup outside clipping containers and supports top placement', async () => {
-    const host = mount({ modelValue: '2026-09-15T08:00', datetime: true, label: '起始时间', placement: 'top', showFooter: false })
+    const host = mount({ modelValue: '2026-09-15', label: '起始日期', placement: 'top' })
     host.querySelector<HTMLButtonElement>('.date-picker-trigger')!.click()
     await nextTick()
     const dialog = document.querySelector<HTMLElement>('.date-picker-popover')!

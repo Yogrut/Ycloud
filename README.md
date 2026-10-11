@@ -116,6 +116,8 @@ BIND_ADDRESS=0.0.0.0 ./target/release/ycloud
 
 By default, configuration is stored in `config.json` and local storage uses `storage/` in the working directory.
 
+`config.example.json` documents the configuration format; it is not a ready-to-run configuration. Its password hash is a placeholder. On a new installation, start Ycloud with no existing file at `CONFIG_PATH` (or the default `config.json`) to generate the configuration and `initial-credentials.json`. Use the admin console to change settings; do not copy the example over an existing configuration.
+
 ## Deployment settings
 
 | Variable | Purpose |

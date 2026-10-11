@@ -91,46 +91,48 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
 <template>
   <Teleport to="body">
     <div class="gallery-lightbox" role="dialog" aria-modal="true" :aria-label="entry.name" @click.self="emit('close')">
-      <div class="gallery-lightbox-meta">
-        <span>{{ index + 1 }} / {{ total }}</span>
-        <strong>{{ entry.name }}</strong>
-      </div>
-      <button class="gallery-lightbox-close" type="button" :aria-label="locale.text('关闭', 'Close')" @click="emit('close')">
-        <PhX :size="23" />
-      </button>
-      <button class="gallery-lightbox-nav previous" type="button" :disabled="index <= 0" :aria-label="locale.text('上一张图片', 'Previous image')" @click="emit('previous')">
-        <span class="gallery-nav-chevron" aria-hidden="true" />
-      </button>
-      <div class="gallery-lightbox-stage" @wheel.prevent="handleWheel">
-        <img
-          v-if="!imageError"
-          :src="source"
-          :alt="entry.name"
-          :class="{ 'is-panning': dragging }"
-          :style="{ transform: `translate(${panX}px, ${panY}px) scale(${zoom / 100})` }"
-          draggable="false"
-          @dblclick="zoom === 100 ? setZoom(200) : resetZoom()"
-          @dragstart.prevent
-          @pointerdown="startPan"
-          @pointermove="movePan"
-          @pointerup="stopPan"
-          @pointercancel="stopPan"
-          @error="handleImageError"
-        >
-        <div v-else class="gallery-lightbox-unavailable">
-          <strong>{{ trafficExhausted ? locale.text('下载流量已用尽或剩余流量不足，请等待重置或联系管理员', 'Download allowance is exhausted or insufficient. Wait for the reset or contact the administrator.') : locale.text('浏览器无法预览此图片', 'This image cannot be previewed in the browser') }}</strong>
-          <a v-if="!trafficExhausted" :href="target" @click.prevent="startDownload">{{ locale.text('下载文件', 'Download file') }}</a>
-          <p v-if="downloadError">{{ downloadError }}</p>
+      <section class="gallery-lightbox-panel">
+        <div class="gallery-lightbox-meta">
+          <span>{{ index + 1 }} / {{ total }}</span>
+          <strong>{{ entry.name }}</strong>
         </div>
-      </div>
-      <button class="gallery-lightbox-nav next" type="button" :disabled="index >= total - 1" :aria-label="locale.text('下一张图片', 'Next image')" @click="emit('next')">
-        <span class="gallery-nav-chevron" aria-hidden="true" />
-      </button>
-      <div v-if="!imageError" class="gallery-lightbox-toolbar" role="toolbar" :aria-label="locale.text('图片缩放', 'Image zoom')">
-        <button type="button" :disabled="zoom <= minZoom" :aria-label="locale.text('缩小图片', 'Zoom out')" @click="setZoom(zoom - zoomStep)">−</button>
-        <button class="gallery-zoom-value" type="button" :aria-label="locale.text('恢复原始缩放', 'Reset zoom')" @click="resetZoom">{{ zoom }}%</button>
-        <button type="button" :disabled="zoom >= maxZoom" :aria-label="locale.text('放大图片', 'Zoom in')" @click="setZoom(zoom + zoomStep)">+</button>
-      </div>
+        <button class="gallery-lightbox-close" type="button" :aria-label="locale.text('关闭', 'Close')" @click="emit('close')">
+          <PhX :size="23" />
+        </button>
+        <button class="gallery-lightbox-nav previous" type="button" :disabled="index <= 0" :aria-label="locale.text('上一张图片', 'Previous image')" @click="emit('previous')">
+          <span class="gallery-nav-chevron" aria-hidden="true" />
+        </button>
+        <div class="gallery-lightbox-stage" @wheel.prevent="handleWheel">
+          <img
+            v-if="!imageError"
+            :src="source"
+            :alt="entry.name"
+            :class="{ 'is-panning': dragging }"
+            :style="{ transform: `translate(${panX}px, ${panY}px) scale(${zoom / 100})` }"
+            draggable="false"
+            @dblclick="zoom === 100 ? setZoom(200) : resetZoom()"
+            @dragstart.prevent
+            @pointerdown="startPan"
+            @pointermove="movePan"
+            @pointerup="stopPan"
+            @pointercancel="stopPan"
+            @error="handleImageError"
+          >
+          <div v-else class="gallery-lightbox-unavailable">
+            <strong>{{ trafficExhausted ? locale.text('下载流量已用尽或剩余流量不足，请等待重置或联系管理员', 'Download allowance is exhausted or insufficient. Wait for the reset or contact the administrator.') : locale.text('浏览器无法预览此图片', 'This image cannot be previewed in the browser') }}</strong>
+            <a v-if="!trafficExhausted" :href="target" @click.prevent="startDownload">{{ locale.text('下载文件', 'Download file') }}</a>
+            <p v-if="downloadError">{{ downloadError }}</p>
+          </div>
+        </div>
+        <button class="gallery-lightbox-nav next" type="button" :disabled="index >= total - 1" :aria-label="locale.text('下一张图片', 'Next image')" @click="emit('next')">
+          <span class="gallery-nav-chevron" aria-hidden="true" />
+        </button>
+        <div v-if="!imageError" class="gallery-lightbox-toolbar" role="toolbar" :aria-label="locale.text('图片缩放', 'Image zoom')">
+          <button type="button" :disabled="zoom <= minZoom" :aria-label="locale.text('缩小图片', 'Zoom out')" @click="setZoom(zoom - zoomStep)">−</button>
+          <button class="gallery-zoom-value" type="button" :aria-label="locale.text('恢复原始缩放', 'Reset zoom')" @click="resetZoom">{{ zoom }}%</button>
+          <button type="button" :disabled="zoom >= maxZoom" :aria-label="locale.text('放大图片', 'Zoom in')" @click="setZoom(zoom + zoomStep)">+</button>
+        </div>
+      </section>
     </div>
   </Teleport>
 </template>
@@ -140,10 +142,13 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
   position: fixed;
   z-index: 260;
   inset: 0;
+  display: grid;
+  place-items: center;
   color: white;
   background: rgb(6 8 12 / 74%);
   backdrop-filter: blur(3px);
 }
+.gallery-lightbox-panel { position: relative; width: 100%; height: 100%; color: var(--text); background: var(--panel-soft); }
 .gallery-lightbox-meta {
   position: absolute;
   z-index: 3;
@@ -159,8 +164,8 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
 }
 .gallery-lightbox-meta span {
   padding: 5px 12px;
-  color: rgb(255 255 255 / 88%);
-  background: rgb(18 20 24 / 72%);
+  color: var(--muted);
+  background: var(--panel);
   border-radius: 999px;
   font-size: 12px;
   font-variant-numeric: tabular-nums;
@@ -172,7 +177,6 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
   font-size: 13px;
   text-align: center;
   text-overflow: ellipsis;
-  text-shadow: 0 1px 5px rgb(0 0 0 / 90%);
   white-space: nowrap;
 }
 .gallery-lightbox-close {
@@ -185,14 +189,13 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
   display: grid;
   place-items: center;
   padding: 0;
-  color: white;
+  color: inherit;
   background: transparent;
   border: 0;
   border-radius: 50%;
   cursor: pointer;
 }
 .gallery-lightbox-close:hover { opacity: .72; }
-.gallery-lightbox-close svg { filter: drop-shadow(0 1px 3px rgb(0 0 0 / 85%)); }
 .gallery-lightbox-stage {
   position: absolute;
   inset: 0;
@@ -225,7 +228,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
   text-align: center;
 }
 .gallery-lightbox-unavailable a { color: white; background: var(--accent); border-radius: 6px; padding: 9px 18px; text-decoration: none; }
-.gallery-lightbox-unavailable p { margin: 0; color: white; }
+.gallery-lightbox-unavailable p { margin: 0; color: inherit; }
 .gallery-lightbox-nav {
   position: absolute;
   z-index: 3;
@@ -235,9 +238,9 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
   display: grid;
   place-items: center;
   padding: 0;
-  color: white;
-  background: rgb(18 20 24 / 64%);
-  border: 1px solid rgb(255 255 255 / 12%);
+  color: inherit;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
   border-radius: 50%;
   cursor: pointer;
   transform: translateY(-50%);
@@ -251,7 +254,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
 }
 .gallery-lightbox-nav.next .gallery-nav-chevron { transform: rotate(45deg); }
 .gallery-lightbox-nav.previous .gallery-nav-chevron { transform: rotate(-135deg); }
-.gallery-lightbox-nav:hover:not(:disabled) { background: rgb(42 44 49 / 82%); }
+.gallery-lightbox-nav:hover:not(:disabled) { background: var(--field); }
 .gallery-lightbox-nav:disabled { opacity: .2; cursor: default; }
 .gallery-lightbox-nav.previous { left: 18px; }
 .gallery-lightbox-nav.next { right: 18px; }
@@ -264,8 +267,8 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
   align-items: center;
   gap: 2px;
   padding: 4px;
-  background: rgb(18 20 24 / 84%);
-  border: 1px solid rgb(255 255 255 / 12%);
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
   border-radius: 9px;
   box-shadow: 0 8px 28px rgb(0 0 0 / 28%);
   transform: translateX(-50%);
@@ -276,7 +279,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
   display: grid;
   place-items: center;
   padding: 0 8px;
-  color: white;
+  color: inherit;
   background: transparent;
   border: 0;
   border-radius: 6px;
@@ -284,21 +287,22 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
   font-size: 16px;
   cursor: pointer;
 }
-.gallery-lightbox-toolbar button:hover:not(:disabled) { background: rgb(255 255 255 / 10%); }
+.gallery-lightbox-toolbar button:hover:not(:disabled) { background: var(--panel-soft); }
 .gallery-lightbox-toolbar button:disabled { opacity: .35; cursor: default; }
 .gallery-lightbox-toolbar .gallery-zoom-value {
   min-width: 62px;
-  color: rgb(255 255 255 / 82%);
+  color: var(--muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
-@media (max-width: 640px) {
-  .gallery-lightbox-stage { padding: 74px 50px 72px; }
+@media (max-width: 1024px), (pointer: coarse) {
+  .gallery-lightbox-panel { width: min(1040px, calc(100% - 32px)); height: min(720px, 78dvh); overflow: hidden; border: 1px solid var(--line-strong); border-radius: 8px; }
+  .gallery-lightbox-stage { padding: 64px 42px 58px; }
   .gallery-lightbox-nav { width: 36px; height: 36px; font-size: 25px; }
   .gallery-lightbox-nav.previous { left: 8px; }
   .gallery-lightbox-nav.next { right: 8px; }
   .gallery-lightbox-close { top: 12px; right: 12px; width: 38px; height: 38px; }
-  .gallery-lightbox-meta { max-width: 62vw; }
+  .gallery-lightbox-meta { max-width: calc(100% - 112px); }
 }
 @media (prefers-reduced-motion: reduce) {
   .gallery-lightbox-stage img { transition: none; }

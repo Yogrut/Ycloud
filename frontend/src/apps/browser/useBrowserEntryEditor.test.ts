@@ -76,11 +76,11 @@ describe('browser entry editor', () => {
     expect(rename).not.toHaveBeenCalled()
   })
 
-  it.each(kinds)('freezes the %s destination and trims only the submitted name', async kind => {
+  it.each(kinds)('freezes the %s destination and preserves the submitted name', async kind => {
     const { editor, context, open } = setup()
     open(kind)
     expect(editor.entryName.value).toBe(kind === 'folder' ? '' : 'one.txt')
-    editor.entryName.value = '  renamed + 文件  '
+    editor.entryName.value = 'renamed + 文件'
     context.path.value = 'other'
     context.storageId.value = 'secondary'
     context.entries.value = []
@@ -102,6 +102,23 @@ describe('browser entry editor', () => {
     const { editor } = setup()
     editor.openRenameDialog('elsewhere/space name.txt')
     expect(editor.entryName.value).toBe('space name.txt')
+  })
+
+  it.each(kinds)('keeps a rejected %s name unchanged instead of silently fixing it', async kind => {
+    const write = kind === 'folder' ? create : rename
+    write.mockRejectedValueOnce(new ApiError('Invalid file or directory name', 400, 'bad_request'))
+    const { editor, context, open } = setup()
+    open(kind)
+    const name = '  invalid?name  '
+    editor.entryName.value = name
+    await editor.submitEntry()
+    if (kind === 'folder') expect(create).toHaveBeenCalledExactlyOnceWith('source', name, 'primary')
+    else expect(rename).toHaveBeenCalledExactlyOnceWith('source', 'source/one.txt', name, 'primary')
+    expect(editor.entryName.value).toBe(name)
+    expect(editor.editorKind.value).toBe(kind)
+    expect(editor.entryError.value).toBe('Invalid file or directory name')
+    expect(context.announce).not.toHaveBeenCalled()
+    expect(context.refresh).not.toHaveBeenCalled()
   })
 
   it.each(kinds)('ignores an empty %s name without closing the editor', async kind => {

@@ -351,22 +351,27 @@ impl StorageService {
         }
     }
 
-    pub(crate) async fn recover_quiesced_uploads(&self) -> AppResult<()> {
+    pub(crate) async fn recover_quiesced_uploads(
+        &self,
+        capacity: &crate::capacity::CapacityTracker,
+    ) -> AppResult<()> {
         let _mutation = self.mutation_gate.lock().await;
-        self.transactions.recover(self.root()).await?;
+        self.transactions
+            .recover(self.root(), || capacity.mark_uncertain())
+            .await?;
         self.cleanup.notify();
         Ok(())
     }
 
-    pub(crate) async fn upload_committed(
+    pub(crate) async fn upload_outcome(
         &self,
         path: &str,
         size: u64,
         operation_id: &str,
-    ) -> AppResult<bool> {
+    ) -> AppResult<Option<crate::error::OperationOutcome>> {
         let _mutation = self.mutation_gate.lock().await;
         self.transactions
-            .receipt_matches(path, size, operation_id)
+            .receipt_outcome(path, size, operation_id)
             .await
     }
 

@@ -12,7 +12,7 @@ use crate::{
     storage_catalog::LocalMountCatalog,
 };
 
-mod commit;
+pub(crate) mod commit;
 mod credentials;
 /// Process-local opaque entity version. A restart invalidates old forms;
 /// keyed hashing prevents a version from exposing secret configuration values.

@@ -16,12 +16,14 @@ const submitting = ref(false)
 const formRef = ref<HTMLFormElement>()
 
 function openBrowser(): void {
-  sessionStorage.removeItem('ycloud-stay-signed-out')
+  try { sessionStorage.removeItem('ycloud-stay-signed-out') } catch { /* Optional preference, not authentication. */ }
   window.location.replace(appPath('/browse'))
 }
 
 async function detectExistingAccess(): Promise<void> {
-  if (sessionStorage.getItem('ycloud-stay-signed-out') === '1') return
+  try {
+    if (sessionStorage.getItem('ycloud-stay-signed-out') === '1') return
+  } catch { /* Access detection does not require preference storage. */ }
 
   try {
     const identity = await getIdentity()

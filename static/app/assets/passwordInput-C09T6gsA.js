@@ -1,1 +1,0 @@
-import{N as e}from"./auth-Bk8ZCeDQ.js";var t=`••••••`;function n(t){let n=t.target;n.value===`••••••`&&e(()=>n.select())}export{n,t};

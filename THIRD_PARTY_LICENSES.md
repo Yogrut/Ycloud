@@ -14,6 +14,7 @@ License texts are taken from the installed dependency packages. Identical terms 
 
 | Component | Version | Declared license |
 | --- | --- | --- |
+| Material Icon Theme (selected SVG assets) | 5.39.0 / a7ffd480d308a153b95cf241999dbaaa58bf4992 | MIT |
 | aho-corasick | 1.1.4 | Unlicense OR MIT |
 | allocator-api2 | 0.2.21 | MIT OR Apache-2.0 |
 | anyhow | 1.0.103 | MIT OR Apache-2.0 |
@@ -253,6 +254,7 @@ License texts are taken from the installed dependency packages. Identical terms 
 - tailwind-merge 3.7.0 — LICENSE.md
 - tailwindcss 4.3.3 — LICENSE
 - shadcn-vue — adapted UI components
+- Material Icon Theme — selected SVG assets, upstream LICENSE at https://github.com/material-extensions/vscode-material-icon-theme/blob/a7ffd480d308a153b95cf241999dbaaa58bf4992/LICENSE
 - aho-corasick 1.1.4 — LICENSE-MIT
 - allocator-api2 0.2.21 — LICENSE-MIT
 - anyhow 1.0.103 — LICENSE-MIT
@@ -411,6 +413,8 @@ License texts are taken from the installed dependency packages. Identical terms 
 
 ````````text
 Copyright (c) 2020 Phosphor Icons
+
+Copyright (c) 2025 Material Extensions
 
 Copyright (c) 2018-present, Yuxi (Evan) You
 

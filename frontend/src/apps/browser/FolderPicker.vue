@@ -20,19 +20,17 @@ async function load(destination: string): Promise<void> {
   const version = ++requestVersion
   loading.value = true
   error.value = ''
+  path.value = destination.replace(/^\/+|\/+$/g, '')
+  directories.value = []
   try {
     let cursor: string | undefined
-    let currentPath = destination
-    const found: FileEntry[] = []
     do {
       const data = await listFiles(destination, props.storageId, { limit: 100, cursor })
       if (version !== requestVersion) return
-      currentPath = data.current_path
-      found.push(...data.entries.filter(entry => entry.is_dir && !entry.locked))
+      path.value = data.current_path.replace(/^\/+|\/+$/g, '')
+      directories.value.push(...data.entries.filter(entry => entry.is_dir && !entry.locked))
       cursor = data.next_cursor ?? undefined
     } while (cursor)
-    path.value = currentPath.replace(/^\/+|\/+$/g, '')
-    directories.value = found
   } catch (reason) {
     if (version === requestVersion) error.value = reason instanceof Error ? reason.message : locale.t('picker.loadFailed')
   } finally {

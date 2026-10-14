@@ -59,15 +59,17 @@ describe('interactive focus styling', () => {
     expect(themeCss).not.toContain('gap: 18px; padding-top: 64px;')
   })
 
-  it('shares file header, file content and admin outer widths on desktop and mobile', () => {
-    const sharedRule = /\.browser-chrome,\s*\.browser-page,\s*\.admin-shell\s*\{([^}]*)\}/g
+  it('shares home, file browser and admin outer widths on desktop and mobile', () => {
+    const sharedRule = /\.login-header,\s*\.login-shell,\s*\.browser-chrome,\s*\.browser-page,\s*\.admin-shell\s*\{([^}]*)\}/g
     const sharedWidths = [...themeCss.matchAll(sharedRule)]
-    expect(sharedWidths).toHaveLength(2)
-    expect(sharedWidths[0][1]).toContain('width: min(1400px, calc(100% - 32px));')
-    expect(sharedWidths[1][1]).toContain('width: calc(100% - 18px);')
+    expect(sharedWidths).toHaveLength(1)
+    expect(sharedWidths[0][1]).toContain('width: calc(100% - var(--workspace-gutter) * 2);')
+    expect(themeCss).toMatch(/:root\s*\{[^}]*--workspace-gutter: 4.5vw;/)
+    const mobile = themeCss.match(/@media \(max-width: 760px\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(mobile).toContain(':root { --workspace-gutter: 9px; }')
     // Individual surface rules must not override the common outer grid.
     const individualCss = themeCss.replace(sharedRule, '')
-    for (const selector of ['browser-chrome', 'browser-page', 'admin-shell']) {
+    for (const selector of ['login-header', 'login-shell', 'browser-chrome', 'browser-page', 'admin-shell']) {
       const individualRules = [...individualCss.matchAll(new RegExp('\\.' + selector + '\\s*\\{([^}]*)\\}', 'g'))]
       for (const rule of individualRules) {
         expect(rule[1]).not.toMatch(/(?:^|;)\s*width\s*:/)
@@ -98,9 +100,24 @@ describe('interactive focus styling', () => {
     const view = readFileSync('src/apps/login/LoginView.vue', 'utf8')
     expect(view).toContain('class="h-11 rounded-full px-4 text-sm md:text-sm"')
     expect(view).toContain('class="h-11 w-full rounded-full text-sm font-semibold"')
-    expect(themeCss).toContain('.login-header {\n  width: min(1400px, calc(100% - 36px));')
+    expect(themeCss).not.toContain('width: min(1400px, calc(100% - 36px));')
     expect(themeCss).toContain('.login-card [data-slot="input"] { color: var(--login-text); background: var(--login-field); border-color: transparent;')
     expect(themeCss).toContain('.login-card [data-slot="button"] { border-radius: 9999px; }')
+  })
+
+  it('keeps the home content centered at its original width independently of the outer page gutter', () => {
+    const mobile = themeCss.match(/@media \(max-width: 560px\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    const content = themeCss.match(/\.login-content\s*\{([^}]*)\}/)?.[1] ?? ''
+    expect(content).toContain('width: min(1100px, 100%);')
+    expect(content).toContain('grid-template-columns: minmax(0, 1fr) minmax(420px, 500px);')
+    expect(content).toContain('gap: clamp(48px, 7vw, 120px);')
+    expect(themeCss).toMatch(/\.login-shell\s*\{[^}]*margin: 0 auto;[^}]*padding: 64px 0 88px;/)
+    expect(themeCss).toMatch(/\.login-shell\s*\{[^}]*place-items: center;/)
+    expect(mobile).toContain('.login-page { --workspace-gutter: 16px; }')
+    expect(mobile).toContain('.login-shell { min-height: calc(100dvh - 76px); padding: 36px 0 56px; }')
+    expect(themeCss).toContain('.login-content { max-width: 500px; grid-template-columns: minmax(0, 1fr);')
+    const view = readFileSync('src/apps/login/LoginView.vue', 'utf8')
+    expect(view).toContain('login-card w-full max-w-[500px]')
   })
 
   it('scopes the Ycloud login palette and shadcn-vue components to the entry page', () => {
@@ -189,9 +206,10 @@ describe('interactive focus styling', () => {
 
   it('keeps the collapsed music button inside the wide-screen left gutter', () => {
     const browser = readFileSync('src/apps/browser/BrowserView.vue', 'utf8')
-    expect(browser).toMatch(/\.ycloud-audio-dock\s*\{[^}]*left: 6px; width: 56px; height: 56px;/)
+    expect(browser).toMatch(/\.ycloud-audio-dock\s*\{[^}]*left: max\(6px, calc\(var\(--workspace-gutter\) \/ 2 - 28px\)\); width: 56px; height: 56px;/)
     expect(browser).toContain('<AppIcon name="vinyl-record" :size="28" weight="fill" />')
-    expect(browser).toContain('@media (min-width: 1536px) { .ycloud-audio-dock { left: calc((100vw - 1400px) / 4 - 28px); } }')
+    expect(browser).not.toContain('100vw - 1400px')
+    expect(browser).not.toContain('@media (min-width: 1536px)')
     expect(browser).toMatch(/\.ycloud-audio-dock summary\s*\{[^}]*width: 100%; height: 100%;/)
     expect(browser).toContain('@media (max-width: 520px) { .ycloud-audio-popover { bottom: calc(100% + 10px); left: 8px; width: calc(100vw - 28px); } }')
   })

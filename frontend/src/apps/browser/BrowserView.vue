@@ -606,7 +606,8 @@ onBeforeUnmount(() => {
   font-size: 12px;
   white-space: nowrap;
 }
-.ycloud-audio-dock { position: fixed; z-index: 80; bottom: clamp(90px, 27vh, 290px); left: 6px; width: 56px; height: 56px; }
+/* Share the page gutter; retain the existing edge position on narrow screens. */
+.ycloud-audio-dock { position: fixed; z-index: 80; bottom: clamp(90px, 27vh, 290px); left: max(6px, calc(var(--workspace-gutter) / 2 - 28px)); width: 56px; height: 56px; }
 .ycloud-audio-dock summary { display: grid; place-items: center; width: 100%; height: 100%; color: var(--audio-accent); background: var(--panel); border: 1px solid var(--line); border-radius: 50%; box-shadow: 0 4px 16px rgb(0 0 0 / 10%); cursor: pointer; list-style: none; }
 .ycloud-audio-dock summary::-webkit-details-marker { display: none; }
 .ycloud-audio-dock summary:hover, .ycloud-audio-dock[open] summary { background: var(--audio-accent-soft); border-color: var(--audio-accent); }
@@ -614,7 +615,5 @@ onBeforeUnmount(() => {
 .ycloud-audio-dock summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .ycloud-audio-popover { position: absolute; bottom: 0; left: calc(100% + 12px); width: min(380px, calc(100vw - 120px)); padding: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 11px; box-shadow: 0 12px 30px rgb(0 0 0 / 12%); }
 .ycloud-audio-popover :deep(.ycloud-media-player.audio) { width: 100%; max-width: none; background: transparent; border: 0; }
-/* Center the collapsed button in the desktop gutter, outside the 1400px file panel. */
-@media (min-width: 1536px) { .ycloud-audio-dock { left: calc((100vw - 1400px) / 4 - 28px); } }
 @media (max-width: 520px) { .ycloud-audio-popover { bottom: calc(100% + 10px); left: 8px; width: calc(100vw - 28px); } }
 </style>

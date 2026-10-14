@@ -24,6 +24,7 @@
   --selected-row: #eef5ff;
   --shadow: 0 12px 34px rgba(35, 42, 54, .055);
   --font: Inter, "Noto Sans SC", "Microsoft YaHei", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --workspace-gutter: 4.5vw;
 }
 
 /* Give the light file browser a softer surface hierarchy without changing dark mode. */
@@ -197,7 +198,6 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 }
 
 .login-header {
-  width: min(1400px, calc(100% - 36px));
   min-height: 68px;
   margin: 18px auto 0;
   display: flex;
@@ -228,9 +228,10 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 
 .login-shell {
   min-height: calc(100dvh - 86px);
+  margin: 0 auto;
   display: grid;
   place-items: center;
-  padding: 64px 28px 88px;
+  padding: 64px 0 88px;
 }
 
 .login-content {
@@ -357,10 +358,12 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 
 .brand { display: flex; align-items: center; gap: 11px; font-weight: 760; }
 .brand svg { width: 28px; height: 28px; color: var(--accent); }
-/* Keep file chrome, file content and administration on the same outer grid. */
+/* Keep home, file browsing and administration on the same outer grid. */
+.login-header,
+.login-shell,
 .browser-chrome,
 .browser-page,
-.admin-shell { width: min(1400px, calc(100% - 32px)); }
+.admin-shell { width: calc(100% - var(--workspace-gutter) * 2); }
 .browser-shell {
   height: 100dvh;
   display: grid;
@@ -1089,8 +1092,9 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
   .browser-chrome { flex-wrap: wrap; }
   .browser-chrome .browser-storage-switcher { order: 3; flex-basis: 100%; }
   .browser-chrome .browser-storage-switcher .app-select { width: 100%; max-width: none; }
-  .login-header { width: calc(100% - 32px); min-height: 60px; margin-top: 16px; padding: 0 14px; }
-  .login-shell { min-height: calc(100dvh - 76px); padding: 36px 16px 56px; }
+  .login-page { --workspace-gutter: 16px; }
+  .login-header { min-height: 60px; margin-top: 16px; padding: 0 14px; }
+  .login-shell { min-height: calc(100dvh - 76px); padding: 36px 0 56px; }
   .login-card { min-width: 0; }
 }
 
@@ -1103,9 +1107,7 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 }
 
 @media (max-width: 760px) {
-  .browser-chrome,
-  .browser-page,
-  .admin-shell { width: calc(100% - 18px); }
+  :root { --workspace-gutter: 9px; }
   .browser-chrome { min-height: 56px; margin-top: 8px; gap: 6px; padding: 7px 10px; border-radius: 13px; }
   .browser-chrome .brand span { display: none; }
   .browser-chrome .brand svg { width: 24px; height: 24px; }

@@ -175,6 +175,7 @@ const {
   uploadDropActive,
   uploadFiles,
   uploadTasks,
+  uploadTransfer,
 } = useUploadQueue({
   storageId: currentStorageId,
   path,
@@ -555,6 +556,7 @@ onBeforeUnmount(() => {
   <UploadQueueDialog
     v-if="showUpload"
     :tasks="uploadTasks"
+    :transfer="uploadTransfer"
     @choose-files="chooseFiles"
     @choose-folder="chooseFolder"
     @drop="handleUploadDrop"

@@ -1,4 +1,4 @@
-import { createApp, nextTick, reactive } from 'vue'
+import { createApp, h, nextTick, reactive } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import UploadQueueDialog from './UploadQueueDialog.vue'
 import type { UploadTask, UploadTaskStatus } from './uploadQueue'
@@ -23,13 +23,51 @@ function task(id: number, status: UploadTaskStatus, error = ''): UploadTask {
   }
 }
 
-function mountUploadDialog(host: HTMLElement, props: Record<string, unknown>) {
-  const app = createApp(UploadQueueDialog, props)
+function mountUploadDialog(host: HTMLElement, props: { tasks: UploadTask[] } & Record<string, unknown>, onRender?: () => void) {
+  const app = createApp({ render: () => {
+    onRender?.()
+    return h(UploadQueueDialog, { transfer: { transferredBytes: 0 }, ...props })
+  } })
   app.mount(host)
   return app
 }
 
 describe('UploadQueueDialog', () => {
+  it('does not lose bytes from a file that starts and completes between display ticks', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
+    const host = document.createElement('div')
+    document.body.append(host)
+    const props = reactive({ tasks: [task(1, 'queued'), task(2, 'uploading')], transfer: { transferredBytes: 0 } })
+    const app = mountUploadDialog(host, props)
+    props.tasks[0]!.status = 'uploading'
+    props.tasks[0]!.loaded = 4
+    props.transfer.transferredBytes = 4
+    props.tasks[0]!.status = 'succeeded'
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('8 B/s')
+    app.unmount()
+  })
+
+  it('uses elapsed time across irregular progress events rather than alternating with empty half-second samples', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
+    const host = document.createElement('div')
+    document.body.append(host)
+    const props = reactive({ tasks: [{ ...task(1, 'uploading'), file: new File([new Uint8Array(4096)], 'large.bin') }], transfer: { transferredBytes: 0 } })
+    const app = mountUploadDialog(host, props)
+    await vi.advanceTimersByTimeAsync(250)
+    props.tasks[0]!.loaded = 1024
+    props.transfer.transferredBytes = 1024
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(250)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('2.0 KB/s')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('1.0 KB/s')
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('0 B/s')
+    app.unmount()
+  })
+
   it('updates toolbar eligibility and counters when the same task changes status', async () => {
     const host = document.createElement('div')
     document.body.append(host)
@@ -60,6 +98,62 @@ describe('UploadQueueDialog', () => {
     } finally { app.unmount() }
   })
 
+  it('counts irregular timestamped events in one elapsed-time window and expires a real stall', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
+    const host = document.createElement('div')
+    document.body.append(host)
+    const transfer = reactive({ transferredBytes: 0 })
+    const app = mountUploadDialog(host, { tasks: [task(1, 'uploading')], transfer })
+    let elapsed = 0
+    for (const at of [50, 800, 1050, 1800]) {
+      await vi.advanceTimersByTimeAsync(at - elapsed)
+      transfer.transferredBytes += 1024
+      elapsed = at
+    }
+    await vi.advanceTimersByTimeAsync(2000 - elapsed)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('2.0 KB/s')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('1.2 KB/s')
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('0 B/s')
+    app.unmount()
+  })
+
+  it('does not inflate a delayed progress notification by charging all its bytes to two seconds', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
+    const host = document.createElement('div')
+    document.body.append(host)
+    const transfer = reactive({ transferredBytes: 0 })
+    const app = mountUploadDialog(host, { tasks: [task(1, 'uploading')], transfer })
+    await vi.advanceTimersByTimeAsync(5000)
+    transfer.transferredBytes = 10240
+    await vi.advanceTimersByTimeAsync(500)
+    // 10 KiB over five seconds: only the overlapping 1.5 seconds belongs
+    // to the current two-second window, followed by 0.5 seconds without data.
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('1.5 KB/s')
+    await vi.advanceTimersByTimeAsync(1500)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('0 B/s')
+    app.unmount()
+  })
+
+  it('observes transfer events without rerendering the parent file browser for every progress update', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
+    const host = document.createElement('div')
+    document.body.append(host)
+    const transfer = reactive({ transferredBytes: 0 })
+    const tasks = reactive([task(1, 'uploading')])
+    let parentRenders = 0
+    const app = mountUploadDialog(host, { tasks, transfer }, () => { parentRenders++ })
+    for (let index = 0; index < 10; index++) {
+      transfer.transferredBytes += 100
+      await nextTick()
+    }
+    await vi.advanceTimersByTimeAsync(500)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('2.0 KB/s')
+    expect(parentRenders).toBe(1)
+    app.unmount()
+  })
+
   it('disables termination when all visible tasks are only awaiting result confirmation', async () => {
     const host = document.createElement('div')
     document.body.append(host)
@@ -74,36 +168,49 @@ describe('UploadQueueDialog', () => {
     } finally { app.unmount() }
   })
 
-  it('samples live upload speed and resets on stalls, pause, retry and completion', async () => {
+  it('expires actual byte samples and resets immediately on pause, resume and completion', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
     const host = document.createElement('div')
     document.body.append(host)
     const files = reactive([{ ...task(1, 'uploading'), file: new File([new Uint8Array(4096)], 'large.bin') }])
-    const app = mountUploadDialog(host, { tasks: files })
+    const props = reactive({ tasks: files, transfer: { transferredBytes: 0 } })
+    const app = mountUploadDialog(host, props)
     const speed = () => host.querySelector('.upload-overall-speed')?.textContent
     expect(speed()).toBe('0 B/s')
     files[0]!.loaded = 1024
+    props.transfer.transferredBytes += 1024
+    await nextTick()
     await vi.advanceTimersByTimeAsync(500)
     await nextTick()
     expect(speed()).toBe('2.0 KB/s')
     expect(host.querySelector('.upload-overall-transfer')?.lastElementChild?.className).toBe('upload-overall-percent')
     await vi.advanceTimersByTimeAsync(500)
+    expect(speed()).toBe('1.0 KB/s')
+    await vi.advanceTimersByTimeAsync(1500)
     expect(speed()).toBe('0 B/s')
     files[0]!.status = 'paused'
     files[0]!.loaded = 0
-    await vi.advanceTimersByTimeAsync(500)
+    await nextTick()
     expect(speed()).toBe('0 B/s')
     files[0]!.status = 'uploading'
-    await vi.advanceTimersByTimeAsync(500)
     files[0]!.loaded = 512
+    props.transfer.transferredBytes += 512
+    await nextTick()
     await vi.advanceTimersByTimeAsync(500)
     expect(speed()).toBe('1.0 KB/s')
+    files[0]!.status = 'paused'
     files[0]!.loaded = 0
-    await vi.advanceTimersByTimeAsync(500)
+    await nextTick()
     expect(speed()).toBe('0 B/s')
+    files[0]!.status = 'uploading'
+    files[0]!.loaded = 512
+    props.transfer.transferredBytes += 512
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(speed()).toBe('1.0 KB/s')
     files[0]!.loaded = 4096
     files[0]!.status = 'verifying'
-    await vi.advanceTimersByTimeAsync(500)
+    await nextTick()
     expect(speed()).toBe('0 B/s')
     expect(host.querySelector('.upload-overall-percent')?.textContent).toBe('99%')
     files[0]!.status = 'succeeded'
@@ -111,6 +218,27 @@ describe('UploadQueueDialog', () => {
     expect(speed()).toBe('0 B/s')
     expect(host.querySelector('.upload-overall-percent')?.textContent).toBe('100%')
     app.unmount()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('does not count previous bytes when the dialog is reopened or retain removed task objects', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] })
+    const host = document.createElement('div')
+    document.body.append(host)
+    const props = reactive({ tasks: [task(1, 'succeeded'), task(2, 'uploading')], transfer: { transferredBytes: 1024 } })
+    const app = mountUploadDialog(host, props)
+    await vi.advanceTimersByTimeAsync(500)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('0 B/s')
+    props.transfer.transferredBytes += 512
+    props.tasks.splice(0, 1)
+    await nextTick()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('512 B/s')
+    app.unmount()
+    const reopened = mountUploadDialog(host, props)
+    await vi.advanceTimersByTimeAsync(500)
+    expect(host.querySelector('.upload-overall-speed')?.textContent).toBe('0 B/s')
+    reopened.unmount()
     expect(vi.getTimerCount()).toBe(0)
   })
 

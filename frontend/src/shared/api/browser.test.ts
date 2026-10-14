@@ -64,13 +64,17 @@ describe('browser API paths', () => {
     for (const [index, request] of UploadRequest.instances.entries()) {
       expect(request.body).toBe(files[index])
       expect(request.url).toContain(`photo-${index}.jpeg`)
-      request.upload.dispatchEvent(new ProgressEvent('progress', { loaded: index + 1, lengthComputable: true }))
+      request.upload.dispatchEvent(new ProgressEvent('progress', { loaded: index + 1, lengthComputable: index !== 1 }))
       expect(progress[index]).toHaveBeenLastCalledWith(index + 1)
     }
     // One response cannot settle or reuse another file's request.
     for (const request of [...UploadRequest.instances].reverse()) request.dispatchEvent(new Event('load'))
     await Promise.all(uploads)
-    for (const callback of progress) expect(callback).toHaveBeenLastCalledWith(files[0]!.size)
+    // Completion is a receipt, not a new transfer event. An unknown total
+    // does not invalidate observed loaded bytes either.
+    for (const [index, callback] of progress.entries()) {
+      expect(callback).toHaveBeenCalledExactlyOnceWith(index + 1)
+    }
   })
 
   it('encodes complete nested paths as one query value', () => {

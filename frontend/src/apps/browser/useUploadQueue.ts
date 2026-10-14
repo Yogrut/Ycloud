@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import type { Ref } from 'vue'
 import { cancelUploadBatch, createFolder, getUploadBatchStatus, listFiles, prepareUploadBatch, uploadFile } from '../../shared/api/browser'
 import type { UploadBatchItemState, UploadBatchStatus } from '../../shared/api/browser'
@@ -42,6 +42,9 @@ export function useUploadQueue(context: UploadQueueContext) {
   const showUpload = ref(false)
   const uploading = ref(false)
   const uploadTasks = ref<UploadTask[]>([])
+  // Sent bytes are a transfer metric, not task completion. Keep retries and
+  // removed records from resetting the queue's physical upload counter.
+  const uploadTransfer = reactive({ transferredBytes: 0 })
   const retainedUploadTasks = computed(() => new Set(uploadTasks.value))
   const uploadDropActive = ref(false)
   let uploadTaskSequence = 0
@@ -354,7 +357,11 @@ export function useUploadQueue(context: UploadQueueContext) {
         try {
           task.attempted = true
           task.safeToPrepare = false
-          await uploadFile(task.targetPath, task.file, loaded => { if (!disposed && task.status === 'uploading') task.loaded = loaded }, storageId, ticket, controller.signal, task.directUpload)
+          await uploadFile(task.targetPath, task.file, loaded => {
+            if (disposed || task.status !== 'uploading') return
+            uploadTransfer.transferredBytes += Math.max(0, loaded - task.loaded)
+            task.loaded = loaded
+          }, storageId, ticket, controller.signal, task.directUpload)
           if (disposed) return
           if (task.cancelRequested || task.pauseRequested) {
             void reconcileInterruptedUpload(task)
@@ -685,5 +692,6 @@ export function useUploadQueue(context: UploadQueueContext) {
     uploadDropActive,
     uploadFiles,
     uploadTasks,
+    uploadTransfer,
   }
 }

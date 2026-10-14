@@ -75,6 +75,37 @@ function folderSelection(...paths: string[]): Event {
 }
 
 describe('upload ticket grouping and mappings', () => {
+  it('counts only progress byte deltas across duplicate events, retries and record removal', async () => {
+    const { queue } = uploads()
+    vi.mocked(uploadFile).mockImplementation(async (_path, _file, progress) => {
+      progress(1); progress(1); progress(3)
+      throw new ApiError('Upload rejected', 400)
+    })
+    queue.uploadFiles({ target: { files: [new File(['data'], 'bytes.txt')], value: '' } } as unknown as Event)
+    await settle()
+    expect(queue.uploadTransfer.transferredBytes).toBe(3)
+    expect(queue.uploadTasks.value[0]!.status).toBe('failed')
+    vi.mocked(getUploadBatchStatus).mockResolvedValue({ ticket: 'ticket', items: [{ path: 'original/bytes.txt', size: 4, status: 'failed' }] })
+    vi.mocked(uploadFile).mockImplementation(async (_path, _file, progress) => {
+      progress(2); progress(2); progress(4)
+    })
+    queue.retryUpload(queue.uploadTasks.value[0]!.id)
+    await settle()
+    expect(queue.uploadTransfer.transferredBytes).toBe(7)
+    expect(queue.uploadTasks.value[0]!.status).toBe('succeeded')
+    queue.clearUploadTasks([queue.uploadTasks.value[0]!.id])
+    expect(queue.uploadTasks.value).toHaveLength(0)
+    expect(queue.uploadTransfer.transferredBytes).toBe(7)
+  })
+
+  it('does not turn a server completion or verification response into transmitted bytes', async () => {
+    const { queue } = uploads()
+    queue.uploadFiles({ target: { files: [new File(['data'], 'done.txt')], value: '' } } as unknown as Event)
+    await settle()
+    expect(queue.uploadTasks.value[0]!.status).toBe('succeeded')
+    expect(queue.uploadTransfer.transferredBytes).toBe(0)
+  })
+
   it('creates the selected folder and nested parents before preparing or uploading files', async () => {
     const { queue } = uploads()
     const directories = new Set(['original'])

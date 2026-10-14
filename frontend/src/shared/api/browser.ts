@@ -295,7 +295,7 @@ export async function uploadFile(path: string, file: File, onProgress: (loaded: 
     request.setRequestHeader('Content-Type', 'application/octet-stream')
     request.upload.addEventListener('progress', event => {
       resetIdleTimer()
-      if (event.lengthComputable) onProgress(Math.min(file.size, event.loaded))
+      onProgress(Math.min(file.size, event.loaded))
     })
     request.addEventListener('load', () => {
       if (request.status === 401) {
@@ -310,7 +310,6 @@ export async function uploadFile(path: string, file: File, onProgress: (loaded: 
         try { receipt = JSON.parse(request.responseText) } catch { /* A non-JSON response is not an upload receipt. */ }
         try { requireSuccess(receipt, request.status, request.getResponseHeader('x-request-id') ?? undefined) }
         catch (error) { reject(error); return }
-        onProgress(file.size)
         resolve()
         return
       }

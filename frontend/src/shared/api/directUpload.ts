@@ -34,7 +34,7 @@ function putPart(url: string, bytes: Blob, progress: (loaded: number) => void, s
     request.upload.addEventListener('progress', event => { tick(); progress(Math.min(bytes.size, event.loaded)) })
     request.addEventListener('load', () => {
       cleanup()
-      if (request.status >= 200 && request.status < 300) { progress(bytes.size); resolve() }
+      if (request.status >= 200 && request.status < 300) resolve()
       else reject(stalled())
     })
     request.addEventListener('error', () => { cleanup(); reject(stalled()) })
@@ -89,7 +89,6 @@ export async function uploadDirectFile(
     if (controller.signal.aborted) throw new DOMException('Upload aborted', 'AbortError')
     const receipt = await command('complete', { session }, controller.signal)
     requireSuccess(receipt)
-    onProgress(file.size)
     return true
   } catch (error) {
     controller.abort()

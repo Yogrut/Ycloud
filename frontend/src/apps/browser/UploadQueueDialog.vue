@@ -1,15 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import { formatSize } from '../../shared/format'
 import { useLocale } from '../../shared/i18n'
-import type { UploadTask, UploadTaskStatus } from './uploadQueue'
-import { canUploadTaskAction, isUploadTaskActive, summarizeUploadTasks, uploadLoadedBytes, uploadTaskPercent as taskPercent } from './uploadQueue'
+import type { UploadTask } from './uploadQueue'
+import { canUploadTaskAction, isUploadTaskActive, summarizeUploadTasks, uploadTaskPercent as taskPercent } from './uploadQueue'
 
 type UploadFilter = 'all' | 'active' | 'succeeded' | 'failed' | 'cancelled'
 
 const props = defineProps<{
   tasks: UploadTask[]
+  transfer: { readonly transferredBytes: number }
 }>()
 
 const emit = defineEmits<{
@@ -31,30 +32,56 @@ const dropActive = ref(false)
 let dragDepth = 0
 const uploadSpeed = ref(0)
 let speedTimer: ReturnType<typeof setInterval> | undefined
-let sampledAt = 0
-let samples = new Map<number, { loaded: number; status: UploadTaskStatus }>()
+const SPEED_WINDOW_MS = 2000
+const hasUploadingTasks = computed(() => props.tasks.some(task => task.status === 'uploading'))
+let startedAt = 0
+let observedAt = 0
+let sampledBytes = 0
+let samples: Array<{ from: number; to: number; bytes: number }> = []
+
+function resetSpeed(): void {
+  startedAt = performance.now()
+  observedAt = startedAt
+  sampledBytes = props.transfer.transferredBytes
+  samples = []
+  uploadSpeed.value = 0
+}
+
+// Record actual progress updates before display sampling. File status changes,
+// retry resets and record removal must not fabricate or erase sent bytes.
+watch(() => props.transfer.transferredBytes, bytes => {
+  const transferred = bytes - sampledBytes
+  sampledBytes = bytes
+  if (hasUploadingTasks.value && transferred > 0) {
+    const now = performance.now()
+    samples.push({ from: observedAt, to: now, bytes: transferred })
+    observedAt = now
+  }
+}, { flush: 'sync' })
+watch(hasUploadingTasks, resetSpeed, { flush: 'sync' })
 
 function sampleSpeed(): void {
+  if (!hasUploadingTasks.value) { resetSpeed(); return }
   const now = performance.now()
-  let transferred = 0
-  const next = new Map<number, { loaded: number; status: UploadTaskStatus }>()
-  for (const task of props.tasks) {
-    const loaded = uploadLoadedBytes(task)
-    const previous = samples.get(task.id)
-    if (previous?.status === 'uploading' && ['uploading', 'verifying', 'succeeded'].includes(task.status)) {
-      transferred += Math.max(0, loaded - previous.loaded)
-    }
-    next.set(task.id, { loaded, status: task.status })
-  }
-  const elapsed = now - sampledAt
-  uploadSpeed.value = props.tasks.some(task => task.status === 'uploading') && elapsed > 0
+  const cutoff = now - SPEED_WINDOW_MS
+  let expired = 0
+  while (expired < samples.length && samples[expired]!.to <= cutoff) expired++
+  if (expired) samples.splice(0, expired)
+  // A callback reports bytes accumulated since the previous observation, not
+  // bytes sent at this instant. Estimate its overlap at that interval's rate;
+  // sparse callbacks must not turn five seconds of data into a two-second burst.
+  const transferred = samples.reduce((total, sample) => {
+    const duration = sample.to - sample.from
+    const overlap = sample.to - Math.max(sample.from, cutoff)
+    return total + (duration > 0 ? sample.bytes * overlap / duration : sample.bytes)
+  }, 0)
+  const elapsed = Math.min(now - startedAt, SPEED_WINDOW_MS)
+  uploadSpeed.value = elapsed > 0
     ? Math.round(transferred * 1000 / elapsed) : 0
-  sampledAt = now
-  samples = next
 }
 
 onMounted(() => {
-  sampleSpeed()
+  resetSpeed()
   speedTimer = setInterval(sampleSpeed, 500)
 })
 onUnmounted(() => clearInterval(speedTimer))
@@ -165,7 +192,7 @@ function handleDrop(event: DragEvent): void {
       </div>
 
       <progress class="upload-overall-progress" :value="overallPercent" max="100" :aria-label="locale.text('全部文件上传进度', 'Overall upload progress')">{{ overallPercent }}%</progress>
-      <div class="upload-overall-meta"><span><strong>{{ completionLabel }}</strong> · {{ locale.text(`成功 ${succeeded} · 失败/异常 ${failed} · 已终止 ${cancelled}`, `${succeeded} succeeded · ${failed} failed · ${cancelled} terminated`) }}</span><span class="upload-overall-transfer"><span class="upload-overall-speed" :title="locale.text('浏览器实时上传速率，不代表存储已写入完成', 'Live browser upload speed, not final storage completion')">{{ formatSize(uploadSpeed) }}/s</span><span class="upload-overall-percent">{{ overallPercent }}%</span></span></div>
+      <div class="upload-overall-meta"><span><strong>{{ completionLabel }}</strong> · {{ locale.text(`成功 ${succeeded} · 失败/异常 ${failed} · 已终止 ${cancelled}`, `${succeeded} succeeded · ${failed} failed · ${cancelled} terminated`) }}</span><span class="upload-overall-transfer"><span class="upload-overall-speed" :title="locale.text('浏览器最近 2 秒的平均上传速率，不代表存储已写入完成', 'Average browser upload speed over the last 2 seconds, not final storage completion')">{{ formatSize(uploadSpeed) }}/s</span><span class="upload-overall-percent">{{ overallPercent }}%</span></span></div>
 
       <div v-if="visibleTasks.length" class="upload-task-list">
         <article v-for="task in visibleTasks" :key="task.id" class="upload-task" :class="`is-${task.status}`">

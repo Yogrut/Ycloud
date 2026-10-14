@@ -6,6 +6,7 @@ class StorageRequest extends EventTarget {
   static peak = 0
   static payloads: Blob[] = []
   static failing = false
+  static reportFinalProgress = true
   upload = new EventTarget()
   withCredentials = true
   status = 200
@@ -22,7 +23,7 @@ class StorageRequest extends EventTarget {
       if (StorageRequest.failing) this.dispatchEvent(new Event('error'))
       else {
         this.upload.dispatchEvent(new ProgressEvent('progress', { loaded: Math.floor(bytes.size / 2), total: bytes.size, lengthComputable: true }))
-        this.upload.dispatchEvent(new ProgressEvent('progress', { loaded: bytes.size, total: bytes.size, lengthComputable: true }))
+        if (StorageRequest.reportFinalProgress) this.upload.dispatchEvent(new ProgressEvent('progress', { loaded: bytes.size, total: bytes.size, lengthComputable: true }))
         this.dispatchEvent(new Event('load'))
       }
     }, 0)
@@ -40,6 +41,7 @@ function install(mode = 'direct'): ReturnType<typeof vi.fn> {
   StorageRequest.peak = 0
   StorageRequest.payloads = []
   StorageRequest.failing = false
+  StorageRequest.reportFinalProgress = true
   vi.stubGlobal('XMLHttpRequest', StorageRequest)
   const fetchMock = vi.fn(async (url: string) => {
     const action = new URL(url, 'http://localhost').pathname.split('/').at(-1)
@@ -65,13 +67,22 @@ describe('S3 browser direct upload', () => {
     const reported = progress.mock.calls.map(([bytes]) => bytes as number)
     expect(reported).toEqual([...reported].sort((a, b) => a - b))
     expect(reported.every(bytes => bytes >= 0 && bytes <= 18)).toBe(true)
-    // Both final progress and successful load report a part's full size.
-    // They must replace its previous contribution, not count it twice.
-    expect(reported.slice(0, 4)).toEqual([2, 4, 4, 6])
+    // A successful response does not duplicate the final transfer event.
+    expect(reported.slice(0, 4)).toEqual([2, 4, 6, 8])
     expect(fetchMock.mock.calls.filter(([url]) => url.includes('/complete'))).toHaveLength(1)
     expect(fetchMock.mock.calls.filter(([url]) => url.includes('/cancel'))).toHaveLength(0)
     expect(fetchMock.mock.calls.every(([url]) => url.startsWith('/api/upload/direct/'))).toBe(true)
   })
+  it('does not fabricate missing progress bytes from successful storage responses', async () => {
+    const fetchMock = install()
+    StorageRequest.reportFinalProgress = false
+    const progress = vi.fn()
+    expect(await uploadDirectFile('', new File(['abcdefghijklmnopqr'], 'test'), progress)).toBe(true)
+    expect(progress).toHaveBeenLastCalledWith(9)
+    expect(progress).toHaveBeenCalledTimes(5)
+    expect(fetchMock.mock.calls.filter(([url]) => url.includes('/complete'))).toHaveLength(1)
+  })
+
   it('uses the explicit relay response without sending storage PUTs', async () => {
     install('relay')
     expect(await uploadDirectFile('', new File(['a'], 'test'), vi.fn())).toBe(false)

@@ -102,6 +102,7 @@ export type UploadBatchItemState = 'pending' | 'in_progress' | 'complete' | 'fai
 
 export interface UploadBatchStatus {
   ticket: string
+  upload_file_concurrency?: number
   items: Array<{
     path: string
     size: number
@@ -222,7 +223,7 @@ export function prepareArchive(paths: string[], storageId?: string): Promise<Arc
   })
 }
 
-export function prepareUploadBatch(items: UploadBatchItem[], storageId?: string): Promise<{ ticket: string; upload_mode?: 'direct' | 'relay'; items?: Array<{ original_path: string; path: string }> }> {
+export function prepareUploadBatch(items: UploadBatchItem[], storageId?: string): Promise<{ ticket: string; upload_mode?: 'direct' | 'relay'; upload_file_concurrency?: number; items?: Array<{ original_path: string; path: string }> }> {
   return apiRequest(withStorage('/api/upload/prepare', storageId), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

@@ -31,7 +31,8 @@ pub use crate::directory_listing::BackendEntry;
 
 mod lifecycle;
 pub use lifecycle::StorageEditGuard;
-use lifecycle::{interruptible_body, AdmissionLease, MAX_MUTATION_OWNERS};
+pub(crate) use lifecycle::MAX_MUTATION_OWNERS;
+use lifecycle::{interruptible_body, AdmissionLease};
 #[cfg(test)]
 mod copy_tests;
 mod maintenance;

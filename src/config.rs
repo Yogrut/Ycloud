@@ -94,6 +94,9 @@ pub use validation::{
 pub const DEFAULT_MAX_UPLOAD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_UPLOAD_BATCH_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_UPLOAD_BATCH_ENTRIES: usize = 1_000;
+pub const DEFAULT_UPLOAD_FILE_CONCURRENCY: usize = 4;
+// A browser queue should not start more files than one storage can admit.
+pub const MAX_UPLOAD_FILE_CONCURRENCY: usize = crate::storage_backend::MAX_MUTATION_OWNERS;
 pub const DEFAULT_MAX_ARCHIVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 1_000;
 pub const DEFAULT_DEPLOYMENT_MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024 * 1024;
@@ -122,7 +125,7 @@ pub const MIN_TRANSFER_RATE_BYTES: u64 = 64 * 1024;
 const MIN_TRANSFER_BYTES: u64 = 1024 * 1024;
 pub const MIN_STORAGE_CAPACITY_BYTES: u64 = 1024 * 1024;
 pub const HARD_MAX_STORAGE_CAPACITY_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024 * 1024;
-pub const CONFIG_SCHEMA_VERSION: u32 = 16;
+pub const CONFIG_SCHEMA_VERSION: u32 = 17;
 pub const DEFAULT_STORAGE_ID: &str = "primary";
 pub const MAX_STORAGE_INSTANCES: usize = 16;
 pub const MAX_USER_ACCOUNTS: usize = 100;
@@ -284,6 +287,10 @@ const fn default_max_upload_batch_entries() -> usize {
     DEFAULT_MAX_UPLOAD_BATCH_ENTRIES
 }
 
+const fn default_upload_file_concurrency() -> usize {
+    DEFAULT_UPLOAD_FILE_CONCURRENCY
+}
+
 const fn default_max_archive_bytes() -> u64 {
     DEFAULT_MAX_ARCHIVE_BYTES
 }
@@ -355,6 +362,23 @@ mod tests {
         ));
         assert!(!path_is_same_or_descendant("photos-old", "photos"));
         assert!(!path_is_same_or_descendant("photos", ""));
+    }
+
+    #[test]
+    fn file_upload_concurrency_is_validated_on_the_full_configuration() {
+        let mut config = ConfigFile::default();
+        assert_eq!(
+            config.upload_file_concurrency,
+            super::DEFAULT_UPLOAD_FILE_CONCURRENCY
+        );
+        for value in [1, 4, super::MAX_UPLOAD_FILE_CONCURRENCY] {
+            config.upload_file_concurrency = value;
+            config.validate().unwrap();
+        }
+        for value in [0, super::MAX_UPLOAD_FILE_CONCURRENCY + 1, usize::MAX] {
+            config.upload_file_concurrency = value;
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]

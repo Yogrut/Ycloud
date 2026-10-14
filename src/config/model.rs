@@ -7,7 +7,7 @@ use super::{
     default_max_archive_bytes, default_max_archive_entries, default_max_upload_batch_bytes,
     default_max_upload_batch_entries, default_max_upload_bytes, default_security_log_max_entries,
     default_security_log_retention_days, default_storage_id, default_true,
-    default_web_login_failures, uuid_v4,
+    default_upload_file_concurrency, default_web_login_failures, uuid_v4,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +302,8 @@ pub struct ConfigFile {
     pub max_upload_batch_bytes: u64,
     #[serde(default = "default_max_upload_batch_entries")]
     pub max_upload_batch_entries: usize,
+    #[serde(default = "default_upload_file_concurrency")]
+    pub upload_file_concurrency: usize,
     #[serde(default = "default_max_archive_bytes")]
     pub max_archive_bytes: u64,
     #[serde(default = "default_max_archive_entries")]
@@ -349,6 +351,7 @@ impl ConfigFile {
             max_upload_bytes: default_max_upload_bytes(),
             max_upload_batch_bytes: default_max_upload_batch_bytes(),
             max_upload_batch_entries: default_max_upload_batch_entries(),
+            upload_file_concurrency: default_upload_file_concurrency(),
             max_archive_bytes: default_max_archive_bytes(),
             max_archive_entries: default_max_archive_entries(),
             admin_login_failures: default_admin_login_failures(),

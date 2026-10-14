@@ -36,6 +36,8 @@ export interface AdminInfo {
   max_upload_bytes: number
   max_upload_batch_bytes?: number
   max_upload_batch_entries?: number
+  upload_file_concurrency?: number
+  max_upload_file_concurrency?: number
   max_archive_bytes: number
   max_archive_entries: number
   deployment_max_upload_bytes?: number
@@ -292,6 +294,7 @@ export interface UpdateTransferLimitsRequest {
   max_upload_bytes: number
   max_upload_batch_bytes: number
   max_upload_batch_entries: number
+  upload_file_concurrency: number
   max_archive_bytes: number
   max_archive_entries: number
   upload_rate_bytes_per_sec: number

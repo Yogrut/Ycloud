@@ -210,6 +210,9 @@ impl Drop for UploadExecutionGuard {
 pub struct UploadBatchStatusResponse {
     pub ticket: String,
     pub items: Vec<UploadItemStatus>,
+    /// Current browser scheduling policy, supplied only by the HTTP handler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_file_concurrency: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -987,6 +990,7 @@ impl UploadBatchStore {
         Ok(UploadBatchStatusResponse {
             ticket: token.to_owned(),
             items,
+            upload_file_concurrency: None,
         })
     }
 }
@@ -1100,12 +1104,26 @@ pub struct PrepareUploadBatchResponse {
     pub ticket: String,
     pub items: Vec<PreparedUploadName>,
     pub upload_mode: &'static str,
+    pub upload_file_concurrency: usize,
 }
 
 #[derive(Serialize)]
 pub struct PreparedUploadName {
     pub original_path: String,
     pub path: String,
+}
+
+/// Relay scheduling and direct account admission use the same saved file limit.
+fn browser_upload_policy(
+    policy: &crate::config::ConfigFile,
+    storage_id: &str,
+) -> (&'static str, usize) {
+    let direct = policy.storage_instances.iter().any(|instance| instance.id == storage_id
+        && matches!(&instance.backend, crate::config::StorageBackendConfig::S3(settings) if !settings.relay_upload));
+    (
+        if direct { "direct" } else { "relay" },
+        policy.upload_file_concurrency,
+    )
 }
 
 fn numbered_upload_name(name: &str, names: &HashSet<String>) -> AppResult<String> {
@@ -1166,10 +1184,7 @@ pub async fn prepare_upload_batch(
         .await
         .ok_or(AppError::Forbidden)?;
     let policy = state.config_file.read().await.clone();
-    let upload_mode = if policy.storage_instances.iter().any(|instance| instance.id == share.storage_id
-        && matches!(&instance.backend, crate::config::StorageBackendConfig::S3(settings) if !settings.relay_upload)) {
-        "direct"
-    } else { "relay" };
+    let (upload_mode, upload_file_concurrency) = browser_upload_policy(&policy, &share.storage_id);
     if body.items.is_empty() || body.items.len() > policy.max_upload_batch_entries {
         return Err(AppError::PayloadTooLarge);
     }
@@ -1287,6 +1302,7 @@ pub async fn prepare_upload_batch(
         ticket,
         items: prepared,
         upload_mode,
+        upload_file_concurrency,
     }))
 }
 
@@ -1336,22 +1352,112 @@ pub async fn upload_batch_status(
         .batch
         .as_deref()
         .ok_or_else(|| AppError::BadRequest("缺少上传批次票据".into()))?;
-    Ok(Json(
-        state
-            .upload_batches
-            .status_for_account(
-                ticket,
-                &subject,
-                &crate::traffic::browser_subject(&state, &headers).await,
-                &share.storage_id,
-            )
-            .await?,
-    ))
+    let mut response = state
+        .upload_batches
+        .status_for_account(
+            ticket,
+            &subject,
+            &crate::traffic::browser_subject(&state, &headers).await,
+            &share.storage_id,
+        )
+        .await?;
+    let policy = state.config_file.read().await;
+    response.upload_file_concurrency = Some(browser_upload_policy(&policy, &share.storage_id).1);
+    Ok(Json(response))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_concurrency_is_the_same_for_relay_and_direct_uploads() {
+        use crate::config::{ConfigFile, S3StorageConfig, StorageBackendConfig};
+        let mut policy = ConfigFile::with_test_storage();
+        policy.upload_file_concurrency = 32;
+        assert_eq!(browser_upload_policy(&policy, "primary"), ("relay", 32));
+        let settings: S3StorageConfig = serde_json::from_value(serde_json::json!({
+            "provider": "s3_compatible", "endpoint": "http://127.0.0.1:9000", "bucket": "test-bucket",
+            "region": "us-east-1", "prefix": "", "addressing_style": "path",
+            "access_key_id": "fixture", "secret_access_key": "fixture", "relay_upload": false,
+        })).unwrap();
+        policy.storage_instances[0].backend = StorageBackendConfig::S3(settings.clone());
+        for limit in [1, 4, 8, 32] {
+            policy.upload_file_concurrency = limit;
+            assert_eq!(browser_upload_policy(&policy, "primary"), ("direct", limit));
+        }
+        policy.upload_file_concurrency = 8;
+        policy.storage_instances[0].backend = StorageBackendConfig::S3(S3StorageConfig {
+            relay_upload: true,
+            ..settings
+        });
+        assert_eq!(browser_upload_policy(&policy, "primary"), ("relay", 8));
+    }
+
+    #[test]
+    fn file_concurrency_is_only_http_policy_not_persistent_ticket_state() {
+        let response = UploadBatchStatusResponse {
+            ticket: "ticket".into(),
+            items: vec![],
+            upload_file_concurrency: None,
+        };
+        assert!(serde_json::to_value(response)
+            .unwrap()
+            .get("upload_file_concurrency")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_and_resume_responses_read_current_file_concurrency() {
+        use axum::http::header;
+        let directory = crate::test_support::TestDirectory::new("upload-file-concurrency");
+        let config = crate::config::ConfigFile {
+            upload_file_concurrency: 2,
+            ..crate::config::ConfigFile::with_test_storage()
+        };
+        let state = crate::test_support::app_state(&directory, config).await;
+        let token = state.sessions.create().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("session={token}").parse().unwrap());
+        let prepared = prepare_upload_batch(
+            State(state.clone()),
+            headers.clone(),
+            Query(FileQuery::default()),
+            Json(PrepareUploadBatchRequest {
+                items: vec![PrepareUploadItem {
+                    path: "photo.jpeg".into(),
+                    size: 4,
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(prepared.upload_file_concurrency, 2);
+        let ticket = prepared.ticket;
+        state
+            .update_config(|config| {
+                config.upload_file_concurrency = 8;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let status = upload_batch_status(
+            State(state),
+            headers,
+            Query(FileQuery {
+                path: None,
+                storage_id: Some("primary".into()),
+                batch: Some(ticket),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(status.upload_file_concurrency, Some(8));
+        assert_eq!(status.items.len(), 1);
+        assert_eq!(status.items[0].status, UploadStatus::Pending);
+    }
 
     #[test]
     fn pending_names_expire_soon_but_running_and_unknown_results_keep_their_budget() {

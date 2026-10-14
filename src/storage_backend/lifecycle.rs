@@ -12,7 +12,7 @@ use super::{StorageBackend, StorageBackendKind};
 use crate::error::{AppError, AppResult};
 
 // Detached HTTP waiters must not admit an unbounded number of mutation owners.
-pub(super) const MAX_MUTATION_OWNERS: usize = 32;
+pub(crate) const MAX_MUTATION_OWNERS: usize = 32;
 const EDIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) type AdmissionLease = std::sync::Mutex<Option<tokio::sync::OwnedRwLockReadGuard<()>>>;
 

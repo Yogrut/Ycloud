@@ -7,14 +7,12 @@ A self-hosted file manager built with Rust and Vue, with local storage and S3-co
 ## Features
 
 - Local storage, Alibaba Cloud OSS, Tencent Cloud COS, MinIO, RustFS, and other S3-compatible services.
-- Uploads, downloads, previews, search, move, copy, rename, delete, ZIP archives, and an image gallery.
+- File/folder uploads, downloads, previews, search, move, copy, rename, delete, ZIP archives, and an image gallery.
 - Separate access rules for administrators, guests, user accounts, and WebDAV mounts.
 - Password-protected folders, TOTP, login protection, access logs, and transfer limits.
 - Direct S3 uploads from the browser, streaming relay uploads, atomic local writes, and automatic recovery of interrupted uploads.
 
-Browser uploads never overwrite a file with the same name. Ycloud saves the new file with a numbered suffix and shows its saved name in the upload task. WebDAV keeps the client's normal write and overwrite behavior. Administrators create user accounts; the user icon opens user sign-in, and the shield opens administrator sign-in. Only one administrator session can be active at a time.
-
-Successful sign-out revokes the current browser's account session, site access token, and folder access tokens. An unconfirmed sign-out does not redirect or report success.
+Browser uploads save same-name files with numbered suffixes; WebDAV retains overwrite semantics. Administrators create user accounts. The user icon opens user sign-in; the shield opens admin sign-in. Each account has one active browser session: signing in again replaces its previous session.
 
 See [Backend design and maintenance](docs/backend-design.md) for commit boundaries, recovery rules, and implementation details.
 
@@ -132,7 +130,7 @@ By default, configuration is stored in `config.json` and local storage uses `sto
 
 The Dockerfile sets the container's listening address, port, and data paths. A normal Compose deployment does not need additional access-mode settings.
 
-To record client IPs behind a reverse proxy, enter its source IP under **Trusted proxy IP** in the admin console's domain binding settings. The change is saved and takes effect immediately; no environment variable or restart is needed. Use the IP that Ycloud sees as the proxy's connection source, without a scheme or port. Separate multiple IPv4 or IPv6 addresses with commas. An empty list disables trust in forwarded headers. The proxy must overwrite `X-Real-IP`; Nginx Proxy Manager supplies this header by default. Existing logs are not rewritten. Keep the backend port accessible only to the proxy where possible.
+Behind a reverse proxy, enter its connection-source IP under **Domain binding → Trusted proxy IP**; changes take effect immediately. Separate addresses with commas; an empty list trusts no forwarded headers. The proxy must overwrite `X-Real-IP`. Keep the backend port accessible only to the proxy where possible.
 
 ### Configuration master key
 
@@ -144,17 +142,7 @@ Changing a connection, restricting access, or disabling storage may interrupt ac
 
 Guest access controls browser access without an account. WebDAV uses its own mount credentials and read/write permissions.
 
-WebDAV shares the single-file upload limit, site-wide traffic quota, and global upload/download rate limits; `0` means no rate limit. Local storage accepts streaming uploads of unknown length. Downloads support a single Range; resumable uploads are not supported. Successful password checks use a small, short-lived in-memory cache, but every request still checks the current mount and permissions. A timeout does not prove that a file was not committed. Check the destination before sending it again.
-
-Changing a global rate limit also affects data released by existing transfers. Removing the limit wakes waiting transfers; it cannot recall bytes already released. An unlimited rate does not bypass traffic quotas.
-
-File downloads and WebDAV reads return attachment responses with content-isolation headers, without changing the file bytes. Opening a WebDAV file URL in a browser downloads it. Previews use a separate content-type policy; S3 Content-Type metadata does not decide whether content can be displayed inline.
-
-HEAD returns metadata without reading the body. `If-Range` returns a partial response only when it matches the current S3 strong ETag. A different or unverifiable version returns the complete file. Local storage does not treat file size and modification time as a strong version: ordinary Range requests work, but requests with `If-Range` return the complete file.
-
-PROPFIND accepts UTF-8 and UTF-16 XML. WebDAV directory queries support `Depth: 0`, `Depth: 1`, selected properties, property names, and allprop/include. Recursive directory queries, including requests without a Depth header, return 403 with `propfind-finite-depth` rather than claiming a one-level listing is recursive. Clients should use Depth 0 or 1. Unsupported properties get a separate 404 property status. WebDAV locks and resumable uploads are not supported.
-
-WebDAV PUT supports write preconditions. Failed preconditions return 412 without changing the destination. Local storage checks existence and modification time but does not invent a strong ETag. S3 uses version-conditional publication after checking the provider's atomic-condition support; an uncertain result is not retried or rolled back automatically. Write conditions on other methods, DAV If lock conditions, conditional OSS uploads, and conditional S3 uploads above 4 GiB are explicitly rejected. Conditions are never silently ignored. Unconditional uploads keep their existing behavior. See [Conditional WebDAV writes](docs/backend-design.md#conditional-webdav-writes).
+WebDAV shares the single-file size limit, site-wide traffic quota, and global transfer rates (`0` means unlimited rate). It supports Depth 0/1 directory listings and single-Range downloads, but not recursive listings, locks, or resumable uploads. Downloads use attachment responses. A timeout does not prove failure: check the destination before uploading again. See [Backend design](docs/backend-design.md) for protocol and conditional-write boundaries.
 
 Example of an additional local mount:
 
@@ -164,9 +152,9 @@ LOCAL_STORAGE_MOUNTS=[{"id":"archive","name":"Archive","path":"/srv/ycloud/archi
 
 For self-hosted S3 services such as MinIO or RustFS, enter the Endpoint, Bucket, and access keys in the admin console. No endpoint allowlist is required. Endpoints must be HTTP(S) addresses without embedded credentials, a path, or a query string. HTTP is available on trusted internal networks; use HTTPS on untrusted networks.
 
-Direct uploads require the browser to reach the configured Endpoint. The bucket's CORS policy must allow `PUT` from the Ycloud site's origin, with request headers `*`. An HTTPS site needs an HTTPS storage endpoint; browsers block HTTP mixed content. Access keys stay on the server. Ycloud issues short-lived upload URLs tied to temporary objects and parts, then verifies the parts before publishing the final file.
+Direct uploads require a browser-accessible Endpoint and bucket CORS allowing `PUT` from the Ycloud site's origin with request headers `*`. HTTPS sites need HTTPS storage endpoints. Access keys stay on the server; browsers receive temporary upload URLs.
 
-Enable relay uploads when the server can reach storage but the browser cannot. This is not limited to internal storage. Upgrades retain relay mode for existing S3 configurations; new configurations default to direct uploads. Failed direct uploads do not fall back to relay automatically. Direct S3 uploads bypass Ycloud's live rate limiter and all traffic accounting and quotas, regardless of the user's role. Permissions, file-size limits, and storage capacity limits still apply. Relay and WebDAV transfers are counted as file data passing through the server. Current S3 downloads are server-relayed and count toward traffic; being stored in S3 does not exempt them. Downloads redirected to a direct URL are not counted.
+Enable relay uploads if only the server can reach storage. New S3 connections default to direct uploads; existing connections keep their mode. Direct-upload failures do not automatically switch to relay. Direct payloads bypass Ycloud's rate limits and traffic quotas; permissions, file-size and storage-capacity limits still apply. Relayed uploads and downloads are counted as server traffic.
 
 Use the official HTTPS endpoint for the bucket's Region with Alibaba Cloud OSS and Tencent Cloud COS. Only one Ycloud instance may write to a given Bucket/Prefix.
 
@@ -184,6 +172,8 @@ The admin console can change application limits, but cannot exceed these deploym
 
 On first start, each application default is the lower of its built-in default and the deployment limit. Existing configurations are not reduced automatically. Upload and archive byte limits must be at least 1 MiB; the batch byte limit must be at least the single-file upload limit.
 
+Admin **Transfer limits → File upload concurrency** sets simultaneous files (1–32, default 4). S3 direct uploads use the same per-account limit across pages, with at most 32 active files globally. Lowering the setting does not cancel active transfers. WebDAV and S3 per-file part concurrency are unchanged. See [Configuration limits](docs/admin-configuration-audit.zh-CN.md) (Chinese) for parameter bounds.
+
 ## Checks
 
 ```bash
@@ -198,8 +188,8 @@ npm run check
 ## Traffic quotas and accounting
 
 - **Quotas:** site-wide, shared guest downloads, shared user-account traffic, and per-account traffic. Uploads and downloads are separate; `0` means unlimited.
-- **Accounting:** the dashboard counts file data passing through the VPS. User uploads are inbound; user downloads are outbound. Direct S3 uploads and downloads redirected to a direct URL are excluded for every role. Server-relayed downloads, previews, and archives still count. Disabling quotas does not disable accounting. Administrator relay transfers count but are not quota-limited; independent WebDAV mounts are subject to the site-wide quota. These are application-level file bytes, not total network-interface traffic. System/API overhead and the extra backend connection used by S3 relay are not included.
-- **Older data:** previous versions did not record whether traffic was direct or relayed, so old direct-upload traffic cannot be subtracted reliably. Upgrades retain existing data; new rules apply from the upgrade and use the existing reset cycle.
+- **Accounting:** only file bytes passing through the server count; direct S3 uploads and direct-link downloads do not. Relayed downloads, previews, and archives count. Administrator relay traffic is counted but quota-exempt; independent WebDAV mounts use the site-wide quota. Disabling quotas does not disable accounting. This is not a network-interface traffic meter.
+- **Upgrades:** existing usage is retained; historical direct traffic cannot be reliably subtracted.
 - **Resets and backups:** quotas reset on hourly, daily, or monthly cycles. Restarts do not reset usage. Stop the service before backing up, and save the configuration together with `traffic-usage.json` and `traffic-usage.jsonl`.
 
 ### Diagnose a damaged ledger

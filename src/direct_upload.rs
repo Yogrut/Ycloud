@@ -126,6 +126,7 @@ pub(crate) async fn start(
             _ => true,
         });
     let maximum = policy.max_upload_bytes;
+    let file_concurrency = policy.upload_file_concurrency;
     drop(policy);
     // An empty object needs no payload transfer and avoids provider-specific
     // zero-length multipart behaviour; use the existing bounded PutObject path.
@@ -166,7 +167,7 @@ pub(crate) async fn start(
             .values()
             .filter(|session| session.account == account && session.active.load(Ordering::Acquire))
             .count()
-            >= 4
+            >= file_concurrency
     {
         return Err(AppError::TooManyRequests);
     }
@@ -373,6 +374,133 @@ pub(crate) async fn cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_session(account: &str, active: bool) -> Arc<Session> {
+        let (commands, _receiver) = mpsc::channel(4);
+        Arc::new(Session {
+            subject: RequestSubject::Session(uuid::Uuid::new_v4().to_string()),
+            account: account.into(),
+            storage_id: "primary".into(),
+            path: "file".into(),
+            commands,
+            active: AtomicBool::new(active),
+            completing: AtomicBool::new(false),
+            done: Notify::new(),
+            result: Mutex::new(None),
+            expires: std::sync::Mutex::new(Instant::now() + Duration::from_secs(60)),
+        })
+    }
+
+    #[tokio::test]
+    async fn direct_admission_reads_saved_concurrency_and_preserves_global_and_retained_caps() {
+        use crate::{config::StorageBackendConfig, storage_backend::StorageBackend, test_support};
+        use axum::http::header;
+
+        let directory = test_support::TestDirectory::new("direct-file-concurrency");
+        let state =
+            test_support::app_state(&directory, crate::config::ConfigFile::with_test_storage())
+                .await;
+        // Only a local fixture endpoint is used; admission must stop before any
+        // multipart creation because the deliberately absent ticket is checked next.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new()).await.unwrap();
+        });
+        let remote = crate::s3_backend::protocol_tests::test_backend(&endpoint);
+        let backend =
+            StorageBackend::s3_configured(remote, None, directory.path().join("capacity.json"))
+                .await
+                .unwrap();
+        state.backends.insert_ready("primary", backend).await;
+        state
+            .update_config(|config| {
+                config.storage_instances[0].backend = StorageBackendConfig::S3(
+                    crate::s3_backend::protocol_tests::test_settings(&endpoint),
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let token = state.sessions.create().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("session={token}").parse().unwrap());
+
+        // Same-account sessions have distinct subjects, so account admission is
+        // shared across pages. Finished results do not count as active files.
+        for (limit, own, others, finished, rejected) in [
+            (1, 0, 0, 0, false),
+            (1, 1, 0, 0, true),
+            (4, 3, 0, 0, false),
+            (4, 4, 0, 0, true),
+            (8, 4, 0, 0, false),
+            (8, 7, 0, 0, false),
+            (8, 8, 0, 0, true),
+            (32, 31, 0, 0, false),
+            (32, 32, 0, 0, true),
+            (8, 1, 30, 0, false),
+            (8, 0, 32, 0, true),
+            (8, 7, 0, 120, false),
+            (8, 0, 0, 128, true),
+            (2, 5, 0, 0, true),
+        ] {
+            state
+                .update_config(|config| {
+                    config.upload_file_concurrency = limit;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            {
+                let mut sessions = state.direct_uploads.0.lock().await;
+                sessions.clear();
+                for index in 0..own {
+                    sessions.insert(format!("own-{index}"), test_session("admin", true));
+                }
+                for index in 0..others {
+                    sessions.insert(
+                        format!("other-{index}"),
+                        test_session("other-account", true),
+                    );
+                }
+                for index in 0..finished {
+                    sessions.insert(format!("finished-{index}"), test_session("admin", false));
+                }
+                let expired = test_session("admin", false);
+                *expired.expires.lock().unwrap() = Instant::now() - Duration::from_secs(1);
+                sessions.insert("expired".into(), expired);
+            }
+            let result = start(
+                State(state.clone()),
+                headers.clone(),
+                Query(FileQuery {
+                    storage_id: Some("primary".into()),
+                    path: Some("new.bin".into()),
+                    batch: Some("missing-ticket".into()),
+                }),
+                Json(StartRequest { size: 4 }),
+            )
+            .await;
+            if rejected {
+                assert!(
+                    matches!(result, Err(AppError::TooManyRequests)),
+                    "limit={limit} own={own} others={others} finished={finished}"
+                );
+            } else {
+                assert!(matches!(result, Err(AppError::UploadBatchExpired)), "admission should reach ticket validation: limit={limit} own={own} others={others} finished={finished}");
+            }
+            let sessions = state.direct_uploads.0.lock().await;
+            assert_eq!(sessions.len(), own + others + finished);
+            assert_eq!(
+                sessions
+                    .values()
+                    .filter(|session| session.active.load(Ordering::Acquire))
+                    .count(),
+                own + others
+            );
+        }
+        server.abort();
+    }
 
     #[tokio::test]
     async fn concurrent_waiters_observe_one_cached_completion_and_connection_edit_guard() {

@@ -7,7 +7,7 @@ import SettingsDrawer from '../../shared/components/SettingsDrawer.vue'
 import type { AdminInfo, UpdateTransferLimitsRequest } from '../../shared/api/admin'
 import { updateTransferLimits } from '../../shared/api/admin'
 import { useLocale } from '../../shared/i18n'
-import { DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_BATCH_ENTRIES, DEFAULT_MAX_BYTES, GIB, formatGiB, useTransferLimitsForm } from './useTransferLimitsForm'
+import { DEFAULT_MAX_ARCHIVE_ENTRIES, DEFAULT_MAX_BATCH_ENTRIES, DEFAULT_MAX_BYTES, DEFAULT_MAX_UPLOAD_FILE_CONCURRENCY, GIB, formatGiB, useTransferLimitsForm } from './useTransferLimitsForm'
 
 const props = defineProps<{ info: AdminInfo }>()
 const emit = defineEmits<{ saved: [message: string] }>()
@@ -17,7 +17,7 @@ const trafficPanel = ref<InstanceType<typeof TrafficPanel>>()
 const form = useTransferLimitsForm(() => props.info)
 const {
   uploadGiB, uploadBatchGiB, uploadBatchEntries, archiveGiB, archiveEntries,
-  uploadRate, downloadRate, initial, hasChanges, buildRequest,
+  uploadRate, downloadRate, uploadFileConcurrency, initial, hasChanges, buildRequest,
 } = form
 const saving = ref(false)
 const errorMessage = ref('')
@@ -30,6 +30,7 @@ const fields = computed(() => [
   { label: locale.text('全局下载限速', 'Global download rate'), value: `${initial.downloadRate} MiB/s` },
   { label: locale.text('打包源文件总大小', 'Archive source-size limit'), value: `${initial.archiveGiB} GiB` },
   { label: locale.text('打包条目数量', 'Archive entry limit'), value: initial.archiveEntries },
+  { label: locale.text('文件上传并发数', 'File upload concurrency'), value: initial.uploadFileConcurrency },
 ])
 
 function openEditor(index: number): void {
@@ -74,7 +75,7 @@ async function submit(): Promise<void> {
     <header class="admin-pane-head">
       <div>
         <h1 id="limits-title">{{ locale.text('传输限制', 'Transfer limits') }}</h1>
-        <p>{{ locale.text('根据存储容量调整单次传输范围；并发、密码队列和磁盘安全余量继续由系统固定保护。', 'Adjust transfer sizes for your storage capacity. Concurrency, password queues, and disk reserves remain protected by fixed system limits.') }}</p>
+        <p>{{ locale.text('根据部署资源调整传输范围、限速和文件上传并发；后端 I/O、密码队列和磁盘余量仍使用原有规则。', 'Adjust transfer sizes, rates, and file upload concurrency for your deployment. Backend I/O, password queues, and disk reserves keep their existing rules.') }}</p>
       </div>
     </header>
     <div class="settings-rows">
@@ -133,6 +134,13 @@ async function submit(): Promise<void> {
           <span class="limits-control">
             <input v-model="archiveEntries" aria-required="true" type="number" min="1" :max="info.deployment_max_archive_entries ?? DEFAULT_MAX_ARCHIVE_ENTRIES" step="1" inputmode="numeric">
             <small>{{ locale.text('文件与文件夹递归合计；重复选择父目录与子项时会自动去重。', 'Counts files and folders recursively. Overlapping parent and child selections are deduplicated.') }}</small>
+          </span>
+        </label>
+        <label v-if="editor === 7" class="compact-field limits-field limit-upload-file-concurrency">
+          <span>{{ locale.text('文件上传并发数', 'File upload concurrency') }}</span>
+          <span class="limits-control">
+            <input v-model="uploadFileConcurrency" aria-required="true" type="number" min="1" :max="info.max_upload_file_concurrency ?? DEFAULT_MAX_UPLOAD_FILE_CONCURRENCY" step="1" inputmode="numeric">
+            <small>{{ locale.text('每个网页上传队列的文件数，默认 4；S3 直传每账号的活动文件上限使用同一设置，跨页面共享，全站最多 32 个。新调度和直传准入读取已保存值，不中断在途文件，也不改变 WebDAV 或 S3 分片并发。', 'Files per browser upload queue; default 4. Direct S3 uploads use the same active-file limit per account, shared across pages, with at most 32 globally. New scheduling and direct admission read the saved value without interrupting in-flight files or changing WebDAV/S3 part concurrency.') }}</small>
           </span>
         </label>
       </div>

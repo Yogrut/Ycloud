@@ -676,7 +676,7 @@ mod tests {
         let directory = TestDirectory::new("logout-browser-credentials");
         let state = app_state(&directory, ConfigFile::default()).await;
         let session = state.sessions.create_user("reader".into()).await;
-        let other_session = state.sessions.create_user("reader".into()).await;
+        let other_session = state.sessions.create_user("other-reader".into()).await;
         let gate = state.gate_access.create("__gate__".into()).await;
         let other_gate = state.gate_access.create("__gate__".into()).await;
         let folder = state.folder_access.create("locked".into()).await;
@@ -717,6 +717,66 @@ mod tests {
             assert!(state.gate_access.get_scope(&other_gate).await.is_some());
             assert!(state.folder_access.get_scope(&other_folder).await.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn user_login_replaces_the_previous_cookie_and_stale_logout_keeps_the_new_session() {
+        let directory = TestDirectory::new("user-single-session");
+        let config = ConfigFile {
+            user_accounts: vec![UserAccount {
+                id: "reader-id".into(),
+                username: "reader".into(),
+                password_hash: hash_password("reader-password"),
+                enabled: true,
+                permissions: vec![],
+            }],
+            ..ConfigFile::default()
+        };
+        let state = app_state(&directory, config).await;
+        let administrator = state.sessions.create().await;
+        let other = state.sessions.create_user("other-reader".into()).await;
+        let mut cookies = Vec::new();
+        for _ in 0..2 {
+            let response = authenticate_account(
+                state.clone(),
+                [127, 0, 0, 1].into(),
+                HeaderMap::new(),
+                LoginRequest {
+                    username: Some("reader".into()),
+                    password: "reader-password".into(),
+                    totp_code: None,
+                },
+                AccountLoginKind::User,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let cookie = response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap()
+                .to_owned();
+            cookies.push(cookie);
+        }
+        let old = cookies[0].strip_prefix("session=").unwrap();
+        let new = cookies[1].strip_prefix("session=").unwrap();
+        assert!(state.sessions.principal(old).await.is_none());
+        assert!(state.sessions.principal(new).await.is_some());
+        let mut stale_headers = HeaderMap::new();
+        stale_headers.insert(header::COOKIE, HeaderValue::from_str(&cookies[0]).unwrap());
+        assert!(super::current_principal(&state, &stale_headers)
+            .await
+            .is_none());
+        let response =
+            super::logout_handler(axum::extract::State(state.clone()), stale_headers).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.sessions.principal(new).await.is_some());
+        assert!(state.sessions.principal(&other).await.is_some());
+        assert!(state.sessions.principal(&administrator).await.is_some());
     }
 
     #[tokio::test]

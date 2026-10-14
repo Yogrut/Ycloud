@@ -36,6 +36,8 @@ pub struct AdminInfo {
     pub max_upload_bytes: u64,
     pub max_upload_batch_bytes: u64,
     pub max_upload_batch_entries: usize,
+    pub upload_file_concurrency: usize,
+    pub max_upload_file_concurrency: usize,
     pub max_archive_bytes: u64,
     pub max_archive_entries: usize,
     pub deployment_max_upload_bytes: u64,
@@ -320,6 +322,8 @@ pub async fn admin_info(State(state): State<AppState>) -> AppResult<Json<AdminIn
             max_upload_bytes: config.max_upload_bytes,
             max_upload_batch_bytes: config.max_upload_batch_bytes,
             max_upload_batch_entries: config.max_upload_batch_entries,
+            upload_file_concurrency: config.upload_file_concurrency,
+            max_upload_file_concurrency: crate::config::MAX_UPLOAD_FILE_CONCURRENCY,
             max_archive_bytes: config.max_archive_bytes,
             max_archive_entries: config.max_archive_entries,
             deployment_max_upload_bytes: state.config.max_upload_bytes,
@@ -674,6 +678,7 @@ pub struct UpdateTransferLimitsRequest {
     pub max_upload_bytes: Option<u64>,
     pub max_upload_batch_bytes: Option<u64>,
     pub max_upload_batch_entries: Option<usize>,
+    pub upload_file_concurrency: Option<usize>,
     pub max_archive_bytes: Option<u64>,
     pub max_archive_entries: Option<usize>,
     #[serde(default)]
@@ -697,6 +702,9 @@ pub async fn update_transfer_limits(
             }
             if let Some(value) = body.max_upload_batch_entries {
                 config.max_upload_batch_entries = value;
+            }
+            if let Some(value) = body.upload_file_concurrency {
+                config.upload_file_concurrency = value;
             }
             if let Some(value) = body.max_archive_bytes {
                 config.max_archive_bytes = value;
@@ -1330,6 +1338,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_concurrency_updates_are_validated_persisted_and_visible_in_admin_info() {
+        use super::*;
+        use crate::test_support::{app_state, TestDirectory};
+        let directory = TestDirectory::new("file-concurrency-limits");
+        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
+        for value in [1, 8, crate::config::MAX_UPLOAD_FILE_CONCURRENCY] {
+            let request =
+                serde_json::from_value(serde_json::json!({ "upload_file_concurrency": value }))
+                    .unwrap();
+            let _ = update_transfer_limits(State(state.clone()), Json(request))
+                .await
+                .unwrap();
+            let info = admin_info(State(state.clone())).await.unwrap().0;
+            assert_eq!(info.upload_file_concurrency, value);
+            assert_eq!(
+                info.max_upload_file_concurrency,
+                crate::config::MAX_UPLOAD_FILE_CONCURRENCY
+            );
+            let persisted = crate::config::load_config(&state.config.config_path)
+                .await
+                .unwrap();
+            assert_eq!(persisted.upload_file_concurrency, value);
+        }
+        for value in [0, crate::config::MAX_UPLOAD_FILE_CONCURRENCY + 1] {
+            let request =
+                serde_json::from_value(serde_json::json!({ "upload_file_concurrency": value }))
+                    .unwrap();
+            assert!(update_transfer_limits(State(state.clone()), Json(request))
+                .await
+                .is_err());
+            assert_eq!(
+                state.config_file.read().await.upload_file_concurrency,
+                crate::config::MAX_UPLOAD_FILE_CONCURRENCY
+            );
+            let persisted = crate::config::load_config(&state.config.config_path)
+                .await
+                .unwrap();
+            assert_eq!(
+                persisted.upload_file_concurrency,
+                crate::config::MAX_UPLOAD_FILE_CONCURRENCY
+            );
+        }
+        for invalid in [serde_json::json!(-1), serde_json::json!(1.5)] {
+            assert!(serde_json::from_value::<UpdateTransferLimitsRequest>(
+                serde_json::json!({ "upload_file_concurrency": invalid })
+            )
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn concurrent_partial_rate_updates_preserve_both_explicit_values() {
         use super::*;
         use crate::test_support::{app_state, TestDirectory};
@@ -1340,6 +1399,7 @@ mod tests {
             max_upload_bytes: Some(config.max_upload_bytes),
             max_upload_batch_bytes: Some(config.max_upload_batch_bytes),
             max_upload_batch_entries: Some(config.max_upload_batch_entries),
+            upload_file_concurrency: None,
             max_archive_bytes: Some(config.max_archive_bytes),
             max_archive_entries: Some(config.max_archive_entries),
             upload_rate_bytes_per_sec: upload_rate,

@@ -690,7 +690,7 @@ mod tests {
         .await
         .unwrap();
         let mut admin_token = state.sessions.create().await;
-        let reader_token = state.sessions.create_user("reader".into()).await;
+        let mut reader_token = state.sessions.create_user("reader".into()).await;
         let gate_token = state.gate_access.create("__gate__".into()).await;
         let app = build_router(state);
 
@@ -732,6 +732,20 @@ mod tests {
                 let session_cookie = cookie.to_str().unwrap().split(';').next().unwrap();
                 if administrator {
                     admin_token = session_cookie.strip_prefix("session=").unwrap().to_owned();
+                } else {
+                    let old_reader = app
+                        .clone()
+                        .oneshot(
+                            test_request()
+                                .uri("/api/files")
+                                .header(header::COOKIE, format!("session={reader_token}"))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(old_reader.status(), StatusCode::UNAUTHORIZED);
+                    reader_token = session_cookie.strip_prefix("session=").unwrap().to_owned();
                 }
                 let me = app
                     .clone()

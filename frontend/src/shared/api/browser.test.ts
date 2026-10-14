@@ -40,6 +40,39 @@ describe('browser API paths', () => {
     expect(fileApi('/')).toBe('/api/files')
   })
 
+  it('sends independent upload requests concurrently and reports each files own progress', async () => {
+    class UploadRequest extends EventTarget {
+      static instances: UploadRequest[] = []
+      upload = new EventTarget()
+      withCredentials = false
+      status = 200
+      responseText = '{"success":true}'
+      url = ''
+      body?: File
+      constructor() { super(); UploadRequest.instances.push(this) }
+      open(method: string, url: string) { expect(method).toBe('PUT'); this.url = url }
+      setRequestHeader() {}
+      getResponseHeader() { return null }
+      send(file: File) { this.body = file }
+      abort() { this.dispatchEvent(new Event('abort')) }
+    }
+    vi.stubGlobal('XMLHttpRequest', UploadRequest)
+    const files = Array.from({ length: 4 }, (_, index) => new File(['photo-data'], `photo-${index}.jpeg`))
+    const progress = files.map(() => vi.fn())
+    const uploads = files.map((file, index) => uploadFile(file.name, file, progress[index]!, 'local', 'ticket'))
+    expect(UploadRequest.instances).toHaveLength(4)
+    for (const [index, request] of UploadRequest.instances.entries()) {
+      expect(request.body).toBe(files[index])
+      expect(request.url).toContain(`photo-${index}.jpeg`)
+      request.upload.dispatchEvent(new ProgressEvent('progress', { loaded: index + 1, lengthComputable: true }))
+      expect(progress[index]).toHaveBeenLastCalledWith(index + 1)
+    }
+    // One response cannot settle or reuse another file's request.
+    for (const request of [...UploadRequest.instances].reverse()) request.dispatchEvent(new Event('load'))
+    await Promise.all(uploads)
+    for (const callback of progress) expect(callback).toHaveBeenLastCalledWith(files[0]!.size)
+  })
+
   it('encodes complete nested paths as one query value', () => {
     expect(fileApi('/中文/space name/')).toBe('/api/files?path=%2F%E4%B8%AD%E6%96%87%2Fspace+name')
   })

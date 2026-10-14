@@ -7,6 +7,7 @@ const MIB = 1024 ** 2
 function info(overrides: Partial<TransferLimitsInfo> = {}): TransferLimitsInfo {
   return {
     max_upload_bytes: 5 * GIB, max_upload_batch_bytes: 20 * GIB, max_upload_batch_entries: 1000,
+    upload_file_concurrency: 4,
     max_archive_bytes: 3 * GIB, max_archive_entries: 1000,
     upload_rate_bytes_per_sec: 0, download_rate_bytes_per_sec: 0,
     ...overrides,
@@ -20,7 +21,7 @@ describe('transfer limits draft', () => {
     const current = info()
     Object.defineProperty(current, 'user_accounts', { get: () => { throw new Error('unrelated account data read') } })
     const form = useTransferLimitsForm(() => current)
-    expect(form.initial).toEqual({ uploadGiB: '5', uploadBatchGiB: '20', uploadBatchEntries: '1000', archiveGiB: '3', archiveEntries: '1000', uploadRate: '0', downloadRate: '0' })
+    expect(form.initial).toEqual({ uploadGiB: '5', uploadBatchGiB: '20', uploadBatchEntries: '1000', uploadFileConcurrency: '4', archiveGiB: '3', archiveEntries: '1000', uploadRate: '0', downloadRate: '0' })
     expect(form.hasChanges.value).toBe(false)
     expect(form.buildRequest()).toEqual(current)
     expect(form.changes(form.buildRequest())).toEqual({})
@@ -73,7 +74,7 @@ describe('transfer limits draft', () => {
 
   it('accepts a successful candidate through the same reset path and copies its exact baseline', () => {
     const form = useTransferLimitsForm(() => info())
-    const candidate = { ...info(), max_upload_batch_bytes: 20 * GIB, max_upload_batch_entries: 1000, upload_rate_bytes_per_sec: MIB + 7 }
+    const candidate = { ...form.buildRequest(), max_upload_batch_bytes: 20 * GIB, max_upload_batch_entries: 1000, upload_rate_bytes_per_sec: MIB + 7 }
     form.accept(candidate)
     candidate.upload_rate_bytes_per_sec = 99
     expect(form.uploadRate.value).toBe('1')
@@ -85,6 +86,7 @@ describe('transfer limits draft', () => {
     ['uploadGiB', 6, 'max_upload_bytes', 6 * GIB],
     ['uploadBatchGiB', 21, 'max_upload_batch_bytes', 21 * GIB],
     ['uploadBatchEntries', 999, 'max_upload_batch_entries', 999],
+    ['uploadFileConcurrency', 8, 'upload_file_concurrency', 8],
     ['archiveGiB', 4, 'max_archive_bytes', 4 * GIB],
     ['archiveEntries', 999, 'max_archive_entries', 999],
     ['uploadRate', 1, 'upload_rate_bytes_per_sec', MIB],
@@ -102,11 +104,29 @@ describe('transfer limits draft', () => {
     const current = info()
     const form = useTransferLimitsForm(() => current)
     const candidate = form.buildRequest()
-    expect(form.changes({ download_rate_bytes_per_sec: candidate.download_rate_bytes_per_sec, upload_rate_bytes_per_sec: candidate.upload_rate_bytes_per_sec, max_archive_entries: candidate.max_archive_entries, max_archive_bytes: candidate.max_archive_bytes, max_upload_batch_entries: candidate.max_upload_batch_entries, max_upload_batch_bytes: candidate.max_upload_batch_bytes, max_upload_bytes: candidate.max_upload_bytes })).toEqual({})
+    expect(form.changes({ upload_file_concurrency: candidate.upload_file_concurrency, download_rate_bytes_per_sec: candidate.download_rate_bytes_per_sec, upload_rate_bytes_per_sec: candidate.upload_rate_bytes_per_sec, max_archive_entries: candidate.max_archive_entries, max_archive_bytes: candidate.max_archive_bytes, max_upload_batch_entries: candidate.max_upload_batch_entries, max_upload_batch_bytes: candidate.max_upload_batch_bytes, max_upload_bytes: candidate.max_upload_bytes })).toEqual({})
   })
 })
 
 describe('transfer limits boundaries', () => {
+  it.each([1, 4, 8, 32])('accepts file concurrency %s', value => {
+    const form = useTransferLimitsForm(() => info())
+    form.uploadFileConcurrency.value = value
+    expect(form.buildRequest().upload_file_concurrency).toBe(value)
+  })
+
+  it.each([0, -1, 1.5, 33, NaN, Infinity, ''])('rejects invalid file concurrency %s', value => {
+    const form = useTransferLimitsForm(() => info())
+    form.uploadFileConcurrency.value = value
+    expect(() => form.buildRequest()).toThrow('并发数')
+  })
+
+  it('keeps an older response at four without submitting an unedited new field', () => {
+    const form = useTransferLimitsForm(() => info({ upload_file_concurrency: undefined }))
+    expect(form.uploadFileConcurrency.value).toBe('4')
+    expect(form.changes(form.buildRequest())).toEqual({})
+  })
+
   it.each([MIB / GIB, 100])('accepts changed byte-size boundaries: %s GiB', value => {
     const form = useTransferLimitsForm(() => info())
     form.uploadGiB.value = value

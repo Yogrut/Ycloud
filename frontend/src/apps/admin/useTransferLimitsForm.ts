@@ -9,22 +9,26 @@ const DEFAULT_BATCH_ENTRIES = 1000
 export const DEFAULT_MAX_BYTES = 100 * GIB
 export const DEFAULT_MAX_BATCH_ENTRIES = 10_000
 export const DEFAULT_MAX_ARCHIVE_ENTRIES = 100_000
+export const DEFAULT_UPLOAD_FILE_CONCURRENCY = 4
+export const DEFAULT_MAX_UPLOAD_FILE_CONCURRENCY = 32
 const HARD_MAX_RATE_BYTES = 1024 * MIB
 const MIN_RATE_BYTES = 64 * 1024
 
 const LIMIT_FIELDS = [
   'max_upload_bytes', 'max_upload_batch_bytes', 'max_upload_batch_entries',
+  'upload_file_concurrency',
   'max_archive_bytes', 'max_archive_entries', 'upload_rate_bytes_per_sec', 'download_rate_bytes_per_sec',
 ] as const
 
 export type TransferLimitsInfo = Pick<AdminInfo, keyof UpdateTransferLimitsRequest
   | 'deployment_max_upload_bytes' | 'deployment_max_upload_batch_bytes' | 'deployment_max_upload_batch_entries'
-  | 'deployment_max_archive_bytes' | 'deployment_max_archive_entries'>
+  | 'deployment_max_archive_bytes' | 'deployment_max_archive_entries' | 'max_upload_file_concurrency'>
 
 interface TransferLimitsInputs {
   uploadGiB: string | number
   uploadBatchGiB: string | number
   uploadBatchEntries: string | number
+  uploadFileConcurrency: string | number
   archiveGiB: string | number
   archiveEntries: string | number
   uploadRate: string | number
@@ -44,6 +48,7 @@ function currentLimits(info: TransferLimitsInfo): UpdateTransferLimitsRequest {
     max_upload_bytes: info.max_upload_bytes,
     max_upload_batch_bytes: info.max_upload_batch_bytes ?? DEFAULT_BATCH_BYTES,
     max_upload_batch_entries: info.max_upload_batch_entries ?? DEFAULT_BATCH_ENTRIES,
+    upload_file_concurrency: info.upload_file_concurrency ?? DEFAULT_UPLOAD_FILE_CONCURRENCY,
     max_archive_bytes: info.max_archive_bytes,
     max_archive_entries: info.max_archive_entries,
     upload_rate_bytes_per_sec: info.upload_rate_bytes_per_sec,
@@ -56,6 +61,7 @@ function displayInputs(limits: UpdateTransferLimitsRequest): TransferLimitsInput
     uploadGiB: formatGiB(limits.max_upload_bytes),
     uploadBatchGiB: formatGiB(limits.max_upload_batch_bytes),
     uploadBatchEntries: String(limits.max_upload_batch_entries),
+    uploadFileConcurrency: String(limits.upload_file_concurrency),
     archiveGiB: formatGiB(limits.max_archive_bytes),
     archiveEntries: String(limits.max_archive_entries),
     uploadRate: formatRate(limits.upload_rate_bytes_per_sec),
@@ -72,6 +78,7 @@ export function useTransferLimitsForm(getInfo: () => TransferLimitsInfo) {
     String(draft.uploadGiB).trim() !== initial.uploadGiB
     || String(draft.uploadBatchGiB).trim() !== initial.uploadBatchGiB
     || String(draft.uploadBatchEntries).trim() !== initial.uploadBatchEntries
+    || String(draft.uploadFileConcurrency).trim() !== initial.uploadFileConcurrency
     || String(draft.archiveGiB).trim() !== initial.archiveGiB
     || String(draft.archiveEntries).trim() !== initial.archiveEntries
     || String(draft.uploadRate).trim() !== initial.uploadRate
@@ -132,10 +139,16 @@ export function useTransferLimitsForm(getInfo: () => TransferLimitsInfo) {
     if (!Number.isInteger(entries) || entries < 1 || entries > maxArchiveEntries) {
       throw new Error(locale.text(`打包条目数量上限必须在 1 到 ${maxArchiveEntries} 之间`, `Archive entry limit must be between 1 and ${maxArchiveEntries}`))
     }
+    const concurrency = Number(draft.uploadFileConcurrency)
+    const maxConcurrency = info.max_upload_file_concurrency ?? DEFAULT_MAX_UPLOAD_FILE_CONCURRENCY
+    if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > maxConcurrency) {
+      throw new Error(locale.text(`文件上传并发数必须在 1 到 ${maxConcurrency} 之间`, `File upload concurrency must be between 1 and ${maxConcurrency}`))
+    }
     return {
       max_upload_bytes: maxUploadBytes,
       max_upload_batch_bytes: maxUploadBatchBytes,
       max_upload_batch_entries: batchEntries,
+      upload_file_concurrency: concurrency,
       max_archive_bytes: maxArchiveBytes,
       max_archive_entries: entries,
       upload_rate_bytes_per_sec: parseRate(draft.uploadRate, initial.uploadRate, baseline.upload_rate_bytes_per_sec, locale.text('上传限速', 'Upload rate limit')),
@@ -147,7 +160,8 @@ export function useTransferLimitsForm(getInfo: () => TransferLimitsInfo) {
     const info = getInfo()
     const body: Partial<UpdateTransferLimitsRequest> = {}
     for (const field of LIMIT_FIELDS) {
-      if (limits[field] !== info[field]) body[field] = limits[field]
+      const previous = field === 'upload_file_concurrency' ? info[field] ?? DEFAULT_UPLOAD_FILE_CONCURRENCY : info[field]
+      if (limits[field] !== previous) body[field] = limits[field]
     }
     return body
   }

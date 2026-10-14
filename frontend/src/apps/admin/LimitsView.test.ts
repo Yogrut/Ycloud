@@ -33,6 +33,28 @@ function mountLimits(host: HTMLElement, currentInfo = info, onSaved?: (message: 
 }
 
 describe('LimitsView', () => {
+  it('edits file concurrency through the existing drawer and sends only that field', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountLimits(host, { ...info, upload_file_concurrency: 4, max_upload_file_concurrency: 32 })
+    try {
+      host.querySelectorAll<HTMLButtonElement>('.setting-row button')[8]!.click()
+      await nextTick()
+      const input = host.querySelector<HTMLInputElement>('.settings-drawer input')!
+      expect([input.value, input.min, input.max, input.step]).toEqual(['4', '1', '32', '1'])
+      expect(host.querySelector('.settings-drawer')!.textContent).toContain('S3 直传每账号的活动文件上限使用同一设置')
+      input.value = '8'
+      input.dispatchEvent(new Event('input'))
+      host.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(JSON.parse(fetchMock.mock.calls[0]![1].body)).toEqual({ upload_file_concurrency: 8 })
+      expect(host.querySelector('.settings-drawer')).toBeNull()
+      expect(host.querySelectorAll('.setting-row-value')[8]!.textContent).toBe('8')
+    } finally { app.unmount() }
+  })
+
   it('submits only an explicitly edited rate while preserving the other precise rate', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }))
     vi.stubGlobal('fetch', fetchMock)
@@ -145,7 +167,7 @@ describe('LimitsView', () => {
     const app = mountLimits(host)
     await nextTick()
 
-    expect([...host.querySelectorAll('.setting-row-value')].map(el => el.textContent)).toEqual(['统一设置', '5 GiB', '20 GiB', '1000', '0 MiB/s', '0 MiB/s', '3 GiB', '1000'])
+    expect([...host.querySelectorAll('.setting-row-value')].map(el => el.textContent)).toEqual(['统一设置', '5 GiB', '20 GiB', '1000', '0 MiB/s', '0 MiB/s', '3 GiB', '1000', '4'])
     expect(host.querySelector('.setting-row-label')?.textContent).toBe('流量限制')
     expect(host.querySelector('.settings-drawer')).toBeNull()
     host.querySelectorAll<HTMLButtonElement>('.setting-row button')[1]!.click()

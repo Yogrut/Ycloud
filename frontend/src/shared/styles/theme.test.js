@@ -207,6 +207,14 @@ describe('interactive focus styling', () => {
     expect(mobile).toContain('-webkit-overflow-scrolling: touch;')
   })
 
+  it('allocates upload height to the scroll viewport rather than shrinking controls with the task count', () => {
+    expect(themeCss).toMatch(/\.upload-window-head,\s*\.upload-add-zone,\s*\.upload-queue-toolbar,\s*\.upload-overall-meta\s*\{\s*flex: 0 0 auto;/)
+    expect(themeCss).toMatch(/\.upload-task-list\s*\{[^}]*min-height: 0;[^}]*flex: 1 0 96px;[^}]*overflow-y: auto;/)
+    expect(themeCss).toMatch(/\.upload-queue-modal\s*\{[^}]*overflow: auto;/)
+    const mobile = themeCss.match(/@media \(max-width: 760px\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    expect(mobile).not.toMatch(/\.upload-task-list\s*\{[^}]*flex:/)
+  })
+
   it('keeps the storage editor wide on desktop', () => {
     expect(themeCss).toMatch(/\.modal\.storage-editor\s*\{[^}]*width: min\(1120px, calc\(100vw - 48px\)\);/s)
   })

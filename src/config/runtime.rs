@@ -25,7 +25,7 @@ impl Config {
             PathBuf::from(std::env::var("CONFIG_PATH").unwrap_or_else(|_| "./config.json".into()));
         // This is an absolute transport envelope. The administrator-facing,
         // persisted upload limit is enforced by StorageService and can be
-        // changed without exposing concurrency/resource protection controls.
+        // changed without exposing backend concurrency/resource budgets.
         let max_upload_bytes = env_parse("MAX_UPLOAD_BYTES", DEFAULT_DEPLOYMENT_MAX_UPLOAD_BYTES)?;
         let max_upload_batch_bytes = env_parse(
             "MAX_UPLOAD_BATCH_BYTES",

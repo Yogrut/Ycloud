@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use super::{
     CONFIG_SCHEMA_VERSION, DEFAULT_MAX_UPLOAD_BATCH_BYTES, DEFAULT_MAX_UPLOAD_BATCH_ENTRIES,
-    DEFAULT_STORAGE_ID,
+    DEFAULT_STORAGE_ID, DEFAULT_UPLOAD_FILE_CONCURRENCY,
 };
 
 pub(super) fn migrate_config(raw: &mut Value) -> anyhow::Result<bool> {
@@ -60,6 +60,11 @@ fn schema_version(raw: &Value) -> anyhow::Result<u64> {
 
 fn migrate_step(raw: &mut Value, target: u64) -> anyhow::Result<()> {
     match target {
+        17 => set_default(
+            raw,
+            "upload_file_concurrency",
+            Value::from(DEFAULT_UPLOAD_FILE_CONCURRENCY),
+        ),
         16 => {
             // Old releases discarded this field. Preserve the bound domain,
             // but do not silently reactivate an obsolete proxy trust policy.
@@ -215,6 +220,32 @@ fn migrate_storage_visibility(raw: &mut Value) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_concurrency_migration_preserves_existing_values_and_defaults_old_configs() {
+        for existing in [None, Some(1), Some(8), Some(32)] {
+            let mut raw =
+                serde_json::to_value(super::super::ConfigFile::with_test_storage()).unwrap();
+            raw["schema_version"] = Value::from(16);
+            if let Some(value) = existing {
+                raw["upload_file_concurrency"] = Value::from(value);
+            } else {
+                raw.as_object_mut()
+                    .unwrap()
+                    .remove("upload_file_concurrency");
+            }
+            assert!(migrate_config(&mut raw).unwrap());
+            assert_eq!(
+                raw["upload_file_concurrency"],
+                Value::from(existing.unwrap_or(4))
+            );
+            let candidate: super::super::ConfigFile = serde_json::from_value(raw.clone()).unwrap();
+            candidate.validate().unwrap();
+            let before = raw.clone();
+            assert!(!migrate_config(&mut raw).unwrap());
+            assert_eq!(raw, before);
+        }
+    }
 
     #[test]
     fn current_schema_is_an_identity_transformation() {

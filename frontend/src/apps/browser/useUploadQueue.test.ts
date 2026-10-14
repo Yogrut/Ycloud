@@ -1,7 +1,7 @@
 import { ref } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cancelUploadBatch, getUploadBatchStatus, prepareUploadBatch, uploadFile } from '../../shared/api/browser'
-import type { UploadBatchStatus } from '../../shared/api/browser'
+import { cancelUploadBatch, createFolder, getUploadBatchStatus, listFiles, prepareUploadBatch, uploadFile } from '../../shared/api/browser'
+import type { FileListResponse, UploadBatchStatus } from '../../shared/api/browser'
 import type { UploadTask } from './uploadQueue'
 import { ApiError } from '../../shared/api/client'
 import { useUploadQueue } from './useUploadQueue'
@@ -9,6 +9,7 @@ import { useUploadQueue } from './useUploadQueue'
 vi.mock('../../shared/api/browser', async importOriginal => ({
   ...await importOriginal<typeof import('../../shared/api/browser')>(),
   prepareUploadBatch: vi.fn(), uploadFile: vi.fn(), getUploadBatchStatus: vi.fn(),
+  createFolder: vi.fn(), listFiles: vi.fn(),
   cancelUploadBatch: vi.fn().mockResolvedValue(undefined),
 }))
 
@@ -49,6 +50,8 @@ beforeEach(() => {
   vi.mocked(prepareUploadBatch).mockResolvedValue({ ticket: 'ticket' })
   vi.mocked(uploadFile).mockResolvedValue(undefined)
   vi.mocked(getUploadBatchStatus).mockResolvedValue({ ticket: 'ticket', items: [] })
+  vi.mocked(createFolder).mockResolvedValue({ success: true })
+  vi.mocked(listFiles).mockRejectedValue(new ApiError('Not Found', 404, 'not_found'))
 })
 
 function ticketedTask(id: number, storageId = 'first', status: UploadTask['status'] = 'paused'): UploadTask {
@@ -56,7 +59,163 @@ function ticketedTask(id: number, storageId = 'first', status: UploadTask['statu
     basePath: 'original', targetPath: `original/${id}.txt`, relativePath: `${id}.txt`, loaded: 0, error: '' }
 }
 
+const emptyDirectory: FileListResponse = {
+  storage_id: 'first', storages: [], current_path: '', parent_path: null, entries: [],
+  page_start: 1, page_size: 20, next_cursor: null, can_write: true,
+  max_upload_bytes: 0, max_archive_bytes: 0, max_archive_entries: 0,
+}
+
+function folderSelection(...paths: string[]): Event {
+  const files = paths.map(path => {
+    const file = new File(['data'], path.split('/').pop()!)
+    Object.defineProperty(file, 'webkitRelativePath', { value: path })
+    return file
+  })
+  return { target: { files, value: '' } } as unknown as Event
+}
+
 describe('upload ticket grouping and mappings', () => {
+  it('creates the selected folder and nested parents before preparing or uploading files', async () => {
+    const { queue } = uploads()
+    const directories = new Set(['original'])
+    const events: string[] = []
+    vi.mocked(createFolder).mockImplementation(async (parent, name, storage) => {
+      expect(storage).toBe('first')
+      expect(directories.has(parent)).toBe(true)
+      const path = `${parent}/${name}`
+      directories.add(path)
+      events.push(`mkdir:${path}`)
+      return { success: true }
+    })
+    vi.mocked(prepareUploadBatch).mockImplementation(async items => {
+      events.push('prepare')
+      for (const item of items) {
+        if (!directories.has(item.path.slice(0, item.path.lastIndexOf('/')))) {
+          throw new ApiError('Destination directory does not exist', 400, 'bad_request')
+        }
+      }
+      return { ticket: 'folder-ticket' }
+    })
+    const files = [new File(['one'], 'one.txt'), new File(['two'], 'two.txt')]
+    Object.defineProperty(files[0], 'webkitRelativePath', { value: 'BUG/one.txt' })
+    Object.defineProperty(files[1], 'webkitRelativePath', { value: 'BUG/nested/two.txt' })
+    queue.uploadFiles({ target: { files, value: '' } } as unknown as Event)
+    await settle(); await settle()
+    expect(events).toEqual(['mkdir:original/BUG', 'mkdir:original/BUG/nested', 'prepare'])
+    expect(listFiles).toHaveBeenCalledTimes(2)
+    expect(createFolder).toHaveBeenCalledTimes(2)
+    expect(uploadFile).toHaveBeenCalledTimes(2)
+    expect(queue.uploadTasks.value.map(task => task.status)).toEqual(['succeeded', 'succeeded'])
+  })
+
+  it('creates selected descendants at the root, including Unicode directories', async () => {
+    const { context, queue } = uploads()
+    context.path.value = ''
+    queue.uploadFiles(folderSelection('图片/子目录/照片.jpg'))
+    await settle(); await settle()
+    expect(vi.mocked(createFolder).mock.calls).toEqual([['', '图片', 'first'], ['图片', '子目录', 'first']])
+    expect(prepareUploadBatch).toHaveBeenCalledExactlyOnceWith([{ path: '图片/子目录/照片.jpg', size: 4 }], 'first')
+    expect(queue.uploadTasks.value[0]?.status).toBe('succeeded')
+  })
+
+  it('reuses existing directories without requiring or repeating directory creation', async () => {
+    const { queue } = uploads()
+    vi.mocked(listFiles).mockResolvedValue(emptyDirectory)
+    queue.uploadFiles(folderSelection('BUG/one.txt', 'BUG/two.txt'))
+    await settle(); await settle()
+    expect(listFiles).toHaveBeenCalledExactlyOnceWith('original/BUG', 'first')
+    expect(createFolder).not.toHaveBeenCalled()
+    expect(uploadFile).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([400, 401, 403, 503])('does not interpret directory lookup HTTP %s as a missing directory', async status => {
+    const { context, queue } = uploads()
+    vi.mocked(listFiles).mockRejectedValue(new ApiError('Directory lookup failed', status))
+    queue.uploadFiles(folderSelection('BUG/file.txt'))
+    await settle(); await settle()
+    expect(createFolder).not.toHaveBeenCalled()
+    expect(prepareUploadBatch).not.toHaveBeenCalled()
+    expect(uploadFile).not.toHaveBeenCalled()
+    expect(queue.uploadTasks.value[0]).toMatchObject({ status: 'failed', error: 'Directory lookup failed' })
+    expect(context.announce).toHaveBeenCalledWith('Directory lookup failed')
+  })
+
+  it.each([
+    new ApiError('No directory permission', 403),
+    new ApiError('A file occupies the directory name', 409, 'conflict'),
+    new ApiError('Directory creation result is unknown', 0, 'operation_result_unknown'),
+  ])('stops when directory creation fails: %s', async error => {
+    const { queue } = uploads()
+    vi.mocked(createFolder).mockRejectedValue(error)
+    queue.uploadFiles(folderSelection('BUG/nested/file.txt'))
+    await settle(); await settle()
+    expect(createFolder).toHaveBeenCalledExactlyOnceWith('original', 'BUG', 'first')
+    expect(prepareUploadBatch).not.toHaveBeenCalled()
+    expect(uploadFile).not.toHaveBeenCalled()
+    expect(queue.uploadTasks.value[0]?.error).toBe(error.message)
+  })
+
+  it('does not recreate a destination that disappeared after selection', async () => {
+    const { queue } = uploads()
+    vi.mocked(createFolder).mockRejectedValue(new ApiError('Destination directory does not exist', 400))
+    queue.uploadFiles(folderSelection('BUG/file.txt'))
+    await settle(); await settle()
+    expect(createFolder).toHaveBeenCalledExactlyOnceWith('original', 'BUG', 'first')
+    expect(listFiles).toHaveBeenCalledExactlyOnceWith('original/BUG', 'first')
+    expect(prepareUploadBatch).not.toHaveBeenCalled()
+  })
+
+  it('keeps folder setup bound to the selected destination after navigation, including direct upload', async () => {
+    const { context, queue } = uploads()
+    let finish!: (value: FileListResponse) => void
+    vi.mocked(listFiles).mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+    vi.mocked(prepareUploadBatch).mockResolvedValueOnce({ ticket: 'direct', upload_mode: 'direct' })
+    queue.uploadFiles(folderSelection('BUG/nested/file.txt'))
+    context.path.value = 'changed'
+    context.storageId.value = 'second'
+    finish(emptyDirectory)
+    await settle(); await settle()
+    expect(createFolder).toHaveBeenCalledExactlyOnceWith('original/BUG', 'nested', 'first')
+    expect(prepareUploadBatch).toHaveBeenCalledExactlyOnceWith([{ path: 'original/BUG/nested/file.txt', size: 4 }], 'first')
+    expect(uploadFile).toHaveBeenCalledWith('original/BUG/nested/file.txt', expect.any(File), expect.any(Function), 'first', 'direct', expect.any(AbortSignal), true)
+    expect(context.refresh).not.toHaveBeenCalled()
+  })
+
+  it('does not include cancelled tasks when folder preparation has not issued a ticket', async () => {
+    const { queue } = uploads()
+    let finish!: (value: FileListResponse) => void
+    vi.mocked(listFiles).mockReturnValueOnce(new Promise(resolve => { finish = resolve }))
+    queue.uploadFiles(folderSelection('BUG/one.txt', 'BUG/two.txt'))
+    queue.terminateUploads([2])
+    finish(emptyDirectory)
+    await settle(); await settle()
+    expect(prepareUploadBatch).toHaveBeenCalledExactlyOnceWith([{ path: 'original/BUG/one.txt', size: 4 }], 'first')
+    expect(queue.uploadTasks.value[1]?.status).toBe('cancelled')
+    expect(queue.uploadTasks.value[1]?.ticket).toBeUndefined()
+    expect(cancelUploadBatch).not.toHaveBeenCalled()
+  })
+
+  it.each(['cancel', 'dispose', 'pause'] as const)('does not create or upload after %s during directory lookup', async action => {
+    const { queue } = uploads()
+    let fail!: (error: Error) => void
+    vi.mocked(listFiles).mockReturnValueOnce(new Promise((_, reject) => { fail = reject }))
+    queue.uploadFiles(folderSelection('BUG/nested/file.txt'))
+    if (action === 'cancel') queue.terminateUploads([1])
+    if (action === 'dispose') queue.disposeUploads()
+    if (action === 'pause') queue.pauseUploads([1])
+    fail(new ApiError('Not Found', 404))
+    await settle(); await settle()
+    expect(createFolder).not.toHaveBeenCalled()
+    expect(prepareUploadBatch).not.toHaveBeenCalled()
+    expect(uploadFile).not.toHaveBeenCalled()
+    if (action === 'pause') {
+      queue.resumeUploads([1])
+      await settle(); await settle()
+      expect(createFolder).toHaveBeenCalledTimes(2)
+      expect(queue.uploadTasks.value[0]?.status).toBe('succeeded')
+    }
+  })
+
   it('runs at most four files and replaces a finished worker without waiting for other files', async () => {
     const { queue } = uploads()
     const complete: Array<() => void> = []
@@ -76,6 +235,90 @@ describe('upload ticket grouping and mappings', () => {
     expect(uploadFile).toHaveBeenCalledTimes(5)
     for (let index = 1; index < 8; index++) { complete[index]!(); await settle() }
     expect(peak).toBe(4)
+    expect(queue.uploadTasks.value.every(task => task.status === 'succeeded')).toBe(true)
+    expect(listFiles).not.toHaveBeenCalled()
+    expect(createFolder).not.toHaveBeenCalled()
+  })
+
+  it.each([1, 2, 8, 32])('uses the prepared file concurrency %s with independent worker replacement', async concurrency => {
+    const { queue } = uploads()
+    vi.mocked(prepareUploadBatch).mockResolvedValue({ ticket: 'ticket', upload_file_concurrency: concurrency })
+    let active = 0
+    let peak = 0
+    const complete: Array<() => void> = []
+    vi.mocked(uploadFile).mockImplementation(() => {
+      peak = Math.max(peak, ++active)
+      return new Promise<void>(resolve => complete.push(() => { active--; resolve() }))
+    })
+    const files = Array.from({ length: concurrency + 3 }, (_, index) => new File(['data'], `${index}.jpeg`))
+    queue.uploadFiles({ target: { files, value: '' } } as unknown as Event)
+    await settle()
+    expect(uploadFile).toHaveBeenCalledTimes(concurrency)
+    complete[0]!()
+    await settle()
+    expect(uploadFile).toHaveBeenCalledTimes(concurrency + 1)
+    for (let index = 1; index < files.length; index++) { complete[index]!(); await settle() }
+    expect(peak).toBe(concurrency)
+    expect(queue.uploadTasks.value.every(task => task.status === 'succeeded')).toBe(true)
+  })
+
+  it('reads the current concurrency when resuming an existing ticket without re-preparing it', async () => {
+    const { queue } = uploads()
+    const tasks = [ticketedTask(1), ticketedTask(2), ticketedTask(3)]
+    queue.uploadTasks.value.push(...tasks)
+    vi.mocked(getUploadBatchStatus).mockResolvedValue({ ticket: 'shared', upload_file_concurrency: 1,
+      items: tasks.map(task => ({ path: task.targetPath, size: 4, status: 'pending' })) })
+    const complete: Array<() => void> = []
+    vi.mocked(uploadFile).mockImplementation(() => new Promise<void>(resolve => complete.push(resolve)))
+    queue.resumeUploads([1, 2, 3])
+    await settle()
+    expect(uploadFile).toHaveBeenCalledTimes(1)
+    for (let index = 0; index < 3; index++) { complete[index]!(); await settle() }
+    expect(prepareUploadBatch).not.toHaveBeenCalled()
+    expect(queue.uploadTasks.value.every(task => task.status === 'succeeded')).toBe(true)
+  })
+
+  it('reads a higher setting on the next wave instead of retaining the previous limit', async () => {
+    const { queue } = uploads()
+    vi.mocked(prepareUploadBatch).mockResolvedValueOnce({ ticket: 'first', upload_file_concurrency: 1 })
+      .mockResolvedValue({ ticket: 'second', upload_file_concurrency: 8 })
+    queue.uploadFiles({ target: { files: [new File(['data'], 'first.jpeg')], value: '' } } as unknown as Event)
+    await settle()
+    expect(queue.uploadTasks.value[0]?.status).toBe('succeeded')
+    const complete: Array<() => void> = []
+    vi.mocked(uploadFile).mockImplementation(() => new Promise<void>(resolve => complete.push(resolve)))
+    queue.uploadFiles({ target: { files: Array.from({ length: 8 }, (_, index) => new File(['data'], `next-${index}.jpeg`)), value: '' } } as unknown as Event)
+    await settle()
+    expect(complete).toHaveLength(8)
+    for (const finish of complete) finish()
+    await settle()
+    expect(queue.uploadTasks.value.every(task => task.status === 'succeeded')).toBe(true)
+  })
+
+  it.each([
+    ['local', 'direct', 8], ['direct', 'local', 8],
+    ['local', 'direct', 4], ['direct', 'local', 4],
+  ] as const)('uses the common configured concurrency for mixed storages in order %s/%s with limit %s', async (first, second, effectiveLimit) => {
+    const { queue } = uploads()
+    const tasks = [first, second].flatMap((storage, group) => Array.from({ length: 4 }, (_, index) => ticketedTask(group * 4 + index + 1, storage)))
+    queue.uploadTasks.value.push(...tasks)
+    vi.mocked(getUploadBatchStatus).mockImplementation(async (_ticket, storage) => ({
+      // The setting may change between status requests, not by storage mode.
+      ticket: 'shared', upload_file_concurrency: storage === second ? effectiveLimit : 8,
+      items: tasks.filter(task => task.storageId === storage).map(task => ({ path: task.targetPath, size: 4, status: 'pending' })),
+    }))
+    let active = 0
+    let peak = 0
+    const complete: Array<() => void> = []
+    vi.mocked(uploadFile).mockImplementation(() => {
+      peak = Math.max(peak, ++active)
+      return new Promise<void>(resolve => complete.push(() => { active--; resolve() }))
+    })
+    queue.resumeUploads(tasks.map(task => task.id))
+    await settle()
+    expect(uploadFile).toHaveBeenCalledTimes(effectiveLimit)
+    for (let index = 0; index < tasks.length; index++) { complete[index]!(); await settle() }
+    expect(peak).toBe(effectiveLimit)
     expect(queue.uploadTasks.value.every(task => task.status === 'succeeded')).toBe(true)
   })
 

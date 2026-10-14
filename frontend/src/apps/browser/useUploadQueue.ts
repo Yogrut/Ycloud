@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
 import type { Ref } from 'vue'
-import { cancelUploadBatch, getUploadBatchStatus, prepareUploadBatch, uploadFile } from '../../shared/api/browser'
+import { cancelUploadBatch, createFolder, getUploadBatchStatus, listFiles, prepareUploadBatch, uploadFile } from '../../shared/api/browser'
 import type { UploadBatchItemState, UploadBatchStatus } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import { useLocale } from '../../shared/i18n'
@@ -31,8 +31,8 @@ interface UploadDestination {
 }
 
 // File workers and S3's four within-file parts are separate limits. The server
-// remains authoritative for account admission and relay memory reservations.
-const MAX_PARALLEL_UPLOAD_FILES = 4
+// remains authoritative for account admission and backend I/O/stream permits.
+const DEFAULT_PARALLEL_UPLOAD_FILES = 4
 
 export function useUploadQueue(context: UploadQueueContext) {
   const locale = useLocale()
@@ -45,6 +45,7 @@ export function useUploadQueue(context: UploadQueueContext) {
   const retainedUploadTasks = computed(() => new Set(uploadTasks.value))
   const uploadDropActive = ref(false)
   let uploadTaskSequence = 0
+  let uploadFileConcurrency = DEFAULT_PARALLEL_UPLOAD_FILES
   let uploadDragDepth = 0
   const uploadControllers = new Map<number, AbortController>()
   const ticketCheckedAt = new Map<string, number>()
@@ -186,6 +187,7 @@ export function useUploadQueue(context: UploadQueueContext) {
         try {
           const batch = await getUploadBatchStatus(task.ticket, task.storageId)
           if (disposed) return
+          uploadFileConcurrency = Math.min(uploadFileConcurrency, batch.upload_file_concurrency ?? DEFAULT_PARALLEL_UPLOAD_FILES)
           ticketCheckedAt.set(key, performance.now())
           checkedTickets.set(key, indexUploadBatchItems(batch))
         } catch (error) {
@@ -217,6 +219,33 @@ export function useUploadQueue(context: UploadQueueContext) {
     }
   }
 
+  async function prepareUploadDirectories(tasks: UploadTask[]): Promise<void> {
+    // Folder selection supplies relative file paths, not server directories.
+    // Keep the existing destination itself; create only selected descendants.
+    const checked = new Set<string>()
+    for (const task of tasks) {
+      let parent = task.basePath
+      for (const name of task.relativePath.split('/').slice(0, -1)) {
+        if (disposed) return
+        if (task.status !== 'preparing') break
+        const directory = joinUploadPath(parent, name)
+        if (!checked.has(directory)) {
+          try {
+            await listFiles(directory, task.storageId)
+          } catch (error) {
+            if (!(error instanceof ApiError) || error.status !== 404) throw error
+            if (disposed) return
+            if (task.status !== 'preparing') break
+            await createFolder(parent, name, task.storageId)
+          }
+          if (disposed) return
+          checked.add(directory)
+        }
+        parent = directory
+      }
+    }
+  }
+
   async function prepareMissingTickets(tasks: UploadTask[]): Promise<void> {
     const prepareGroups = groupUploadTasksByStorage(tasks.filter(task => task.status === 'queued' && !task.ticket))
     for (const [storageId, group] of prepareGroups) {
@@ -231,8 +260,15 @@ export function useUploadQueue(context: UploadQueueContext) {
       }
       for (const task of group) task.status = 'preparing'
       try {
+        let preparedTasks = group
+        if (group.some(task => task.relativePath.includes('/'))) {
+          await prepareUploadDirectories(group)
+          if (disposed) return
+          preparedTasks = group.filter(task => task.status === 'preparing')
+          if (!preparedTasks.length) continue
+        }
         const prepared = await prepareUploadBatch(
-          group.map(task => ({ path: task.targetPath, size: task.file.size })),
+          preparedTasks.map(task => ({ path: task.targetPath, size: task.file.size })),
           storageId,
         )
         if (disposed) {
@@ -240,12 +276,13 @@ export function useUploadQueue(context: UploadQueueContext) {
           return
         }
         ticketCheckedAt.set(uploadTicketKey(storageId, prepared.ticket), performance.now())
+        uploadFileConcurrency = Math.min(uploadFileConcurrency, prepared.upload_file_concurrency ?? DEFAULT_PARALLEL_UPLOAD_FILES)
         const assignedPaths = new Map<string, string>()
         for (const item of prepared.items ?? []) {
           const originalPath = item.original_path
           if (!assignedPaths.has(originalPath)) assignedPaths.set(originalPath, item.path)
         }
-        for (const task of group) {
+        for (const task of preparedTasks) {
           task.ticket = prepared.ticket
           task.directUpload = prepared.upload_mode === 'direct'
           const assignedPath = assignedPaths.get(task.targetPath)
@@ -255,7 +292,7 @@ export function useUploadQueue(context: UploadQueueContext) {
               ? assignedPath.slice(task.basePath.length + 1) : assignedPath
           }
         }
-        const cancelledPaths = group
+        const cancelledPaths = preparedTasks
           .filter(task => task.status === 'cancelled')
           .map(task => task.targetPath)
         if (cancelledPaths.length) {
@@ -264,7 +301,7 @@ export function useUploadQueue(context: UploadQueueContext) {
         if (disposed) {
           return
         }
-        for (const task of group) {
+        for (const task of preparedTasks) {
           if (task.status === 'cancelled') continue
           if (task.status === 'preparing') task.status = 'queued'
         }
@@ -349,7 +386,7 @@ export function useUploadQueue(context: UploadQueueContext) {
         }
       }
     }
-    await Promise.all(Array.from({ length: Math.min(MAX_PARALLEL_UPLOAD_FILES, pending.length) }, () => worker()))
+    await Promise.all(Array.from({ length: Math.min(uploadFileConcurrency, pending.length) }, () => worker()))
   }
 
   async function runUploadTasks(taskIds: number[]): Promise<void> {
@@ -359,6 +396,9 @@ export function useUploadQueue(context: UploadQueueContext) {
     if (!tasks.length) return
     uploading.value = true
     const completedContexts = new Set<string>()
+    // All selected storage responses constrain this one worker pool. Reset
+    // between waves so a previous setting cannot limit a later batch.
+    uploadFileConcurrency = Number.POSITIVE_INFINITY
     try {
       // A fresh queue must enter "preparing" synchronously, as it did before
       // this phase was extracted; avoid an extra await when no ticket exists.

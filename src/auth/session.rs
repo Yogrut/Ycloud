@@ -8,7 +8,6 @@ use uuid::Uuid;
 pub(super) const SESSION_TTL: chrono::Duration = chrono::Duration::hours(24);
 pub(super) const ACCESS_TOKEN_TTL: chrono::Duration = chrono::Duration::days(7);
 const MAX_SESSIONS: usize = 4_096;
-const MAX_SESSIONS_PER_PRINCIPAL: usize = 16;
 const MAX_ACCESS_TOKENS: usize = 4_096;
 const MAX_ACCESS_TOKENS_PER_SCOPE: usize = 16;
 
@@ -38,18 +37,16 @@ pub enum RequestSubject {
 pub struct SessionStore {
     sessions: RwLock<HashMap<String, Session>>,
     max_total: usize,
-    max_per_principal: usize,
 }
 
 impl SessionStore {
     pub fn new() -> Self {
-        Self::with_limits(MAX_SESSIONS, MAX_SESSIONS_PER_PRINCIPAL)
+        Self::with_limit(MAX_SESSIONS)
     }
-    fn with_limits(max_total: usize, max_per_principal: usize) -> Self {
+    fn with_limit(max_total: usize) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             max_total: max_total.max(1),
-            max_per_principal: max_per_principal.max(1),
         }
     }
     pub async fn create(&self) -> String {
@@ -62,18 +59,11 @@ impl SessionStore {
         let token = Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
         let mut sessions = self.sessions.write().await;
-        sessions.retain(|_, session| now - session.created_at <= SESSION_TTL);
-        if principal == SessionPrincipal::Administrator {
-            sessions.retain(|_, session| session.principal != SessionPrincipal::Administrator);
-        }
-        while sessions
-            .values()
-            .filter(|session| session.principal == principal)
-            .count()
-            >= self.max_per_principal
-        {
-            remove_oldest_where(&mut sessions, |session| session.principal == principal);
-        }
+        // Replacement and insertion share the write lock: concurrent logins
+        // cannot leave multiple valid browser sessions for the same account.
+        sessions.retain(|_, session| {
+            now - session.created_at <= SESSION_TTL && session.principal != principal
+        });
         while sessions.len() >= self.max_total {
             remove_oldest_where(&mut sessions, |_| true);
         }
@@ -365,6 +355,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_login_replaces_only_the_same_accounts_session() {
+        let sessions = SessionStore::new();
+        let administrator = sessions.create().await;
+        let other = sessions.create_user("other-user".into()).await;
+        let old = sessions.create_user("reader".into()).await;
+        let newest = sessions.create_user("reader".into()).await;
+        assert!(!sessions.validate(&old).await);
+        assert!(sessions.validate(&newest).await);
+        assert!(sessions.validate(&other).await);
+        assert!(sessions.validate(&administrator).await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_logins_leave_exactly_one_session_for_the_account() {
+        let sessions = Arc::new(SessionStore::new());
+        let mut logins = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let sessions = sessions.clone();
+            logins.spawn(async move { sessions.create_user("reader".into()).await });
+        }
+        let mut tokens = Vec::new();
+        while let Some(token) = logins.join_next().await {
+            tokens.push(token.unwrap());
+        }
+        let mut valid = 0;
+        for token in tokens {
+            valid += usize::from(sessions.validate(&token).await);
+        }
+        assert_eq!(valid, 1);
+    }
+
+    #[tokio::test]
     async fn administrator_has_one_session_and_revocation_preserves_users() {
         let sessions = SessionStore::new();
         let user = sessions.create_user("ordinary".into()).await;
@@ -392,22 +414,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_are_bounded_per_principal_and_globally() {
-        let sessions = SessionStore::with_limits(3, 2);
+    async fn sessions_are_single_per_principal_and_bounded_globally() {
+        let sessions = SessionStore::with_limit(3);
         let first = sessions.create_user("same-user".into()).await;
         let second = sessions.create_user("same-user".into()).await;
         let newest = sessions.create_user("same-user".into()).await;
         let surviving_same_user = usize::from(sessions.validate(&first).await)
             + usize::from(sessions.validate(&second).await)
             + usize::from(sessions.validate(&newest).await);
-        assert_eq!(surviving_same_user, 2);
+        assert_eq!(surviving_same_user, 1);
         assert!(sessions.validate(&newest).await);
 
         let administrator = sessions.create().await;
         let other = sessions.create_user("other-user".into()).await;
         assert!(sessions.validate(&administrator).await);
         assert!(sessions.validate(&other).await);
-        assert!(sessions.sessions.read().await.len() <= 3);
+        let last = sessions.create_user("last-user".into()).await;
+        assert!(sessions.validate(&last).await);
+        assert_eq!(sessions.sessions.read().await.len(), 3);
     }
 
     #[tokio::test]

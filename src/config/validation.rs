@@ -66,6 +66,15 @@ impl ConfigFile {
             self.max_archive_bytes,
             self.max_archive_entries,
         )?;
+        if !(1..=super::MAX_UPLOAD_FILE_CONCURRENCY).contains(&self.upload_file_concurrency) {
+            return Err(AppError::BadRequest(
+                format!(
+                    "文件上传并发数必须在 1 到 {} 之间",
+                    super::MAX_UPLOAD_FILE_CONCURRENCY
+                )
+                .into(),
+            ));
+        }
         validate_login_security_settings(
             self.admin_login_failures,
             self.web_login_failures,

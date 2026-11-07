@@ -61,6 +61,8 @@ cargo build --release --locked
 
 开发时在仓库根目录运行 `cargo run --locked`，另开终端在 `frontend/` 运行 `npm run dev`，访问 `http://127.0.0.1:5173`。Vite 将 API 请求转发到默认的后端地址 `127.0.0.1:18473`。首次启动生成的凭据保存在运行目录的 `initial-credentials.json`，请勿提交。
 
+图片加载性能测试请使用 `cargo run --release --locked`，避免把未优化的 debug 解码速度当作生产性能。画廊只请求缩略图，由浏览器自主缓存；原图只在当前预览中加载，不做 HTTP 缓存。
+
 ## Docker Compose
 
 ```bash

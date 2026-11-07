@@ -8,6 +8,17 @@ import { isStorageUsable, rememberedStorage, rememberStorage, shouldForgetStorag
 type SortKey = 'name' | 'time' | 'size'
 type PageSize = 10 | 20 | 50 | 100
 
+interface PageTarget {
+  cursor: string | undefined
+  history: Array<string | undefined>
+}
+
+interface ListingRefresh {
+  target?: PageTarget
+  keepGallery?: boolean
+  fillAfterDelete?: boolean
+}
+
 interface BrowserListingContext {
   announce: (message: string) => void
   resetSelection: () => void
@@ -48,6 +59,7 @@ export function useBrowserListing(context: BrowserListingContext) {
   const nextCursor = ref<string | null>(null)
   const cursorHistory = ref<Array<string | undefined>>([])
   const loading = ref(true)
+  const retainingGallery = ref(false)
   const emptyReason = ref<string | null>(null)
   let selectionScope = ''
   let restoreSelection = true
@@ -126,18 +138,19 @@ export function useBrowserListing(context: BrowserListingContext) {
     context.resetSelection()
   }
 
-  async function refresh(): Promise<void> {
+  async function refresh({ target, keepGallery = false, fillAfterDelete = false }: ListingRefresh = {}): Promise<void> {
     resetDirectorySizes()
     const sequence = ++refreshSequence
     listingRequest?.abort()
     const controller = new AbortController()
     listingRequest = controller
+    retainingGallery.value = keepGallery && galleryMode.value
     loading.value = true
     try {
       const data = await listFiles(path.value, currentStorageId.value || undefined, {
         signal: controller.signal,
-        limit: galleryMode.value ? 20 : pageSize.value,
-        cursor: currentCursor.value,
+        limit: pageSize.value,
+        cursor: target ? target.cursor : currentCursor.value,
         search: appliedQuery.value || undefined,
         sort: sort.value,
         direction: ascending.value ? 'asc' : 'desc',
@@ -165,10 +178,19 @@ export function useBrowserListing(context: BrowserListingContext) {
         if (scope) rememberStorage(scope, data.storage_id)
         rememberNextSelection = false
       }
+      if (fillAfterDelete && !data.empty_reason && !data.entries.length && cursorHistory.value.length) {
+        await refresh({ target: previousTarget(), keepGallery: true })
+        return
+      }
+      if (target) {
+        currentCursor.value = target.cursor
+        cursorHistory.value = target.history
+      }
       applyListing(data)
     } catch (error) {
       if (sequence !== refreshSequence) return
-      if (error instanceof ApiError && [401, 403, 404, 503].includes(error.status)) {
+      if (error instanceof ApiError && ([401, 403].includes(error.status)
+        || !target && !keepGallery && [404, 503].includes(error.status))) {
         clearListingEntries()
         context.resetSelection()
       }
@@ -195,6 +217,7 @@ export function useBrowserListing(context: BrowserListingContext) {
     } finally {
       if (sequence === refreshSequence) {
         loading.value = false
+        retainingGallery.value = false
         listingRequest = undefined
       }
     }
@@ -275,7 +298,6 @@ export function useBrowserListing(context: BrowserListingContext) {
   }
 
   function changePageSize(): void {
-    if (galleryMode.value) return
     resetPagination()
     void refresh()
   }
@@ -288,19 +310,34 @@ export function useBrowserListing(context: BrowserListingContext) {
 
   function nextPage(): void {
     if (!nextCursor.value || loading.value) return
-    cursorHistory.value = [...cursorHistory.value, currentCursor.value]
-    currentCursor.value = nextCursor.value
-    context.resetSelection()
-    void refresh()
+    void refresh({
+      target: { cursor: nextCursor.value, history: [...cursorHistory.value, currentCursor.value] },
+      keepGallery: true,
+    })
+  }
+
+  function previousTarget(): PageTarget {
+    const history = [...cursorHistory.value]
+    return { cursor: history.pop(), history }
   }
 
   function previousPage(): void {
     if (!cursorHistory.value.length || loading.value) return
-    const history = [...cursorHistory.value]
-    currentCursor.value = history.pop()
-    cursorHistory.value = history
-    context.resetSelection()
-    void refresh()
+    void refresh({ target: previousTarget(), keepGallery: true })
+  }
+
+  async function reconcileDeletion(storageId: string, paths: string[]): Promise<void> {
+    if (storageId !== currentStorageId.value) return
+    if (!galleryMode.value) {
+      await refresh()
+      return
+    }
+    const deleted = new Set(paths.map(path => path.replace(/^\/+|\/+$/g, '')))
+    const remaining = entries.value.filter(entry => !deleted.has(entry.path.replace(/^\/+|\/+$/g, '')))
+    if (remaining.length === entries.value.length) return
+    entries.value = remaining
+    // Reconcile the cursor and fill the visible page without unmounting it.
+    await refresh({ keepGallery: true, fillAfterDelete: true })
   }
 
   async function resetAfterSignIn(requestedStorageId: string): Promise<void> {
@@ -367,7 +404,9 @@ export function useBrowserListing(context: BrowserListingContext) {
     path,
     previousPage,
     query,
+    reconcileDeletion,
     refresh,
+    retainingGallery,
     resetAfterSignIn,
     scheduleSearch,
     sort,

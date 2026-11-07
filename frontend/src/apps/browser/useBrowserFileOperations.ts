@@ -11,7 +11,7 @@ interface BrowserFileOperationsContext {
   selected: Ref<Set<string>>
   requireCapability: (action: keyof BrowserCapabilities) => boolean
   announce: (message: string, kind?: 'error' | 'success') => void
-  refresh: () => Promise<void>
+  refresh: (deletion?: { storageId: string; paths: string[] }) => Promise<void>
 }
 
 interface BatchRequest {
@@ -99,7 +99,12 @@ export function useBrowserFileOperations(context: BrowserFileOperationsContext) 
     context.selected.value = new Set()
     // Refresh has its own outcome; it cannot make a completed batch retryable.
     try {
-      await context.refresh()
+      if (operation === 'delete') {
+        const paths = result.results
+          .filter(item => item.status >= 200 && item.status < 300 || item.operation?.commit === 'committed')
+          .map(item => item.path)
+        await context.refresh({ storageId, paths })
+      } else await context.refresh()
     } catch (error) {
       if (!disposed) context.announce(error instanceof Error ? error.message : locale.text('目录加载失败', 'Unable to load this folder'))
     }

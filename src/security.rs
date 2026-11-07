@@ -218,9 +218,16 @@ pub async fn security_headers_middleware(
         .unwrap_or_else(|| state.config.clone());
     let sensitive_response =
         request.uri().path().starts_with("/api/") || request.uri().path().starts_with("/dav/");
+    let thumbnail_request = request.uri().path() == "/api/thumbnail";
     let mut response = next.run(request).await;
+    let cacheable_thumbnail = thumbnail_request
+        && matches!(response.status(), StatusCode::OK | StatusCode::NOT_MODIFIED)
+        && response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .is_some_and(|value| value == "private, no-cache");
     let headers = response.headers_mut();
-    if sensitive_response {
+    if sensitive_response && !cacheable_thumbnail {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     headers.insert(

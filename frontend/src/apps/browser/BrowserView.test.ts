@@ -29,6 +29,10 @@ async function chooseOption(host: HTMLElement, selector: string, label: string):
   option.click()
 }
 
+function openGallery(host: HTMLElement): void {
+  host.querySelector<HTMLButtonElement>('.gallery-toggle')!.click()
+}
+
 function listResponse(names: string[]) {
   return {
     storage_id: 'primary',
@@ -176,7 +180,8 @@ describe('BrowserView', () => {
     app.unmount()
   })
 
-  it('toggles a fixed twenty-image gallery and returns to the normal list', async () => {
+  it('shows the existing page-size selector in the gallery and returns to the normal list', async () => {
+    const previewRequests: AbortSignal[] = []
     const images = Array.from({ length: 20 }, (_, index) => ({
       name: `photo-${index}.jpg`,
       path: `photo-${index}.jpg`,
@@ -187,8 +192,13 @@ describe('BrowserView', () => {
       icon: 'image',
       locked: false,
     }))
-    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
-      const gallery = new URL(String(input), 'http://localhost').searchParams.get('gallery') === 'true'
+    const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, options: RequestInit) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname === '/api/thumbnail') {
+        previewRequests.push(options.signal!)
+        return new Promise(() => {})
+      }
+      const gallery = url.searchParams.get('gallery') === 'true'
       const body = gallery
         ? { ...listResponse([]), entries: images, page_start: 1, page_size: 20 }
         : listResponse(['notes.txt'])
@@ -203,7 +213,7 @@ describe('BrowserView', () => {
 
     const toggle = host.querySelector<HTMLButtonElement>('.gallery-toggle')!
     expect(toggle.getAttribute('aria-pressed')).toBe('false')
-    toggle.click()
+    openGallery(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -215,8 +225,11 @@ describe('BrowserView', () => {
     expect(galleryBody.querySelector('.file-pagination')).toBeNull()
     expect(galleryBody.nextElementSibling?.classList.contains('file-pagination')).toBe(true)
     expect(host.querySelector('.file-head')).toBeNull()
-    expect(host.querySelector('.gallery-page-size')?.textContent).toContain('20')
+    expect(host.querySelector('.page-size-select')?.textContent).toContain('20')
+    expect(host.querySelector('.page-size-select .app-select-trigger')?.getAttribute('aria-label')).toBe('每页图片数量')
     expect(toggle.getAttribute('aria-pressed')).toBe('true')
+    expect(previewRequests).toHaveLength(0)
+    expect(host.querySelectorAll('.gallery-card img[src^="/api/thumbnail?"]')).toHaveLength(20)
 
     host.querySelector<HTMLButtonElement>('.gallery-select')!.click()
     await nextTick()
@@ -232,17 +245,19 @@ describe('BrowserView', () => {
     toggle.click()
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
-    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/files?storage_id=primary&limit=20&sort=name&direction=asc', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/files?storage_id=primary&limit=20&sort=name&direction=asc', expect.objectContaining({ credentials: 'same-origin', signal: expect.any(AbortSignal) }))
+    expect(previewRequests).toHaveLength(0)
     expect(host.querySelector('.file-row')?.textContent).toContain('notes.txt')
     expect(host.querySelector('.gallery-card')).toBeNull()
     app.unmount()
   })
 
   it('opens a supported list image in the same draggable viewer as the gallery', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(listResponse(['photo.jpg', 'notes.txt'])), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    })))
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).startsWith('/api/preview?')) return new Promise<Response>(() => {})
+      return new Response(JSON.stringify(listResponse(['photo.jpg', 'notes.txt'])), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
     const open = vi.spyOn(window, 'open').mockImplementation(() => null)
     const host = document.createElement('div')
     document.body.append(host)
@@ -253,7 +268,8 @@ describe('BrowserView', () => {
     host.querySelector<HTMLElement>('[data-entry-path="photo.jpg"]')!
       .dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
     await nextTick()
-    expect(document.body.querySelector('.gallery-lightbox-stage img')?.getAttribute('alt')).toBe('photo.jpg')
+    expect(document.body.querySelector('.gallery-lightbox')?.getAttribute('aria-label')).toBe('photo.jpg')
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/preview?path=%2Fphoto.jpg'), expect.objectContaining({ priority: 'high' }))
     expect(document.body.querySelector('.gallery-lightbox-close svg')).not.toBeNull()
     expect(document.body.querySelector('.gallery-lightbox-close .app-icon')).toBeNull()
     expect(open).not.toHaveBeenCalled()
@@ -275,7 +291,7 @@ describe('BrowserView', () => {
     document.body.append(host)
     const app = mountBrowser(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
-    host.querySelector<HTMLButtonElement>('.gallery-toggle')!.click()
+    openGallery(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     await nextTick()
 
@@ -311,7 +327,7 @@ describe('BrowserView', () => {
     const navigate = vi.spyOn(window.location, 'href', 'set').mockImplementation(() => {})
     try {
       await new Promise(resolve => window.setTimeout(resolve, 0))
-      host.querySelector<HTMLButtonElement>('.gallery-toggle')!.click()
+      openGallery(host)
       await new Promise(resolve => window.setTimeout(resolve, 0))
       await nextTick()
       host.querySelectorAll<HTMLButtonElement>('.gallery-select').forEach(button => button.click())
@@ -536,7 +552,7 @@ describe('BrowserView', () => {
   })
 
   it.each([true, false])('uses the normal download capability gate for gallery opening (allowed: %s)', async allowed => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(JSON.stringify({
       ...listResponse(['photo.jpg']),
       capabilities: { download: allowed, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false },
     }))))
@@ -545,7 +561,7 @@ describe('BrowserView', () => {
     const app = mountBrowser(host)
     try {
       await new Promise(resolve => setTimeout(resolve, 0))
-      host.querySelector<HTMLButtonElement>('.gallery-toggle')!.click()
+      openGallery(host)
       await new Promise(resolve => setTimeout(resolve, 0))
       host.querySelector<HTMLButtonElement>('.gallery-card-open')!.click()
       await nextTick()

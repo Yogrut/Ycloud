@@ -4,6 +4,7 @@ export interface FileEntry {
   is_dir: boolean
   size: number
   modified: string
+  modified_unix?: number | null
   mime: string
   icon: string
   locked: boolean
@@ -203,6 +204,10 @@ export function downloadUrl(path: string, storageId?: string): string {
 export function previewUrl(path: string, storageId?: string): string {
   const clean = cleanPath(path)
   return withStorage(`/api/preview?path=${encodeURIComponent(`/${clean}`)}`, storageId)
+}
+
+export function thumbnailUrl(entry: FileEntry, storageId: string): string {
+  return actionApi('thumbnail', entry.path, storageId) + '&v=' + encodeURIComponent(JSON.stringify([entry.size, entry.modified_unix ?? entry.modified]))
 }
 
 export async function renameItem(currentPath: string, path: string, newName: string, storageId?: string): Promise<{ success?: boolean }> {

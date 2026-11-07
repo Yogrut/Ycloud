@@ -25,6 +25,7 @@ pub mod storage;
 pub mod storage_backend;
 pub mod storage_catalog;
 mod storage_transaction;
+mod thumbnail;
 pub mod totp;
 pub mod traffic;
 pub mod transfer_limit;

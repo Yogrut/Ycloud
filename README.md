@@ -61,6 +61,8 @@ The executable is `target/release/ycloud`, or `ycloud.exe` on Windows. After cha
 
 For development, run `cargo run --locked` from the repository root and `npm run dev` from `frontend/` in another terminal. Open `http://127.0.0.1:5173`. Vite forwards API requests to `127.0.0.1:18473` by default. Initial credentials are written to `initial-credentials.json` in the working directory; do not commit that file.
 
+Use `cargo run --release --locked` to measure image loading performance; unoptimized debug decoding is not representative. The gallery requests browser-cached thumbnails only. Original images load only for the current preview and are not HTTP-cached.
+
 ## Docker Compose
 
 From the repository root:

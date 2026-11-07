@@ -36,6 +36,7 @@ http-body = "1"
 http-body-util = "0.1"
 httpdate = "1.0.3"
 roxmltree = { version = "0.21.1", default-features = false, features = ["std"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

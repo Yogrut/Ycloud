@@ -51,7 +51,7 @@ pub(crate) fn is_gallery_image_name(name: &str) -> bool {
     };
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "jpg" | "jpeg" | "png" | "webp" | "avif" | "gif"
+        "jpg" | "jpeg" | "jfif" | "png" | "webp" | "avif" | "gif"
     )
 }
 

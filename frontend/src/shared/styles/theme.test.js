@@ -194,7 +194,7 @@ describe('interactive focus styling', () => {
   it('uses matching compact pagination controls and a soft-blue current page', () => {
     const trafficPanel = readFileSync('src/apps/admin/TrafficPanel.vue', 'utf8')
     expect(trafficPanel).toMatch(/\.range-presets button\s*\{[^}]*min-width: 60px; height: 28px; padding: 0 10px;[^}]*font-size: 13px;/)
-    expect(themeCss).toContain('.page-size-select { width: 60px; height: 34px;')
+    expect(themeCss).toContain('.page-size-select { width: 76px; height: 34px;')
     expect(themeCss).toContain('.page-size-select .app-select-trigger { min-height: 34px; height: 34px;')
     expect(themeCss).toContain('.page-size-select .app-select-menu { right: 0; left: auto; width: 100%; }')
     expect(themeCss).toContain('.current-page { flex: 0 0 34px; color: var(--icon-color); background: var(--accent-soft);')

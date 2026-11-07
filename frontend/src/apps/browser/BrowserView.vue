@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { BrowserCapabilities, FileEntry } from '../../shared/api/browser'
+import { thumbnailUrl } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import AppFeedback from '../../shared/components/AppFeedback.vue'
@@ -80,7 +81,9 @@ const {
   path,
   previousPage,
   query,
+  reconcileDeletion,
   refresh,
+  retainingGallery,
   resetAfterSignIn,
   scheduleSearch,
   sort,
@@ -102,6 +105,10 @@ const {
   openPreviewImage, openPreviewFile, moveAudio, onAudioError, closeAudio,
   moveGalleryEntry, closeGalleryEntry, closeFilePreview, closePendingDownload,
 } = useBrowserPreviews({ storageId: currentStorageId, visibleEntries, announce })
+
+const galleryThumbnailSource = computed(() => galleryStorageId.value === currentStorageId.value && activeGalleryEntry.value
+  && capabilities.value.download && !activeGalleryEntry.value.locked && !/\.avif$/i.test(activeGalleryEntry.value.name)
+  ? thumbnailUrl(activeGalleryEntry.value, currentStorageId.value) : undefined)
 
 function changeGalleryMode(): void {
   closeGalleryEntry()
@@ -235,7 +242,7 @@ const {
   selected,
   requireCapability,
   announce,
-  refresh,
+  refresh: deletion => deletion ? reconcileDeletion(deletion.storageId, deletion.paths) : refresh(),
 })
 
 const {
@@ -404,11 +411,11 @@ onBeforeUnmount(() => {
           <button class="sort-btn right" type="button" @click="changeSort('size')">{{ locale.text('大小', 'Size') }} <span>{{ sort === 'size' ? (ascending ? '▲' : '▼') : '' }}</span></button>
           <button class="sort-btn right modified" type="button" @click="changeSort('time')">{{ locale.text('修改时间', 'Modified') }} <span>{{ sort === 'time' ? (ascending ? '▲' : '▼') : '' }}</span></button>
         </div>
-        <div v-if="loading" class="empty file-list-body">{{ locale.t('common.loading') }}</div>
+        <div v-if="loading && !retainingGallery" class="empty file-list-body">{{ locale.t('common.loading') }}</div>
         <div v-else-if="emptyReason" class="empty file-list-body">{{ emptyReason === 'unconfigured' ? locale.text('尚未配置存储，请管理员在后台添加存储。', 'No storage configured. Ask an administrator to add one.') : emptyReason === 'forbidden' ? locale.text('当前账号没有可访问的存储。', 'No storage is accessible to this account.') : locale.text('存储暂不可用，请稍后重试。', 'Storage is temporarily unavailable. Please try again later.') }}</div>
         <div v-else-if="!(galleryMode ? galleryImages.length : visibleEntries.length)" class="empty file-list-body">{{ appliedQuery ? locale.text('没有匹配的文件', 'No matching files') : galleryMode ? locale.text('此文件夹没有可展示的图片', 'No supported images in this folder') : locale.text('此文件夹为空', 'This folder is empty') }}</div>
         <div v-else-if="galleryMode" class="file-list-body gallery-list-body">
-          <GalleryGrid :entries="visibleEntries" :storage-id="currentStorageId" :selected="selected" @open="openEntry" @select="toggleSelection($event.path)" @context-menu="openRowMenu" />
+          <GalleryGrid :entries="visibleEntries" :storage-id="currentStorageId" :can-download="capabilities.download" :selected="selected" @open="openEntry" @select="toggleSelection($event.path)" @context-menu="openRowMenu" />
         </div>
         <div v-else class="file-list-body">
           <div
@@ -446,8 +453,7 @@ onBeforeUnmount(() => {
         </div>
         <footer class="file-pagination">
           <div class="pagination-summary">
-            <span v-if="galleryMode" class="gallery-page-size">{{ locale.text('每页 20 张', '20 images per page') }}</span>
-            <AppSelect v-else v-model="pageSize" class="page-size-select" placement="top" :options="pageSizeOptions" :label="locale.text('每页显示数量', 'Items per page')" @change="changePageSize" />
+            <AppSelect v-model="pageSize" class="page-size-select" placement="top" :options="pageSizeOptions" :label="galleryMode ? locale.text('每页图片数量', 'Images per page') : locale.text('每页显示数量', 'Items per page')" @change="changePageSize" />
           </div>
           <nav class="pagination-controls" :aria-label="locale.text('文件翻页', 'File pagination')">
             <button class="page-arrow" type="button" :disabled="!cursorHistory.length || loading" :title="locale.text('上一页', 'Previous page')" :aria-label="locale.text('上一页', 'Previous page')" @click="previousPage"><span class="page-chevron previous" aria-hidden="true" /></button>
@@ -485,6 +491,7 @@ onBeforeUnmount(() => {
     v-if="activeGalleryEntry"
     :entry="activeGalleryEntry"
     :storage-id="galleryStorageId"
+    :thumbnail-source="galleryThumbnailSource"
     :index="activeGalleryIndex"
     :total="galleryImages.length"
     @close="closeGalleryEntry"
@@ -597,14 +604,6 @@ onBeforeUnmount(() => {
   color: var(--accent);
   background: var(--accent-soft);
   border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
-}
-.gallery-page-size {
-  display: inline-flex;
-  align-items: center;
-  min-height: 34px;
-  color: var(--muted);
-  font-size: 12px;
-  white-space: nowrap;
 }
 /* Share the page gutter; retain the existing edge position on narrow screens. */
 .ycloud-audio-dock { position: fixed; z-index: 80; bottom: clamp(90px, 27vh, 290px); left: max(6px, calc(var(--workspace-gutter) / 2 - 28px)); width: 56px; height: 56px; }

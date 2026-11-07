@@ -74,6 +74,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/archive", get(archive::download_archive))
         .route("/preview", get(api::preview_file))
+        .route("/thumbnail", get(api::thumbnail_file))
         .merge(unlock_route);
 
     // Batch payloads contain only paths and a destination. Keep their JSON

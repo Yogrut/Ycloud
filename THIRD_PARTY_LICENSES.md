@@ -15,6 +15,25 @@ License texts are taken from the installed dependency packages. Identical terms 
 | Component | Version | Declared license |
 | --- | --- | --- |
 | Material Icon Theme (selected SVG assets) | 5.39.0 / a7ffd480d308a153b95cf241999dbaaa58bf4992 | MIT |
+| adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |
+| bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT |
+| byteorder-lite | 0.1.0 | Unlicense OR MIT |
+| color_quant | 1.1.0 | MIT |
+| fdeflate | 0.3.7 | MIT OR Apache-2.0 |
+| flate2 | 1.1.11 | MIT OR Apache-2.0 |
+| gif | 0.14.2 | MIT OR Apache-2.0 |
+| image | 0.25.10 | MIT OR Apache-2.0 |
+| image-webp | 0.2.4 | MIT OR Apache-2.0 |
+| miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |
+| miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 |
+| moxcms | 0.8.1 | BSD-3-Clause OR Apache-2.0 |
+| png | 0.18.1 | MIT OR Apache-2.0 |
+| pxfm | 0.1.30 | BSD-3-Clause OR Apache-2.0 |
+| quick-error | 2.0.1 | MIT OR Apache-2.0 |
+| simd-adler32 | 0.3.10 | MIT |
+| weezl | 0.1.12 | MIT OR Apache-2.0 |
+| zune-core | 0.5.3 | MIT OR Apache-2.0 OR Zlib |
+| zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib |
 | aho-corasick | 1.1.4 | Unlicense OR MIT |
 | allocator-api2 | 0.2.21 | MIT OR Apache-2.0 |
 | anyhow | 1.0.103 | MIT OR Apache-2.0 |
@@ -62,7 +81,7 @@ License texts are taken from the installed dependency packages. Identical terms 
 | crc32fast | 1.5.0 | MIT OR Apache-2.0 |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 |
 | crypto-common | 0.2.2 | MIT OR Apache-2.0 |
-| ctutils | 0.4.2 | Apache-2.0 OR MIT |
+| ctutils | 0.4.4 | Apache-2.0 OR MIT |
 | deranged | 0.5.8 | MIT OR Apache-2.0 |
 | digest | 0.10.7 | MIT OR Apache-2.0 |
 | digest | 0.11.3 | MIT OR Apache-2.0 |
@@ -151,10 +170,10 @@ License texts are taken from the installed dependency packages. Identical terms 
 | ring | 0.17.14 | Apache-2.0 AND ISC |
 | roxmltree | 0.21.1 | MIT OR Apache-2.0 |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
-| rustls | 0.23.45 | Apache-2.0 OR ISC OR MIT |
+| rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT |
 | rustls-native-certs | 0.8.4 | Apache-2.0 OR ISC OR MIT |
 | rustls-pki-types | 1.15.1 | MIT OR Apache-2.0 |
-| rustls-webpki | 0.103.15 | ISC |
+| rustls-webpki | 0.103.16 | ISC |
 | rustversion | 1.0.23 | MIT OR Apache-2.0 |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | schannel | 0.1.29 | MIT |
@@ -182,7 +201,7 @@ License texts are taken from the installed dependency packages. Identical terms 
 | time | 0.3.55 | MIT OR Apache-2.0 |
 | time-core | 0.1.9 | MIT OR Apache-2.0 |
 | tinystr | 0.8.4 | Unicode-3.0 |
-| tokio | 1.52.3 | MIT |
+| tokio | 1.53.3 | MIT |
 | tokio-rustls | 0.26.4 | MIT OR Apache-2.0 |
 | tokio-util | 0.7.18 | MIT |
 | tower | 0.5.3 | MIT |
@@ -282,7 +301,7 @@ License texts are taken from the installed dependency packages. Identical terms 
 - crc32fast 1.5.0 — LICENSE-MIT
 - crypto-common 0.1.7 — LICENSE-MIT
 - crypto-common 0.2.2 — LICENSE-MIT
-- ctutils 0.4.2 — LICENSE-MIT
+- ctutils 0.4.4 — LICENSE-MIT
 - deranged 0.5.8 — LICENSE-MIT
 - digest 0.10.7 — LICENSE-MIT
 - digest 0.11.3 — LICENSE-MIT
@@ -360,7 +379,23 @@ License texts are taken from the installed dependency packages. Identical terms 
 - regex-syntax 0.8.11 — LICENSE-MIT
 - rustix 1.1.4 — LICENSE-MIT
 - roxmltree 0.21.1 — LICENSE-MIT
-- rustls 0.23.45 — LICENSE-MIT
+- adler2 2.0.1 — LICENSE-MIT
+- byteorder-lite 0.1.0 — LICENSE-MIT
+- color_quant 1.1.0 — LICENSE
+- fdeflate 0.3.7 — LICENSE-MIT
+- flate2 1.1.11 — LICENSE-MIT
+- gif 0.14.2 — LICENSE-MIT
+- image 0.25.10 — LICENSE-MIT
+- image-webp 0.2.4 — LICENSE-MIT
+- miniz_oxide 0.8.9 — LICENSE-MIT.md
+- miniz_oxide 0.9.1 — LICENSE-MIT.md
+- png 0.18.1 — LICENSE-MIT
+- quick-error 2.0.1 — LICENSE-MIT
+- simd-adler32 0.3.10 — LICENSE.md
+- weezl 0.1.12 — LICENSE-MIT
+- zune-core 0.5.3 — LICENSE-MIT
+- zune-jpeg 0.5.15 — LICENSE-MIT
+- rustls 0.23.46 — LICENSE-MIT
 - rustls-native-certs 0.8.4 — LICENSE-MIT
 - rustls-pki-types 1.15.1 — LICENSE-MIT
 - rustversion 1.0.23 — LICENSE-MIT
@@ -386,7 +421,7 @@ License texts are taken from the installed dependency packages. Identical terms 
 - thread_local 1.1.10 — LICENSE-MIT
 - time 0.3.55 — LICENSE-MIT
 - time-core 0.1.9 — LICENSE-MIT
-- tokio 1.52.3 — LICENSE
+- tokio 1.53.3 — LICENSE
 - tokio-rustls 0.26.4 — LICENSE-MIT
 - tokio-util 0.7.18 — LICENSE
 - tower 0.5.3 — LICENSE
@@ -636,6 +671,30 @@ Copyright (c) 2018-2019 Sean McArthur
 Copyright (c) 2018 Reizner Evgeniy
 
 Copyright (c) 2018-2026 The RustCrypto Project Developers
+
+Copyright (c) 2015 Andrew Gallant
+
+Copyright (c) 2016 PistonDevelopers
+
+Copyright (c) 2014-2026 Alex Crichton
+
+Copyright (c) 2015 nwin
+
+Copyright 2013-2014 RAD Game Tools and Valve Software
+
+Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+
+Copyright (c) 2017 Frommi
+
+Copyright (c) 2017-2024 oyvindln
+
+Copyright (c) 2015 The quick-error Developers
+
+Copyright (c) [2021] [Marvin Countryman]
+
+Copyright (c) HeroicKatora 2020
+
+Copyright (c) zune-image developers
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -2574,7 +2633,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## License group 15
 
-- rustls-webpki 0.103.15 — LICENSE
+- rustls-webpki 0.103.16 — LICENSE
 
 ````````text
 Except as otherwise noted, this project is licensed under the following
@@ -2963,3 +3022,57 @@ Permission is hereby granted, free of charge, to any person obtaining a copy
 ````````
 
 <!-- license-boundary-21 -->
+
+## License group 22
+
+- bytemuck 1.25.2 — LICENSE-MIT
+
+````````
+MIT License
+
+Copyright (c) 2019 Daniel "Lokathor" Gee.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next paragraph) shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````````
+
+<!-- license-boundary-22 -->
+
+## License group 23
+
+- moxcms 0.8.1 — LICENSE.md
+- pxfm 0.1.30 — LICENSE.md
+
+````````
+Copyright (c) Radzivon Bartoshyk. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1.  Redistributions of source code must retain the above copyright notice, this
+    list of conditions and the following disclaimer.
+
+2.  Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+3.  Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+````````
+
+<!-- license-boundary-23 -->

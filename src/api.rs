@@ -37,6 +37,7 @@ pub struct FileEntry {
     pub is_dir: bool,
     pub size: u64,
     pub modified: String,
+    pub modified_unix: Option<i64>,
     pub mime: String,
     pub icon: String,
     #[serde(default)]
@@ -240,7 +241,9 @@ fn get_icon(name: &str, is_dir: bool, mime: &str) -> String {
     }
     let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
     match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "svg" | "bmp" | "ico" | "avif" => "image",
+        "jpg" | "jpeg" | "jfif" | "png" | "gif" | "webp" | "svg" | "bmp" | "ico" | "avif" => {
+            "image"
+        }
         "mp4" | "mkv" | "webm" | "mov" | "avi" | "wmv" | "flv" => "video",
         "mp3" | "wav" | "flac" | "aac" | "ogg" | "wma" | "m4a" => "audio",
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" => "archive",
@@ -337,11 +340,7 @@ pub async fn list_files(
     } else {
         DirectoryEntryFilter::All
     };
-    let page_size = if query.gallery {
-        DEFAULT_PAGE_SIZE
-    } else {
-        page_size(query.limit)?
-    };
+    let page_size = page_size(query.limit)?;
     let cursor = decode_cursor(
         query.cursor.as_deref(),
         &share.storage_id,
@@ -415,6 +414,7 @@ pub async fn list_files(
             is_dir,
             size,
             modified,
+            modified_unix: entry.modified_unix,
             mime,
             icon,
             locked,
@@ -691,20 +691,30 @@ async fn file_response(
     mode: FileResponseMode,
     method: Method,
 ) -> AppResult<axum::response::Response> {
-    let share = resolve_share(&state, &headers, &query).await?;
-    ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Download).await?;
-    let backend = state.storage_backend(&share.storage_id).await?;
-    let request_path = query.path.as_deref().unwrap_or("");
-    check_folder_locks(
-        &state,
-        &headers,
-        &share.storage_id,
-        &share_storage_path(&share, request_path),
-    )
-    .await?;
-    let file = share_storage_path(&share, request_path);
+    let (backend, file) = authorized_file_read(&state, &headers, &query).await?;
     let response = backend.stream_file(&file, &headers, mode, &method).await?;
-    let subject = crate::traffic::browser_subject(&state, &headers).await;
+    meter_file_response(&state, &headers, response).await
+}
+
+async fn authorized_file_read(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &FileQuery,
+) -> AppResult<(crate::storage_backend::StorageBackend, String)> {
+    let share = resolve_share(state, headers, query).await?;
+    ensure_storage_action(state, headers, &share.storage_id, StorageAction::Download).await?;
+    let backend = state.storage_backend(&share.storage_id).await?;
+    let file = share_storage_path(&share, query.path.as_deref().unwrap_or(""));
+    check_folder_locks(state, headers, &share.storage_id, &file).await?;
+    Ok((backend, file))
+}
+
+async fn meter_file_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    response: axum::response::Response,
+) -> AppResult<axum::response::Response> {
+    let subject = crate::traffic::browser_subject(state, headers).await;
     Ok(state
         .download_limiter
         .wrap_response(state.traffic.download(response, subject).await?))
@@ -782,6 +792,17 @@ pub async fn preview_file(
     Query(query): Query<FileQuery>,
 ) -> AppResult<axum::response::Response> {
     file_response(state, headers, query, FileResponseMode::Preview, method).await
+}
+
+pub async fn thumbnail_file(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<FileQuery>,
+) -> AppResult<axum::response::Response> {
+    let (backend, file) = authorized_file_read(&state, &headers, &query).await?;
+    let response = crate::thumbnail::response(&state, &backend, &file, &headers, &method).await?;
+    meter_file_response(&state, &headers, response).await
 }
 
 /// POST /api/folder/unlock — verify a folder lock password and return a token cookie.
@@ -1035,7 +1056,7 @@ mod pagination_tests {
 
 #[cfg(test)]
 mod response_tests {
-    use super::{download_file, preview_file};
+    use super::{download_file, preview_file, thumbnail_file};
     use crate::{
         file_access::FileQuery,
         test_support::{app_state, TestDirectory},
@@ -1045,6 +1066,57 @@ mod response_tests {
         extract::{Query, State},
         http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     };
+
+    #[tokio::test]
+    async fn gallery_honors_each_supported_page_size_and_cursor() {
+        let directory = TestDirectory::new("gallery-selected-page-size");
+        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
+        for index in 0..113 {
+            tokio::fs::write(
+                state
+                    .config
+                    .storage_path
+                    .join(format!("photo-{index:03}.jpg")),
+                b"fixture",
+            )
+            .await
+            .unwrap();
+        }
+        let token = state.sessions.create().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("session={token}")).unwrap(),
+        );
+        for limit in [10, 20, 50, 100] {
+            let query = |cursor: Option<String>| {
+                serde_json::from_value::<super::FileListQuery>(serde_json::json!({
+                "storage_id": crate::config::DEFAULT_STORAGE_ID, "gallery": true, "limit": limit, "cursor": cursor
+            })).unwrap()
+            };
+            let first =
+                super::list_files(State(state.clone()), headers.clone(), Query(query(None)))
+                    .await
+                    .unwrap()
+                    .0;
+            assert_eq!(first.page_size, limit);
+            assert_eq!(first.entries.len(), limit);
+            let second = super::list_files(
+                State(state.clone()),
+                headers.clone(),
+                Query(query(first.next_cursor)),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(second.page_start, limit + 1);
+            assert_eq!(second.entries.len(), limit.min(113 - limit));
+            assert!(second
+                .entries
+                .iter()
+                .all(|item| !first.entries.iter().any(|old| old.path == item.path)));
+        }
+    }
 
     #[tokio::test]
     async fn download_and_preview_share_access_but_keep_their_response_modes() {
@@ -1106,5 +1178,133 @@ mod response_tests {
             to_bytes(preview.into_body(), 1024).await.unwrap(),
             "file content"
         );
+    }
+
+    #[tokio::test]
+    async fn thumbnail_requires_file_access_and_leaves_the_original_unchanged() {
+        let directory = TestDirectory::new("browser-thumbnail-response");
+        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
+        let mut source = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_fn(1280, 720, |x, y| {
+            image::Rgb([x as u8, y as u8, (x ^ y) as u8])
+        })
+        .write_to(&mut source, image::ImageFormat::Png)
+        .unwrap();
+        let source = source.into_inner();
+        tokio::fs::write(state.config.storage_path.join("photo.png"), &source)
+            .await
+            .unwrap();
+        let query = || FileQuery {
+            path: Some("photo.png".into()),
+            storage_id: Some(crate::config::DEFAULT_STORAGE_ID.into()),
+            batch: None,
+        };
+        assert!(thumbnail_file(
+            State(state.clone()),
+            Method::GET,
+            HeaderMap::new(),
+            Query(query())
+        )
+        .await
+        .is_err());
+        let token = state.sessions.create().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("session={token}")).unwrap(),
+        );
+        let thumb = thumbnail_file(
+            State(state.clone()),
+            Method::GET,
+            headers.clone(),
+            Query(query()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(thumb.headers()[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(thumb.headers()[header::CACHE_CONTROL], "private, no-cache");
+        let etag = thumb.headers()[header::ETAG].clone();
+        let thumb = to_bytes(thumb.into_body(), 256 * 1024).await.unwrap();
+        let decoded = image::load_from_memory(&thumb).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (640, 360));
+        // A cached request must not wait for the image CPU worker.
+        let workers = state.thumbnail_gate.available_permits() as u32;
+        let permit = state
+            .thumbnail_gate
+            .clone()
+            .acquire_many_owned(workers)
+            .await
+            .unwrap();
+        let mut conditional = headers.clone();
+        conditional.insert(header::IF_NONE_MATCH, etag.clone());
+        let unchanged = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            thumbnail_file(
+                State(state.clone()),
+                Method::GET,
+                conditional.clone(),
+                Query(query()),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            unchanged.headers()[header::CACHE_CONTROL],
+            "private, no-cache"
+        );
+        assert_eq!(unchanged.headers()[header::ETAG], etag);
+        assert!(to_bytes(unchanged.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(permit);
+        let original = preview_file(State(state.clone()), Method::GET, headers, Query(query()))
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(original.into_body(), source.len()).await.unwrap(),
+            source
+        );
+        let mut changed = std::io::Cursor::new(Vec::new());
+        // Valid JPEG bytes with a .png name must still produce a thumbnail.
+        image::RgbImage::from_pixel(640, 480, image::Rgb([200, 30, 50]))
+            .write_to(&mut changed, image::ImageFormat::Jpeg)
+            .unwrap();
+        tokio::fs::write(
+            state.config.storage_path.join("photo.png"),
+            changed.into_inner(),
+        )
+        .await
+        .unwrap();
+        let changed = thumbnail_file(
+            State(state.clone()),
+            Method::GET,
+            conditional.clone(),
+            Query(query()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(changed.headers()[header::ETAG], etag);
+        let bytes = to_bytes(changed.into_body(), 256 * 1024).await.unwrap();
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (640, 480));
+        assert!(thumbnail_file(
+            State(state.clone()),
+            Method::GET,
+            HeaderMap::new(),
+            Query(query())
+        )
+        .await
+        .is_err());
+        tokio::fs::remove_file(state.config.storage_path.join("photo.png"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            thumbnail_file(State(state), Method::GET, conditional, Query(query())).await,
+            Err(crate::error::AppError::NotFound)
+        ));
     }
 }

@@ -1,23 +1,83 @@
 /* eslint-disable vue/one-component-per-file */
-import { createApp, nextTick } from 'vue'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createApp, h, nextTick, reactive } from 'vue'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { FileEntry } from '../../shared/api/browser'
 import GalleryGrid from './GalleryGrid.vue'
 import GalleryLightbox from './GalleryLightbox.vue'
 
 afterEach(() => { vi.unstubAllGlobals(); document.body.replaceChildren() })
+beforeEach(() => { vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {}))) })
 
 function entry(name: string): FileEntry {
   return { name, path: `photos/${name}`, is_dir: false, size: 12, modified: '', mime: 'image/*', icon: 'image', locked: false }
 }
 
 describe('gallery presentation', () => {
-  it('shows only the six supported browser image formats in source order', async () => {
+  it('preserves source order when the number of vertically arranged images changes', async () => {
+    const host = document.createElement('div')
+    const props = reactive({ entries: Array.from({ length: 14 }, (_, i) => entry(`${i}.jpg`)), storageId: 'primary' })
+    const app = createApp({ render: () => h(GalleryGrid, props) })
+    app.mount(host)
+    const paths = () => [...host.querySelectorAll<HTMLElement>('.gallery-card')].map(card => card.dataset.entryPath)
+    expect(paths()).toEqual(props.entries.map(item => item.path))
+    props.entries = Array.from({ length: 20 }, (_, i) => entry(`${i}.jpg`))
+    await nextTick()
+    expect(paths()).toEqual(props.entries.map(item => item.path))
+    props.entries = props.entries.slice(0, 5)
+    await nextTick()
+    expect(paths()).toEqual(props.entries.map(item => item.path))
+    app.unmount()
+  })
+
+  it('retains unchanged image elements after deletion and updates URLs when file versions change', async () => {
+    const host = document.createElement('div')
+    const entries = Array.from({ length: 10 }, (_, i) => entry(`${i}.jpg`))
+    const props = reactive({ entries, storageId: 'primary' })
+    const app = createApp({ render: () => h(GalleryGrid, props) })
+    app.mount(host)
+    const before = [...host.querySelectorAll<HTMLImageElement>('img')]
+    props.entries = entries.slice(1)
+    await nextTick()
+    const after = [...host.querySelectorAll('img')]
+    expect(after).toHaveLength(before.length - 1)
+    expect(after.every((image, i) => image === before[i + 1])).toBe(true)
+    const oldUrl = after[0]!.getAttribute('src')
+    props.entries[0]!.modified = 'changed'
+    await nextTick()
+    expect(host.querySelector('img')!.getAttribute('src')).not.toBe(oldUrl)
+    app.unmount()
+  })
+
+  it('uses browser-native lazy thumbnail URLs without downloading original blobs', async () => {
+    const host = document.createElement('div')
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const entries = [entry('one.jpg'), entry('two.jpg')]
+    const props = reactive({ entries, storageId: 'primary', canDownload: true })
+    const app = createApp({ render: () => h(GalleryGrid, props) })
+    app.mount(host)
+    const loaded = host.querySelector<HTMLImageElement>('img')!
+    expect(host.querySelectorAll('img')).toHaveLength(2)
+    expect(loaded.getAttribute('src')).toContain('/api/thumbnail?')
+    expect(loaded.getAttribute('loading')).toBe('lazy')
+    expect(loaded.getAttribute('decoding')).toBe('async')
+    loaded.dispatchEvent(new Event('load'))
+    expect(loaded.classList.contains('is-loaded')).toBe(true)
+    loaded.dispatchEvent(new Event('error'))
+    expect(loaded.classList.contains('is-loaded')).toBe(false)
+    props.canDownload = false
+    await nextTick()
+    expect(host.querySelector('img')).toBeNull()
+    expect(fetchMock).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('shows browser image formats including JFIF in source order', async () => {
     const host = document.createElement('div')
     document.body.append(host)
     const app = createApp(GalleryGrid, {
       entries: [
-        entry('one.JPG'), entry('two.jpeg'), entry('three.png'), entry('four.webp'), entry('five.avif'), entry('six.gif'),
+        entry('one.JPG'), entry('two.jpeg'), entry('three.png'), entry('four.webp'), entry('five.avif'), entry('six.gif'), entry('seven.jfif'),
         entry('no.bmp'), entry('no.ico'), entry('no.svg'), entry('no.tiff'), entry('no.jxl'), entry('no.heic'), entry('no.raw'),
       ],
       storageId: 'primary',
@@ -26,13 +86,13 @@ describe('gallery presentation', () => {
     await nextTick()
 
     const cards = [...host.querySelectorAll<HTMLElement>('.gallery-card')]
-    expect(cards).toHaveLength(6)
-    expect(cards.map(card => card.querySelector('.gallery-card-open')?.getAttribute('aria-label'))).toEqual(['one.JPG', 'two.jpeg', 'three.png', 'four.webp', 'five.avif', 'six.gif'])
-    expect(host.querySelectorAll('.gallery-select')).toHaveLength(6)
+    expect(cards).toHaveLength(7)
+    expect(cards.map(card => card.querySelector('.gallery-card-open')?.getAttribute('aria-label'))).toEqual(['one.JPG', 'two.jpeg', 'three.png', 'four.webp', 'five.avif', 'six.gif', 'seven.jfif'])
+    expect(host.querySelectorAll('.gallery-select')).toHaveLength(7)
     expect(host.textContent).not.toContain('no.bmp')
     expect(host.textContent).not.toContain('one.JPG')
     expect(host.querySelector('.gallery-card-caption')).toBeNull()
-    expect(host.querySelector('img')?.getAttribute('src')).toContain('/api/preview?path=%2Fphotos%2Fone.JPG&storage_id=primary')
+    expect(host.querySelector('img')?.getAttribute('src')).toContain('/api/thumbnail?path=%2Fphotos%2Fone.JPG')
     app.unmount()
   })
 
@@ -53,28 +113,6 @@ describe('gallery presentation', () => {
     app.unmount()
   })
 
-  it('sizes gallery images from their natural aspect ratios', async () => {
-    const host = document.createElement('div')
-    document.body.append(host)
-    const app = createApp(GalleryGrid, { entries: [entry('wide.jpg'), entry('tall.jpg')], storageId: 'primary' })
-    app.mount(host)
-    await nextTick()
-
-    const wide = host.querySelectorAll<HTMLImageElement>('.gallery-card img')[0]!
-    const tall = host.querySelectorAll<HTMLImageElement>('.gallery-card img')[1]!
-    Object.defineProperties(wide, { naturalWidth: { value: 400 }, naturalHeight: { value: 200 } })
-    Object.defineProperties(tall, { naturalWidth: { value: 100 }, naturalHeight: { value: 200 } })
-    wide.dispatchEvent(new Event('load'))
-    tall.dispatchEvent(new Event('load'))
-    await nextTick()
-
-    const cards = [...host.querySelectorAll<HTMLElement>('.gallery-card')]
-    expect(cards[0]?.style.width).toBe('380px')
-    expect(cards[1]?.style.width).toBe('95px')
-    expect(cards[0]?.style.height).toBe('190px')
-    app.unmount()
-  })
-
   it('supports keyboard navigation, closing, and zooming in the lightbox', async () => {
     const host = document.createElement('div')
     document.body.append(host)
@@ -84,6 +122,7 @@ describe('gallery presentation', () => {
       storageId: 'primary',
       index: 1,
       total: 3,
+      thumbnailSource: 'blob:thumbnail',
       onPrevious: () => events.push('previous'),
       onNext: () => events.push('next'),
       onClose: () => events.push('close'),
@@ -112,6 +151,7 @@ describe('gallery presentation', () => {
       storageId: 'primary',
       index: 0,
       total: 1,
+      thumbnailSource: 'blob:thumbnail',
     })
     app.mount(host)
     await nextTick()
@@ -124,6 +164,7 @@ describe('gallery presentation', () => {
 
     image.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 100, clientY: 120 }))
     image.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: 145, clientY: 85 }))
+    await new Promise(requestAnimationFrame)
     await nextTick()
     expect(image.style.transform).toBe('translate(45px, -35px) scale(1.25)')
     expect(image.classList.contains('is-panning')).toBe(true)
@@ -139,7 +180,7 @@ describe('gallery presentation', () => {
   it('lets an image be dragged at 100% and below 100%', async () => {
     const host = document.createElement('div')
     document.body.append(host)
-    const app = createApp(GalleryLightbox, { entry: entry('small.jpg'), storageId: 'primary', index: 0, total: 1 })
+    const app = createApp(GalleryLightbox, { entry: entry('small.jpg'), storageId: 'primary', index: 0, total: 1, thumbnailSource: 'blob:thumbnail' })
     app.mount(host)
     await nextTick()
 
@@ -178,7 +219,7 @@ describe('gallery presentation', () => {
     app.mount(host)
     await nextTick()
 
-    document.body.querySelector('.gallery-lightbox-stage img')?.dispatchEvent(new Event('error'))
+    await new Promise(resolve => setTimeout(resolve, 0))
     await nextTick()
     expect(document.body.querySelector('.gallery-lightbox-stage img')).toBeNull()
     expect(document.body.querySelector('.gallery-lightbox-unavailable a')?.getAttribute('href'))

@@ -1,6 +1,6 @@
 export type PreviewKind = 'image' | 'video' | 'audio' | 'pdf' | 'text' | 'unsupported'
 
-const imageExtensions = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif'])
+const imageExtensions = new Set(['jpg', 'jpeg', 'jfif', 'png', 'gif', 'webp', 'avif'])
 const videoExtensions = new Set(['mp4', 'webm'])
 const audioExtensions = new Set(['mp3', 'm4a', 'wav', 'flac'])
 const textExtensions = new Set([

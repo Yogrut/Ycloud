@@ -11,13 +11,115 @@ function response(id = 'first', scope = 'guest', items = storages): FileListResp
 function listing() { return useBrowserListing({ announce: vi.fn(), resetSelection: vi.fn(), openLockedEntry: vi.fn(), requestStorageLogin: vi.fn() }) }
 function deferred<T>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>(yes => { resolve = yes })
-  return { promise, resolve }
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
 }
 
 const writable: BrowserCapabilities = { download: true, upload: true, create_directory: true, rename: true, move_items: true, copy: true, delete: true }
 const entry: FileEntry = { name: 'one.txt', path: 'folder/one.txt', is_dir: false, size: 3, modified: '2026-09-30T00:00:00Z', mime: 'text/plain', icon: 'file', locked: false }
 afterEach(() => { vi.restoreAllMocks(); localStorage.clear() })
+
+describe('gallery page transactions', () => {
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0))
+  const photo = (name: string): FileEntry => ({ ...entry, name, path: `photos/${name}`, mime: 'image/jpeg', icon: 'image' })
+
+  it('uses the selected gallery size and clears the preceding page cursor on changes', async () => {
+    const request = vi.spyOn(api, 'listFiles').mockImplementation(async (_path, _storage, options) => ({
+      ...response(), entries: Array.from({ length: options?.limit ?? 20 }, (_, index) => photo(`${index}.jpg`)),
+      next_cursor: 'next-page',
+    }))
+    const state = listing()
+    state.toggleGalleryMode()
+    await settle()
+    state.nextPage()
+    await settle()
+    expect(state.pageNumber.value).toBe(2)
+    for (const size of [10, 20, 50, 100] as const) {
+      state.pageSize.value = size
+      state.changePageSize()
+      await settle()
+      expect(state.pageNumber.value).toBe(1)
+      expect(request).toHaveBeenLastCalledWith('', 'first', expect.objectContaining({ limit: size, gallery: true, cursor: undefined }))
+      expect(state.entries.value).toHaveLength(size)
+    }
+    state.toggleGalleryMode()
+    await settle()
+    expect(request).toHaveBeenLastCalledWith('', 'first', expect.objectContaining({ limit: 100, gallery: undefined }))
+  })
+
+  it('keeps the original entries, cursor and page number on a failed turn', async () => {
+    const first = photo('first.jpg')
+    const second = photo('second.jpg')
+    const pending = deferred<FileListResponse>()
+    const request = vi.spyOn(api, 'listFiles')
+      .mockResolvedValueOnce({ ...response(), entries: [first], next_cursor: 'second-page' })
+      .mockReturnValueOnce(pending.promise)
+      .mockResolvedValueOnce({ ...response(), entries: [second] })
+    vi.spyOn(api, 'listStorages').mockResolvedValue(storages)
+    const state = listing()
+    state.toggleGalleryMode()
+    await settle()
+    state.nextPage()
+    expect(state.pageNumber.value).toBe(1)
+    expect(state.entries.value).toEqual([first])
+    expect(state.retainingGallery.value).toBe(true)
+    pending.reject(new ApiError('Unavailable', 503))
+    await settle()
+    expect(state.pageNumber.value).toBe(1)
+    expect(state.nextCursor.value).toBe('second-page')
+    expect(state.entries.value).toEqual([first])
+    state.nextPage()
+    await settle()
+    expect(request).toHaveBeenLastCalledWith('', 'first', expect.objectContaining({ cursor: 'second-page' }))
+    expect(state.pageNumber.value).toBe(2)
+    expect(state.entries.value).toEqual([second])
+  })
+
+  it('removes only confirmed files and retains the remaining page while filling it', async () => {
+    const removed = photo('remove.jpg')
+    const kept = photo('keep.jpg')
+    const replacement = photo('fill.jpg')
+    const refill = deferred<FileListResponse>()
+    const request = vi.spyOn(api, 'listFiles')
+      .mockResolvedValueOnce({ ...response(), entries: [removed, kept], next_cursor: 'next-page' })
+      .mockReturnValueOnce(refill.promise)
+    const state = listing()
+    state.toggleGalleryMode()
+    await settle()
+    await state.reconcileDeletion('second', ['/photos/remove.jpg'])
+    expect(state.entries.value).toEqual([removed, kept])
+    expect(request).toHaveBeenCalledTimes(1)
+    const deletion = state.reconcileDeletion('first', ['/photos/remove.jpg'])
+    expect(state.entries.value).toEqual([kept])
+    expect(state.retainingGallery.value).toBe(true)
+    refill.resolve({ ...response(), entries: [kept, replacement] })
+    await deletion
+    expect(state.pageNumber.value).toBe(1)
+    expect(state.entries.value).toEqual([kept, replacement])
+  })
+
+  it('returns to the preceding page after deleting the last image of the last page', async () => {
+    const first = photo('first.jpg')
+    const last = photo('last.jpg')
+    const request = vi.spyOn(api, 'listFiles')
+      .mockResolvedValueOnce({ ...response(), entries: [first], next_cursor: 'last-page' })
+      .mockResolvedValueOnce({ ...response(), entries: [last] })
+      .mockResolvedValueOnce(response())
+      .mockResolvedValueOnce({ ...response(), entries: [first] })
+    const state = listing()
+    state.toggleGalleryMode()
+    await settle()
+    state.nextPage()
+    await settle()
+    expect(state.pageNumber.value).toBe(2)
+    await state.reconcileDeletion('first', ['/photos/last.jpg'])
+    expect(request.mock.calls[2]?.[2]?.cursor).toBe('last-page')
+    expect(request.mock.calls[3]?.[2]?.cursor).toBeUndefined()
+    expect(state.pageNumber.value).toBe(1)
+    expect(state.entries.value).toEqual([first])
+  })
+})
 
 describe('storage selection', () => {
   it('starts with the first available storage and remembers manual selection', async () => {

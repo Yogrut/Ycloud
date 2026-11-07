@@ -43,6 +43,7 @@ pub struct AppState {
     pub webdav_gate: Arc<Semaphore>,
     pub(crate) webdav_credentials: crate::webdav::CredentialCache,
     pub(crate) directory_size_gate: Arc<Semaphore>,
+    pub(crate) thumbnail_gate: Arc<Semaphore>,
     pub login_security: LoginSecurity,
     pub upload_limiter: BandwidthLimiter,
     pub download_limiter: BandwidthLimiter,
@@ -186,6 +187,11 @@ impl AppState {
             webdav_gate: Arc::new(Semaphore::new(8)),
             webdav_credentials: crate::webdav::CredentialCache::default(),
             directory_size_gate: Arc::new(Semaphore::new(2)),
+            thumbnail_gate: Arc::new(Semaphore::new(
+                std::thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .min(2),
+            )),
             login_security,
             upload_limiter: BandwidthLimiter::new(persisted.upload_rate_bytes_per_sec),
             download_limiter: BandwidthLimiter::new(persisted.download_rate_bytes_per_sec),

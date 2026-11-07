@@ -3,25 +3,31 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { PhX } from '@phosphor-icons/vue'
 import type { FileEntry } from '../../shared/api/browser'
 import { downloadUrl, previewUrl } from '../../shared/api/browser'
+import { ApiError } from '../../shared/api/client'
 import { useLocale } from '../../shared/i18n'
-import { useMediaPreview } from '../../shared/composables/useMediaPreview'
 import { usePreviewDownload } from '../../shared/composables/usePreviewDownload'
+import { decodeImageBlob, fetchImageBlob } from './galleryImageResource'
 
 const props = defineProps<{
   entry: FileEntry
   storageId: string
   index: number
   total: number
+  thumbnailSource?: string
 }>()
 const emit = defineEmits<{ close: []; previous: []; next: [] }>()
 const locale = useLocale()
 const zoom = ref(100)
-const panX = ref(0)
-const panY = ref(0)
+const imageElement = ref<HTMLImageElement | null>(null)
 const dragging = ref(false)
-const source = computed(() => previewUrl(props.entry.path, props.storageId))
+const decodedOriginal = ref('')
+const originalLoading = ref(true)
+const imageError = ref(false)
+const trafficExhausted = ref(false)
+const thumbnailFailed = ref(false)
+const originalSource = computed(() => previewUrl(props.entry.path, props.storageId))
+const source = computed(() => decodedOriginal.value || (!thumbnailFailed.value ? props.thumbnailSource : undefined))
 const target = computed(() => downloadUrl(props.entry.path, props.storageId))
-const { failed: imageError, trafficExhausted, onError: handleImageError } = useMediaPreview(source)
 const { error: downloadError, startDownload } = usePreviewDownload(target)
 const minZoom = 50
 const maxZoom = 300
@@ -30,11 +36,21 @@ let dragStartX = 0
 let dragStartY = 0
 let dragOriginX = 0
 let dragOriginY = 0
+let panX = 0
+let panY = 0
+let panFrame: number | undefined
+
+function paintTransform(): void {
+  if (panFrame !== undefined) cancelAnimationFrame(panFrame)
+  panFrame = undefined
+  if (imageElement.value) imageElement.value.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom.value / 100})`
+}
 
 function resetPan(): void {
   dragging.value = false
-  panX.value = 0
-  panY.value = 0
+  panX = 0
+  panY = 0
+  paintTransform()
 }
 
 function setZoom(value: number): void {
@@ -52,25 +68,29 @@ function startPan(event: PointerEvent): void {
   dragging.value = true
   dragStartX = event.clientX
   dragStartY = event.clientY
-  dragOriginX = panX.value
-  dragOriginY = panY.value
+  dragOriginX = panX
+  dragOriginY = panY
   ;(event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId)
 }
 
 function movePan(event: PointerEvent): void {
   if (!dragging.value) return
-  panX.value = dragOriginX + event.clientX - dragStartX
-  panY.value = dragOriginY + event.clientY - dragStartY
+  panX = dragOriginX + event.clientX - dragStartX
+  panY = dragOriginY + event.clientY - dragStartY
+  // Pointer events can outnumber display frames. Updating only the image's
+  // transform avoids rendering the entire dialog for every pointer sample.
+  panFrame ??= requestAnimationFrame(paintTransform)
 }
 
 function stopPan(event: PointerEvent): void {
   if (!dragging.value) return
+  paintTransform()
   dragging.value = false
   ;(event.currentTarget as HTMLElement).releasePointerCapture?.(event.pointerId)
 }
 
 function handleWheel(event: WheelEvent): void {
-  if (imageError.value) return
+  if (!source.value) return
   setZoom(zoom.value + (event.deltaY < 0 ? zoomStep : -zoomStep))
 }
 
@@ -83,9 +103,45 @@ function handleKeydown(event: KeyboardEvent): void {
   if (event.key === '0') resetZoom()
 }
 
-watch(source, resetZoom, { flush: 'sync' })
+function onImageError(event: Event): void {
+  if (event.currentTarget !== imageElement.value || imageElement.value?.getAttribute('src') !== source.value) return
+  if (decodedOriginal.value) {
+    decodedOriginal.value = ''
+    imageError.value = true
+  } else thumbnailFailed.value = true
+}
+
+watch(originalSource, async (url, _previous, onCleanup) => {
+  const controller = new AbortController()
+  onCleanup(() => {
+    if (decodedOriginal.value && imageElement.value?.getAttribute('src') === decodedOriginal.value) imageElement.value.removeAttribute('src')
+    controller.abort()
+  })
+  resetZoom()
+  decodedOriginal.value = ''
+  originalLoading.value = true
+  imageError.value = false
+  trafficExhausted.value = false
+  thumbnailFailed.value = false
+  try {
+    const blob = await fetchImageBlob(url, controller.signal, 'high')
+    const resource = await decodeImageBlob(blob, controller.signal)
+    if (!controller.signal.aborted) decodedOriginal.value = resource.source
+  } catch (error) {
+    if (controller.signal.aborted) return
+    imageError.value = true
+    trafficExhausted.value = error instanceof ApiError && error.status === 429
+    if (error instanceof ApiError && [401, 403, 404].includes(error.status)) thumbnailFailed.value = true
+  } finally {
+    if (!controller.signal.aborted) originalLoading.value = false
+  }
+}, { immediate: true, flush: 'sync' })
+watch([imageElement, zoom], paintTransform, { flush: 'post' })
 onMounted(() => document.addEventListener('keydown', handleKeydown))
-onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
+onBeforeUnmount(() => {
+  document.removeEventListener('keydown', handleKeydown)
+  if (panFrame !== undefined) cancelAnimationFrame(panFrame)
+})
 </script>
 
 <template>
@@ -103,12 +159,15 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
           <span class="gallery-nav-chevron" aria-hidden="true" />
         </button>
         <div class="gallery-lightbox-stage" @wheel.prevent="handleWheel">
+          <div v-if="originalLoading" class="gallery-lightbox-loading" role="status">{{ locale.text('正在加载原图…', 'Loading original image…') }}</div>
           <img
-            v-if="!imageError"
+            v-if="source"
+            :key="originalSource"
+            ref="imageElement"
             :src="source"
             :alt="entry.name"
+            decoding="async"
             :class="{ 'is-panning': dragging }"
-            :style="{ transform: `translate(${panX}px, ${panY}px) scale(${zoom / 100})` }"
             draggable="false"
             @dblclick="zoom === 100 ? setZoom(200) : resetZoom()"
             @dragstart.prevent
@@ -116,9 +175,9 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
             @pointermove="movePan"
             @pointerup="stopPan"
             @pointercancel="stopPan"
-            @error="handleImageError"
+            @error="onImageError"
           >
-          <div v-else class="gallery-lightbox-unavailable">
+          <div v-if="imageError" class="gallery-lightbox-unavailable" :class="{ 'over-thumbnail': !!source }">
             <strong>{{ trafficExhausted ? locale.text('下载流量已用尽或剩余流量不足，请等待重置或联系管理员', 'Download allowance is exhausted or insufficient. Wait for the reset or contact the administrator.') : locale.text('浏览器无法预览此图片', 'This image cannot be previewed in the browser') }}</strong>
             <a v-if="!trafficExhausted" :href="target" @click.prevent="startDownload">{{ locale.text('下载文件', 'Download file') }}</a>
             <p v-if="downloadError">{{ downloadError }}</p>
@@ -127,7 +186,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
         <button class="gallery-lightbox-nav next" type="button" :disabled="index >= total - 1" :aria-label="locale.text('下一张图片', 'Next image')" @click="emit('next')">
           <span class="gallery-nav-chevron" aria-hidden="true" />
         </button>
-        <div v-if="!imageError" class="gallery-lightbox-toolbar" role="toolbar" :aria-label="locale.text('图片缩放', 'Image zoom')">
+        <div v-if="source" class="gallery-lightbox-toolbar" role="toolbar" :aria-label="locale.text('图片缩放', 'Image zoom')">
           <button type="button" :disabled="zoom <= minZoom" :aria-label="locale.text('缩小图片', 'Zoom out')" @click="setZoom(zoom - zoomStep)">−</button>
           <button class="gallery-zoom-value" type="button" :aria-label="locale.text('恢复原始缩放', 'Reset zoom')" @click="resetZoom">{{ zoom }}%</button>
           <button type="button" :disabled="zoom >= maxZoom" :aria-label="locale.text('放大图片', 'Zoom in')" @click="setZoom(zoom + zoomStep)">+</button>
@@ -220,7 +279,9 @@ onBeforeUnmount(() => document.removeEventListener('keydown', handleKeydown))
   touch-action: none;
   user-select: none;
 }
-.gallery-lightbox-stage img.is-panning { cursor: grabbing; transition: none; }
+.gallery-lightbox-stage img.is-panning { cursor: grabbing; transition: none; will-change: transform; }
+.gallery-lightbox-loading { position: absolute; z-index: 2; top: 58px; padding: 4px 8px; background: var(--panel); border-radius: 4px; color: var(--muted); pointer-events: none; }
+.gallery-lightbox-unavailable.over-thumbnail { position: absolute; z-index: 2; bottom: 64px; max-width: 80%; padding: 8px 12px; background: var(--panel); border-radius: 6px; }
 .gallery-lightbox-unavailable {
   display: grid;
   justify-items: center;

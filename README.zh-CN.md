@@ -61,7 +61,7 @@ cargo build --release --locked
 
 开发时在仓库根目录运行 `cargo run --locked`，另开终端在 `frontend/` 运行 `npm run dev`，访问 `http://127.0.0.1:5173`。Vite 将 API 请求转发到默认的后端地址 `127.0.0.1:18473`。首次启动生成的凭据保存在运行目录的 `initial-credentials.json`，请勿提交。
 
-图片加载性能测试请使用 `cargo run --release --locked`，避免把未优化的 debug 解码速度当作生产性能。画廊只请求缩略图，由浏览器自主缓存；原图只在当前预览中加载，不做 HTTP 缓存。
+画廊只下载小图，点开才加载原图。上传确认写入后即排队生成长边不超过 640 像素的私有缩略图，旧图首次显示时加入后台队列。libvips 子进程一次生成一张；小图缓存位于配置文件旁的磁盘目录，按需重建。Docker 已包含工具；独立运行时需在 PATH 中提供 `vipsheader` 和 `vipsthumbnail`（Linux 还需要 `prlimit`）。
 
 ## Docker Compose
 

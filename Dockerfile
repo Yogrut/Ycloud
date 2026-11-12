@@ -12,7 +12,7 @@ ARG YCLOUD_UID=10001
 ARG YCLOUD_GID=10001
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates \
+    && apt-get install --yes --no-install-recommends ca-certificates libvips-tools util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid "${YCLOUD_GID}" ycloud \
     && useradd --uid "${YCLOUD_UID}" --gid "${YCLOUD_GID}" --no-create-home --home-dir /var/lib/ycloud --shell /usr/sbin/nologin ycloud \

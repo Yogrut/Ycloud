@@ -104,7 +104,7 @@ describe('GalleryLightbox', () => {
 
   it('keeps an authorized thumbnail if the original is quota-denied, without a second request', async () => {
     showGallery()
-    requests[0]!.resolve(new Response(null, { status: 429 }))
+    requests[0]!.resolve(new Response(JSON.stringify({ error: { code: 'traffic_exhausted' } }), { status: 429 }))
     await settle()
     expect(image()?.getAttribute('src')).toBe('blob:thumb-primary-photo.jpg')
     const unavailable = document.body.querySelector('.gallery-lightbox-unavailable')!

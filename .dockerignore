@@ -4,6 +4,7 @@
 .obsidian
 Temporary
 .ycloud-system
+**/*.gallery-cache
 target
 frontend
 storage

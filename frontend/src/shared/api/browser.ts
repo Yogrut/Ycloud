@@ -206,8 +206,8 @@ export function previewUrl(path: string, storageId?: string): string {
   return withStorage(`/api/preview?path=${encodeURIComponent(`/${clean}`)}`, storageId)
 }
 
-export function thumbnailUrl(entry: FileEntry, storageId: string): string {
-  return actionApi('thumbnail', entry.path, storageId) + '&v=' + encodeURIComponent(JSON.stringify([entry.size, entry.modified_unix ?? entry.modified]))
+export function thumbnailUrl(path: string, storageId?: string): string {
+  return actionApi('thumbnail', path, storageId)
 }
 
 export async function renameItem(currentPath: string, path: string, newName: string, storageId?: string): Promise<{ success?: boolean }> {

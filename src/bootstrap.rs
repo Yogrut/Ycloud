@@ -29,6 +29,7 @@ pub async fn run() -> anyhow::Result<()> {
     let health_task = spawn_health_task(state.clone(), cleanup_signal.clone());
     let retired_task = spawn_retired_cleanup_task(state.clone(), cleanup_signal.clone());
     let cleanup_task = spawn_cleanup_task(state.clone(), cleanup_signal);
+    let gallery_task = state.gallery.spawn(state.clone(), cleanup_stop.subscribe());
     let router = app::build_router(state);
     let address = SocketAddr::new(runtime.bind_address, runtime.port);
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -48,6 +49,7 @@ pub async fn run() -> anyhow::Result<()> {
     .await;
 
     let _ = cleanup_stop.send(true);
+    let _ = gallery_task.await;
     let _ = cleanup_task.await;
     let _ = health_task.await;
     let _ = retired_task.await;

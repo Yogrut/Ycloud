@@ -62,6 +62,7 @@ pub(crate) enum TransferKind {
 /// point. Its identity is immutable after registration.
 #[derive(Clone)]
 pub struct StorageBackend {
+    pub(crate) gallery: Option<(crate::gallery::Gallery, String)>,
     active: Arc<ActiveStorage>,
     lease: Option<Arc<AdmissionLease>>,
     transfer: Option<tokio_util::sync::CancellationToken>,
@@ -225,7 +226,6 @@ struct ActiveStorage {
     capacity: CapacityTracker,
     local_reconcile_wake: Option<Arc<Notify>>,
     directory_snapshots: DirectorySnapshotStore,
-    thumbnails: crate::thumbnail::ThumbnailCache,
     lifecycle: Arc<RwLock<()>>,
     retired: AtomicBool,
     mutation_owners: Arc<tokio::sync::Semaphore>,
@@ -246,7 +246,6 @@ impl ActiveStorage {
             capacity,
             local_reconcile_wake,
             directory_snapshots: DirectorySnapshotStore::new(),
-            thumbnails: crate::thumbnail::ThumbnailCache::default(),
             lifecycle: Arc::new(RwLock::new(())),
             retired: AtomicBool::new(false),
             mutation_owners: Arc::new(tokio::sync::Semaphore::new(MAX_MUTATION_OWNERS)),
@@ -309,36 +308,6 @@ impl StorageBackend {
 
     pub(crate) fn instance_key(&self) -> usize {
         Arc::as_ptr(&self.active) as usize
-    }
-
-    pub(crate) fn thumbnail_cache(&self) -> &crate::thumbnail::ThumbnailCache {
-        &self.active.thumbnails
-    }
-
-    pub(crate) async fn thumbnail_version(&self, relative: &str) -> AppResult<Option<String>> {
-        match &self.active.kind {
-            StorageBackendKind::Local(storage) => {
-                let path = storage.resolve_existing(relative).await?;
-                let metadata = storage.metadata(&path).await?;
-                if metadata.is_dir() {
-                    return Err(AppError::BadRequest("Expected an image file".into()));
-                }
-                // This is an internal invalidation stamp, not a strong HTTP ETag.
-                Ok(metadata
-                    .modified()
-                    .ok()
-                    .map(|modified| format!("{}:{modified:?}", metadata.len())))
-            }
-            StorageBackendKind::S3(_) => {
-                let metadata = self.metadata(relative).await?;
-                if metadata.is_dir {
-                    return Err(AppError::BadRequest("Expected an image file".into()));
-                }
-                Ok(metadata
-                    .version_tag
-                    .map(|etag| format!("{}:{etag}", metadata.size)))
-            }
-        }
     }
 
     fn observe_result<T>(&self, result: &AppResult<T>) {
@@ -462,6 +431,7 @@ impl StorageBackend {
 
     pub fn local(storage: StorageService) -> Self {
         Self {
+            gallery: None,
             lease: None,
             transfer: None,
             active: Arc::new(ActiveStorage::new(
@@ -483,6 +453,7 @@ impl StorageBackend {
             CapacityTracker::new_with_ledger(capacity_limit, used, true, Some(ledger_path));
         capacity.set_reconcile_wake(&reconcile_wake);
         let backend = Self {
+            gallery: None,
             lease: None,
             transfer: None,
             active: Arc::new(ActiveStorage::new(
@@ -511,6 +482,7 @@ impl StorageBackend {
         // as current before an online reconciliation finishes.
         let used = persisted.unwrap_or(0);
         let backend = Self {
+            gallery: None,
             lease: None,
             transfer: None,
             active: Arc::new(ActiveStorage::new(
@@ -531,6 +503,31 @@ impl StorageBackend {
         let result = self.metadata_inner(relative).await;
         self.observe_result(&result);
         result
+    }
+
+    pub(crate) async fn gallery_stamp(&self, relative: &str) -> AppResult<(u64, String)> {
+        match &self.active.kind {
+            StorageBackendKind::Local(storage) => {
+                let resolved = storage.resolve_existing(relative).await?;
+                let metadata = storage.metadata(&resolved).await?;
+                if !metadata.is_file() {
+                    return Err(AppError::NotFound);
+                }
+                let modified = metadata.modified().map_err(|error| {
+                    AppError::with_source("failed to read image modification time", error)
+                })?;
+                let stamp = format!("{:?}:{modified:?}", storage.root());
+                Ok((metadata.len(), stamp))
+            }
+            StorageBackendKind::S3(_) => {
+                let metadata = self.metadata(relative).await?;
+                if metadata.is_dir {
+                    return Err(AppError::NotFound);
+                }
+                let stamp = format!("{:?}:{:?}", metadata.version_tag, metadata.modified_unix);
+                Ok((metadata.size, stamp))
+            }
+        }
     }
 
     async fn metadata_inner(&self, relative: &str) -> AppResult<BackendMetadata> {
@@ -850,7 +847,7 @@ impl StorageBackend {
         input.cancellation = Some(cancellation);
         let (relative, content_type) = (relative.to_owned(), content_type.map(str::to_owned));
         self.owned_mutation(move |backend| async move {
-            backend
+            let result = backend
                 .upload_file_mode_inner(
                     &relative,
                     input,
@@ -859,7 +856,19 @@ impl StorageBackend {
                     content_type.as_deref(),
                     create_only,
                 )
-                .await
+                .await;
+            if result.is_ok()
+                || result.as_ref().is_err_and(|error| {
+                    error.operation().is_some_and(|outcome| {
+                        outcome.commit == crate::error::CommitState::Committed
+                    })
+                })
+            {
+                if let Some((gallery, id)) = &backend.gallery {
+                    gallery.enqueue_committed(id, &relative);
+                }
+            }
+            result
         })
         .await
     }
@@ -1031,8 +1040,14 @@ impl StorageBackend {
 
     pub async fn remove(&self, relative: &str) -> AppResult<()> {
         let relative = relative.to_owned();
-        self.owned_mutation(move |backend| async move { backend.remove_inner(&relative).await })
-            .await
+        self.owned_mutation(move |backend| async move {
+            backend.remove_inner(&relative).await?;
+            if let Some((gallery, id)) = &backend.gallery {
+                gallery.forget(id, &relative).await;
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn remove_inner(&self, relative: &str) -> AppResult<()> {
@@ -1492,6 +1507,7 @@ mod tests {
             listener.local_addr().unwrap()
         ));
         let backend = StorageBackend {
+            gallery: None,
             lease: None,
             transfer: None,
             active: Arc::new(super::ActiveStorage::new(

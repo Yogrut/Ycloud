@@ -194,7 +194,7 @@ describe('BrowserView', () => {
     }))
     const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, options: RequestInit) => {
       const url = new URL(String(input), 'http://localhost')
-      if (url.pathname === '/api/thumbnail') {
+      if (url.pathname === '/api/preview' || url.pathname === '/api/thumbnail') {
         previewRequests.push(options.signal!)
         return new Promise(() => {})
       }
@@ -229,7 +229,7 @@ describe('BrowserView', () => {
     expect(host.querySelector('.page-size-select .app-select-trigger')?.getAttribute('aria-label')).toBe('每页图片数量')
     expect(toggle.getAttribute('aria-pressed')).toBe('true')
     expect(previewRequests).toHaveLength(0)
-    expect(host.querySelectorAll('.gallery-card img[src^="/api/thumbnail?"]')).toHaveLength(20)
+    expect(host.querySelectorAll('.gallery-card img')).toHaveLength(0)
 
     host.querySelector<HTMLButtonElement>('.gallery-select')!.click()
     await nextTick()
@@ -551,21 +551,29 @@ describe('BrowserView', () => {
     }
   })
 
-  it.each([true, false])('uses the normal download capability gate for gallery opening (allowed: %s)', async allowed => {
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response(JSON.stringify({
+  it.each([true, false])('only offers the gallery when downloading is allowed (allowed: %s)', async allowed => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({
       ...listResponse(['photo.jpg']),
       capabilities: { download: allowed, upload: false, create_directory: false, rename: false, move_items: false, copy: false, delete: false },
-    }))))
+    })))
+    vi.stubGlobal('fetch', fetchMock)
     const host = document.createElement('div')
     document.body.append(host)
     const app = mountBrowser(host)
     try {
       await new Promise(resolve => setTimeout(resolve, 0))
+      expect(host.querySelector('.gallery-toggle') !== null).toBe(allowed)
+      if (!allowed) {
+        expect(host.querySelector('.file-row')?.textContent).toContain('photo.jpg')
+        expect(host.querySelector('.gallery-grid')).toBeNull()
+        expect(fetchMock).toHaveBeenCalledTimes(1)
+        return
+      }
       openGallery(host)
       await new Promise(resolve => setTimeout(resolve, 0))
       host.querySelector<HTMLButtonElement>('.gallery-card-open')!.click()
       await nextTick()
-      expect(document.body.querySelector('.gallery-lightbox') !== null).toBe(allowed)
+      expect(document.body.querySelector('.gallery-lightbox')).not.toBeNull()
     } finally {
       app.unmount()
     }

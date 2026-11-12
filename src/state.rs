@@ -43,7 +43,7 @@ pub struct AppState {
     pub webdav_gate: Arc<Semaphore>,
     pub(crate) webdav_credentials: crate::webdav::CredentialCache,
     pub(crate) directory_size_gate: Arc<Semaphore>,
-    pub(crate) thumbnail_gate: Arc<Semaphore>,
+    pub(crate) gallery: crate::gallery::Gallery,
     pub login_security: LoginSecurity,
     pub upload_limiter: BandwidthLimiter,
     pub download_limiter: BandwidthLimiter,
@@ -168,6 +168,7 @@ impl AppState {
         upload_batches.bind_receipt_registry(backends.clone());
         let traffic =
             crate::traffic::TrafficStore::load(&config.config_path, config_file.clone()).await?;
+        let gallery = crate::gallery::Gallery::new(&config.config_path);
         Ok(Self {
             retired_storage,
             traffic,
@@ -187,11 +188,7 @@ impl AppState {
             webdav_gate: Arc::new(Semaphore::new(8)),
             webdav_credentials: crate::webdav::CredentialCache::default(),
             directory_size_gate: Arc::new(Semaphore::new(2)),
-            thumbnail_gate: Arc::new(Semaphore::new(
-                std::thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .min(2),
-            )),
+            gallery,
             login_security,
             upload_limiter: BandwidthLimiter::new(persisted.upload_rate_bytes_per_sec),
             download_limiter: BandwidthLimiter::new(persisted.download_rate_bytes_per_sec),
@@ -212,7 +209,9 @@ impl AppState {
         if !enabled {
             return Err(AppError::NotFound);
         }
-        self.backends.get(storage_id).await
+        let mut backend = self.backends.get(storage_id).await?;
+        backend.gallery = Some((self.gallery.clone(), storage_id.to_owned()));
+        Ok(backend)
     }
 
     pub async fn test_local_storage(&self, path: &str) -> AppResult<()> {

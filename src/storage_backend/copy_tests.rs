@@ -137,6 +137,7 @@ impl CopyFixture {
             Some(directory.path().join("ledger.json")),
         );
         let backend = StorageBackend {
+            gallery: None,
             active: Arc::new(ActiveStorage::new(
                 StorageBackendKind::S3(remote),
                 capacity,

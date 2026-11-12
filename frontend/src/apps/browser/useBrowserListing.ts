@@ -108,9 +108,16 @@ export function useBrowserListing(context: BrowserListingContext) {
     context.resetSelection()
   }
 
+  function setGalleryMode(enabled: boolean): void {
+    if (galleryMode.value === enabled) return
+    galleryMode.value = enabled
+    resetPagination()
+  }
+
   function clearListingEntries(): void {
     entries.value = []
     capabilities.value = emptyCapabilities()
+    setGalleryMode(false)
   }
 
   function applyListing(data: FileListResponse): void {
@@ -177,6 +184,16 @@ export function useBrowserListing(context: BrowserListingContext) {
       if (rememberNextSelection) {
         if (scope) rememberStorage(scope, data.storage_id)
         rememberNextSelection = false
+      }
+      if (galleryMode.value && data.capabilities?.download === false) {
+        clearListingEntries()
+        // A gallery cursor and its image-only results cannot be reused by the full list.
+        if (!data.empty_reason) {
+          await refresh()
+          return
+        }
+        applyListing(data)
+        return
       }
       if (fillAfterDelete && !data.empty_reason && !data.entries.length && cursorHistory.value.length) {
         await refresh({ target: previousTarget(), keepGallery: true })
@@ -303,8 +320,8 @@ export function useBrowserListing(context: BrowserListingContext) {
   }
 
   function toggleGalleryMode(): void {
-    galleryMode.value = !galleryMode.value
-    resetPagination()
+    if (!capabilities.value.download) return
+    setGalleryMode(!galleryMode.value)
     void refresh()
   }
 

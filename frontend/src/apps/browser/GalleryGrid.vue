@@ -1,34 +1,60 @@
 <script setup lang="ts">
-import { computed } from 'vue'
-import { thumbnailUrl, type FileEntry } from '../../shared/api/browser'
+import { computed, ref } from 'vue'
+import type { FileEntry } from '../../shared/api/browser'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import { useLocale } from '../../shared/i18n'
 import { previewKind } from '../../shared/previewFormats'
+import { galleryImageKey, useGalleryThumbnails } from './useGalleryThumbnails'
 
-const props = withDefaults(defineProps<{ entries: FileEntry[]; storageId: string; canDownload?: boolean; selected?: ReadonlySet<string> }>(), { canDownload: true })
+const props = withDefaults(defineProps<{ entries: FileEntry[]; storageId: string; canDownload?: boolean; paused?: boolean; selected?: ReadonlySet<string> }>(), { canDownload: true })
 const emit = defineEmits<{ open: [entry: FileEntry]; select: [entry: FileEntry]; contextMenu: [event: MouseEvent, entry: FileEntry] }>()
 const locale = useLocale()
 
-const imageEntries = computed(() => props.entries.filter(entry => !entry.is_dir && previewKind(entry.name) === 'image'))
+const grid = ref<HTMLElement | null>(null)
+const imageCards = computed(() => props.entries
+  .filter(entry => !entry.is_dir && previewKind(entry.name) === 'image')
+  .map(entry => ({ entry, key: galleryImageKey(entry, props.storageId) })))
+const candidates = computed(() => new Map(imageCards.value
+  .filter(({ entry }) => props.canDownload && !entry.locked)
+  .map(({ entry, key }) => [key, entry])))
+const { sources, ratios, status } = useGalleryThumbnails(grid, candidates, () => props)
+const cards = computed(() => imageCards.value.filter(({ key }) => status.get(key) !== 'invalid'))
+const statusLabel = (key: string) => {
+  switch (status.get(key)) {
+    case 'pending': return locale.text('正在生成缩略图', 'Generating thumbnail')
+    case 'traffic': return locale.text('下载流量不足', 'Download allowance insufficient')
+    case 'forbidden': return locale.text('图片不可访问', 'Image not accessible')
+    case 'limited': return locale.text('图片超出缩图处理范围', 'Image exceeds thumbnail limits')
+    case 'unavailable': return locale.text('无法生成缩略图', 'Thumbnail unavailable')
+    case 'network': return locale.text('缩略图加载失败', 'Thumbnail request failed')
+    default: return ''
+  }
+}
+defineExpose({ thumbnailFor: (entry: FileEntry) => sources.get(galleryImageKey(entry, props.storageId)) })
 </script>
 
 <template>
-  <div class="gallery-grid" :aria-label="locale.text(`画廊，共 ${imageEntries.length} 张图片`, `Gallery, ${imageEntries.length} images`)">
+  <div ref="grid" class="gallery-grid" :aria-label="locale.text(`画廊，共 ${cards.length} 张图片`, `Gallery, ${cards.length} images`)">
     <div
-      v-for="entry in imageEntries"
-      :key="`${storageId}:${entry.path}`"
+      v-for="{ entry, key } in cards"
+      :key="key"
       class="gallery-card"
+      :data-gallery-key="key"
       :data-entry-path="entry.path"
       :class="{ selected: selected?.has(entry.path) }"
       @contextmenu.stop="emit('contextMenu', $event, entry)"
     >
-      <button class="gallery-card-open" type="button" :aria-label="entry.name" @mousedown.stop @click="emit('open', entry)">
-        <img v-if="canDownload !== false && !entry.locked && !/\.avif$/i.test(entry.name)" :key="thumbnailUrl(entry, storageId)" :src="thumbnailUrl(entry, storageId)" :alt="entry.name" loading="lazy" decoding="async" fetchpriority="low" @load="($event.currentTarget as HTMLImageElement).classList.add('is-loaded')" @error="($event.currentTarget as HTMLImageElement).classList.remove('is-loaded')">
-        <span class="gallery-card-fallback" aria-hidden="true"><AppIcon name="file-image" :size="28" /></span>
+      <button class="gallery-card-open" type="button" :aria-label="entry.name" :style="{ aspectRatio: ratios.get(key) ?? 1.5 }" @mousedown.stop @click="emit('open', entry)">
+        <img v-if="candidates.has(key) && sources.has(key)" :src="sources.get(key)" :alt="entry.name" decoding="async" @load="($event.currentTarget as HTMLImageElement).classList.add('is-loaded')" @error="($event.currentTarget as HTMLImageElement).classList.remove('is-loaded')">
+        <span v-if="!sources.has(key)" class="gallery-card-fallback">
+          <span v-if="statusLabel(key)">{{ statusLabel(key) }}</span>
+          <AppIcon v-else name="file-image" :size="28" aria-hidden="true" />
+        </span>
       </button>
       <button class="gallery-select" :class="{ checked: selected?.has(entry.path) }" type="button" :aria-pressed="selected?.has(entry.path) ?? false" :aria-label="locale.text(`选择 ${entry.name}`, `Select ${entry.name}`)" @click.stop="emit('select', entry)" />
     </div>
   </div>
+  <div v-if="!cards.length && imageCards.length" class="empty">{{ locale.text('没有可展示的图片', 'No images to display') }}</div>
 </template>
 
 <style scoped>
@@ -53,11 +79,12 @@ const imageEntries = computed(() => props.entries.filter(entry => !entry.is_dir 
 .gallery-card.selected::after { position: absolute; z-index: 2; inset: 0; content: ''; border: 2px solid var(--accent); pointer-events: none; }
 .gallery-card-open { position: relative; width: 100%; display: block; padding: 0; background: transparent; border: 0; line-height: 0; cursor: zoom-in; -webkit-touch-callout: none; }
 .gallery-card-open img {
-  position: relative;
+  position: absolute;
+  inset: 0;
   z-index: 1;
   width: 100%;
-  height: auto;
-  aspect-ratio: auto 3 / 2;
+  height: 100%;
+  object-fit: contain;
   display: block;
   opacity: 0;
 }
@@ -78,6 +105,7 @@ const imageEntries = computed(() => props.entries.filter(entry => !entry.is_dir 
   display: grid;
   place-items: center;
   color: var(--muted-2);
+  font-size: .85rem;
+  line-height: 1.3;
 }
-.gallery-card-fallback:first-child { position: relative; aspect-ratio: 3 / 2; }
 </style>

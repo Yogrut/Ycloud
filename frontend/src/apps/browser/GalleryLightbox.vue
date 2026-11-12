@@ -124,13 +124,13 @@ watch(originalSource, async (url, _previous, onCleanup) => {
   trafficExhausted.value = false
   thumbnailFailed.value = false
   try {
-    const blob = await fetchImageBlob(url, controller.signal, 'high')
+    const blob = await fetchImageBlob(url, controller.signal)
     const resource = await decodeImageBlob(blob, controller.signal)
     if (!controller.signal.aborted) decodedOriginal.value = resource.source
   } catch (error) {
     if (controller.signal.aborted) return
     imageError.value = true
-    trafficExhausted.value = error instanceof ApiError && error.status === 429
+    trafficExhausted.value = error instanceof ApiError && error.code === 'traffic_exhausted'
     if (error instanceof ApiError && [401, 403, 404].includes(error.status)) thumbnailFailed.value = true
   } finally {
     if (!controller.signal.aborted) originalLoading.value = false

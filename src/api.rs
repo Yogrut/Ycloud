@@ -691,25 +691,25 @@ async fn file_response(
     mode: FileResponseMode,
     method: Method,
 ) -> AppResult<axum::response::Response> {
-    let (backend, file) = authorized_file_read(&state, &headers, &query).await?;
+    let (_, backend, file) = authorized_file_read(&state, &headers, &query).await?;
     let response = backend.stream_file(&file, &headers, mode, &method).await?;
-    meter_file_response(&state, &headers, response).await
+    meter_download(&state, &headers, response).await
 }
 
 async fn authorized_file_read(
     state: &AppState,
     headers: &HeaderMap,
     query: &FileQuery,
-) -> AppResult<(crate::storage_backend::StorageBackend, String)> {
+) -> AppResult<(String, crate::storage_backend::StorageBackend, String)> {
     let share = resolve_share(state, headers, query).await?;
     ensure_storage_action(state, headers, &share.storage_id, StorageAction::Download).await?;
     let backend = state.storage_backend(&share.storage_id).await?;
     let file = share_storage_path(&share, query.path.as_deref().unwrap_or(""));
     check_folder_locks(state, headers, &share.storage_id, &file).await?;
-    Ok((backend, file))
+    Ok((share.storage_id, backend, file))
 }
 
-async fn meter_file_response(
+async fn meter_download(
     state: &AppState,
     headers: &HeaderMap,
     response: axum::response::Response,
@@ -718,6 +718,24 @@ async fn meter_file_response(
     Ok(state
         .download_limiter
         .wrap_response(state.traffic.download(response, subject).await?))
+}
+
+pub async fn thumbnail_file(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<FileQuery>,
+) -> AppResult<axum::response::Response> {
+    let (id, backend, file) = authorized_file_read(&state, &headers, &query).await?;
+    let response = state
+        .gallery
+        .response(&backend, &id, &file, &method)
+        .await?;
+    if response.status() == axum::http::StatusCode::OK {
+        meter_download(&state, &headers, response).await
+    } else {
+        Ok(response)
+    }
 }
 
 pub async fn delete_file(
@@ -792,17 +810,6 @@ pub async fn preview_file(
     Query(query): Query<FileQuery>,
 ) -> AppResult<axum::response::Response> {
     file_response(state, headers, query, FileResponseMode::Preview, method).await
-}
-
-pub async fn thumbnail_file(
-    State(state): State<AppState>,
-    method: Method,
-    headers: HeaderMap,
-    Query(query): Query<FileQuery>,
-) -> AppResult<axum::response::Response> {
-    let (backend, file) = authorized_file_read(&state, &headers, &query).await?;
-    let response = crate::thumbnail::response(&state, &backend, &file, &headers, &method).await?;
-    meter_file_response(&state, &headers, response).await
 }
 
 /// POST /api/folder/unlock — verify a folder lock password and return a token cookie.
@@ -1056,7 +1063,7 @@ mod pagination_tests {
 
 #[cfg(test)]
 mod response_tests {
-    use super::{download_file, preview_file, thumbnail_file};
+    use super::{download_file, preview_file};
     use crate::{
         file_access::FileQuery,
         test_support::{app_state, TestDirectory},
@@ -1169,7 +1176,7 @@ mod response_tests {
             "file content"
         );
 
-        let preview = preview_file(State(state), Method::GET, headers, Query(query()))
+        let preview = preview_file(State(state.clone()), Method::GET, headers, Query(query()))
             .await
             .unwrap();
         assert_eq!(preview.status(), StatusCode::OK);
@@ -1178,133 +1185,5 @@ mod response_tests {
             to_bytes(preview.into_body(), 1024).await.unwrap(),
             "file content"
         );
-    }
-
-    #[tokio::test]
-    async fn thumbnail_requires_file_access_and_leaves_the_original_unchanged() {
-        let directory = TestDirectory::new("browser-thumbnail-response");
-        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
-        let mut source = std::io::Cursor::new(Vec::new());
-        image::RgbImage::from_fn(1280, 720, |x, y| {
-            image::Rgb([x as u8, y as u8, (x ^ y) as u8])
-        })
-        .write_to(&mut source, image::ImageFormat::Png)
-        .unwrap();
-        let source = source.into_inner();
-        tokio::fs::write(state.config.storage_path.join("photo.png"), &source)
-            .await
-            .unwrap();
-        let query = || FileQuery {
-            path: Some("photo.png".into()),
-            storage_id: Some(crate::config::DEFAULT_STORAGE_ID.into()),
-            batch: None,
-        };
-        assert!(thumbnail_file(
-            State(state.clone()),
-            Method::GET,
-            HeaderMap::new(),
-            Query(query())
-        )
-        .await
-        .is_err());
-        let token = state.sessions.create().await;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::COOKIE,
-            HeaderValue::from_str(&format!("session={token}")).unwrap(),
-        );
-        let thumb = thumbnail_file(
-            State(state.clone()),
-            Method::GET,
-            headers.clone(),
-            Query(query()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(thumb.headers()[header::CONTENT_TYPE], "image/jpeg");
-        assert_eq!(thumb.headers()[header::CACHE_CONTROL], "private, no-cache");
-        let etag = thumb.headers()[header::ETAG].clone();
-        let thumb = to_bytes(thumb.into_body(), 256 * 1024).await.unwrap();
-        let decoded = image::load_from_memory(&thumb).unwrap();
-        assert_eq!((decoded.width(), decoded.height()), (640, 360));
-        // A cached request must not wait for the image CPU worker.
-        let workers = state.thumbnail_gate.available_permits() as u32;
-        let permit = state
-            .thumbnail_gate
-            .clone()
-            .acquire_many_owned(workers)
-            .await
-            .unwrap();
-        let mut conditional = headers.clone();
-        conditional.insert(header::IF_NONE_MATCH, etag.clone());
-        let unchanged = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            thumbnail_file(
-                State(state.clone()),
-                Method::GET,
-                conditional.clone(),
-                Query(query()),
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(unchanged.status(), StatusCode::NOT_MODIFIED);
-        assert_eq!(
-            unchanged.headers()[header::CACHE_CONTROL],
-            "private, no-cache"
-        );
-        assert_eq!(unchanged.headers()[header::ETAG], etag);
-        assert!(to_bytes(unchanged.into_body(), 1024)
-            .await
-            .unwrap()
-            .is_empty());
-        drop(permit);
-        let original = preview_file(State(state.clone()), Method::GET, headers, Query(query()))
-            .await
-            .unwrap();
-        assert_eq!(
-            to_bytes(original.into_body(), source.len()).await.unwrap(),
-            source
-        );
-        let mut changed = std::io::Cursor::new(Vec::new());
-        // Valid JPEG bytes with a .png name must still produce a thumbnail.
-        image::RgbImage::from_pixel(640, 480, image::Rgb([200, 30, 50]))
-            .write_to(&mut changed, image::ImageFormat::Jpeg)
-            .unwrap();
-        tokio::fs::write(
-            state.config.storage_path.join("photo.png"),
-            changed.into_inner(),
-        )
-        .await
-        .unwrap();
-        let changed = thumbnail_file(
-            State(state.clone()),
-            Method::GET,
-            conditional.clone(),
-            Query(query()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(changed.status(), StatusCode::OK);
-        assert_ne!(changed.headers()[header::ETAG], etag);
-        let bytes = to_bytes(changed.into_body(), 256 * 1024).await.unwrap();
-        let decoded = image::load_from_memory(&bytes).unwrap();
-        assert_eq!((decoded.width(), decoded.height()), (640, 480));
-        assert!(thumbnail_file(
-            State(state.clone()),
-            Method::GET,
-            HeaderMap::new(),
-            Query(query())
-        )
-        .await
-        .is_err());
-        tokio::fs::remove_file(state.config.storage_path.join("photo.png"))
-            .await
-            .unwrap();
-        assert!(matches!(
-            thumbnail_file(State(state), Method::GET, conditional, Query(query())).await,
-            Err(crate::error::AppError::NotFound)
-        ));
     }
 }

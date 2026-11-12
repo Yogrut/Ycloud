@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "fs", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "fs", "io-util", "sync", "time", "process"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["request-id", "sensitive-headers", "trace"] }
 serde = { version = "1", features = ["derive"] }
@@ -36,7 +36,6 @@ http-body = "1"
 http-body-util = "0.1"
 httpdate = "1.0.3"
 roxmltree = { version = "0.21.1", default-features = false, features = ["std"] }
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

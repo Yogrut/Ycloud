@@ -4,9 +4,33 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { FileEntry } from '../../shared/api/browser'
 import GalleryGrid from './GalleryGrid.vue'
 import GalleryLightbox from './GalleryLightbox.vue'
+import { fetchGalleryThumbnail, type ThumbnailResult } from './galleryImageResource'
+
+vi.mock('./galleryImageResource', async importOriginal => ({
+  ...await importOriginal<typeof import('./galleryImageResource')>(),
+  fetchGalleryThumbnail: vi.fn(),
+}))
+
+let changeVisibility: (node: Element, visible: boolean) => void
+const createThumbnail = vi.mocked(fetchGalleryThumbnail)
+const thumbnail = (): ThumbnailResult => ({ status: 'ready', thumb: { bytes: new Blob(['thumbnail'], { type: 'image/jpeg' }), ratio: 0.75 } })
 
 afterEach(() => { vi.unstubAllGlobals(); document.body.replaceChildren() })
-beforeEach(() => { vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {}))) })
+beforeEach(() => {
+  vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})))
+  vi.stubGlobal('IntersectionObserver', class {
+    constructor(callback: IntersectionObserverCallback) {
+      changeVisibility = (target, isIntersecting) => callback(
+        [{ target, isIntersecting, intersectionRatio: isIntersecting ? 1 : 0 } as IntersectionObserverEntry],
+        this as unknown as IntersectionObserver,
+      )
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  })
+  createThumbnail.mockReset().mockImplementation(async () => thumbnail())
+})
 
 function entry(name: string): FileEntry {
   return { name, path: `photos/${name}`, is_dir: false, size: 12, modified: '', mime: 'image/*', icon: 'image', locked: false }
@@ -29,46 +53,97 @@ describe('gallery presentation', () => {
     app.unmount()
   })
 
-  it('retains unchanged image elements after deletion and updates URLs when file versions change', async () => {
+  it('retains unchanged cards after deletion and replaces a card when its file version changes', async () => {
     const host = document.createElement('div')
     const entries = Array.from({ length: 10 }, (_, i) => entry(`${i}.jpg`))
     const props = reactive({ entries, storageId: 'primary' })
     const app = createApp({ render: () => h(GalleryGrid, props) })
     app.mount(host)
-    const before = [...host.querySelectorAll<HTMLImageElement>('img')]
+    const before = [...host.querySelectorAll('.gallery-card')]
     props.entries = entries.slice(1)
     await nextTick()
-    const after = [...host.querySelectorAll('img')]
+    const after = [...host.querySelectorAll('.gallery-card')]
     expect(after).toHaveLength(before.length - 1)
     expect(after.every((image, i) => image === before[i + 1])).toBe(true)
-    const oldUrl = after[0]!.getAttribute('src')
     props.entries[0]!.modified = 'changed'
     await nextTick()
-    expect(host.querySelector('img')!.getAttribute('src')).not.toBe(oldUrl)
+    expect(host.querySelector('.gallery-card')).not.toBe(after[0])
     app.unmount()
   })
 
-  it('uses browser-native lazy thumbnail URLs without downloading original blobs', async () => {
+  it('keeps only visible image URLs and reads the authorized disk thumbnail on return', async () => {
     const host = document.createElement('div')
-    const fetchMock = vi.fn()
-    vi.stubGlobal('fetch', fetchMock)
-    const entries = [entry('one.jpg'), entry('two.jpg')]
+    const entries = Array.from({ length: 100 }, (_, index) => entry(`${index}.jpg`))
     const props = reactive({ entries, storageId: 'primary', canDownload: true })
     const app = createApp({ render: () => h(GalleryGrid, props) })
     app.mount(host)
-    const loaded = host.querySelector<HTMLImageElement>('img')!
-    expect(host.querySelectorAll('img')).toHaveLength(2)
-    expect(loaded.getAttribute('src')).toContain('/api/thumbnail?')
-    expect(loaded.getAttribute('loading')).toBe('lazy')
-    expect(loaded.getAttribute('decoding')).toBe('async')
-    loaded.dispatchEvent(new Event('load'))
-    expect(loaded.classList.contains('is-loaded')).toBe(true)
-    loaded.dispatchEvent(new Event('error'))
-    expect(loaded.classList.contains('is-loaded')).toBe(false)
+    const first = () => host.querySelector('.gallery-card')!
+    const image = () => first().querySelector('img')
+    expect(host.querySelectorAll('.gallery-card')).toHaveLength(100)
+    expect(image()).toBeNull()
+    changeVisibility(first(), true)
+    await vi.waitFor(() => expect(image()?.src).toMatch(/^blob:/))
+    expect(host.querySelectorAll('img')).toHaveLength(1)
+    expect(createThumbnail).toHaveBeenCalledExactlyOnceWith('/api/thumbnail?path=%2Fphotos%2F0.jpg&storage_id=primary', expect.any(AbortSignal))
+    const oldSource = image()?.src
+    const ratio = first().querySelector('button')?.style.aspectRatio
+    changeVisibility(first(), false)
+    await nextTick()
+    expect(image()).toBeNull()
+    expect(first().querySelector('button')?.style.aspectRatio).toBe(ratio)
+    changeVisibility(first(), true)
+    await vi.waitFor(() => expect(image()?.src).toMatch(/^blob:/))
+    expect(image()?.src).not.toBe(oldSource)
+
+    props.entries = [entry('next.jpg')]
+    await nextTick()
+    props.entries = entries
+    await nextTick()
+    changeVisibility(first(), true)
+    await vi.waitFor(() => expect(image()?.src).toMatch(/^blob:/))
+    expect(createThumbnail).toHaveBeenCalledTimes(3)
     props.canDownload = false
     await nextTick()
     expect(host.querySelector('img')).toBeNull()
-    expect(fetchMock).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('loads a thumbnail regardless of original file size and hides confirmed invalid files', async () => {
+    const host = document.createElement('div')
+    createThumbnail.mockImplementationOnce(async () => ({ status: 'invalid' }))
+    const app = createApp(GalleryGrid, {
+      entries: [
+        entry('not-image.jpg'),
+        { ...entry('large.jpg'), size: 100 * 1024 * 1024 },
+      ],
+      storageId: 'primary',
+    })
+    app.mount(host)
+    const [invalid, large] = host.querySelectorAll('.gallery-card')
+    changeVisibility(invalid!, true)
+    changeVisibility(large!, true)
+    await vi.waitFor(() => expect(large!.querySelector('img')?.src).toMatch(/^blob:/))
+    expect(host.contains(invalid!)).toBe(false)
+    expect(createThumbnail).toHaveBeenLastCalledWith('/api/thumbnail?path=%2Fphotos%2Flarge.jpg&storage_id=primary', expect.any(AbortSignal))
+    app.unmount()
+  })
+
+  it('cancels an obsolete source without mounting its late result', async () => {
+    const host = document.createElement('div')
+    let finish!: (value: ReturnType<typeof thumbnail>) => void
+    createThumbnail.mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const app = createApp(GalleryGrid, { entries: [entry('first.jpg'), entry('second.jpg')], storageId: 'primary' })
+    app.mount(host)
+    const [first, second] = host.querySelectorAll('.gallery-card')
+    changeVisibility(first!, true)
+    await vi.waitFor(() => expect(createThumbnail).toHaveBeenCalledTimes(1))
+    const signal = createThumbnail.mock.calls[0]![1]
+    changeVisibility(first!, false)
+    expect(signal.aborted).toBe(true)
+    changeVisibility(second!, true)
+    finish(thumbnail())
+    await vi.waitFor(() => expect(second!.querySelector('img')?.src).toMatch(/^blob:/))
+    expect(first!.querySelector('img')).toBeNull()
     app.unmount()
   })
 
@@ -92,7 +167,7 @@ describe('gallery presentation', () => {
     expect(host.textContent).not.toContain('no.bmp')
     expect(host.textContent).not.toContain('one.JPG')
     expect(host.querySelector('.gallery-card-caption')).toBeNull()
-    expect(host.querySelector('img')?.getAttribute('src')).toContain('/api/thumbnail?path=%2Fphotos%2Fone.JPG')
+    expect(host.querySelector('img')).toBeNull()
     app.unmount()
   })
 

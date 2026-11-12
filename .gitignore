@@ -15,6 +15,7 @@
 /config.json.bak
 /config.json.pre-migration
 /initial-credentials.json
+/*.gallery-cache/
 /traffic-usage.json
 /traffic-usage.jsonl
 /security-events.json

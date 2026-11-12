@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { BrowserCapabilities, FileEntry } from '../../shared/api/browser'
-import { thumbnailUrl } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import AppFeedback from '../../shared/components/AppFeedback.vue'
@@ -106,9 +105,10 @@ const {
   moveGalleryEntry, closeGalleryEntry, closeFilePreview, closePendingDownload,
 } = useBrowserPreviews({ storageId: currentStorageId, visibleEntries, announce })
 
+const galleryGrid = ref<InstanceType<typeof GalleryGrid> | null>(null)
 const galleryThumbnailSource = computed(() => galleryStorageId.value === currentStorageId.value && activeGalleryEntry.value
-  && capabilities.value.download && !activeGalleryEntry.value.locked && !/\.avif$/i.test(activeGalleryEntry.value.name)
-  ? thumbnailUrl(activeGalleryEntry.value, currentStorageId.value) : undefined)
+  && capabilities.value.download && !activeGalleryEntry.value.locked
+  ? galleryGrid.value?.thumbnailFor(activeGalleryEntry.value) : undefined)
 
 function changeGalleryMode(): void {
   closeGalleryEntry()
@@ -354,6 +354,7 @@ onBeforeUnmount(() => {
       </div>
       <div class="top-actions">
         <button
+          v-if="capabilities.download"
           class="icon-btn flat gallery-toggle"
           :class="{ active: galleryMode }"
           type="button"
@@ -415,7 +416,7 @@ onBeforeUnmount(() => {
         <div v-else-if="emptyReason" class="empty file-list-body">{{ emptyReason === 'unconfigured' ? locale.text('尚未配置存储，请管理员在后台添加存储。', 'No storage configured. Ask an administrator to add one.') : emptyReason === 'forbidden' ? locale.text('当前账号没有可访问的存储。', 'No storage is accessible to this account.') : locale.text('存储暂不可用，请稍后重试。', 'Storage is temporarily unavailable. Please try again later.') }}</div>
         <div v-else-if="!(galleryMode ? galleryImages.length : visibleEntries.length)" class="empty file-list-body">{{ appliedQuery ? locale.text('没有匹配的文件', 'No matching files') : galleryMode ? locale.text('此文件夹没有可展示的图片', 'No supported images in this folder') : locale.text('此文件夹为空', 'This folder is empty') }}</div>
         <div v-else-if="galleryMode" class="file-list-body gallery-list-body">
-          <GalleryGrid :entries="visibleEntries" :storage-id="currentStorageId" :can-download="capabilities.download" :selected="selected" @open="openEntry" @select="toggleSelection($event.path)" @context-menu="openRowMenu" />
+          <GalleryGrid ref="galleryGrid" :key="JSON.stringify([currentStorageId, path, pageSize, appliedQuery])" :entries="visibleEntries" :storage-id="currentStorageId" :can-download="capabilities.download" :paused="!!activeGalleryEntry || loading" :selected="selected" @open="openEntry" @select="toggleSelection($event.path)" @context-menu="openRowMenu" />
         </div>
         <div v-else class="file-list-body">
           <div

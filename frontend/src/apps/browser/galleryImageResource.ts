@@ -49,8 +49,10 @@ export interface GalleryThumbnail {
 export type ThumbnailStatus = 'pending' | 'invalid' | 'limited' | 'unavailable' | 'traffic' | 'forbidden' | 'network'
 export type ThumbnailResult = { status: 'ready'; thumb: GalleryThumbnail } | { status: ThumbnailStatus }
 
+// Ready thumbnails carry a short private Cache-Control, so a repeat request may
+// be answered from the browser cache instead of the network.
 export function fetchGalleryThumbnail(url: string, signal: AbortSignal): Promise<ThumbnailResult> {
-  return requestWithDeadline(url, { signal, priority: 'low', cache: 'no-store' }, async response => {
+  return requestWithDeadline(url, { signal, priority: 'low' }, async response => {
     switch (response.status) {
       case 202: return { status: 'pending' }
       case 401:

@@ -3,7 +3,8 @@ import { thumbnailUrl, type FileEntry } from '../../shared/api/browser'
 import { fetchGalleryThumbnail, type ThumbnailStatus } from './galleryImageResource'
 
 const SCROLL_IDLE_FALLBACK_MS = 120
-const MAX_ACTIVE = 3
+const MAX_ACTIVE = 6
+const MAX_CACHED = 400
 const PENDING_INTERVAL_MS = 2_000
 
 export function galleryImageKey(entry: FileEntry, storageId: string): string {
@@ -38,6 +39,16 @@ export function useGalleryThumbnails(
     sources.delete(key)
   }
 
+  // Decoded thumbnails stay alive while their card is off screen: revoking the
+  // blob URL blanks the image and forces a fresh download when it scrolls back.
+  function trimSources(): void {
+    while (sources.size > MAX_CACHED) {
+      const oldest = sources.keys().next()
+      if (oldest.done) return
+      dropSource(oldest.value)
+    }
+  }
+
   function schedule(): void {
     if (disposed || frame !== undefined) return
     frame = requestAnimationFrame(() => {
@@ -50,9 +61,7 @@ export function useGalleryThumbnails(
     clearTimeout(pendingTimer)
     const allowed = candidates.value
     const { paused } = options()
-    for (const key of sources.keys()) {
-      if (!visible.has(key) || !allowed.has(key)) dropSource(key)
-    }
+    for (const key of sources.keys()) if (!allowed.has(key)) dropSource(key)
     for (const [key, controller] of active) {
       if (paused || fastScroll || !visible.has(key) || !allowed.has(key)) controller.abort()
     }
@@ -92,6 +101,7 @@ export function useGalleryThumbnails(
       pendingUntil.delete(key)
       ratios.set(key, thumb.ratio)
       sources.set(key, URL.createObjectURL(thumb.bytes))
+      trimSources()
     } catch {
       if (!controller.signal.aborted) status.set(key, 'network')
     } finally {
@@ -161,7 +171,6 @@ export function useGalleryThumbnails(
         if (entry.isIntersecting && entry.intersectionRatio >= 0.01) visible.add(key)
         else {
           visible.delete(key)
-          dropSource(key)
           active.get(key)?.abort()
           if (status.get(key) === 'network') status.delete(key)
         }

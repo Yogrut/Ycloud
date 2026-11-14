@@ -71,7 +71,7 @@ describe('gallery presentation', () => {
     app.unmount()
   })
 
-  it('keeps only visible image URLs and reads the authorized disk thumbnail on return', async () => {
+  it('keeps a decoded thumbnail while its card is off screen and reuses it on return', async () => {
     const host = document.createElement('div')
     const entries = Array.from({ length: 100 }, (_, index) => entry(`${index}.jpg`))
     const props = reactive({ entries, storageId: 'primary', canDownload: true })
@@ -85,15 +85,15 @@ describe('gallery presentation', () => {
     await vi.waitFor(() => expect(image()?.src).toMatch(/^blob:/))
     expect(host.querySelectorAll('img')).toHaveLength(1)
     expect(createThumbnail).toHaveBeenCalledExactlyOnceWith('/api/thumbnail?path=%2Fphotos%2F0.jpg&storage_id=primary', expect.any(AbortSignal))
-    const oldSource = image()?.src
+    const source = image()?.src
     const ratio = first().querySelector('button')?.style.aspectRatio
     changeVisibility(first(), false)
     await nextTick()
-    expect(image()).toBeNull()
+    expect(image()?.src).toBe(source)
     expect(first().querySelector('button')?.style.aspectRatio).toBe(ratio)
     changeVisibility(first(), true)
-    await vi.waitFor(() => expect(image()?.src).toMatch(/^blob:/))
-    expect(image()?.src).not.toBe(oldSource)
+    await vi.waitFor(() => expect(image()?.src).toBe(source))
+    expect(createThumbnail).toHaveBeenCalledTimes(1)
 
     props.entries = [entry('next.jpg')]
     await nextTick()
@@ -101,7 +101,7 @@ describe('gallery presentation', () => {
     await nextTick()
     changeVisibility(first(), true)
     await vi.waitFor(() => expect(image()?.src).toMatch(/^blob:/))
-    expect(createThumbnail).toHaveBeenCalledTimes(3)
+    expect(createThumbnail).toHaveBeenCalledTimes(2)
     props.canDownload = false
     await nextTick()
     expect(host.querySelector('img')).toBeNull()

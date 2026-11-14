@@ -33,13 +33,16 @@ use crate::{
 
 const MAX_JOBS: usize = 512;
 const MAX_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_PIXELS: u64 = 36_000_000;
+const MAX_PIXELS: u64 = 120_000_000;
 const MAX_OUTPUT_BYTES: u64 = 512 * 1024;
 const CACHE_BYTES: u64 = 128 * 1024 * 1024;
 const CACHE_FILES: usize = 4096;
 const TRIM_INTERVAL: usize = 16;
 const JOB_TIMEOUT: Duration = Duration::from_secs(45);
 const RECORD_HEADER_BYTES: usize = 33;
+/// Bumped whenever the pipeline that produces a record changes, so a verdict
+/// recorded by an older pipeline cannot pin a file to a stale answer.
+const CACHE_VERSION: u8 = 2;
 const STARTING: u8 = 0;
 const READY: u8 = 1;
 const DISABLED: u8 = 2;
@@ -100,6 +103,18 @@ impl Outcome {
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::SourceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
+    }
+}
+
+/// How long a cached failure stays authoritative before the generator retries.
+/// Records are already keyed by the source stamp, so this only bounds retries of
+/// a verdict our own limits or environment could have produced by mistake.
+fn failure_ttl(outcome: Outcome) -> Option<Duration> {
+    match outcome {
+        Outcome::SourceUnavailable => Some(Duration::from_secs(30)),
+        Outcome::Unavailable => Some(Duration::from_secs(600)),
+        Outcome::TooLarge => Some(Duration::from_secs(3600)),
+        Outcome::Ready | Outcome::NotImage => None,
     }
 }
 
@@ -166,7 +181,11 @@ impl Gallery {
         let stamp = backend.gallery_stamp(&path).await?;
         if let Some((outcome, file)) = self.open(storage, &path, &stamp).await? {
             if !matches!(outcome, Outcome::Ready) {
-                return Ok(outcome.status().into_response());
+                return Ok((
+                    outcome.status(),
+                    [(header::CACHE_CONTROL, "no-store".to_owned())],
+                )
+                    .into_response());
             }
             let size = file.metadata().await.map_err(cache_io)?.len() - RECORD_HEADER_BYTES as u64;
             let body = if *method == Method::HEAD {
@@ -178,6 +197,9 @@ impl Gallery {
                 [
                     (header::CONTENT_TYPE, "image/jpeg".to_owned()),
                     (header::CONTENT_LENGTH, size.to_string()),
+                    // Thumbnails are keyed by the source stamp; a short private
+                    // lifetime lets a scroll back or a reload stay off the wire.
+                    (header::CACHE_CONTROL, "private, max-age=60".to_owned()),
                 ],
                 body,
             )
@@ -188,7 +210,14 @@ impl Gallery {
                 "Thumbnail generation is unavailable or busy".into(),
             ));
         }
-        Ok((StatusCode::ACCEPTED, [(header::RETRY_AFTER, "2")]).into_response())
+        Ok((
+            StatusCode::ACCEPTED,
+            [
+                (header::RETRY_AFTER, "2"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+        )
+            .into_response())
     }
 
     fn cached(&self, storage: &str, path: &str) -> PathBuf {
@@ -223,20 +252,21 @@ impl Gallery {
                 Err(cache_io(error))
             };
         }
-        if &header[..32] != digest(&(1, stamp)).as_ref() {
+        if &header[..32] != digest(&(CACHE_VERSION, stamp)).as_ref() {
             return Ok(None);
         }
         let outcome = Outcome::from_byte(header[32]);
-        if matches!(outcome, Some(Outcome::SourceUnavailable))
-            && file
+        if let Some(ttl) = outcome.and_then(failure_ttl) {
+            let expired = file
                 .metadata()
                 .await
                 .map_err(cache_io)?
                 .modified()
                 .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
-                .is_ok_and(|age| age >= Duration::from_secs(30))
-        {
-            return Ok(None);
+                .is_ok_and(|age| age >= ttl);
+            if expired {
+                return Ok(None);
+            }
         }
         Ok(outcome.map(|outcome| (outcome, file)))
     }
@@ -380,7 +410,7 @@ impl Gallery {
         let staged = self.inner.root.join("cache.part");
         let mut record = File::create(&staged).await.map_err(cache_io)?;
         record
-            .write_all(digest(&(1, &stamp)).as_ref())
+            .write_all(digest(&(CACHE_VERSION, &stamp)).as_ref())
             .await
             .map_err(cache_io)?;
         record.write_all(&[outcome as u8]).await.map_err(cache_io)?;
@@ -514,7 +544,7 @@ fn command(program: &str) -> Command {
     #[cfg(target_os = "linux")]
     let mut command = {
         let mut command = Command::new("prlimit");
-        command.args(["--data=117440512", "--", program]);
+        command.args(["--data=268435456", "--", program]);
         command
     };
     #[cfg(not(target_os = "linux"))]
@@ -556,7 +586,7 @@ async fn render(root: &Path) -> Outcome {
         .args([
             "--size",
             "640x640>",
-            "--path",
+            "-o",
             "result.part.jpg[Q=78,strip]",
             "source.part",
         ])
@@ -598,7 +628,7 @@ mod tests {
         let before = (100_u64, "version 1".to_owned());
         let after = (100_u64, "version 2".to_owned());
         let key = gallery.cached("local", "photo.jpg");
-        let mut bytes = digest(&(1, &before)).as_ref().to_vec();
+        let mut bytes = digest(&(CACHE_VERSION, &before)).as_ref().to_vec();
         bytes.push(Outcome::Ready as u8);
         bytes.extend_from_slice(b"thumbnail");
         fs::write(&key, bytes).await.unwrap();

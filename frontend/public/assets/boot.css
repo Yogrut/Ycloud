@@ -1,4 +1,4 @@
-/* Paint the shell before the bundle loads. Loaded from the same origin so the
+/* Paint the shell before the bundle loads. Same-origin file so the
    Content-Security-Policy (style-src 'self') allows it, unlike an inline style. */
 html { background: #111214; }
 @media (prefers-color-scheme: light) { html { background: #f6f7f9; } }

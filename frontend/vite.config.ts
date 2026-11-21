@@ -16,7 +16,13 @@ export default defineConfig({
         this.emitFile({
           type: 'asset',
           fileName: 'embedded-assets.rs',
-          source: renderEmbeddedAssets(Object.keys(bundle).filter(path => path.startsWith('assets/'))),
+          source: renderEmbeddedAssets([
+            ...Object.keys(bundle).filter(path => path.startsWith('assets/')),
+            // Public files are copied outside the bundle; list the boot pair
+            // explicitly so the server embeds and serves them.
+            'assets/boot.css',
+            'assets/boot.js',
+          ]),
         })
       },
     },

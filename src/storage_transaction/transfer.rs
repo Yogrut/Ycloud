@@ -132,7 +132,8 @@ impl TransactionPaths {
         *self
             .pending_publication
             .lock()
-            .expect("publication mutex poisoned") = Some(journal.clone());
+            .map_err(|_| crate::error::AppError::internal("publication mutex poisoned"))? =
+            Some(journal.clone());
         self.settle_publication().await?;
         if let (Some(operation_id), Some(size)) = (&journal.operation_id, journal.operation_size) {
             self.ensure_receipt(

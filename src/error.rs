@@ -231,6 +231,13 @@ impl AppError {
     }
 }
 
+impl AppError {
+    /// Batch keep-both retries only on this condition, so it must stay typed.
+    pub(crate) fn is_destination_exists(&self) -> bool {
+        matches!(self, Self::DestinationExists)
+    }
+}
+
 impl fmt::Display for AppError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

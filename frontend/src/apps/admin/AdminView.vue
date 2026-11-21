@@ -8,7 +8,7 @@ import ThemeToggle from '../../shared/components/ThemeToggle.vue'
 import type { ThemeController } from '../../shared/composables/useTheme'
 import { useLocale } from '../../shared/i18n'
 import AdminNavIcon from './AdminNavIcon.vue'
-import { appPath, currentAppPath } from '../../shared/routes'
+import { appPath, currentAppPath, navigateTo } from '../../shared/routes'
 import { useAdminSession } from './useAdminSession'
 import { lazyPage } from '../../shared/lazyPage'
 
@@ -80,7 +80,7 @@ onScopeDispose(() => window.removeEventListener('popstate', restoreSection))
       <div v-if="!loading" class="top-actions">
         <ThemeToggle :theme="theme.current.value" class="flat" @toggle="theme.toggle" />
         <LocaleToggle class="flat" />
-        <a class="icon-btn flat" :href="appPath('/browse')" :title="locale.text('返回文件', 'Back to files')" :aria-label="locale.text('返回文件', 'Back to files')">
+        <a class="icon-btn flat" :href="appPath('/browse')" :title="locale.text('返回文件', 'Back to files')" :aria-label="locale.text('返回文件', 'Back to files')" @click.prevent="navigateTo('/browse')">
           <AppIcon name="folder-open" />
         </a>
       </div>

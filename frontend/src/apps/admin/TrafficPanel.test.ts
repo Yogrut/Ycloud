@@ -60,9 +60,11 @@ describe('TrafficPanel', () => {
     traffic.days['2026-09-01'] = { upload: 1_000_000, download: 1 }
     const host = await mount('dashboard', traffic)
     const bars = [...host.querySelectorAll<HTMLElement>('.day-bars span')]
-    expect(bars.map(bar => bar.classList.contains('has-traffic'))).toEqual([true, true, false, false])
+    // Only days that carry traffic render a bar, so a lone direction sits dead
+    // centre under its date instead of being pushed into one half of the slot.
+    expect(bars.map(bar => bar.classList.contains('has-traffic'))).toEqual([true, true])
     expect(Number.parseFloat(bars[0]!.style.height)).toBeCloseTo(0.0001, 8)
-    expect(bars.slice(1).map(bar => bar.style.height)).toEqual(['100%', '0%', '0%'])
+    expect(bars[1]!.style.height).toBe('100%')
     host.querySelector<HTMLButtonElement>('.day-bars')!.focus()
     await nextTick()
     expect(host.querySelector('.day-tooltip .download-key b')?.textContent).toBe('1 B')
@@ -93,7 +95,7 @@ describe('TrafficPanel', () => {
     expect(host.querySelectorAll('.traffic-meter')[3]!.querySelector('[role="meter"]')!.getAttribute('aria-valuetext')).toContain('768 B')
     expect(host.querySelector('.day-bars')!.firstElementChild!.classList.contains('download')).toBe(true)
     expect(host.querySelectorAll('.day-bars')).toHaveLength(2)
-    expect(host.querySelectorAll('.day-bars span')).toHaveLength(4)
+    expect(host.querySelectorAll('.day-bars span')).toHaveLength(2)
     expect(host.querySelector('.traffic-totals')).toBeNull()
     expect(host.querySelector('.share-donut')!.textContent).toContain('总流量')
     expect(host.querySelectorAll('.share-ring')).toHaveLength(2)

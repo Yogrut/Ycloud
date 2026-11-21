@@ -8,7 +8,7 @@ const storages: BrowserStorage[] = ['first', 'second'].map(id => ({ id, name: id
 function response(id = 'first', scope = 'guest', items = storages): FileListResponse {
   return { storage_id: id, selection_scope: scope, storages: items, current_path: '', parent_path: null, entries: [], page_start: 0, page_size: 20, next_cursor: null, can_write: false, max_upload_bytes: 1, max_archive_bytes: 1, max_archive_entries: 1 }
 }
-function listing() { return useBrowserListing({ announce: vi.fn(), resetSelection: vi.fn(), openLockedEntry: vi.fn(), requestStorageLogin: vi.fn() }) }
+function listing() { return useBrowserListing({ announce: vi.fn(), resetSelection: vi.fn(), pruneSelection: vi.fn(), openLockedEntry: vi.fn(), requestStorageLogin: vi.fn() }) }
 function deferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (reason: unknown) => void
@@ -19,6 +19,72 @@ function deferred<T>() {
 const writable: BrowserCapabilities = { download: true, upload: true, create_directory: true, rename: true, move_items: true, copy: true, delete: true }
 const entry: FileEntry = { name: 'one.txt', path: 'folder/one.txt', is_dir: false, size: 3, modified: '2026-09-30T00:00:00Z', mime: 'text/plain', icon: 'file', locked: false }
 afterEach(() => { vi.restoreAllMocks(); localStorage.clear() })
+
+describe('silent refresh', () => {
+  function silentListing() {
+    const context = { announce: vi.fn(), resetSelection: vi.fn(), pruneSelection: vi.fn(), openLockedEntry: vi.fn(), requestStorageLogin: vi.fn() }
+    return { context, state: useBrowserListing(context) }
+  }
+
+  it('never shows a loading state and keeps the selection instead of resetting it', async () => {
+    const request = vi.spyOn(api, 'listFiles').mockResolvedValue({ ...response(), entries: [entry] })
+    const { context, state } = silentListing()
+    await state.refresh()
+    expect(context.resetSelection).toHaveBeenCalledTimes(1)
+    await state.refresh({ silent: true })
+    expect(state.loading.value).toBe(false)
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(context.resetSelection).toHaveBeenCalledTimes(1)
+    expect(context.pruneSelection).toHaveBeenCalledWith(new Set([entry.path]))
+    state.disposeListing()
+  })
+
+  it('lets a visible refresh finish instead of cancelling it', async () => {
+    const pending = deferred<FileListResponse>()
+    const request = vi.spyOn(api, 'listFiles').mockReturnValueOnce(pending.promise).mockResolvedValue(response())
+    const { state } = silentListing()
+    const visible = state.refresh()
+    await state.refresh({ silent: true })
+    expect(request).toHaveBeenCalledTimes(1)
+    pending.resolve(response())
+    await visible
+    state.disposeListing()
+  })
+
+  it('does not resurrect a deleted row from an older response', async () => {
+    const slow = deferred<FileListResponse>()
+    const listed = { ...response(), entries: [entry] }
+    vi.spyOn(api, 'listFiles')
+      .mockResolvedValueOnce(listed)
+      .mockReturnValueOnce(slow.promise)
+      .mockResolvedValue({ ...response(), entries: [] })
+    const { state } = silentListing()
+    await state.refresh()
+    expect(state.entries.value).toHaveLength(1)
+    const inFlight = state.refresh({ silent: true })
+    state.hideEntries('first', [entry.path])
+    await state.reconcileDeletion('first', [entry.path])
+    // The batch releases its hidden paths once it is done; from here only a newer
+    // listing may keep the old response from being applied.
+    state.releaseEntries('first', [entry.path])
+    slow.resolve(listed)
+    await inFlight
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(state.entries.value).toHaveLength(0)
+    state.disposeListing()
+  })
+
+  it('collapses a burst of silent refreshes into one request', async () => {
+    const request = vi.spyOn(api, 'listFiles').mockResolvedValue(response())
+    const { state } = silentListing()
+    await state.refresh()
+    await state.refresh({ silent: true })
+    await state.refresh({ silent: true })
+    await state.refresh({ silent: true })
+    expect(request).toHaveBeenCalledTimes(2)
+    state.disposeListing()
+  })
+})
 
 describe('gallery page transactions', () => {
   const settle = () => new Promise(resolve => setTimeout(resolve, 0))
@@ -193,7 +259,7 @@ describe('storage selection', () => {
   })
   it('opens account login for a storage missing from the authorized list', async () => {
     const requestStorageLogin = vi.fn()
-    const state = useBrowserListing({ announce: vi.fn(), resetSelection: vi.fn(), openLockedEntry: vi.fn(), requestStorageLogin })
+    const state = useBrowserListing({ announce: vi.fn(), resetSelection: vi.fn(), pruneSelection: vi.fn(), openLockedEntry: vi.fn(), requestStorageLogin })
     const request = vi.spyOn(api, 'listFiles').mockResolvedValue(response())
     await state.refresh()
     await state.switchStorage('private')

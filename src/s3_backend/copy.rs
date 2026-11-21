@@ -62,7 +62,7 @@ impl S3Backend {
         }
         self.ensure_parent_directory(destination).await?;
         match self.metadata(destination).await {
-            Ok(_) => return Err(AppError::Conflict("目标路径已经存在".into())),
+            Ok(_) => return Err(AppError::DestinationExists),
             Err(AppError::NotFound) => {}
             Err(error) => return Err(error),
         }

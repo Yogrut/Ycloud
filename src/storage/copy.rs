@@ -331,7 +331,7 @@ async fn ensure_destination_absent(path: &std::path::Path) -> AppResult<()> {
         .await
         .map_err(|error| AppError::with_source("failed to inspect copy destination", error))?
     {
-        return Err(AppError::Conflict("Destination already exists".into()));
+        return Err(AppError::DestinationExists);
     }
     Ok(())
 }

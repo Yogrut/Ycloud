@@ -25,9 +25,12 @@ describe('FolderPicker', () => {
     const app = mountPicker(host)
     await new Promise(resolve => window.setTimeout(resolve, 0))
     expect(host.querySelector('.picker-row')?.textContent).toContain('visible')
-    expect(host.querySelector('.picker-state')).not.toBeNull()
+    // Later pages append in the background; the dialog is never held in a
+    // blocking loading state once the first page has rendered.
+    expect(host.querySelector('.picker-state')).toBeNull()
     resolveNext(reply([], null))
     await new Promise(resolve => window.setTimeout(resolve, 0))
+    expect(host.querySelectorAll('.picker-row')).toHaveLength(1)
     expect(host.querySelector('.picker-state')).toBeNull()
     app.unmount()
   })
@@ -64,9 +67,9 @@ describe('FolderPicker', () => {
     await new Promise(resolve => window.setTimeout(resolve, 0))
     resolveFirst(response('first'))
     await new Promise(resolve => window.setTimeout(resolve, 0))
-    expect(host.querySelector('.picker-path')?.textContent).toBe('/second')
-    host.querySelector<HTMLButtonElement>('.modal-actions button:last-child')?.click()
-    expect(chosen).toHaveBeenCalledWith('second')
+    expect(host.querySelector('.picker-crumbs')?.textContent).toContain('second')
+    host.querySelector<HTMLButtonElement>('.picker-choices button:last-child')?.click()
+    expect(chosen).toHaveBeenCalledWith('second', 'overwrite')
     app.unmount()
   })
 

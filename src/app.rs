@@ -66,6 +66,7 @@ pub fn build_router(state: AppState) -> Router {
     let read_api = Router::new()
         .route("/storages", get(api::browser_storages))
         .route("/files", get(api::list_files))
+        .route("/changes", get(api::directory_changes))
         .route("/directory/size", get(crate::directory_size::calculate))
         .route("/download", get(api::download_file))
         .route(

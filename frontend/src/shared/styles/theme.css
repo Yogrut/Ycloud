@@ -850,7 +850,10 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
   align-items: center;
   gap: 4px;
   margin-bottom: 6px;
-  padding: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -864,6 +867,10 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
   min-height: 30px;
   padding: 5px 10px;
   flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
   color: var(--muted);
   white-space: nowrap;
   background: transparent;
@@ -877,7 +884,7 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 .crumb[aria-current="location"] { color: var(--accent); background: var(--accent-soft); font-weight: 680; }
 .home-crumb { display: inline-flex; align-items: center; gap: 7px; }
 .home-crumb svg { width: 17px; height: 17px; }
-.crumb-separator { color: var(--muted-2); font-size: 17px; user-select: none; }
+.crumb-separator { display: inline-flex; align-items: center; color: var(--muted-2); font-size: 14px; line-height: 1; user-select: none; }
 
 .file-panel { position: relative; height: 100%; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: 14px 28px 14px; border-radius: 12px; user-select: none; }
 .file-list-body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }

@@ -236,7 +236,7 @@ describe('browser API paths', () => {
     await expect(batchOperation('move', ['one.txt', 'two.txt'], '/target/')).resolves.toEqual(payload)
     expect(fetchMock).toHaveBeenCalledWith('/api/batch/move', expect.objectContaining({
       method: 'PUT',
-      body: JSON.stringify({ paths: ['one.txt', 'two.txt'], target: '/target' }),
+      body: JSON.stringify({ paths: ['one.txt', 'two.txt'], target: '/target', conflict: 'error' }),
     }))
   })
 })

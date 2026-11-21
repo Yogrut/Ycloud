@@ -21,6 +21,7 @@ function setup() {
     }),
     isAdministrator: ref(false),
     navigate: vi.fn().mockResolvedValue(undefined),
+    refresh: vi.fn().mockResolvedValue(undefined),
     resetAfterSignIn: vi.fn().mockResolvedValue(undefined),
     openPreviewImage: vi.fn().mockReturnValue(false),
     openPreviewFile: vi.fn(), openAccountMenu: vi.fn(),

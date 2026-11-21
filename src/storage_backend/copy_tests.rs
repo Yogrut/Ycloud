@@ -145,6 +145,7 @@ impl CopyFixture {
             )),
             lease: None,
             transfer: None,
+            storage_id: Arc::from(""),
         };
         let server = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();

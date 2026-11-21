@@ -66,6 +66,23 @@ pub struct StorageBackend {
     active: Arc<ActiveStorage>,
     lease: Option<Arc<AdmissionLease>>,
     transfer: Option<tokio_util::sync::CancellationToken>,
+    /// Immutable storage identity. Empty on backends built directly by tests,
+    /// which simply publish nothing.
+    storage_id: Arc<str>,
+}
+
+impl StorageBackend {
+    /// Binds the registry identity so mutations can publish change signals.
+    pub(crate) fn with_storage_id(self, storage_id: &str) -> Self {
+        Self {
+            storage_id: Arc::from(storage_id),
+            ..self
+        }
+    }
+
+    fn publish_change(&self, path: &str) {
+        crate::events::publish(&self.storage_id, path);
+    }
 }
 
 /// Routes every storage operation through an immutable storage identity.
@@ -111,18 +128,23 @@ impl StorageRegistry {
     }
 
     pub async fn single(storage_id: impl Into<String>, backend: StorageBackend) -> Self {
+        let storage_id = storage_id.into();
         let mut entries = HashMap::new();
-        entries.insert(storage_id.into(), RegisteredStorage::Ready(backend));
+        entries.insert(
+            storage_id.clone(),
+            RegisteredStorage::Ready(backend.with_storage_id(&storage_id)),
+        );
         Self {
             entries: Arc::new(RwLock::new(entries)),
         }
     }
 
     pub async fn insert_ready(&self, storage_id: impl Into<String>, backend: StorageBackend) {
-        self.entries
-            .write()
-            .await
-            .insert(storage_id.into(), RegisteredStorage::Ready(backend));
+        let storage_id = storage_id.into();
+        self.entries.write().await.insert(
+            storage_id.clone(),
+            RegisteredStorage::Ready(backend.with_storage_id(&storage_id)),
+        );
     }
 
     pub async fn insert_unavailable(&self, storage_id: impl Into<String>) {
@@ -434,6 +456,7 @@ impl StorageBackend {
             gallery: None,
             lease: None,
             transfer: None,
+            storage_id: Arc::from(""),
             active: Arc::new(ActiveStorage::new(
                 StorageBackendKind::Local(storage),
                 CapacityTracker::new(None, 0),
@@ -456,6 +479,7 @@ impl StorageBackend {
             gallery: None,
             lease: None,
             transfer: None,
+            storage_id: Arc::from(""),
             active: Arc::new(ActiveStorage::new(
                 StorageBackendKind::Local(storage),
                 capacity,
@@ -485,6 +509,7 @@ impl StorageBackend {
             gallery: None,
             lease: None,
             transfer: None,
+            storage_id: Arc::from(""),
             active: Arc::new(ActiveStorage::new(
                 StorageBackendKind::S3(storage),
                 CapacityTracker::new_with_ledger(capacity_limit, used, false, Some(ledger_path)),
@@ -864,6 +889,7 @@ impl StorageBackend {
                     })
                 })
             {
+                backend.publish_change(&relative);
                 if let Some((gallery, id)) = &backend.gallery {
                     gallery.enqueue_committed(id, &relative);
                 }
@@ -1019,11 +1045,14 @@ impl StorageBackend {
     }
 
     pub async fn create_directory(&self, relative: &str) -> AppResult<()> {
+        let changed = relative.to_owned();
         let relative = relative.to_owned();
         self.owned_mutation(move |backend| async move {
             backend.create_directory_inner(&relative).await
         })
-        .await
+        .await?;
+        self.publish_change(&changed);
+        Ok(())
     }
 
     async fn create_directory_inner(&self, relative: &str) -> AppResult<()> {
@@ -1039,15 +1068,21 @@ impl StorageBackend {
     }
 
     pub async fn remove(&self, relative: &str) -> AppResult<()> {
+        let changed = relative.to_owned();
         let relative = relative.to_owned();
-        self.owned_mutation(move |backend| async move {
-            backend.remove_inner(&relative).await?;
-            if let Some((gallery, id)) = &backend.gallery {
-                gallery.forget(id, &relative).await;
-            }
-            Ok(())
-        })
-        .await
+        let result = self
+            .owned_mutation(move |backend| async move {
+                backend.remove_inner(&relative).await?;
+                if let Some((gallery, id)) = &backend.gallery {
+                    gallery.forget(id, &relative).await;
+                }
+                Ok(())
+            })
+            .await;
+        if result.is_ok() {
+            self.publish_change(&changed);
+        }
+        result
     }
 
     async fn remove_inner(&self, relative: &str) -> AppResult<()> {
@@ -1086,7 +1121,40 @@ impl StorageBackend {
         }
     }
 
+    /// WebDAV and overwrite transfers: the body is unchanged, but the affected
+    /// directories are announced once the transfer commits.
     pub(crate) async fn dav_transfer(
+        &self,
+        source: &str,
+        destination: &str,
+        kind: TransferKind,
+        overwrite: bool,
+    ) -> AppResult<bool> {
+        let (changed_source, changed_destination) = (source.to_owned(), destination.to_owned());
+        let moves = kind == TransferKind::Move;
+        let result = self
+            .dav_transfer_inner(source, destination, kind, overwrite)
+            .await;
+        // Announce unless the outcome is definitely "nothing changed": an
+        // unknown or partially committed transfer may already be visible on the
+        // storage, and a redundant signal only costs one extra refresh.
+        let changed = match &result {
+            Ok(_) => true,
+            Err(error) => error
+                .operation()
+                .map(|outcome| outcome.commit != crate::error::CommitState::NotCommitted)
+                .unwrap_or(true),
+        };
+        if changed {
+            if moves {
+                self.publish_change(&changed_source);
+            }
+            self.publish_change(&changed_destination);
+        }
+        result
+    }
+
+    async fn dav_transfer_inner(
         &self,
         source: &str,
         destination: &str,
@@ -1176,10 +1244,14 @@ impl StorageBackend {
 
     pub async fn move_path(&self, source: &str, destination: &str) -> AppResult<()> {
         let (source, destination) = (source.to_owned(), destination.to_owned());
+        let (changed_source, changed_destination) = (source.clone(), destination.clone());
         self.owned_mutation(move |backend| async move {
             backend.move_path_inner(&source, &destination).await
         })
-        .await
+        .await?;
+        self.publish_change(&changed_source);
+        self.publish_change(&changed_destination);
+        Ok(())
     }
 
     async fn move_path_inner(&self, source: &str, destination: &str) -> AppResult<()> {
@@ -1216,10 +1288,13 @@ impl StorageBackend {
 
     pub async fn copy_path(&self, source: &str, destination: &str) -> AppResult<()> {
         let (source, destination) = (source.to_owned(), destination.to_owned());
+        let changed_destination = destination.clone();
         self.owned_mutation(move |backend| async move {
             backend.copy_path_inner(&source, &destination).await
         })
-        .await
+        .await?;
+        self.publish_change(&changed_destination);
+        Ok(())
     }
 
     async fn copy_path_inner(&self, source: &str, destination: &str) -> AppResult<()> {
@@ -1510,6 +1585,7 @@ mod tests {
             gallery: None,
             lease: None,
             transfer: None,
+            storage_id: Arc::from(""),
             active: Arc::new(super::ActiveStorage::new(
                 super::StorageBackendKind::S3(s3.clone()),
                 crate::capacity::CapacityTracker::new(None, 0),

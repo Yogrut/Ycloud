@@ -7,6 +7,11 @@
     <meta name="color-scheme" content="light dark">
     <title>Ycloud</title>
     <link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml">
+    <!-- Paint the shell background before the bundle loads so a full page
+         navigation never flashes a bare canvas. Same-origin files keep the
+         Content-Security-Policy ('self') satisfied. -->
+    <link rel="stylesheet" href="/boot.css">
+    <script src="/boot.js"></script>
   </head>
   <body>
     <div id="app"></div>

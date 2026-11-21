@@ -17,11 +17,19 @@ interface ListingRefresh {
   target?: PageTarget
   keepGallery?: boolean
   fillAfterDelete?: boolean
+  /// Must run even while a visible refresh is in flight and ignores the minimum
+  /// interval: used after a write, where a fresh list is the only proof.
+  force?: boolean
+  /// Refresh without a loading state, without touching the selection and
+  /// without announcing transient failures.
+  silent?: boolean
 }
 
 interface BrowserListingContext {
   announce: (message: string) => void
   resetSelection: () => void
+  /// Drops selected paths that are no longer in the list.
+  pruneSelection: (keep: Set<string>) => void
   openLockedEntry: (entry: FileEntry) => void
   requestStorageLogin: (storageId: string) => void
 }
@@ -118,14 +126,86 @@ export function useBrowserListing(context: BrowserListingContext) {
     entries.value = []
     capabilities.value = emptyCapabilities()
     setGalleryMode(false)
+    pendingRemovals.clear()
   }
 
-  function applyListing(data: FileListResponse): void {
+  /// Rows hidden while their delete/move is still in flight. Keyed by storage so
+  /// another storage that happens to share a path is never affected.
+  /// Hidden rows, keyed by storage + path. `null` = operation still running;
+  /// a number = the monotonic ticket taken when the operation settled. A listing
+  /// started after that ticket may show the row again (or keep it hidden if the
+  /// server no longer has it).
+  const pendingRemovals = new Map<string, number | null>()
+  /// Monotonic ticket source, incremented when a listing request starts.
+  let startCounter = 0
+  let settledTimers: number[] = []
+  /// When the current page last came from the server; drives the visibility check.
+  let lastLoadedAt = 0
+  /// Silent refreshes run one at a time and at most once per interval: every
+  /// write invalidates the server snapshot, so a burst must not turn into a
+  /// request storm.
+  const SILENT_MIN_INTERVAL_MS = 1500
+  let silentInFlight = false
+  let silentQueued = false
+  let forceQueued = false
+  let silentTimer: number | undefined
+  let lastSilentAt = 0
+  const pendingRemovalKey = (storageId: string, path: string): string =>
+    `${storageId}\u0000${path.replace(/^\/+|\/+$/g, '')}`
+
+  /// Hides rows at once so the user sees the change immediately; the request then
+  /// runs in the background.
+  function hideEntries(storageId: string, paths: string[]): void {
+    if (storageId !== currentStorageId.value) return
+    const hidden = new Set(paths.map(path => path.replace(/^\/+|\/+$/g, '')))
+    for (const path of hidden) pendingRemovals.set(pendingRemovalKey(storageId, path), null)
+    if (!entries.value.some(entry => hidden.has(entry.path.replace(/^\/+|\/+$/g, '')))) return
+    entries.value = entries.value.filter(entry => !hidden.has(entry.path.replace(/^\/+|\/+$/g, '')))
+    for (const path of hidden) directorySizes.value.delete(path)
+  }
+
+  /// Stops hiding; call from `finally` so timeouts and exceptions release too.
+  function releaseEntries(storageId: string, paths: string[]): void {
+    for (const path of paths) pendingRemovals.delete(pendingRemovalKey(storageId, path))
+  }
+
+  /// The operation finished: keep its rows hidden until a listing that started
+  /// after this ticket is applied. Releasing here would let an older response
+  /// (sent before the write) put the rows back.
+  function settleEntries(storageId: string, paths: string[]): void {
+    const settledAt = ++startCounter
+    for (const path of paths) {
+      const key = pendingRemovalKey(storageId, path)
+      if (pendingRemovals.has(key)) pendingRemovals.set(key, settledAt)
+    }
+    // Never hide a row forever: if no listing ever arrives, give up after 10s.
+    settledTimers.push(window.setTimeout(() => {
+      for (const path of paths) pendingRemovals.delete(pendingRemovalKey(storageId, path))
+    }, 10_000))
+  }
+
+  function applyListing(data: FileListResponse, preserveSelection = false, startedAt = 0): void {
+    lastLoadedAt = Date.now()
     emptyReason.value = data.empty_reason ?? null
     currentStorageId.value = data.storage_id
     storages.value = data.storages ?? []
     path.value = data.current_path.replace(/^\/+|\/+$/g, '')
-    entries.value = data.entries
+    const kept: FileEntry[] = []
+    for (const entry of data.entries) {
+      const key = pendingRemovalKey(data.storage_id, entry.path)
+      const settledAt = pendingRemovals.get(key)
+      if (settledAt === undefined) {
+        kept.push(entry)
+        continue
+      }
+      // Still running, or started before the operation settled: keep it hidden.
+      if (settledAt === null || settledAt >= startedAt) continue
+      // This listing started after the operation settled and the server still
+      // returns the row, so it is real again.
+      pendingRemovals.delete(key)
+      kept.push(entry)
+    }
+    entries.value = kept
     nextCursor.value = data.next_cursor ?? null
     isAdministrator.value = Boolean(data.is_admin)
     capabilities.value = data.capabilities ?? {
@@ -142,17 +222,55 @@ export function useBrowserListing(context: BrowserListingContext) {
     maxUploadBatchEntries.value = data.max_upload_batch_entries ?? 1
     maxArchiveBytes.value = data.max_archive_bytes
     maxArchiveEntries.value = data.max_archive_entries
-    context.resetSelection()
+    if (preserveSelection) context.pruneSelection(new Set(entries.value.map(entry => entry.path)))
+    else context.resetSelection()
   }
 
-  async function refresh({ target, keepGallery = false, fillAfterDelete = false }: ListingRefresh = {}): Promise<void> {
+  async function refresh({ target, keepGallery = false, fillAfterDelete = false, silent = false, force = false }: ListingRefresh = {}): Promise<void> {
+    if (silent && !force) {
+      // A visible refresh (navigation, paging, sorting) always wins: a silent one
+      // must never abort it.
+      if (loading.value) return
+      if (silentInFlight) {
+        silentQueued = true
+        return
+      }
+      const wait = SILENT_MIN_INTERVAL_MS - (Date.now() - lastSilentAt)
+      if (wait > 0) {
+        if (silentTimer === undefined) {
+          silentTimer = window.setTimeout(() => {
+            silentTimer = undefined
+            void refresh({ silent: true })
+          }, wait)
+        }
+        return
+      }
+      silentInFlight = true
+      lastSilentAt = Date.now()
+    } else if (silent) {
+      // Forced: skips the minimum interval, but never cancels a visible refresh —
+      // it queues and runs as soon as that one finishes.
+      if (loading.value || silentInFlight) {
+        forceQueued = true
+        return
+      }
+      silentInFlight = true
+      lastSilentAt = Date.now()
+    } else {
+      silentQueued = false
+      if (silentTimer !== undefined) {
+        window.clearTimeout(silentTimer)
+        silentTimer = undefined
+      }
+    }
     resetDirectorySizes()
+    const startedAt = ++startCounter
     const sequence = ++refreshSequence
     listingRequest?.abort()
     const controller = new AbortController()
     listingRequest = controller
     retainingGallery.value = keepGallery && galleryMode.value
-    loading.value = true
+    if (!silent) loading.value = true
     try {
       const data = await listFiles(path.value, currentStorageId.value || undefined, {
         signal: controller.signal,
@@ -192,7 +310,7 @@ export function useBrowserListing(context: BrowserListingContext) {
           await refresh()
           return
         }
-        applyListing(data)
+        applyListing(data, silent, startedAt)
         return
       }
       if (fillAfterDelete && !data.empty_reason && !data.entries.length && cursorHistory.value.length) {
@@ -203,11 +321,11 @@ export function useBrowserListing(context: BrowserListingContext) {
         currentCursor.value = target.cursor
         cursorHistory.value = target.history
       }
-      applyListing(data)
+      applyListing(data, silent, startedAt)
     } catch (error) {
       if (sequence !== refreshSequence) return
       if (error instanceof ApiError && ([401, 403].includes(error.status)
-        || !target && !keepGallery && [404, 503].includes(error.status))) {
+        || !silent && !target && !keepGallery && [404, 503].includes(error.status))) {
         clearListingEntries()
         context.resetSelection()
       }
@@ -230,14 +348,33 @@ export function useBrowserListing(context: BrowserListingContext) {
         } catch { /* Keep the original file-list error. */ }
       }
       if (sequence !== refreshSequence) return
-      context.announce(error instanceof Error ? error.message : locale.text('目录加载失败', 'Unable to load this folder'))
+      if (!silent) context.announce(error instanceof Error ? error.message : locale.text('目录加载失败', 'Unable to load this folder'))
     } finally {
+      if (silent) {
+        silentInFlight = false
+        if (forceQueued) {
+          forceQueued = false
+          silentQueued = false
+          void refresh({ silent: true, force: true })
+        } else if (silentQueued) {
+          silentQueued = false
+          void refresh({ silent: true })
+        }
+      }
       if (sequence === refreshSequence) {
         loading.value = false
         retainingGallery.value = false
         listingRequest = undefined
       }
     }
+  }
+
+  /// Refreshes silently when the page has gone stale, e.g. after the tab was in
+  /// the background. Writes made outside the app are only visible this way.
+  async function refreshIfStale(maxAgeMs: number): Promise<void> {
+    if (document.visibilityState === 'hidden') return
+    if (Date.now() - lastLoadedAt < maxAgeMs) return
+    await refresh({ silent: true })
   }
 
   async function calculateSize(entry: FileEntry): Promise<void> {
@@ -345,16 +482,15 @@ export function useBrowserListing(context: BrowserListingContext) {
 
   async function reconcileDeletion(storageId: string, paths: string[]): Promise<void> {
     if (storageId !== currentStorageId.value) return
-    if (!galleryMode.value) {
-      await refresh()
-      return
-    }
     const deleted = new Set(paths.map(path => path.replace(/^\/+|\/+$/g, '')))
     const remaining = entries.value.filter(entry => !deleted.has(entry.path.replace(/^\/+|\/+$/g, '')))
-    if (remaining.length === entries.value.length) return
-    entries.value = remaining
-    // Reconcile the cursor and fill the visible page without unmounting it.
-    await refresh({ keepGallery: true, fillAfterDelete: true })
+    // Drop the removed rows at once, then fill the page in the background. The
+    // list is never blanked, so no loading state can flash between the two.
+    if (remaining.length !== entries.value.length) entries.value = remaining
+    // Always fetch a fresh page after a removal. The server snapshot may still
+    // contain the removed rows, and only a newer response replaces an older one;
+    // releasing the hidden paths before that would resurrect them.
+    await refresh({ keepGallery: true, fillAfterDelete: true, silent: true, force: true })
   }
 
   async function resetAfterSignIn(requestedStorageId: string): Promise<void> {
@@ -387,6 +523,12 @@ export function useBrowserListing(context: BrowserListingContext) {
     listingRequest = undefined
     resetDirectorySizes()
     if (searchTimer !== undefined) window.clearTimeout(searchTimer)
+    if (silentTimer !== undefined) window.clearTimeout(silentTimer)
+    silentTimer = undefined
+    for (const timer of settledTimers) window.clearTimeout(timer)
+    settledTimers = []
+    silentQueued = false
+    forceQueued = false
   }
 
   return {
@@ -421,6 +563,10 @@ export function useBrowserListing(context: BrowserListingContext) {
     path,
     previousPage,
     query,
+    hideEntries,
+    releaseEntries,
+    settleEntries,
+    refreshIfStale,
     reconcileDeletion,
     refresh,
     retainingGallery,

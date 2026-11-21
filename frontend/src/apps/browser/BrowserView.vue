@@ -27,6 +27,7 @@ import { useBrowserDownloads } from './useBrowserDownloads'
 import { useBrowserListing } from './useBrowserListing'
 import { useBrowserAccess } from './useBrowserAccess'
 import { useBrowserPreviews } from './useBrowserPreviews'
+import { useDirectoryWatcher } from './useDirectoryWatcher'
 import { formatBatchSummary } from './operationFeedback'
 import FilePreviewDialog from './FilePreviewDialog.vue'
 import MediaPlayer from '../../shared/components/MediaPlayer.vue'
@@ -80,6 +81,10 @@ const {
   path,
   previousPage,
   query,
+  hideEntries,
+  releaseEntries,
+  settleEntries,
+  refreshIfStale,
   reconcileDeletion,
   refresh,
   retainingGallery,
@@ -94,6 +99,7 @@ const {
 } = useBrowserListing({
   announce,
   resetSelection: () => resetListingSelection(),
+  pruneSelection: keep => { selected.value = new Set([...selected.value].filter(path => keep.has(path))) },
   openLockedEntry: entry => openLockedEntry(entry),
   requestStorageLogin: storageId => openRestrictedStorage(storageId),
 })
@@ -104,6 +110,10 @@ const {
   openPreviewImage, openPreviewFile, moveAudio, onAudioError, closeAudio,
   moveGalleryEntry, closeGalleryEntry, closeFilePreview, closePendingDownload,
 } = useBrowserPreviews({ storageId: currentStorageId, visibleEntries, announce })
+
+// Another client adding or deleting a file pushes one directory signal; the
+// list then refreshes quietly, without a prompt and without a loading state.
+useDirectoryWatcher(currentStorageId, path, () => { void refresh({ silent: true }) })
 
 const galleryGrid = ref<InstanceType<typeof GalleryGrid> | null>(null)
 const galleryThumbnailSource = computed(() => galleryStorageId.value === currentStorageId.value && activeGalleryEntry.value
@@ -142,6 +152,7 @@ const {
   capabilities,
   isAdministrator,
   navigate,
+  refresh,
   resetAfterSignIn,
   openPreviewImage,
   openPreviewFile,
@@ -228,6 +239,7 @@ const {
   confirmDelete,
   confirmTransfer,
   operationBusy,
+  pendingBatches,
   operationError,
   operationRetryBlocked,
   pendingDelete,
@@ -242,7 +254,11 @@ const {
   selected,
   requireCapability,
   announce,
-  refresh: deletion => deletion ? reconcileDeletion(deletion.storageId, deletion.paths) : refresh(),
+  refresh: deletion => deletion ? reconcileDeletion(deletion.storageId, deletion.paths) : refresh({ silent: true, force: true }),
+  refreshForced: () => refresh({ silent: true, force: true }),
+  hideEntries,
+  releaseEntries,
+  settleEntries,
 })
 
 const {
@@ -313,8 +329,15 @@ function closeAudioNavOnOutsideClick(event: MouseEvent): void {
   if (audioNav.value && !audioNav.value.contains(event.target as Node)) audioNav.value.open = false
 }
 
+/// Coming back to the tab after a while refreshes quietly; writes made outside
+/// the app (a mount, an SSH session) are only visible through this check.
+function handleVisibilityChange(): void {
+  if (document.visibilityState === 'visible') void refreshIfStale(30_000)
+}
+
 onMounted(() => {
   void refresh()
+  document.addEventListener('visibilitychange', handleVisibilityChange)
   document.addEventListener('pointerdown', startPointerSelection, true)
   document.addEventListener('click', consumeTouchClick, true)
   document.addEventListener('click', handleDocumentClick)
@@ -328,6 +351,7 @@ onMounted(() => {
   window.addEventListener('drop', blockExternalFileDrop)
 })
 onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
   document.removeEventListener('pointerdown', startPointerSelection, true)
   document.removeEventListener('click', consumeTouchClick, true)
   document.removeEventListener('click', handleDocumentClick)
@@ -393,6 +417,7 @@ onBeforeUnmount(() => {
             <input v-model="query" type="search" :placeholder="locale.text('搜索当前目录', 'Search this folder')" :aria-label="locale.text('搜索当前目录', 'Search this folder')" @input="scheduleSearch">
           </label>
           <div class="file-toolbar-actions">
+            <span v-if="pendingBatches" class="pending-badge" role="status">{{ locale.text('正在处理…', 'Working…') }}</span>
             <button class="btn" type="button" @click="openFolderDialog"><AppIcon name="folder-plus" /><span>{{ locale.text('新建', 'New') }}</span></button>
             <button class="btn" type="button" @click="openUploadManager"><AppIcon name="upload" /><span>{{ locale.text('上传', 'Upload') }}</span></button>
           </div>
@@ -412,7 +437,7 @@ onBeforeUnmount(() => {
           <button class="sort-btn right" type="button" @click="changeSort('size')">{{ locale.text('大小', 'Size') }} <span>{{ sort === 'size' ? (ascending ? '▲' : '▼') : '' }}</span></button>
           <button class="sort-btn right modified" type="button" @click="changeSort('time')">{{ locale.text('修改时间', 'Modified') }} <span>{{ sort === 'time' ? (ascending ? '▲' : '▼') : '' }}</span></button>
         </div>
-        <div v-if="loading && !retainingGallery" class="empty file-list-body">{{ locale.t('common.loading') }}</div>
+        <div v-if="loading && !retainingGallery && !(galleryMode ? galleryImages.length : visibleEntries.length)" class="empty file-list-body">{{ locale.t('common.loading') }}</div>
         <div v-else-if="emptyReason" class="empty file-list-body">{{ emptyReason === 'unconfigured' ? locale.text('尚未配置存储，请管理员在后台添加存储。', 'No storage configured. Ask an administrator to add one.') : emptyReason === 'forbidden' ? locale.text('当前账号没有可访问的存储。', 'No storage is accessible to this account.') : locale.text('存储暂不可用，请稍后重试。', 'Storage is temporarily unavailable. Please try again later.') }}</div>
         <div v-else-if="!(galleryMode ? galleryImages.length : visibleEntries.length)" class="empty file-list-body">{{ appliedQuery ? locale.text('没有匹配的文件', 'No matching files') : galleryMode ? locale.text('此文件夹没有可展示的图片', 'No supported images in this folder') : locale.text('此文件夹为空', 'This folder is empty') }}</div>
         <div v-else-if="galleryMode" class="file-list-body gallery-list-body">
@@ -601,6 +626,18 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* Background work stays visible without a spinner or a dialog. */
+.pending-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--panel-soft);
+  font-size: 12px;
+  white-space: nowrap;
+}
 .gallery-toggle.active {
   color: var(--accent);
   background: var(--accent-soft);

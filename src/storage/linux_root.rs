@@ -843,7 +843,7 @@ fn remove_directory_contents(
 
 fn map_mutation_error(context: &'static str, error: Errno) -> AppError {
     match error {
-        Errno::EXIST => AppError::Conflict("Destination already exists".into()),
+        Errno::EXIST => AppError::DestinationExists,
         Errno::NOENT => AppError::NotFound,
         Errno::LOOP | Errno::XDEV | Errno::NOTDIR | Errno::ACCESS | Errno::PERM => {
             AppError::Forbidden
@@ -962,7 +962,7 @@ mod tests {
             handle
                 .rename_noreplace("source/renamed.txt", "source/occupied.txt")
                 .await,
-            Err(AppError::Conflict(_))
+            Err(AppError::DestinationExists)
         ));
 
         handle

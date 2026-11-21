@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
@@ -7,20 +9,36 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    error::{AppResult, CommitState},
+    error::{AppError, AppResult, CommitState},
     file_access::{
         batch_destination_path, ensure_copy_target_outside_source, ensure_non_root,
         ensure_storage_action, ensure_writable, share_storage_path, validate_batch_size, FileQuery,
         FolderLockAuthorizer, StorageAction,
     },
     state::AppState,
+    storage_backend::{StorageBackend, TransferKind},
 };
+
+/// What a batch transfer does when the destination already holds the name.
+#[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictPolicy {
+    /// Keep the current behaviour: report the collision to the caller.
+    #[default]
+    Error,
+    /// Allocate the numbered name the upload path already uses.
+    KeepBoth,
+    /// Replace the destination file through the WebDAV transfer path.
+    Overwrite,
+}
 
 #[derive(Deserialize)]
 pub struct BatchBody {
     pub paths: Vec<String>,
     #[serde(default)]
     pub target: String,
+    #[serde(default)]
+    pub conflict: ConflictPolicy,
 }
 
 #[derive(Serialize)]
@@ -106,12 +124,14 @@ async fn execute(
                     ensure_copy_target_outside_source(&path, &destination_path)?;
                     lock_authorizer
                         .ensure_tree_access(&share_storage_path(&share, &destination_path))?;
-                    let destination = share_storage_path(&share, &destination_path);
-                    if matches!(operation, Operation::Move) {
-                        backend.move_path(&source, &destination).await
-                    } else {
-                        backend.copy_path(&source, &destination).await
-                    }
+                    transfer(
+                        &backend,
+                        operation,
+                        &share_storage_path(&share, &path),
+                        &share_storage_path(&share, &destination_path),
+                        body.conflict,
+                    )
+                    .await
                 }
             }
         }
@@ -134,6 +154,130 @@ async fn execute(
         });
     }
     Ok(batch_response(results).into_response())
+}
+
+/// Applies the collision policy the caller chose before the transfer started.
+/// Directories always take the numbered name: replacing a tree would delete
+/// content the caller never selected.
+async fn transfer(
+    backend: &StorageBackend,
+    operation: Operation,
+    source: &str,
+    destination: &str,
+    conflict: ConflictPolicy,
+) -> AppResult<()> {
+    let directory = backend.metadata(source).await?.is_dir;
+    let policy = if directory {
+        ConflictPolicy::KeepBoth
+    } else {
+        conflict
+    };
+    match policy {
+        ConflictPolicy::Overwrite => {
+            let kind = match operation {
+                Operation::Move => TransferKind::Move,
+                _ => TransferKind::Copy,
+            };
+            backend
+                .dav_transfer(source, destination, kind, true)
+                .await
+                .map(|_| ())
+        }
+        ConflictPolicy::Error => match operation {
+            Operation::Move => backend.move_path(source, destination).await,
+            _ => backend.copy_path(source, destination).await,
+        },
+        ConflictPolicy::KeepBoth => {
+            // Only a collision detected before any write is retried. Files create
+            // the destination with create-new semantics, so a collision means
+            // nothing was written. Directories are not retried: a partial tree
+            // could remain if the conflict surfaced mid-copy.
+            let attempts = if directory { 1 } else { MAX_COLLISION_ATTEMPTS };
+            keep_both_with_retries(
+                attempts,
+                |reserved| {
+                    Box::pin(
+                        async move { available_destination(backend, destination, &reserved).await },
+                    )
+                },
+                |candidate| {
+                    Box::pin(async move {
+                        match operation {
+                            Operation::Move => backend.move_path(source, &candidate).await,
+                            _ => backend.copy_path(source, &candidate).await,
+                        }
+                    })
+                },
+            )
+            .await
+        }
+    }
+}
+
+const MAX_NAME_ATTEMPTS: usize = 1000;
+const MAX_COLLISION_ATTEMPTS: usize = 3;
+
+#[cfg(test)]
+mod retry_tests;
+
+type RetryFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Retries `attempt` with a fresh candidate while it reports `DestinationExists`.
+/// The caller decides how many attempts are safe (directories get one).
+async fn keep_both_with_retries<'a, N, A>(
+    attempts: usize,
+    mut next: N,
+    mut attempt: A,
+) -> AppResult<()>
+where
+    N: FnMut(HashSet<String>) -> RetryFuture<'a, AppResult<String>>,
+    A: FnMut(String) -> RetryFuture<'a, AppResult<()>>,
+{
+    let mut reserved = HashSet::new();
+    let mut last = None;
+    for _ in 0..attempts {
+        let candidate = next(reserved.clone()).await?;
+        match attempt(candidate.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.is_destination_exists() => {
+                reserved.insert(candidate);
+                last = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(if attempts == 1 {
+        last.unwrap_or(AppError::DestinationExists)
+    } else {
+        AppError::Conflict(format!("已尝试 {attempts} 个编号仍冲突").into())
+    })
+}
+
+/// Returns `destination` when it is free, otherwise the next numbered name the
+/// upload path would allocate for the same file. Names this batch already tried
+/// are skipped, so a retry never reuses the same candidate.
+async fn available_destination(
+    backend: &StorageBackend,
+    destination: &str,
+    reserved: &HashSet<String>,
+) -> AppResult<String> {
+    if !reserved.contains(destination) && backend.metadata(destination).await.is_err() {
+        return Ok(destination.to_owned());
+    }
+    let (parent, name) = match destination.rsplit_once('/') {
+        Some((parent, name)) => (format!("{parent}/"), name),
+        None => (String::new(), destination),
+    };
+    let mut names = HashSet::from([name.to_owned()]);
+    for _ in 0..MAX_NAME_ATTEMPTS {
+        let candidate = crate::upload_batch::numbered_upload_name(name, &names)?;
+        let path = format!("{parent}{candidate}");
+        if !reserved.contains(&path) && backend.metadata(&path).await.is_err() {
+            return Ok(path);
+        }
+        names.insert(candidate);
+    }
+    Err(AppError::DestinationExists)
 }
 
 fn batch_response(results: Vec<BatchItemResult>) -> (StatusCode, Json<BatchResponse>) {

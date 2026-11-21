@@ -20,7 +20,7 @@ impl S3Backend {
         options: S3MultipartCopyOptions<'_>,
     ) -> AppResult<String> {
         if options.destination_must_not_exist && self.head_key(destination_key).await?.is_some() {
-            return Err(AppError::Conflict("目标对象已存在".into()));
+            return Err(AppError::DestinationExists);
         }
         let started = self
             .start_multipart_operation(

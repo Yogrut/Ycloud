@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, useId } from 'vue'
 import { useLocale } from '../i18n'
+import AppIcon from './AppIcon.vue'
 
 const props = defineProps<{ title: string; busy?: boolean; wide?: boolean }>()
 const emit = defineEmits<{ close: [] }>()
@@ -38,7 +39,7 @@ onBeforeUnmount(() => {
     <section ref="panel" class="settings-drawer" :class="{ wide }" role="dialog" aria-modal="true" :aria-labelledby="titleId" @keydown="keydown">
       <header class="settings-drawer-head">
         <h2 :id="titleId">{{ title }}</h2>
-        <button class="drawer-close" type="button" :disabled="busy" :aria-label="locale.t('common.close')" @click="close">×</button>
+        <button class="drawer-close" type="button" :disabled="busy" :aria-label="locale.t('common.close')" @click="close"><AppIcon name="close" :size="18" weight="regular" /></button>
       </header>
       <div class="settings-drawer-content"><slot /></div>
     </section>

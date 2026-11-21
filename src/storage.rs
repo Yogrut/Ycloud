@@ -481,7 +481,7 @@ impl StorageService {
                 .await
                 .map_err(|error| AppError::with_source("failed to inspect destination", error))?
             {
-                return Err(AppError::Conflict("Destination already exists".into()));
+                return Err(AppError::DestinationExists);
             }
             require_plain_directory(destination.absolute().parent()).await?;
             fs::rename(source.absolute(), destination.absolute())
@@ -650,9 +650,7 @@ async fn copy_directory_iterative(source: &Path, destination: &Path) -> AppResul
         fs::create_dir(&current_destination)
             .await
             .map_err(|error| match error.kind() {
-                std::io::ErrorKind::AlreadyExists => {
-                    AppError::Conflict("Destination already exists".into())
-                }
+                std::io::ErrorKind::AlreadyExists => AppError::DestinationExists,
                 _ => AppError::with_source("failed to create copied directory", error),
             })?;
         let mut entries = fs::read_dir(&current_source)

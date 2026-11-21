@@ -118,7 +118,18 @@ fn failure_ttl(outcome: Outcome) -> Option<Duration> {
     }
 }
 
+fn lock_queue(mutex: &std::sync::Mutex<Queue>) -> std::sync::MutexGuard<'_, Queue> {
+    // A poisoned queue only costs one regenerated thumbnail; keep serving.
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl Gallery {
+    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+        lock_queue(&self.inner.queue)
+    }
+
     pub(crate) fn new(config: &Path) -> Self {
         Self {
             inner: Arc::new(GalleryState {
@@ -151,7 +162,7 @@ impl Gallery {
             storage: storage.to_owned(),
             path,
         };
-        let mut queue = self.inner.queue.lock().expect("gallery queue poisoned");
+        let mut queue = self.queue();
         if queue.pending.contains(&job) {
             if committed && queue.active.as_ref() == Some(&job) {
                 queue.changed = true;
@@ -320,7 +331,7 @@ impl Gallery {
                         .inner
                         .availability
                         .store(DISABLED, Ordering::Release);
-                    *gallery.inner.queue.lock().expect("gallery queue poisoned") = Queue::default();
+                    *gallery.queue() = Queue::default();
                     tracing::warn!(?error, "gallery generator is disabled");
                     return;
                 }
@@ -331,7 +342,7 @@ impl Gallery {
                     break;
                 }
                 let job = {
-                    let mut queue = gallery.inner.queue.lock().expect("gallery queue poisoned");
+                    let mut queue = gallery.queue();
                     let job = queue.waiting.pop_front();
                     queue.active = job.clone();
                     job
@@ -347,7 +358,7 @@ impl Gallery {
                     result = gallery.generate(&state, &job) => result,
                 };
                 {
-                    let mut queue = gallery.inner.queue.lock().expect("gallery queue poisoned");
+                    let mut queue = gallery.queue();
                     queue.active = None;
                     if std::mem::take(&mut queue.changed) {
                         queue.waiting.push_back(job);
@@ -421,6 +432,9 @@ impl Gallery {
                 .map_err(cache_io)?;
         }
         record.flush().await.map_err(cache_io)?;
+        // A truncated cache record is indistinguishable from a valid one, so the
+        // bytes must reach the disk before the rename publishes it.
+        record.sync_all().await.map_err(cache_io)?;
         drop(record);
         let _ = fs::remove_file(output).await;
         fs::rename(staged, self.cached(&job.storage, &job.path))
@@ -607,6 +621,19 @@ async fn render(root: &Path) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_lock_survives_a_poisoned_mutex() {
+        let mutex = std::sync::Mutex::new(Queue::default());
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mutex.lock().unwrap();
+            panic!("poison the gallery queue");
+        }));
+        assert!(poisoned.is_err());
+        // A thumbnail request must keep working instead of panicking forever.
+        let guard = lock_queue(&mutex);
+        assert!(guard.pending.is_empty());
+    }
 
     #[test]
     fn validates_raster_signatures_without_trusting_the_extension() {

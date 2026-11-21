@@ -181,7 +181,7 @@ impl S3Backend {
                     return Err(if allow_files {
                         AppError::PreconditionFailed
                     } else {
-                        AppError::Conflict("目标路径已经存在".into())
+                        AppError::DestinationExists
                     })
                 }
                 Ok(metadata) => Some(metadata),

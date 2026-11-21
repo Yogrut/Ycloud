@@ -437,7 +437,7 @@ impl TransactionPaths {
             if fs::try_exists(destination).await.map_err(|error| {
                 AppError::with_source("failed to inspect transaction destination", error)
             })? {
-                return Err(AppError::Conflict("Destination already exists".into()));
+                return Err(AppError::DestinationExists);
             }
             fs::rename(source, destination)
                 .await
@@ -880,7 +880,7 @@ impl TransactionPaths {
         let pending = self
             .pending_publication
             .lock()
-            .expect("publication mutex poisoned")
+            .map_err(|_| AppError::internal("publication mutex poisoned"))?
             .clone();
         let Some(mut journal) = pending else {
             return Ok(());
@@ -900,7 +900,7 @@ impl TransactionPaths {
         *self
             .pending_publication
             .lock()
-            .expect("publication mutex poisoned") = None;
+            .map_err(|_| AppError::internal("publication mutex poisoned"))? = None;
         Ok(())
     }
 

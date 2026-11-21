@@ -41,6 +41,11 @@ pub struct AppState {
     pub(crate) login_attempts: Arc<LoginAttemptGates>,
     pub admin_totp_replay: crate::totp::TotpReplayStore,
     pub webdav_gate: Arc<Semaphore>,
+    /// Caps concurrent change streams so one misbehaving client cannot pin an
+    /// unbounded number of long-lived connections.
+    pub(crate) changes_gate: Arc<Semaphore>,
+    /// Per-credential stream budget, keyed by a hash of the token.
+    pub(crate) changes_tokens: Arc<crate::changes_gate::TokenStreams>,
     pub(crate) webdav_credentials: crate::webdav::CredentialCache,
     pub(crate) directory_size_gate: Arc<Semaphore>,
     pub(crate) gallery: crate::gallery::Gallery,
@@ -186,6 +191,8 @@ impl AppState {
             login_attempts: Arc::new(LoginAttemptGates::default()),
             admin_totp_replay: crate::totp::TotpReplayStore::default(),
             webdav_gate: Arc::new(Semaphore::new(8)),
+            changes_gate: Arc::new(Semaphore::new(128)),
+            changes_tokens: Arc::new(crate::changes_gate::TokenStreams::default()),
             webdav_credentials: crate::webdav::CredentialCache::default(),
             directory_size_gate: Arc::new(Semaphore::new(2)),
             gallery,

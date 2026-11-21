@@ -283,7 +283,16 @@ impl TransactionPaths {
             && !anchored_publication
         {
             return Err(AppError::Conflict(
-                "Upload publication identity cannot be verified; resources retained".into(),
+                format!(
+                    "发布身份无法验证（日志 {}）：目标可能已是回滚还原的原文件。资源已保留。\
+                     删除日志 {} 后，对应备份 {} 与锚点 {} 会被当作孤儿清理；\
+                     请先确认目标文件内容就是要保留的版本，再删除日志",
+                    journal.id,
+                    self.journals.join(format!("{}.json", journal.id)).display(),
+                    self.backups.join(&journal.id).display(),
+                    self.anchors.join(&journal.id).display(),
+                )
+                .into(),
             ));
         }
         let was_committed = journal.published || (destination_exists && !upload_exists);

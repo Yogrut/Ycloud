@@ -37,6 +37,8 @@ function operations() {
     capabilities: ref(capabilities), maxArchiveBytes: ref(0), maxArchiveEntries: ref(0),
     selected: ref(new Set<string>()), requireCapability: () => true,
     announce: vi.fn(), refresh: vi.fn().mockResolvedValue(undefined),
+    refreshForced: vi.fn().mockResolvedValue(undefined),
+    hideEntries: vi.fn(), releaseEntries: vi.fn(), settleEntries: vi.fn(),
   }
   const scope = effectScope()
   downloadScopes.push(scope)
@@ -51,7 +53,7 @@ function listingData(path: string): FileListResponse {
 }
 
 function listing() {
-  const context = { announce: vi.fn(), resetSelection: vi.fn(), openLockedEntry: vi.fn(), requestStorageLogin: vi.fn() }
+  const context = { announce: vi.fn(), resetSelection: vi.fn(), pruneSelection: vi.fn(), openLockedEntry: vi.fn(), requestStorageLogin: vi.fn() }
   return { context, view: useBrowserListing(context) }
 }
 
@@ -110,7 +112,7 @@ describe('file operation resilience', () => {
     paths.push('unselected.txt')
     context.storageId.value = 'other'
     await actions.confirmTransfer('target')
-    expect(batchOperation).toHaveBeenCalledExactlyOnceWith(operation, ['one.txt'], 'target', 'primary')
+    expect(batchOperation).toHaveBeenCalledExactlyOnceWith(operation, ['one.txt'], 'target', 'primary', 'error')
     expect(context.announce).toHaveBeenCalledWith(expect.stringContaining('失败 1 项'), 'error')
     expect(actions.batchResult.value?.attentionItems.map(item => item.path)).toEqual(['one.txt'])
     expect(actions.operationBusy.value).toBe(false)
@@ -181,7 +183,7 @@ describe('file operation resilience', () => {
     actions.requestDelete(['other.txt'])
     actions.requestTransfer('copy', ['other.txt'])
     expect(batchOperation).toHaveBeenCalledTimes(1)
-    expect(batchOperation).toHaveBeenCalledWith('delete', ['one.txt'], '', 'primary')
+    expect(batchOperation).toHaveBeenCalledWith('delete', ['one.txt'], '', 'primary', 'error')
     expect(actions.pendingDelete.value).toEqual(['one.txt'])
     expect(actions.pickerOperation.value).toBeNull()
     pending.resolve(completed)

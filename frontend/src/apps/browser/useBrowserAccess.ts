@@ -3,13 +3,14 @@ import type { Ref } from 'vue'
 import type { BrowserCapabilities, FileEntry } from '../../shared/api/browser'
 import { adminLogin, logout, unlockFolder } from '../../shared/api/browser'
 import { useLocale } from '../../shared/i18n'
-import { appPath } from '../../shared/routes'
+import { appPath, navigateTo } from '../../shared/routes'
 
 interface BrowserAccessContext {
   storageId: Ref<string>
   capabilities: Ref<BrowserCapabilities>
   isAdministrator: Ref<boolean>
   navigate: (destination: string) => Promise<void>
+  refresh: () => Promise<void>
   resetAfterSignIn: (requestedStorageId: string) => Promise<void>
   openPreviewImage: (entry: FileEntry) => boolean
   openPreviewFile: (entry: FileEntry) => void
@@ -76,7 +77,7 @@ export function useBrowserAccess(context: BrowserAccessContext) {
   async function openAdmin(): Promise<void> {
     pendingStorageId.value = ''
     if (context.isAdministrator.value) {
-      window.location.href = appPath('/admin/dashboard')
+      navigateTo('/admin/dashboard')
       return
     }
     adminUser.value = ''
@@ -108,7 +109,11 @@ export function useBrowserAccess(context: BrowserAccessContext) {
       adminTotpCode.value = ''
       adminTotpRequired.value = false
       context.isAdministrator.value = result.is_admin
-      if (result.is_admin) window.location.href = appPath('/admin/dashboard')
+      if (result.is_admin) {
+        // Warm the admin chunk so opening the console never repaints a loader.
+        void import('../admin/AdminView.vue').catch(() => undefined)
+        await context.refresh().catch(() => undefined)
+      }
     } catch (error) {
       adminError.value = error instanceof Error ? error.message : locale.text('登录失败', 'Sign-in failed')
     } finally {

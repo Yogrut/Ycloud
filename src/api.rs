@@ -803,6 +803,112 @@ pub async fn rename_file(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// Server-sent change signals for one directory of one storage. The stream
+/// carries no file names: a browser that receives one re-reads the page it is
+/// already showing.
+pub async fn directory_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FileQuery>,
+) -> AppResult<axum::response::Response> {
+    let share = resolve_share(&state, &headers, &query).await?;
+    ensure_storage_action(&state, &headers, &share.storage_id, StorageAction::Browse).await?;
+    // One stream per browser credential: the token is hashed, never stored raw.
+    let subject = crate::auth::current_request_subject(&state, &headers)
+        .await
+        .ok_or(AppError::Unauthorized)?;
+    let token = match subject {
+        crate::auth::RequestSubject::Session(token) | crate::auth::RequestSubject::Gate(token) => {
+            token
+        }
+    };
+    let token_permit = state
+        .changes_tokens
+        .try_enter(&token)
+        .ok_or_else(|| AppError::ServiceUnavailable("实时同步连接数已满，请稍后重试".into()))?;
+    let storage = share.storage_id.clone();
+    let dir = query
+        .path
+        .as_deref()
+        .unwrap_or("")
+        .trim_matches('/')
+        .to_owned();
+    // Same folder-lock gate as the listing: a locked directory needs its key,
+    // otherwise the caller could watch activity inside it.
+    check_folder_locks(
+        &state,
+        &headers,
+        &share.storage_id,
+        &share_storage_path(&share, &dir),
+    )
+    .await?;
+    // One permit per live stream: a client that opens too many gets a clear
+    // refusal instead of an unbounded pile of connections.
+    let permit = state
+        .changes_gate
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::ServiceUnavailable("实时同步连接数已满，请稍后重试".into()))?;
+    let receiver = crate::events::subscribe();
+    // The stream closes after a fixed age so every client re-authenticates on its
+    // automatic reconnect; dead connections (crashed tabs, lost networks) are
+    // reclaimed this way. A one-minute jitter keeps a restart from making every
+    // client reconnect at the same instant.
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::from(elapsed.subsec_nanos()) % 120)
+        .unwrap_or(0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(540 + jitter);
+    let stream = futures_util::stream::unfold(
+        (receiver, storage, dir, (permit, token_permit), deadline),
+        |(mut receiver, storage, dir, permits, deadline)| async move {
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => return None,
+                    received = receiver.recv() => match received {
+                        Ok(change) => {
+                            if change.storage == storage && change.dir == dir {
+                                let event = axum::response::sse::Event::default()
+                                    .event("change")
+                                    .data("1");
+                                return Some((
+                                    Ok::<_, std::convert::Infallible>(event),
+                                    (receiver, storage, dir, permits, deadline),
+                                ));
+                            }
+                        }
+                        // A slow consumer missed signals; tell it to resync
+                        // instead of silently skipping them.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let event = axum::response::sse::Event::default()
+                                .event("change")
+                                .data("resync");
+                            return Some((
+                                Ok::<_, std::convert::Infallible>(event),
+                                (receiver, storage, dir, permits, deadline),
+                            ));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                    },
+                }
+            }
+        },
+    );
+    // Proxies must not buffer the stream, and a change signal is never cacheable.
+    let mut response = axum::response::Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-accel-buffering"),
+        axum::http::HeaderValue::from_static("no"),
+    );
+    Ok(response)
+}
+
 pub async fn preview_file(
     State(state): State<AppState>,
     method: Method,
@@ -881,6 +987,57 @@ pub async fn unlock_folder(
         .map_err(|error| AppError::with_source("failed to build lock cookie", error))?;
     response.headers_mut().append(header::SET_COOKIE, value);
     Ok(response)
+}
+
+#[cfg(test)]
+mod changes_auth_tests {
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use crate::{
+        config::ConfigFile,
+        test_support::{app_state, TestDirectory},
+    };
+
+    // `oneshot` builds a relative URI, so the request needs a Host: the router
+    // rejects host-less requests with 400 before any handler runs.
+    fn subscription(token: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .uri("/api/changes?path=&storage_id=primary")
+            .header(header::HOST, "localhost");
+        if let Some(token) = token {
+            builder = builder.header(header::COOKIE, format!("session={token}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    async fn fixture() -> (TestDirectory, Router, crate::state::AppState) {
+        let directory = TestDirectory::new("changes-auth");
+        let state = app_state(&directory, ConfigFile::with_test_storage()).await;
+        (directory, crate::app::build_router(state.clone()), state)
+    }
+
+    #[tokio::test]
+    async fn rejects_a_subscription_without_credentials() {
+        let (_directory, app, _state) = fixture().await;
+        let response = app.oneshot(subscription(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    // The test configuration keeps the site gate on, so a session alone is not
+    // enough: the gate cookie must be present too. Proving the 200 path needs a
+    // gate token, which this fixture does not mint yet.
+    #[tokio::test]
+    async fn refuses_a_session_subscription_without_the_site_gate() {
+        let (_directory, app, state) = fixture().await;
+        let token = state.sessions.create().await;
+        let response = app.oneshot(subscription(Some(&token))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
 
 #[cfg(test)]

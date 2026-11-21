@@ -213,8 +213,8 @@ defineExpose({ openEditor })
               <div class="chart-days">
                 <div v-for="(day, index) in days" :key="day.date" class="chart-day">
                   <button type="button" class="day-bars" :class="{ selected: selected === day.date }" :aria-label="day.date + ' ' + directionLabel('upload') + ' ' + bytes(day.upload) + ', ' + directionLabel('download') + ' ' + bytes(day.download)" @mouseenter="selectDay(day.date, $event)" @mousemove="selectDay(day.date, $event)" @mouseleave="selected = undefined" @focus="selectDay(day.date, $event)" @blur="selected = undefined" @click="selectDay(day.date, $event)">
-                    <span class="download" :class="{ 'has-traffic': day.download > 0 }" :style="{ height: (day.download / maximum * 100) + '%' }" />
-                    <span class="upload" :class="{ 'has-traffic': day.upload > 0 }" :style="{ height: (day.upload / maximum * 100) + '%' }" />
+                    <span v-if="day.download > 0" class="download has-traffic" :style="{ height: (day.download / maximum * 100) + '%' }" />
+                    <span v-if="day.upload > 0" class="upload has-traffic" :style="{ height: (day.upload / maximum * 100) + '%' }" />
                   </button>
                   <small>{{ index % Math.max(1, Math.ceil(days.length / 7)) === 0 ? day.date.slice(5) : '' }}</small>
                 </div>
@@ -305,7 +305,7 @@ defineExpose({ openEditor })
 .day-bars .download { background: var(--download-used); }
 .day-bars .upload { background: var(--upload-used); }
 .day-bars:hover,.day-bars:focus-visible,.day-bars.selected { background: rgb(128 128 128 / .12); }
-.chart-day small { height: 22px; padding-top: 7px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.chart-day small { height: 22px; padding-top: 7px; color: var(--muted); font-size: 10px; white-space: nowrap; text-align: center; }
 .day-tooltip { position: absolute; z-index: 4; box-sizing: border-box; padding: 10px 12px; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 8px 24px rgb(15 23 42 / .14); pointer-events: none; }
 .day-tooltip > strong { display: block; margin-bottom: 6px; color: var(--text); font-size: 12px; font-weight: 500; }
 .day-tooltip span,.day-tooltip em { display: flex; align-items: center; gap: 6px; min-height: 22px; font-size: 12px; font-style: normal; }

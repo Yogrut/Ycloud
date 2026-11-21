@@ -179,6 +179,7 @@ impl StorageBackend {
             lease: Some(lease),
             transfer: Some(self.transfer_token()),
             gallery: self.gallery.clone(),
+            storage_id: self.storage_id.clone(),
         })
     }
 

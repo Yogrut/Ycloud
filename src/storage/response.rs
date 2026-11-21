@@ -255,6 +255,28 @@ mod tests {
     use super::*;
     use crate::test_support::TestDirectory;
 
+    #[test]
+    fn attachment_header_strips_unsafe_filename_characters() {
+        let header = attachment_header(std::path::Path::new("a\"b;c\r\nd 中文.txt"));
+        let text = header.to_str().unwrap();
+        // The quoted ascii fallback keeps only letters, digits, dot, dash and underscore.
+        let ascii = text
+            .split("filename=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert!(ascii
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_')));
+        assert!(!text.contains('\r') && !text.contains('\n'));
+        let encoded = text.split("filename*=UTF-8''").nth(1).unwrap();
+        // Quotes, semicolons and whitespace are percent-encoded in the RFC 5987 form.
+        assert!(encoded.contains("%22") && encoded.contains("%3B") && encoded.contains("%20"));
+        assert!(!encoded.contains('"') && !encoded.contains(';'));
+    }
+
     #[tokio::test]
     async fn opened_download_keeps_its_own_metadata_when_the_path_is_replaced() {
         let directory = TestDirectory::new("download-opened-identity");

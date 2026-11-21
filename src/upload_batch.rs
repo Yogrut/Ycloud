@@ -1126,7 +1126,7 @@ fn browser_upload_policy(
     )
 }
 
-fn numbered_upload_name(name: &str, names: &HashSet<String>) -> AppResult<String> {
+pub(crate) fn numbered_upload_name(name: &str, names: &HashSet<String>) -> AppResult<String> {
     let (stem, extension) = name
         .rsplit_once('.')
         .filter(|(stem, _)| !stem.is_empty())

@@ -62,9 +62,15 @@ export function useBrowserEntryEditor(context: EntryEditorContext) {
     } catch (error) {
       if (!disposed) {
         entryRetryBlocked.value = error instanceof ApiError && error.blocksRetry
-        entryError.value = error instanceof Error ? error.message : request.kind === 'folder'
-          ? locale.text('创建失败', 'Unable to create the folder')
-          : locale.text('重命名失败', 'Unable to rename the item')
+        if (error instanceof ApiError && error.code === 'conflict' && request.kind === 'rename') {
+          entryError.value = locale.text('该名称已存在', 'That name already exists')
+        } else if (error instanceof Error) {
+          entryError.value = error.message
+        } else {
+          entryError.value = request.kind === 'folder'
+            ? locale.text('创建失败', 'Unable to create the folder')
+            : locale.text('重命名失败', 'Unable to rename the item')
+        }
       }
       return
     } finally {

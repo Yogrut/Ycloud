@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import LoginView from './LoginView.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
 import ThemeToggle from '../../shared/components/ThemeToggle.vue'
@@ -13,17 +13,28 @@ const BrowserView = lazyPage(() => import('../browser/BrowserView.vue').then(mod
 const PreviewView = lazyPage(() => import('../preview/PreviewView.vue').then(module => module.default))
 
 const theme = useTheme()
-const route = computed(() => currentAppPath())
+const activePath = ref(currentAppPath())
+const route = computed(() => activePath.value)
 const isBrowser = computed(() => route.value === '/browse')
 const isAdmin = computed(() => route.value === '/admin' || route.value.startsWith('/admin/'))
 const isPreview = computed(() => route.value === '/preview')
+
+function syncRoute(): void {
+  activePath.value = currentAppPath()
+}
 
 function suppressNativeContextMenu(event: MouseEvent): void {
   event.preventDefault()
 }
 
-onMounted(() => document.addEventListener('contextmenu', suppressNativeContextMenu))
-onBeforeUnmount(() => document.removeEventListener('contextmenu', suppressNativeContextMenu))
+onMounted(() => {
+  window.addEventListener('popstate', syncRoute)
+  document.addEventListener('contextmenu', suppressNativeContextMenu)
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('popstate', syncRoute)
+  document.removeEventListener('contextmenu', suppressNativeContextMenu)
+})
 </script>
 
 <template>

@@ -54,7 +54,12 @@ describe('browser feedback', () => {
       const writeCalls = request.mock.calls.filter(([input]) => String(input).startsWith(`/api/batch/${operation}`))
       expect(writeCalls).toHaveLength(1)
       expect(writeCalls[0]?.[1]?.method).toBe(operation === 'move' ? 'PUT' : 'POST')
-      expect(JSON.parse(String(writeCalls[0]?.[1]?.body))).toEqual({ paths: ['one.txt'], target: '' })
+      expect(JSON.parse(String(writeCalls[0]?.[1]?.body))).toEqual({
+        paths: ['one.txt'],
+        target: '',
+        // Transfers pick the first policy button ("keep both"); delete has none.
+        conflict: operation === 'delete' ? 'error' : 'keep_both',
+      })
       const signal = writeCalls[0]?.[1]?.signal as AbortSignal
       const before = request.mock.calls.length
       app.unmount()

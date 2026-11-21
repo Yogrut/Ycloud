@@ -30,6 +30,8 @@ function setup() {
   const context = {
     storageId: ref('primary'), selected: ref(new Set(['one.txt'])),
     requireCapability: vi.fn().mockReturnValue(true), announce: vi.fn(), refresh: vi.fn().mockResolvedValue(undefined),
+    refreshForced: vi.fn().mockResolvedValue(undefined),
+    hideEntries: vi.fn(), releaseEntries: vi.fn(), settleEntries: vi.fn(),
   }
   const actions = scope.run(() => useBrowserFileOperations(context))!
   const open = (operation: BatchOperation, paths = ['one.txt']) => {
@@ -83,7 +85,7 @@ describe('browser batch operation lifecycle', () => {
     expect(actions.showDelete.value).toBe(false)
     expect(actions.pendingDelete.value).toEqual([])
     expect(actions.pickerOperation.value).toBe('copy')
-    expect(actions.pickerTitle.value).toContain('1 个项目')
+    expect(actions.pickerTitle.value).toContain('复制到')
   })
 
   it('replaces a transfer picker with a delete confirmation and clears closed context', () => {
@@ -116,12 +118,26 @@ describe('browser batch operation lifecycle', () => {
     actions.closeBatchDialog()
     open('delete', ['other.txt'])
     open('copy', ['other.txt'])
-    expect(batch).toHaveBeenCalledExactlyOnceWith(operation, ['one.txt'], operation === 'delete' ? '' : 'target', 'primary')
+    expect(batch).toHaveBeenCalledExactlyOnceWith(operation, ['one.txt'], operation === 'delete' ? '' : 'target', 'primary', 'error')
     expect(actions.showDelete.value).toBe(operation === 'delete')
     expect(actions.pickerOperation.value).toBeNull()
     pending.resolve(completed)
     await request
     expect(context.selected.value.size).toBe(0)
+  })
+
+  it('hides rows while a delete runs, counts it, and releases them afterwards', async () => {
+    const pending = deferred<BatchResponse>()
+    batch.mockReturnValue(pending.promise)
+    const { open, actions, context } = setup()
+    open('delete', ['one.txt'])
+    const request = actions.confirmDelete()
+    expect(context.hideEntries).toHaveBeenCalledExactlyOnceWith('primary', ['one.txt'])
+    expect(actions.pendingBatches.value).toBe(1)
+    pending.resolve(completed)
+    await request
+    expect(actions.pendingBatches.value).toBe(0)
+    expect(context.releaseEntries).toHaveBeenCalled()
   })
 
   it('allows an explicit delete retry after a definite rejection and resets it on close', async () => {
@@ -132,7 +148,8 @@ describe('browser batch operation lifecycle', () => {
     expect(actions.showDelete.value).toBe(true)
     expect(actions.operationError.value).toBe('Denied')
     expect(actions.operationRetryBlocked.value).toBe(false)
-    expect(context.refresh).not.toHaveBeenCalled()
+    // The rows were hidden optimistically, so a failed delete refreshes them back.
+    expect(context.refreshForced).toHaveBeenCalled()
     await actions.confirmDelete()
     expect(batch).toHaveBeenCalledTimes(2)
     expect(actions.operationError.value).toBe('')
@@ -154,7 +171,7 @@ describe('browser batch operation lifecycle', () => {
     expect(actions.operationRetryBlocked.value).toBe(true)
     expect(actions.operationError.value).toBe(error.message)
     expect(batch).toHaveBeenCalledOnce()
-    expect(context.refresh).not.toHaveBeenCalled()
+    expect(context.refreshForced).toHaveBeenCalled()
     actions.closeBatchDialog()
     expect(actions.operationError.value).toBe('')
     expect(actions.operationRetryBlocked.value).toBe(false)
@@ -169,7 +186,8 @@ describe('browser batch operation lifecycle', () => {
     expect(actions.pickerOperation.value).toBeNull()
     expect(actions.operationError.value).toBe('Denied')
     expect(context.announce).toHaveBeenCalledExactlyOnceWith('Denied')
-    expect(context.refresh).not.toHaveBeenCalled()
+    // A move hid its rows, so a failure has to bring them back; a copy hid nothing.
+    expect(context.refreshForced).toHaveBeenCalledTimes(operation === 'move' ? 1 : 0)
     expect(batch).toHaveBeenCalledOnce()
     batch.mockResolvedValue(completed)
     open(operation)
@@ -181,6 +199,7 @@ describe('browser batch operation lifecycle', () => {
   it.each(operations)('does not turn a confirmed %s into a write failure when refresh fails', async operation => {
     const { context, actions, open, confirm } = setup()
     context.refresh.mockRejectedValue(new Error('Listing unavailable'))
+    context.refreshForced.mockRejectedValue(new Error('Listing unavailable'))
     open(operation)
     await confirm(operation)
     expect(context.announce).toHaveBeenCalledWith(expect.stringContaining('成功'), 'success')
@@ -196,6 +215,7 @@ describe('browser batch operation lifecycle', () => {
     const pending = deferred<void>()
     const { context, actions, open, confirm } = setup()
     context.refresh.mockReturnValue(pending.promise)
+    context.refreshForced.mockReturnValue(pending.promise)
     open(operation)
     const request = confirm(operation)
     await Promise.resolve()
@@ -255,6 +275,7 @@ describe('browser batch operation lifecycle', () => {
     const pending = deferred<void>()
     const { context, scope, open, actions } = setup()
     context.refresh.mockReturnValue(pending.promise)
+    context.refreshForced.mockReturnValue(pending.promise)
     open('delete')
     const request = actions.confirmDelete()
     await Promise.resolve()

@@ -168,6 +168,10 @@ export function fileApi(path: string, storageId?: string, options: FileListOptio
   return query ? `/api/files?${query}` : '/api/files'
 }
 
+export function changesUrl(path: string, storageId?: string): string {
+  return withStorage(`/api/changes?path=${encodeURIComponent(`/${cleanPath(path)}`)}`, storageId)
+}
+
 export function listFiles(path: string, storageId?: string, options: FileListOptions = {}): Promise<FileListResponse> {
   return apiRequest<FileListResponse>(fileApi(path, storageId, options), { signal: options.signal })
 }
@@ -252,12 +256,14 @@ export async function cancelUploadBatch(ticket: string, storageId?: string, path
   requireSuccess(result)
 }
 
-export async function batchOperation(operation: BatchOperation, paths: string[], target = '', storageId?: string): Promise<BatchResponse> {
+export type ConflictPolicy = 'error' | 'keep_both' | 'overwrite'
+
+export async function batchOperation(operation: BatchOperation, paths: string[], target = '', storageId?: string, conflict: ConflictPolicy = 'error'): Promise<BatchResponse> {
   const { response, body } = await requestJson<BatchResponse & ErrorEnvelope>(withStorage(`/api/batch/${operation}`, storageId), {
     method: operation === 'move' ? 'PUT' : 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ paths, target: target ? `/${cleanPath(target)}` : '' }),
+    body: JSON.stringify({ paths, target: target ? `/${cleanPath(target)}` : '', conflict }),
   })
   if (response.status === 401) {
     window.location.replace(appPath('/'))

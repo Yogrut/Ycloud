@@ -5,6 +5,12 @@ import { PAGE_LOADING_DELAY_MS } from '../../shared/lazyPage'
 
 vi.mock('./DashboardView.vue', () => ({ default: { template: '<section><h1 id="dashboard-title">仪表盘</h1></section>' } }))
 
+const prefetchAdminPages = vi.hoisted(() => vi.fn())
+vi.mock('./pages', async importOriginal => ({
+  ...await importOriginal<typeof import('./pages')>(),
+  prefetchAdminPages,
+}))
+
 const adminInfo = {
   username: 'admin', has_global_web_password: true, shares: [], folder_locks: [],
   max_upload_bytes: 1024, max_archive_bytes: 1024, max_archive_entries: 100,
@@ -22,6 +28,7 @@ afterEach(() => {
   vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+  prefetchAdminPages.mockClear()
   document.body.replaceChildren()
   window.history.replaceState(null, '', '/')
 })
@@ -71,6 +78,23 @@ describe('AdminView', () => {
     const calls = fetchMock.mock.calls.length
     window.dispatchEvent(new PopStateEvent('popstate'))
     expect(fetchMock).toHaveBeenCalledTimes(calls)
+  })
+
+  it('warms section chunks only once the administrator info is known', async () => {
+    window.history.replaceState(null, '', '/admin/dashboard')
+    let finish!: (response: Response) => void
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(resolve => { finish = resolve })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = await mountAdmin(host)
+    try {
+      // The sign-in card renders for everyone; guests must not download sections.
+      expect(prefetchAdminPages).not.toHaveBeenCalled()
+      finish(new Response(JSON.stringify(adminInfo), { headers: { 'Content-Type': 'application/json' } }))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      await nextTick()
+      expect(prefetchAdminPages).toHaveBeenCalledTimes(1)
+    } finally { app.unmount() }
   })
 
   it('delays the loading placeholder so a fast read never paints it', async () => {

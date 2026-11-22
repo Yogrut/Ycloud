@@ -69,6 +69,10 @@ onScopeDispose(() => {
   if (loadingTimer !== undefined) clearTimeout(loadingTimer)
 })
 
+// Only a confirmed administrator downloads the section chunks: /admin also
+// renders the sign-in card for anyone else. The helper runs at most once.
+watch(info, value => { if (value) prefetchAdminPages() }, { immediate: true })
+
 function selectSection(event: MouseEvent, href: string): void {
   if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return
   event.preventDefault()
@@ -92,9 +96,6 @@ function restoreSection(): void {
 
 onMounted(() => {
   window.addEventListener('popstate', restoreSection)
-  // The console is administrator-only, so warm every section now: clicking a
-  // section should never wait for its code. The helper runs at most once.
-  prefetchAdminPages()
   start()
 })
 onScopeDispose(() => window.removeEventListener('popstate', restoreSection))

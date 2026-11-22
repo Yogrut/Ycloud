@@ -50,3 +50,6 @@ Thumbs.db
 /frontend/dist/
 /frontend/coverage/
 /frontend/*.tsbuildinfo
+
+# Local run capture
+run.log

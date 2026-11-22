@@ -1,6 +1,13 @@
-// Apply the saved theme before the bundle runs. External file because the
-// Content-Security-Policy (script-src 'self') blocks inline scripts.
+// Apply the saved theme and the current shell before the bundle runs, so the
+// first frame already matches the page about to render. External file because
+// the Content-Security-Policy (script-src 'self') blocks inline scripts.
 try {
-  var theme = localStorage.getItem('ycloud-theme')
-  if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme
-} catch (error) { /* A blocked storage API keeps the OS preference. */ }
+  var stored = localStorage.getItem('ycloud-theme')
+  document.documentElement.dataset.theme = stored === 'dark' ? 'dark' : 'light'
+} catch (error) {
+  // A blocked storage API keeps the default light theme.
+  document.documentElement.dataset.theme = 'light'
+}
+var path = location.pathname
+document.documentElement.dataset.shell =
+  path === '/browse' || path.indexOf('/browse/') === 0 ? 'browser' : 'app'

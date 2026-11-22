@@ -61,12 +61,14 @@ mod tests {
             crate::test_support::app_state(&directory, crate::config::ConfigFile::default()).await;
         let router = crate::app::build_router(state);
         assert!(ASSETS.windows(2).all(|pair| pair[0].name < pair[1].name));
+        // The console shell and the file browser now ship inside the entry
+        // script; sections and the preview page remain separate chunks.
         assert!(ASSETS
             .iter()
-            .any(|asset| asset.name.starts_with("AdminView-")));
+            .any(|asset| asset.name.starts_with("DashboardView-")));
         assert!(ASSETS
             .iter()
-            .any(|asset| asset.name.starts_with("BrowserView-")));
+            .any(|asset| asset.name.starts_with("PreviewView-")));
         for asset in &ASSETS {
             let request = |method, etag: Option<&HeaderValue>| {
                 let mut request = Request::builder()

@@ -28,19 +28,10 @@ function suppressNativeContextMenu(event: MouseEvent): void {
 }
 
 // Warm the chunks that a page switch would otherwise have to download. Code
-// only: no request touches the API here.
+// only: no request touches the API here. Console chunks are warmed separately
+// once an administrator is known, so visitors never pay for them.
 function prefetchPages(): void {
   const loads = [
-    () => import('../admin/AdminView.vue'),
-    () => import('../admin/AccountView.vue'),
-    () => import('../admin/DashboardView.vue'),
-    () => import('../admin/LimitsView.vue'),
-    () => import('../admin/LocksView.vue'),
-    () => import('../admin/ProtectionView.vue'),
-    () => import('../admin/SecurityView.vue'),
-    () => import('../admin/StorageView.vue'),
-    () => import('../admin/WebDavView.vue'),
-    () => import('../admin/UsersView.vue'),
     () => import('../browser/BrowserView.vue'),
     () => import('../preview/PreviewView.vue'),
   ]

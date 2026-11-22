@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { BrowserCapabilities, FileEntry } from '../../shared/api/browser'
 import { formatSize } from '../../shared/format'
 import AppIcon from '../../shared/components/AppIcon.vue'
@@ -28,6 +28,7 @@ import { useBrowserListing } from './useBrowserListing'
 import { useBrowserAccess } from './useBrowserAccess'
 import { useBrowserPreviews } from './useBrowserPreviews'
 import { useDirectoryWatcher } from './useDirectoryWatcher'
+import { prefetchAdminPages } from '../admin/pages'
 import { formatBatchSummary } from './operationFeedback'
 import FilePreviewDialog from './FilePreviewDialog.vue'
 import MediaPlayer from '../../shared/components/MediaPlayer.vue'
@@ -114,6 +115,10 @@ const {
 // Another client adding or deleting a file pushes one directory signal; the
 // list then refreshes quietly, without a prompt and without a loading state.
 useDirectoryWatcher(currentStorageId, path, () => { void refresh({ silent: true }) })
+
+// Warm the console chunks once the listing says this account is an
+// administrator; guests never download them. The helper runs at most once.
+watch(isAdministrator, value => { if (value) prefetchAdminPages() }, { immediate: true })
 
 const galleryGrid = ref<InstanceType<typeof GalleryGrid> | null>(null)
 const galleryThumbnailSource = computed(() => galleryStorageId.value === currentStorageId.value && activeGalleryEntry.value

@@ -1,6 +1,6 @@
 import { createApp, h, nextTick, type Component } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { lazyPage } from './lazyPage'
+import { lazyPage, PAGE_LOADING_DELAY_MS } from './lazyPage'
 
 async function settle(): Promise<void> {
   for (let turn = 0; turn < 8; turn++) await Promise.resolve()
@@ -35,7 +35,7 @@ describe('lazy page lifecycle', () => {
       await nextTick()
       // Fast code loads finish before the delay, so no card is painted.
       expect(first.host.querySelector('[role="status"]')).toBeNull()
-      await vi.advanceTimersByTimeAsync(200)
+      await vi.advanceTimersByTimeAsync(PAGE_LOADING_DELAY_MS)
       expect(first.host.querySelector('[role="status"]')).not.toBeNull()
       expect(loader).toHaveBeenCalledTimes(1)
       resolve({ render: () => h('section', 'Loaded page') })

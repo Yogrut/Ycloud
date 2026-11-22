@@ -10,17 +10,18 @@ import { useLocale } from '../../shared/i18n'
 import AdminNavIcon from './AdminNavIcon.vue'
 import { appPath, currentAppPath, navigateTo } from '../../shared/routes'
 import { useAdminSession } from './useAdminSession'
-import { lazyPage } from '../../shared/lazyPage'
+import { lazyPage, PAGE_LOADING_DELAY_MS } from '../../shared/lazyPage'
+import { adminPageLoaders } from './pages'
 
-const AccountView = lazyPage(() => import('./AccountView.vue').then(module => module.default))
-const DashboardView = lazyPage(() => import('./DashboardView.vue').then(module => module.default))
-const LimitsView = lazyPage(() => import('./LimitsView.vue').then(module => module.default))
-const LocksView = lazyPage(() => import('./LocksView.vue').then(module => module.default))
-const ProtectionView = lazyPage(() => import('./ProtectionView.vue').then(module => module.default))
-const SecurityView = lazyPage(() => import('./SecurityView.vue').then(module => module.default))
-const StorageView = lazyPage(() => import('./StorageView.vue').then(module => module.default))
-const WebDavView = lazyPage(() => import('./WebDavView.vue').then(module => module.default))
-const UsersView = lazyPage(() => import('./UsersView.vue').then(module => module.default))
+const AccountView = lazyPage(adminPageLoaders.account)
+const DashboardView = lazyPage(adminPageLoaders.dashboard)
+const LimitsView = lazyPage(adminPageLoaders.limits)
+const LocksView = lazyPage(adminPageLoaders.locks)
+const ProtectionView = lazyPage(adminPageLoaders.protection)
+const SecurityView = lazyPage(adminPageLoaders.security)
+const StorageView = lazyPage(adminPageLoaders.storage)
+const WebDavView = lazyPage(adminPageLoaders.webdav)
+const UsersView = lazyPage(adminPageLoaders.users)
 
 defineProps<{ theme: ThemeController }>()
 const locale = useLocale()
@@ -62,7 +63,7 @@ watch(loading, value => {
   loadingTimer = setTimeout(() => {
     loadingTimer = undefined
     showLoading.value = true
-  }, 200)
+  }, PAGE_LOADING_DELAY_MS)
 }, { immediate: true })
 onScopeDispose(() => {
   if (loadingTimer !== undefined) clearTimeout(loadingTimer)

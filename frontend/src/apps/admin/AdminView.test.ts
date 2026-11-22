@@ -1,6 +1,7 @@
 import { createApp, nextTick, ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import AdminView from './AdminView.vue'
+import { PAGE_LOADING_DELAY_MS } from '../../shared/lazyPage'
 
 vi.mock('./DashboardView.vue', () => ({ default: { template: '<section><h1 id="dashboard-title">仪表盘</h1></section>' } }))
 
@@ -73,6 +74,7 @@ describe('AdminView', () => {
   })
 
   it('delays the loading placeholder so a fast read never paints it', async () => {
+    vi.useFakeTimers()
     window.history.replaceState(null, '', '/admin/dashboard')
     vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => undefined)))
     const host = document.createElement('div')
@@ -80,7 +82,7 @@ describe('AdminView', () => {
     const app = await mountAdmin(host)
     try {
       expect(host.querySelector('.admin-loading')).toBeNull()
-      await new Promise(resolve => setTimeout(resolve, 250))
+      await vi.advanceTimersByTimeAsync(PAGE_LOADING_DELAY_MS)
       await nextTick()
       expect(host.querySelector('.admin-loading')).not.toBeNull()
     } finally { app.unmount() }

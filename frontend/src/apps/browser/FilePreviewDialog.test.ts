@@ -11,16 +11,14 @@ const originalChildNavigation = iframeNavigation.disableChildFrameNavigation
 const originalIframeLoading = iframeSettings.disableIframePageLoading
 
 // Test the viewer's DOM without starting a separate iframe network request.
-// Skipping the page load silently keeps happy-dom from raising a navigation
-// error, which the viewer would treat as a failed preview.
 beforeEach(() => {
   iframeSettings.disableIframePageLoading = true
   iframeNavigation.disableChildFrameNavigation = true
-  document.addEventListener('error', blockIframeErrors, true)
 })
 
-// happy-dom still emits a navigation error for the skipped load; stop it in the
-// capture phase so the viewer's own error handler does not switch to a fallback.
+// happy-dom emits a navigation error for the skipped iframe load. Only the
+// test that needs the viewer to stay ready installs this capture listener, and
+// it removes it again; other tests keep seeing genuine iframe errors.
 function blockIframeErrors(event: Event): void {
   if (event.target instanceof HTMLIFrameElement) {
     event.stopPropagation()
@@ -49,7 +47,6 @@ function showFile(name: string) {
 
 afterEach(() => {
   mountedApps.splice(0).forEach(app => app.unmount())
-  document.removeEventListener('error', blockIframeErrors, true)
   iframeNavigation.disableChildFrameNavigation = originalChildNavigation
   iframeSettings.disableIframePageLoading = originalIframeLoading
   vi.restoreAllMocks()
@@ -239,18 +236,26 @@ describe('FilePreviewDialog', () => {
   })
 
   it('checks a replacement PDF rather than applying the old quota response', async () => {
-    let resolve!: (response: Response) => void
-    const fetchMock = vi.fn().mockReturnValueOnce(new Promise<Response>(accept => { resolve = accept })).mockResolvedValueOnce(new Response(null))
-    vi.stubGlobal('fetch', fetchMock)
-    const { entry } = showFile('old.pdf')
-    entry.path = 'new.pdf'
-    entry.name = 'new.pdf'
-    await new Promise(accept => setTimeout(accept, 0))
-    expect(fetchMock).toHaveBeenCalledTimes(2)
-    resolve(new Response(null, { status: 429 }))
-    await new Promise(accept => setTimeout(accept, 0))
-    await nextTick()
-    expect(document.body.querySelector('iframe')?.getAttribute('src')).toContain('new.pdf')
-    expect(document.body.querySelector('.ycloud-preview-fallback')).toBeNull()
+    // happy-dom reports the navigation it skips as an iframe error; keep that
+    // out of the viewer for this test only. It compensates for the test DOM and
+    // is not a product-behaviour fix.
+    document.addEventListener('error', blockIframeErrors, true)
+    try {
+      let resolve!: (response: Response) => void
+      const fetchMock = vi.fn().mockReturnValueOnce(new Promise<Response>(accept => { resolve = accept })).mockResolvedValueOnce(new Response(null))
+      vi.stubGlobal('fetch', fetchMock)
+      const { entry } = showFile('old.pdf')
+      entry.path = 'new.pdf'
+      entry.name = 'new.pdf'
+      await new Promise(accept => setTimeout(accept, 0))
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      resolve(new Response(null, { status: 429 }))
+      await new Promise(accept => setTimeout(accept, 0))
+      await nextTick()
+      expect(document.body.querySelector('iframe')?.getAttribute('src')).toContain('new.pdf')
+      expect(document.body.querySelector('.ycloud-preview-fallback')).toBeNull()
+    } finally {
+      document.removeEventListener('error', blockIframeErrors, true)
+    }
   })
 })

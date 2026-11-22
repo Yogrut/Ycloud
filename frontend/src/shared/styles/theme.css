@@ -892,7 +892,7 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
    three idle seconds (data-scrolling comes from useScrollbarAutoHide). The
    margin keeps the bar inside the panel padding instead of over the time
    column. Firefox gets the standard properties; WebKit gets the pseudo rules. */
-.file-list-body { --scrollbar-w: 8px; margin-right: var(--scrollbar-w); }
+.file-list-body { --scrollbar-w: 8px; margin-right: calc(-1 * var(--scrollbar-w)); scrollbar-gutter: stable; }
 @supports not selector(::-webkit-scrollbar) {
   .file-list-body { scrollbar-width: thin; scrollbar-color: transparent transparent; }
   .file-list-body[data-scrolling] { scrollbar-color: var(--line-strong) transparent; }

@@ -11,7 +11,7 @@ import AdminNavIcon from './AdminNavIcon.vue'
 import { appPath, currentAppPath, navigateTo } from '../../shared/routes'
 import { useAdminSession } from './useAdminSession'
 import { lazyPage, PAGE_LOADING_DELAY_MS } from '../../shared/lazyPage'
-import { adminPageLoaders } from './pages'
+import { adminPageLoaders, prefetchAdminPages } from './pages'
 
 const AccountView = lazyPage(adminPageLoaders.account)
 const DashboardView = lazyPage(adminPageLoaders.dashboard)
@@ -92,6 +92,9 @@ function restoreSection(): void {
 
 onMounted(() => {
   window.addEventListener('popstate', restoreSection)
+  // The console is administrator-only, so warm every section now: clicking a
+  // section should never wait for its code. The helper runs at most once.
+  prefetchAdminPages()
   start()
 })
 onScopeDispose(() => window.removeEventListener('popstate', restoreSection))

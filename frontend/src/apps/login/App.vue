@@ -7,9 +7,12 @@ import AppIcon from '../../shared/components/AppIcon.vue'
 import { useTheme } from '../../shared/composables/useTheme'
 import { currentAppPath } from '../../shared/routes'
 import { lazyPage } from '../../shared/lazyPage'
+import AdminView from '../admin/AdminView.vue'
+import BrowserView from '../browser/BrowserView.vue'
 
-const AdminView = lazyPage(() => import('../admin/AdminView.vue').then(module => module.default))
-const BrowserView = lazyPage(() => import('../browser/BrowserView.vue').then(module => module.default))
+// Only the preview page still waits for its code; the file browser and the
+// console shell ship with the main program so a route switch never paints a
+// page-load card.
 const PreviewView = lazyPage(() => import('../preview/PreviewView.vue').then(module => module.default))
 
 const theme = useTheme()
@@ -28,11 +31,10 @@ function suppressNativeContextMenu(event: MouseEvent): void {
 }
 
 // Warm the chunks that a page switch would otherwise have to download. Code
-// only: no request touches the API here. Console chunks are warmed separately
+// only: no request touches the API here. Console sections are warmed separately
 // once an administrator is known, so visitors never pay for them.
 function prefetchPages(): void {
   const loads = [
-    () => import('../browser/BrowserView.vue'),
     () => import('../preview/PreviewView.vue'),
   ]
   void (async () => {

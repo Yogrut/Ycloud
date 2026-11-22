@@ -14,13 +14,13 @@ export const adminPageLoaders = {
 
 let adminPrefetchStarted = false
 
-/// Warm the console shell and its sections. Called once an administrator is
-/// known, so visitors never download console code.
+/// Warm the console sections. The shell now ships with the main program, so
+/// only the nine section chunks are fetched here. Called once an administrator
+/// is known, so visitors never download console code.
 export function prefetchAdminPages(): void {
   if (adminPrefetchStarted) return
   adminPrefetchStarted = true
   const loads: Array<() => Promise<unknown>> = [
-    () => import('./AdminView.vue'),
     ...Object.values(adminPageLoaders),
   ]
   void (async () => {

@@ -23,7 +23,7 @@ afterEach(() => {
 })
 
 describe('lazy application routes', () => {
-  it('keeps the login entry eager without importing unselected pages', () => {
+  it('keeps the login entry eager without importing the preview page', () => {
     window.history.replaceState(null, '', '/')
     sessionStorage.setItem('ycloud-stay-signed-out', '1')
     const host = document.createElement('div')
@@ -32,8 +32,7 @@ describe('lazy application routes', () => {
     app.mount(host)
     try {
       expect(host.querySelector('.login-page')).not.toBeNull()
-      expect(imports.admin).not.toHaveBeenCalled()
-      expect(imports.browser).not.toHaveBeenCalled()
+      // The file browser and the console shell are part of the main program now.
       expect(imports.preview).not.toHaveBeenCalled()
     } finally { app.unmount() }
   })
@@ -48,11 +47,26 @@ describe('lazy application routes', () => {
     const app = createApp(App)
     app.mount(host)
     try {
-      await vi.dynamicImportSettled()
+      if (page === 'preview') await vi.dynamicImportSettled()
       await nextTick()
       expect(host.querySelector('[data-page]')?.getAttribute('data-page')).toBe(page)
       expect(host.querySelectorAll('[data-page]')).toHaveLength(1)
       expect(host.querySelector('.login-page')).toBeNull()
+    } finally { app.unmount() }
+  })
+
+  it.each([
+    ['/browse', 'browser'], ['/admin', 'admin'],
+  ])('renders %s with its shell on the first tick', (path, page) => {
+    window.history.replaceState(null, '', path)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = createApp(App)
+    app.mount(host)
+    try {
+      // No code load is pending for these routes, so no loading card can paint.
+      expect(host.querySelector('[data-page]')?.getAttribute('data-page')).toBe(page)
+      expect(host.querySelector('.page-load-state')).toBeNull()
     } finally { app.unmount() }
   })
 })

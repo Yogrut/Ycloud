@@ -2,6 +2,15 @@
 yanked = "warn"
 unmaintained = "workspace"
 unsound = "all"
+# Only advisories with no fixed version may be listed here, each with a reason
+# and a review trigger. A crate that has a patched release must be upgraded
+# instead of ignored.
+ignore = [
+    # chrono is unmaintained (RUSTSEC-2026-0543) and no version is fixed; keep
+    # only until the migration to `time` or `jiff` lands. Tracked in
+    # docs/review/2026-11-23-dependency-followups.md.
+    "RUSTSEC-2026-0543",
+]
 
 [licenses]
 allow = [

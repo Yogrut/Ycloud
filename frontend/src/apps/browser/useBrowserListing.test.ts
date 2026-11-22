@@ -20,6 +20,25 @@ const writable: BrowserCapabilities = { download: true, upload: true, create_dir
 const entry: FileEntry = { name: 'one.txt', path: 'folder/one.txt', is_dir: false, size: 3, modified: '2026-09-30T00:00:00Z', mime: 'text/plain', icon: 'file', locked: false }
 afterEach(() => { vi.restoreAllMocks(); localStorage.clear() })
 
+describe('storage options', () => {
+  it('hides disabled storages and marks enabled but unavailable ones', async () => {
+    const mixed: BrowserStorage[] = [
+      { id: 'off', name: 'RustFs', enabled: false, ready: false },
+      { id: 'down', name: 'Archive', enabled: true, ready: false },
+      { id: 'up', name: 'Local', enabled: true, ready: true },
+    ]
+    vi.spyOn(api, 'listStorages').mockResolvedValue(mixed)
+    vi.spyOn(api, 'listFiles').mockResolvedValue(response('up', 'guest', mixed))
+    const state = listing()
+    try {
+      await state.refresh()
+      expect(state.storageOptions.value.map(option => option.value)).toEqual(['down', 'up'])
+      expect(state.storageOptions.value[0]?.label).toContain('异常')
+      expect(state.storageOptions.value[1]?.label).toBe('Local')
+    } finally { state.disposeListing() }
+  })
+})
+
 describe('silent refresh', () => {
   function silentListing() {
     const context = { announce: vi.fn(), resetSelection: vi.fn(), pruneSelection: vi.fn(), openLockedEntry: vi.fn(), requestStorageLogin: vi.fn() }

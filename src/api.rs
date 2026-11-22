@@ -194,17 +194,22 @@ async fn browser_storage_views(state: &AppState, headers: &HeaderMap) -> Vec<Bro
     );
     let mut storages = Vec::with_capacity(storage_configs.len());
     for storage in storage_configs {
+        // A disabled instance is not offered anywhere; every request path also
+        // rejects it through AppState::storage_backend.
+        if !storage.enabled {
+            continue;
+        }
         let can_browse = storage_permission(state, headers, &storage.id)
             .await
             .is_some_and(|permission| permission.browse);
         if !administrator && !can_browse {
             continue;
         }
-        let ready = storage.enabled && state.backends.is_ready(&storage.id).await;
+        let ready = state.backends.is_ready(&storage.id).await;
         storages.push(BrowserStorageView {
             id: storage.id,
             name: storage.name,
-            enabled: storage.enabled,
+            enabled: true,
             ready,
         });
     }
@@ -1110,7 +1115,7 @@ mod pagination_tests {
     }
 
     #[tokio::test]
-    async fn navigation_is_permission_scoped_and_admin_can_see_disabled_storages() {
+    async fn navigation_is_permission_scoped_and_disabled_storages_are_hidden() {
         use crate::config::{ConfigFile, StoragePermission, UserAccount};
         let directory = crate::test_support::TestDirectory::new("storage-navigation");
         let state =
@@ -1170,9 +1175,15 @@ mod pagination_tests {
             format!("session={token}").parse().unwrap(),
         );
         let admin = browser_storage_views(&state, &headers).await;
-        assert_eq!(admin.len(), 3);
-        assert!(!admin[2].enabled);
-        assert!(!admin[2].ready);
+        assert_eq!(
+            admin
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary", "private"]
+        );
+        assert!(admin.iter().all(|item| item.enabled));
+        // The hidden instance is still rejected on every request path.
         assert!(resolve_share(
             &state,
             &headers,

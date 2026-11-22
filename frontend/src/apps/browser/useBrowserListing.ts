@@ -87,11 +87,15 @@ export function useBrowserListing(context: BrowserListingContext) {
 
   const visibleEntries = computed(() => entries.value)
   const pageNumber = computed(() => cursorHistory.value.length + 1)
-  const storageOptions = computed(() => storages.value.map(storage => ({
-    value: storage.id,
-    label: `${storage.name}${storage.enabled === false ? locale.text('（停用）', ' (disabled)') : storage.ready === false ? locale.text('（异常）', ' (unavailable)') : ''}`,
-    disabled: !isStorageUsable(storage),
-  })))
+  // Disabled instances are hidden; the server already filters them, this keeps
+  // older responses and cached lists from resurfacing one.
+  const storageOptions = computed(() => storages.value
+    .filter(storage => storage.enabled !== false)
+    .map(storage => ({
+      value: storage.id,
+      label: `${storage.name}${storage.ready === false ? locale.text('（异常）', ' (unavailable)') : ''}`,
+      disabled: !isStorageUsable(storage),
+    })))
   const pageSizeOptions = PAGE_SIZES.map(size => ({ value: size, label: String(size) }))
   const crumbs = computed(() => {
     let accumulated = ''

@@ -454,10 +454,70 @@ async fn storage_instance_view(
 /// Validate credentials and the minimum list permission without changing the
 /// active storage backend. Secrets are consumed by the SDK credential provider
 /// and are never returned by this endpoint.
+///
+/// When an existing instance is edited, the form sends blank credential fields.
+/// `storage_id` lets the server reuse the stored pair, but only while every
+/// connection parameter still matches, so a saved secret is never sent to a new
+/// endpoint. The probe never writes configuration or touches a running backend.
+#[derive(Deserialize, Default)]
+pub struct TestStorageQuery {
+    #[serde(default)]
+    pub storage_id: Option<String>,
+}
+
+async fn fill_test_credentials(
+    state: &AppState,
+    mut settings: S3StorageConfig,
+    storage_id: Option<&str>,
+) -> AppResult<S3StorageConfig> {
+    let blank_access = settings.access_key_id.trim().is_empty();
+    let blank_secret = settings.secret_access_key.trim().is_empty();
+    if !blank_access && !blank_secret {
+        return Ok(settings);
+    }
+    let Some(storage_id) = storage_id else {
+        return Err(AppError::BadRequest(
+            "请输入 Access Key ID 和 Secret Access Key".into(),
+        ));
+    };
+    let saved = {
+        let config = state.config_file.read().await;
+        let instance = config
+            .storage_instances
+            .iter()
+            .find(|instance| instance.id == storage_id)
+            .ok_or_else(|| AppError::BadRequest("未知的存储".into()))?;
+        match &instance.backend {
+            StorageBackendConfig::S3(settings) => settings.clone(),
+            _ => return Err(AppError::BadRequest("该存储不是 S3 存储".into())),
+        }
+    };
+    let same_target = settings.provider == saved.provider
+        && settings.endpoint == saved.endpoint
+        && settings.bucket == saved.bucket
+        && settings.region == saved.region
+        && settings.prefix == saved.prefix
+        && settings.addressing_style == saved.addressing_style;
+    if !same_target {
+        return Err(AppError::BadRequest(
+            "修改连接地址后请重新填写密钥".into(),
+        ));
+    }
+    if blank_access {
+        settings.access_key_id = saved.access_key_id;
+    }
+    if blank_secret {
+        settings.secret_access_key = saved.secret_access_key;
+    }
+    Ok(settings)
+}
+
 pub async fn test_s3_storage(
     State(state): State<AppState>,
+    Query(query): Query<TestStorageQuery>,
     Json(settings): Json<S3StorageConfig>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let settings = fill_test_credentials(&state, settings, query.storage_id.as_deref()).await?;
     let backend = S3Backend::new(&settings, &state.config)?;
     backend.activation_probe().await?;
     Ok(Json(serde_json::json!({
@@ -1253,6 +1313,66 @@ fn validate_password(password: &str, minimum: usize, kind: &'static str) -> AppR
 #[cfg(test)]
 mod tests {
     use super::validate_password;
+
+    #[tokio::test]
+    async fn test_connection_reuses_saved_credentials_only_for_the_same_target() {
+        use super::*;
+        use crate::config::{ConfigFile, StorageBackendConfig, StorageInstanceConfig, S3StorageConfig};
+        use crate::test_support::{app_state, TestDirectory};
+
+        fn saved() -> S3StorageConfig {
+            S3StorageConfig {
+                provider: S3Provider::Minio,
+                endpoint: "http://127.0.0.1:9000".into(),
+                bucket: "ycloud".into(),
+                region: "us-east-1".into(),
+                prefix: "data/".into(),
+                addressing_style: S3AddressingStyle::Path,
+                access_key_id: "saved-access".into(),
+                secret_access_key: "saved-secret".into(),
+                relay_upload: false,
+                capacity_limit_bytes: None,
+            }
+        }
+        fn form() -> S3StorageConfig {
+            let mut settings = saved();
+            settings.access_key_id.clear();
+            settings.secret_access_key.clear();
+            settings
+        }
+
+        let directory = TestDirectory::new("test-connection-credentials");
+        let state = app_state(&directory, ConfigFile::with_test_storage()).await;
+        {
+            let mut config = state.config_file.write().await;
+            config.storage_instances.push(StorageInstanceConfig {
+                id: "s3".into(),
+                name: "S3".into(),
+                enabled: true,
+                allow_guest_access: false,
+                allow_guest_download: None,
+                backend: StorageBackendConfig::S3(saved()),
+            });
+        }
+
+        let filled = fill_test_credentials(&state, form(), Some("s3")).await.unwrap();
+        assert_eq!(filled.access_key_id, "saved-access");
+        assert_eq!(filled.secret_access_key, "saved-secret");
+
+        let mut moved = form();
+        moved.endpoint = "http://192.168.3.50:9000".into();
+        let error = fill_test_credentials(&state, moved, Some("s3")).await.unwrap_err();
+        assert!(matches!(error, AppError::BadRequest(message) if message.contains("重新填写密钥")));
+
+        assert!(fill_test_credentials(&state, form(), Some("missing")).await.is_err());
+        assert!(fill_test_credentials(&state, form(), None).await.is_err());
+
+        let mut replaced = saved();
+        replaced.access_key_id = "new-access".into();
+        replaced.secret_access_key = "new-secret".into();
+        let passed = fill_test_credentials(&state, replaced, Some("s3")).await.unwrap();
+        assert_eq!(passed.secret_access_key, "new-secret");
+    }
 
     #[test]
     fn password_policy_counts_unicode_characters_not_utf8_bytes() {

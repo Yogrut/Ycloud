@@ -161,7 +161,9 @@ async function testConnection(): Promise<void> {
   connectionNotice.value = undefined
   const revision = connectionRevision
   try {
-    const result = provider.value === 'local' ? await testLocalStorage(localPath.value.trim()) : await testS3Storage(requestBody())
+    const result = provider.value === 'local'
+      ? await testLocalStorage(localPath.value.trim())
+      : await testS3Storage(requestBody(), editingInstance.value?.id)
     if (!result.success) throw new Error(locale.text('存储连接测试失败', 'Storage connection test failed'))
     if (revision === connectionRevision) connectionNotice.value = { kind: 'success', message: locale.text('测试成功：存储连接与读写能力验证通过', 'Test successful: storage connectivity and read/write capabilities verified') }
   } catch (error) {
@@ -260,7 +262,7 @@ async function clearPending(): Promise<void> {
         </div>
         <div v-if="provider === 'local' && localPath.trim()" class="storage-boundary-note storage-wide">{{ locale.text('保存后直接展示该路径中的现有文件，不进行导入、移动或删除。', 'Existing files at this path are shown directly; nothing is imported, moved, or deleted.') }}</div>
       </div>
-      <div class="modal-actions"><button v-if="!editingInstance" class="btn secondary" type="button" :disabled="busy" @click="testConnection">{{ locale.text('测试连接', 'Test connection') }}</button><button class="btn secondary" type="button" :disabled="busy" @click="editorOpen = false">{{ locale.t('common.cancel') }}</button><button class="btn" type="button" :disabled="busy" @click="saveStorage">{{ locale.text('确认', 'Confirm') }}</button></div>
+      <div class="modal-actions"><button class="btn secondary" type="button" :disabled="busy" :title="editingInstance && provider !== 'local' ? locale.text('密钥留空时使用已保存的密钥', 'Blank credential fields reuse the saved keys') : undefined" @click="testConnection">{{ locale.text('测试连接', 'Test connection') }}</button><button class="btn secondary" type="button" :disabled="busy" @click="editorOpen = false">{{ locale.t('common.cancel') }}</button><button class="btn" type="button" :disabled="busy" @click="saveStorage">{{ locale.text('确认', 'Confirm') }}</button></div>
     </section>
   </SettingsDrawer>
   <AppFeedback v-if="!pendingDelete" :revision="feedbackRevision" :message="errorMessage" />

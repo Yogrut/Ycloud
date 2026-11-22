@@ -469,8 +469,9 @@ export function updateTransferLimits(body: Partial<UpdateTransferLimitsRequest>)
   }, true)
 }
 
-export function testS3Storage(body: TestS3StorageRequest): Promise<{ success: boolean; capabilities: S3CapabilityReport }> {
-  return adminRequest('/api/admin/storage/test', {
+export function testS3Storage(body: TestS3StorageRequest, storageId?: string): Promise<{ success: boolean; capabilities: S3CapabilityReport }> {
+  const suffix = storageId ? `?storage_id=${encodeURIComponent(storageId)}` : ''
+  return adminRequest(`/api/admin/storage/test${suffix}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

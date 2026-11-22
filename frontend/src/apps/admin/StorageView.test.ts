@@ -456,6 +456,31 @@ describe('StorageView', () => {
     } finally { app.unmount() }
   })
 
+  it('tests the saved target from the edit dialog with its storage id', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response())
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div'); document.body.append(host)
+    const { app } = mountStorage(host, null, [{
+      ...localInstance, id: 'objects', revision: 'revision-one', name: 'RustFS',
+      backend: {
+        type: 's3', provider: 'minio', endpoint: 'https://s3.example.com', bucket: 'bucket',
+        region: 'us-east-1', prefix: 'files/', addressing_style: 'path', relay_upload: true,
+        has_access_key_id: true, has_secret_access_key: true, capacity_limit_bytes: null,
+      },
+    }])
+    try {
+      host.querySelector<HTMLButtonElement>('[aria-label="编辑存储"]')!.click()
+      await nextTick()
+      button(host, '测试连接')!.click()
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(fetchMock.mock.calls[0]![0]).toBe('/api/admin/storage/test?storage_id=objects')
+      expect(JSON.parse(String(fetchMock.mock.calls[0]![1].body))).toMatchObject({
+        access_key_id: '', secret_access_key: '', endpoint: 'https://s3.example.com',
+      })
+    } finally { app.unmount() }
+  })
+
   it('suppresses duplicate connection probes and discards their result after the form changes', async () => {
     let finish!: (value: Response) => void
     const fetchMock = vi.fn().mockReturnValueOnce(new Promise(resolve => { finish = resolve }))

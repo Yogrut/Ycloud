@@ -5,11 +5,28 @@ import type { FileEntry } from '../../shared/api/browser'
 import FilePreviewDialog from './FilePreviewDialog.vue'
 
 const mountedApps: Array<ReturnType<typeof createApp>> = []
-const iframeNavigation = (window as unknown as TestWindow).happyDOM.settings.navigation
+const iframeSettings = (window as unknown as TestWindow).happyDOM.settings
+const iframeNavigation = iframeSettings.navigation
 const originalChildNavigation = iframeNavigation.disableChildFrameNavigation
+const originalIframeLoading = iframeSettings.disableIframePageLoading
 
 // Test the viewer's DOM without starting a separate iframe network request.
-beforeEach(() => { iframeNavigation.disableChildFrameNavigation = true })
+// Skipping the page load silently keeps happy-dom from raising a navigation
+// error, which the viewer would treat as a failed preview.
+beforeEach(() => {
+  iframeSettings.disableIframePageLoading = true
+  iframeNavigation.disableChildFrameNavigation = true
+  document.addEventListener('error', blockIframeErrors, true)
+})
+
+// happy-dom still emits a navigation error for the skipped load; stop it in the
+// capture phase so the viewer's own error handler does not switch to a fallback.
+function blockIframeErrors(event: Event): void {
+  if (event.target instanceof HTMLIFrameElement) {
+    event.stopPropagation()
+    event.preventDefault()
+  }
+}
 
 function showFile(name: string) {
   const entry = reactive<FileEntry>({
@@ -32,7 +49,9 @@ function showFile(name: string) {
 
 afterEach(() => {
   mountedApps.splice(0).forEach(app => app.unmount())
+  document.removeEventListener('error', blockIframeErrors, true)
   iframeNavigation.disableChildFrameNavigation = originalChildNavigation
+  iframeSettings.disableIframePageLoading = originalIframeLoading
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   document.body.replaceChildren()

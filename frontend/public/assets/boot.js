@@ -4,7 +4,7 @@
 try {
   var stored = localStorage.getItem('ycloud-theme')
   document.documentElement.dataset.theme = stored === 'dark' ? 'dark' : 'light'
-} catch (error) {
+} catch {
   // A blocked storage API keeps the default light theme.
   document.documentElement.dataset.theme = 'light'
 }

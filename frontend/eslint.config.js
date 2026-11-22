@@ -24,4 +24,14 @@ export default tseslint.config(
       'vue/singleline-html-element-content-newline': 'off',
     },
   },
+  {
+    // Public assets are served as-is and run before the bundle, as plain
+    // scripts — not ES modules — so they get browser globals instead.
+    files: ['public/assets/**/*.js'],
+    languageOptions: {
+      sourceType: 'script',
+      ecmaVersion: 2022,
+      globals: globals.browser,
+    },
+  },
 )

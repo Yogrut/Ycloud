@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import type { FileEntry } from '../../shared/api/browser'
-import { listFiles } from '../../shared/api/browser'
+import { createFolder, listFiles } from '../../shared/api/browser'
+import { ApiError } from '../../shared/api/client'
 import { useLocale } from '../../shared/i18n'
 import FileIcon from './FileIcon.vue'
 import AppFeedback from '../../shared/components/AppFeedback.vue'
@@ -15,6 +16,12 @@ const path = ref('')
 const directories = ref<FileEntry[]>([])
 const loading = ref(false)
 const error = ref('')
+const canCreate = ref(false)
+const creating = ref(false)
+const newName = ref('')
+const createError = ref('')
+const creatingBusy = ref(false)
+const nameInput = ref<HTMLInputElement>()
 let requestVersion = 0
 
 const segments = computed(() => {
@@ -39,6 +46,7 @@ async function load(destination: string): Promise<void> {
       const folders = data.entries.filter(entry => entry.is_dir && !entry.locked)
       if (first) {
         directories.value = folders
+        canCreate.value = data.capabilities?.create_directory !== false
         first = false
         loading.value = false
       } else {
@@ -58,6 +66,45 @@ function choose(conflict: 'keep_both' | 'overwrite'): void {
   emit('confirm', path.value, conflict)
 }
 
+function openCreate(): void {
+  creating.value = true
+  newName.value = ''
+  createError.value = ''
+  void nextTick(() => nameInput.value?.focus())
+}
+
+function cancelCreate(): void {
+  creating.value = false
+  newName.value = ''
+  createError.value = ''
+}
+
+async function submitCreate(): Promise<void> {
+  const name = newName.value.trim()
+  if (!name || creatingBusy.value) return
+  // Remember where the request was made: the user may navigate while it runs.
+  const target = path.value
+  creatingBusy.value = true
+  createError.value = ''
+  try {
+    await createFolder(target, name, props.storageId)
+    creating.value = false
+    newName.value = ''
+    // Refresh only the directory that is still on screen.
+    if (path.value === target) await load(target)
+  } catch (reason) {
+    if (reason instanceof ApiError && (reason.status === 409 || reason.code === 'conflict')) {
+      createError.value = locale.text('该名称已存在', 'That name already exists')
+    } else {
+      createError.value = reason instanceof Error
+        ? reason.message
+        : locale.text('创建文件夹失败', 'Could not create the folder')
+    }
+  } finally {
+    creatingBusy.value = false
+  }
+}
+
 onMounted(() => load(''))
 onBeforeUnmount(() => { requestVersion++ })
 </script>
@@ -72,7 +119,21 @@ onBeforeUnmount(() => { requestVersion++ })
           <span class="crumb-separator" aria-hidden="true">›</span>
           <button class="crumb" type="button" :aria-current="segment.path === path ? 'location' : undefined" :title="segment.name" @click="load(segment.path)">{{ segment.name }}</button>
         </template>
+        <button v-if="canCreate" class="crumb picker-new-folder" type="button" :aria-label="locale.text('新建文件夹', 'New folder')" :title="locale.text('新建文件夹', 'New folder')" @click="openCreate"><AppIcon name="folder-plus" /></button>
       </nav>
+      <form v-if="creating" class="picker-create" @submit.prevent="submitCreate">
+        <input
+          ref="nameInput"
+          v-model="newName"
+          class="input"
+          :placeholder="locale.text('文件夹名称', 'Folder name')"
+          :disabled="creatingBusy"
+          @keydown.esc.prevent="cancelCreate"
+        >
+        <button class="btn secondary" type="button" :disabled="creatingBusy" @click="cancelCreate">{{ locale.t('common.cancel') }}</button>
+        <button class="btn" type="submit" :disabled="creatingBusy || !newName.trim()">{{ locale.text('创建', 'Create') }}</button>
+        <p v-if="createError" class="picker-create-error">{{ createError }}</p>
+      </form>
       <div class="picker-list">
         <button v-for="directory in directories" :key="directory.path" class="picker-row" type="button" :disabled="loading" @click="load(directory.path)">
           <FileIcon :entry="directory" />
@@ -107,6 +168,10 @@ onBeforeUnmount(() => { requestVersion++ })
 .picker-modal h2 { margin: 0 0 12px; }
 .picker-crumbs { flex: 0 0 auto; margin-bottom: 10px; }
 .picker-crumbs .crumb { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+.picker-new-folder { margin-left: auto; flex: 0 0 auto; }
+.picker-create { display: flex; flex: 0 0 auto; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+.picker-create .input { flex: 1 1 160px; min-width: 0; height: 32px; }
+.picker-create-error { flex: 1 0 100%; margin: 0; color: var(--danger); font-size: 13px; }
 .picker-list { flex: 1; min-height: 0; max-height: none; overflow-y: auto; }
 .picker-row { min-height: 46px; }
 .picker-state { display: grid; place-items: center; min-height: 100%; margin: 0; }

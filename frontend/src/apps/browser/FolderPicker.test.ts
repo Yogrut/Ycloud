@@ -119,4 +119,77 @@ describe('FolderPicker', () => {
     expect(new URL(String(fetchMock.mock.calls[1]?.[0]), 'http://localhost').searchParams.get('cursor')).toBe('next-page')
     app.unmount()
   })
+
+  function listing(path: string, entries: object[], capabilities: object = { create_directory: true }) {
+    return new Response(JSON.stringify({
+      storage_id: 'archive', storages: [], current_path: path, parent_path: null, entries,
+      page_start: 0, page_size: 100, next_cursor: null, can_write: true,
+      max_upload_bytes: 0, max_archive_bytes: 0, max_archive_entries: 0, capabilities,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+
+  async function settle() {
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    await nextTick()
+  }
+
+  it('hides the new-folder action without create permission', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(listing('', [], { create_directory: false })))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountPicker(host)
+    await settle()
+    expect(host.querySelector('.picker-new-folder')).toBeNull()
+    app.unmount()
+  })
+
+  it('creates a folder in the current directory and reloads it', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(listing('', []))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(listing('', [{ name: 'fresh', path: 'fresh', is_dir: true, locked: false }]))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountPicker(host)
+    await settle()
+    host.querySelector<HTMLButtonElement>('.picker-new-folder')!.click()
+    await nextTick()
+    const input = host.querySelector<HTMLInputElement>('.picker-create .input')!
+    input.value = 'fresh'
+    input.dispatchEvent(new Event('input'))
+    host.querySelector<HTMLFormElement>('.picker-create')!.dispatchEvent(new Event('submit'))
+    await settle()
+    await settle()
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(host.querySelector('.picker-create')).toBeNull()
+    expect(host.querySelectorAll('.picker-row')).toHaveLength(1)
+    // The reload targets the directory that was on screen when submitting.
+    expect(new URL(String(fetchMock.mock.calls[2]?.[0]), 'http://localhost').searchParams.get('path') ?? '').toBe('')
+    app.unmount()
+  })
+
+  it('keeps the dialog open and explains a duplicate name', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(listing('', []))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: '目标路径已经存在', code: 'conflict' }), {
+        status: 409, headers: { 'Content-Type': 'application/json' },
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = mountPicker(host)
+    await settle()
+    host.querySelector<HTMLButtonElement>('.picker-new-folder')!.click()
+    await nextTick()
+    const input = host.querySelector<HTMLInputElement>('.picker-create .input')!
+    input.value = 'taken'
+    input.dispatchEvent(new Event('input'))
+    host.querySelector<HTMLFormElement>('.picker-create')!.dispatchEvent(new Event('submit'))
+    await settle()
+    expect(host.querySelector('.picker-create-error')?.textContent).toContain('已存在')
+    expect(host.querySelector('.picker-create')).not.toBeNull()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    app.unmount()
+  })
 })

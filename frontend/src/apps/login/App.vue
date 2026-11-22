@@ -27,9 +27,34 @@ function suppressNativeContextMenu(event: MouseEvent): void {
   event.preventDefault()
 }
 
+// Warm the chunks that a page switch would otherwise have to download. Code
+// only: no request touches the API here.
+function prefetchPages(): void {
+  const loads = [
+    () => import('../admin/AdminView.vue'),
+    () => import('../admin/AccountView.vue'),
+    () => import('../admin/DashboardView.vue'),
+    () => import('../admin/LimitsView.vue'),
+    () => import('../admin/LocksView.vue'),
+    () => import('../admin/ProtectionView.vue'),
+    () => import('../admin/SecurityView.vue'),
+    () => import('../admin/StorageView.vue'),
+    () => import('../admin/WebDavView.vue'),
+    () => import('../admin/UsersView.vue'),
+    () => import('../browser/BrowserView.vue'),
+    () => import('../preview/PreviewView.vue'),
+  ]
+  void (async () => {
+    for (const load of loads) await load().catch(() => undefined)
+  })()
+}
+
 onMounted(() => {
   window.addEventListener('popstate', syncRoute)
   document.addEventListener('contextmenu', suppressNativeContextMenu)
+  const idle = window.requestIdleCallback
+  if (typeof idle === 'function') idle.call(window, () => prefetchPages(), { timeout: 2_000 })
+  else window.setTimeout(prefetchPages, 1_200)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('popstate', syncRoute)

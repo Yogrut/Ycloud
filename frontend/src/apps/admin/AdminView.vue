@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import AppFeedback from '../../shared/components/AppFeedback.vue'
-import { computed, onMounted, onScopeDispose, ref } from 'vue'
+import { computed, onMounted, onScopeDispose, ref, watch } from 'vue'
 import AppIcon from '../../shared/components/AppIcon.vue'
 import AdminLoginCard from '../../shared/components/AdminLoginCard.vue'
 import LocaleToggle from '../../shared/components/LocaleToggle.vue'
@@ -44,6 +44,29 @@ const {
   loginError, loggingIn, notice, noticeRevision, submitLogin, resetTotpChallenge,
   showNotice, sessionExpired, start, load,
 } = useAdminSession(() => activeSection.value === 'storage')
+
+// Show the placeholder only when a read outlives a short delay, so a fast
+// console entry never paints a card at all.
+const showLoading = ref(false)
+let loadingTimer: ReturnType<typeof setTimeout> | undefined
+watch(loading, value => {
+  if (loadingTimer !== undefined) {
+    clearTimeout(loadingTimer)
+    loadingTimer = undefined
+  }
+  if (!value) {
+    showLoading.value = false
+    return
+  }
+  if (showLoading.value) return
+  loadingTimer = setTimeout(() => {
+    loadingTimer = undefined
+    showLoading.value = true
+  }, 200)
+}, { immediate: true })
+onScopeDispose(() => {
+  if (loadingTimer !== undefined) clearTimeout(loadingTimer)
+})
 
 function selectSection(event: MouseEvent, href: string): void {
   if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return
@@ -103,7 +126,7 @@ onScopeDispose(() => window.removeEventListener('popstate', restoreSection))
         </nav>
       </aside>
       <div class="admin-content">
-        <div v-if="loading" class="admin-loading glass">{{ locale.t('common.loading') }}</div>
+        <div v-if="showLoading" class="admin-loading glass">{{ locale.t('common.loading') }}</div>
         <DashboardView v-else-if="info && activeSection === 'dashboard'" :info="info" />
         <SecurityView v-else-if="info && activeSection === 'security'" :info="info" @changed="showNotice" />
         <ProtectionView v-else-if="info && activeSection === 'protection'" :info="info" @saved="showNotice" />
@@ -129,7 +152,8 @@ onScopeDispose(() => window.removeEventListener('popstate', restoreSection))
           @changed="showNotice"
         />
         <AccountView v-else-if="info" :info="info" @saved="showNotice" @expired="sessionExpired" />
-        <div v-else class="admin-loading glass">{{ loadError || locale.text('管理后台暂时无法加载', 'The admin console is temporarily unavailable') }}</div>
+        <!-- Nothing is painted while the first read is still inside its delay. -->
+        <div v-else-if="!loading" class="admin-loading glass">{{ loadError || locale.text('管理后台暂时无法加载', 'The admin console is temporarily unavailable') }}</div>
       </div>
     </div>
   </main>

@@ -72,6 +72,20 @@ describe('AdminView', () => {
     expect(fetchMock).toHaveBeenCalledTimes(calls)
   })
 
+  it('delays the loading placeholder so a fast read never paints it', async () => {
+    window.history.replaceState(null, '', '/admin/dashboard')
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => undefined)))
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = await mountAdmin(host)
+    try {
+      expect(host.querySelector('.admin-loading')).toBeNull()
+      await new Promise(resolve => setTimeout(resolve, 250))
+      await nextTick()
+      expect(host.querySelector('.admin-loading')).not.toBeNull()
+    } finally { app.unmount() }
+  })
+
   it('preserves modified navigation clicks for opening a separate tab', async () => {
     window.history.replaceState(null, '', '/admin/dashboard')
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify(adminInfo), { headers: { 'Content-Type': 'application/json' } })))

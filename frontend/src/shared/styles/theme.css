@@ -965,7 +965,7 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 
 .overlay { position: fixed; inset: 0; z-index: 70; display: grid; place-items: center; padding: 18px; background: rgba(31, 35, 41, .44); backdrop-filter: blur(5px); }
 .overlay.admin-login-overlay { padding: 28px; background: rgba(31, 35, 41, .5); backdrop-filter: blur(8px); }
-.modal { width: min(520px, 100%); padding: 30px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); }
+.modal { width: min(520px, 100%); padding: 30px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: var(--dialog-radius); box-shadow: var(--shadow); }
 .modal h2 { margin: 0 0 18px; font-size: 21px; }
 .modal p { color: var(--muted); }
 .modal label { display: grid; gap: 7px; margin-top: 14px; color: var(--muted); font-size: 13px; font-weight: 650; }

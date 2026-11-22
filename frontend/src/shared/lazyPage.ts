@@ -9,7 +9,8 @@ export function lazyPage<T extends Component>(loader: AsyncComponentLoader<T>): 
     loader,
     loadingComponent: PageLoadState,
     errorComponent: PageLoadState,
-    delay: 0,
+    // A short deadline keeps fast loads silent; slow ones still show progress.
+    delay: 200,
     timeout: PAGE_CODE_TIMEOUT_MS,
     // Do not automatically reload the document or retry business operations.
     onError(_error, _retry, fail) { fail() },

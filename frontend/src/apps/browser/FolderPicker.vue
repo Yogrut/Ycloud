@@ -102,7 +102,7 @@ onBeforeUnmount(() => { requestVersion++ })
   flex-direction: column;
   width: min(560px, calc(100vw - 32px));
   height: min(620px, calc(100vh - 96px));
-  border-radius: calc(var(--surface-radius) + 12px);
+  border-radius: var(--dialog-radius);
 }
 .picker-modal h2 { margin: 0 0 12px; }
 .picker-crumbs { flex: 0 0 auto; margin-bottom: 10px; }

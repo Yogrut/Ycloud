@@ -178,7 +178,7 @@ defineExpose({ open, refreshIdentity })
 .user-account-trigger.keyboard-focus:focus, .user-account-signout.keyboard-focus:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
 .user-account-trigger svg { flex-shrink: 0; }
 .user-account-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
-.modal.user-account-modal { position: relative; width: min(420px, 100%); box-sizing: border-box; padding: 28px 30px 30px; max-height: calc(100dvh - 36px); overflow-y: auto; border-radius: 14px; }
+.modal.user-account-modal { position: relative; width: min(420px, 100%); box-sizing: border-box; padding: 28px 30px 30px; max-height: calc(100dvh - 36px); overflow-y: auto; border-radius: var(--dialog-radius); }
 .user-login-brand { display: flex; align-items: center; gap: 9px; font-size: 17px; font-weight: 700; }
 .user-login-brand svg { color: var(--accent); }
 .user-login-intro { margin: 22px 0 24px; }

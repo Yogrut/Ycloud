@@ -110,8 +110,6 @@ export function useBrowserAccess(context: BrowserAccessContext) {
       adminTotpRequired.value = false
       context.isAdministrator.value = result.is_admin
       if (result.is_admin) {
-        // Warm the admin chunk so opening the console never repaints a loader.
-        void import('../admin/AdminView.vue').catch(() => undefined)
         await context.refresh().catch(() => undefined)
       }
     } catch (error) {

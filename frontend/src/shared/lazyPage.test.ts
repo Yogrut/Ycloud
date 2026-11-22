@@ -24,13 +24,18 @@ afterEach(() => {
 })
 
 describe('lazy page lifecycle', () => {
-  it('loads only when selected, shows progress, and reuses resolved code on a later mount', async () => {
+  it('loads only when selected, keeps the progress card hidden for 200ms, and reuses resolved code on a later mount', async () => {
+    vi.useFakeTimers()
     let resolve!: (component: Component) => void
     const loader = vi.fn(() => new Promise<Component>(done => { resolve = done }))
     const page = lazyPage(loader)
     expect(loader).not.toHaveBeenCalled()
     const first = mountPage(page)
     try {
+      await nextTick()
+      // Fast code loads finish before the delay, so no card is painted.
+      expect(first.host.querySelector('[role="status"]')).toBeNull()
+      await vi.advanceTimersByTimeAsync(200)
       expect(first.host.querySelector('[role="status"]')).not.toBeNull()
       expect(loader).toHaveBeenCalledTimes(1)
       resolve({ render: () => h('section', 'Loaded page') })

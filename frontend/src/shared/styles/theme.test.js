@@ -51,7 +51,8 @@ describe('interactive focus styling', () => {
     expect(themeCss).toMatch(/\.btn\.secondary\s*\{[^}]*color: var\(--text\);/)
     expect(themeCss).toMatch(/\.btn\.danger\s*\{[^}]*background: var\(--danger\);[^}]*border-color: var\(--danger\);/)
     expect(themeCss).toContain(':root[data-theme="dark"]')
-    expect(themeCss).toContain('--bg: #111722')
+    // The dark base is neutral so the first painted frame already matches it.
+    expect(themeCss).toContain('--bg: #111214')
     expect(themeCss).toContain('--panel: #171e2a')
   })
 

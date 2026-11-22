@@ -27,12 +27,20 @@ export function useDirectoryWatcher(
   let paused = false
   let disposed = false
   let retry = 0
+  let failures = 0
   let retryTimer: ReturnType<typeof setTimeout> | undefined
+
+  // EventSource cannot see the status code, and a 403 (folder locked, session
+  // revoked) closes it exactly like a fatal error. Retrying forever would hammer
+  // the server, so give up after a few consecutive closed attempts.
+  const MAX_RECONNECT_FAILURES = 3
 
   // A 503 (stream budget full) or 401 (session expired) closes the connection for
   // good — browsers only retry network drops — so reconnect ourselves, backing off.
   function scheduleReconnect(): void {
     if (disposed || retryTimer !== undefined) return
+    if (failures >= MAX_RECONNECT_FAILURES) return
+    failures += 1
     const backoff = Math.min(30_000, 1_000 * 2 ** Math.min(retry, 5))
     const delay = backoff * (0.5 + Math.random() * 0.5)
     retry += 1
@@ -59,14 +67,16 @@ export function useDirectoryWatcher(
   // nothing needs to be pushed to a page nobody is looking at.
   function handleVisibility(): void {
     if (document.visibilityState === 'hidden') {
-      if (source) {
-        stop()
-        paused = true
-      }
+      // Also stop a pending reconnect: it would fire while hidden, skip the
+      // reconnect, and leave nothing to resume from.
+      stop()
+      paused = true
       return
     }
     if (!paused) return
     paused = false
+    // Coming back to the tab is a fresh chance: a previous lock may be gone.
+    failures = 0
     start()
     // Events may have been missed while the stream was closed.
     schedule()
@@ -87,6 +97,7 @@ export function useDirectoryWatcher(
     // lost; one refresh after a reconnect brings the page up to date.
     target.addEventListener('open', () => {
       retry = 0
+      failures = 0
       if (opened) schedule()
       opened = true
     })

@@ -171,8 +171,8 @@ onBeforeUnmount(() => { requestVersion++ })
 .picker-new-folder { margin-left: auto; flex: 0 0 auto; }
 .picker-create { display: flex; flex: 0 0 auto; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
 .picker-create .input { flex: 1 1 160px; min-width: 0; height: 36px; }
-/* Keep the row actions inside the input height instead of the 44px button default. */
-.picker-create .btn { min-width: 56px; min-height: 32px; height: 32px; padding: 4px 12px; font-size: 13px; font-weight: 400; line-height: 20px; border-radius: 8px; }
+/* Same button shape as the action row; only the height follows the input. */
+.picker-create .btn { min-width: 60px; min-height: 36px; height: 36px; padding: 6px 14px; font-size: 14px; font-weight: 400; line-height: 20px; }
 .picker-create-error { flex: 1 0 100%; margin: 0; color: var(--danger); font-size: 13px; }
 .picker-list { flex: 1; min-height: 0; max-height: none; overflow-y: auto; }
 .picker-row { min-height: 46px; }

@@ -28,6 +28,7 @@ import { useBrowserListing } from './useBrowserListing'
 import { useBrowserAccess } from './useBrowserAccess'
 import { useBrowserPreviews } from './useBrowserPreviews'
 import { useDirectoryWatcher } from './useDirectoryWatcher'
+import { useScrollbarAutoHide } from './useScrollbarAutoHide'
 import { prefetchAdminPages } from '../admin/pages'
 import { formatBatchSummary } from './operationFeedback'
 import FilePreviewDialog from './FilePreviewDialog.vue'
@@ -237,6 +238,7 @@ const {
   updatePointerSelection,
 } = useBrowserSelection({ entries, visibleEntries, loading, capabilities, filePanel, openEntry })
 resetListingSelection = clearSelection
+useScrollbarAutoHide(filePanel)
 
 const {
   batchResult,

@@ -888,6 +888,19 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 
 .file-panel { position: relative; height: 100%; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: 14px 28px 14px; border-radius: 12px; user-select: none; }
 .file-list-body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+/* A thin neutral bar: invisible until the list scrolls, then it fades back after
+   three idle seconds (data-scrolling comes from useScrollbarAutoHide). The
+   margin keeps the bar inside the panel padding instead of over the time
+   column. Firefox gets the standard properties; WebKit gets the pseudo rules. */
+.file-list-body { --scrollbar-w: 8px; margin-right: var(--scrollbar-w); }
+@supports not selector(::-webkit-scrollbar) {
+  .file-list-body { scrollbar-width: thin; scrollbar-color: transparent transparent; }
+  .file-list-body[data-scrolling] { scrollbar-color: var(--line-strong) transparent; }
+}
+.file-list-body::-webkit-scrollbar { width: var(--scrollbar-w); }
+.file-list-body::-webkit-scrollbar-track { background: transparent; }
+.file-list-body::-webkit-scrollbar-thumb { background: transparent; border-radius: 4px; }
+.file-list-body[data-scrolling]::-webkit-scrollbar-thumb { background: var(--line-strong); }
 .file-panel.drag-selecting { cursor: crosshair; }
 .file-panel.upload-drop-active { outline: 2px solid var(--accent); outline-offset: -2px; }
 .upload-drop-overlay {

@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import type { ComputedRef, Ref } from 'vue'
 import type { BrowserCapabilities, FileEntry } from '../../shared/api/browser'
+import { isScrollbarHit } from './scrollbarHit'
 
 type DragSession = {
   pointerId: number
@@ -135,6 +136,9 @@ export function useBrowserSelection(context: BrowserSelectionContext) {
     cancelTouchTap()
     if (event.pointerType !== 'mouse' || panel.classList.contains('gallery-mode') || !context.visibleEntries.value.length) return
     if (target.closest('input, select, textarea, a') || (button && !button.classList.contains('select-box'))) return
+    // A press on the scrollbar gutter is not the start of a selection.
+    const body = panel.querySelector<HTMLElement>('.file-list-body')
+    if (body && isScrollbarHit(body, event.clientX)) return
     // Prevent native text/image dragging before the movement threshold. Row
     // checkboxes still receive an ordinary click when no drag occurs.
     event.preventDefault()

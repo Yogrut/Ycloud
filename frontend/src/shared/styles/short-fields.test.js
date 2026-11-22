@@ -7,6 +7,11 @@ it('keeps login spacing independent of inline feedback', () => {
   expect(css).toContain('.admin-login-form-pane label { margin-top: 0; }')
   expect(readFileSync('src/shared/styles/theme.css', 'utf8')).toContain('.login-form { display: grid; gap: 20px; }')
 })
+it('lets modal cards take the dialog radius instead of the surface radius', () => {
+  // A later grouped rule would win at equal specificity and flatten every dialog.
+  expect(css).not.toMatch(/\.glass,\s*\.modal/)
+  expect(css).toMatch(/\.glass,\s*\n?\s*\.user-account-popover\.user-account-popover/)
+})
 it('keeps compact sizing on one-field dialogs without shrinking login forms', () => {
   expect(css).toContain('.short-field-dialog .input { height: 32px; min-height: 32px;')
   expect(css).not.toMatch(/\.user-login-form \.input\.input|\.admin-login-form-pane \.input,/)

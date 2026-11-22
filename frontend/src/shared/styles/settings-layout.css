@@ -15,7 +15,7 @@ body:has(.browser-shell) { --dialog-radius: 16px; }
 .short-field-dialog label { margin-top: 0; font-size: 14px; font-weight: 400; }
 .short-field-dialog .modal-actions { margin-top: 20px; }
 .short-field-dialog .modal-actions .btn { min-width: 60px; height: 32px; min-height: 32px; padding: 5px 14px; font-size: 14px; font-weight: 400; line-height: 20px; }
-.glass, .modal,
+.glass,
 .user-account-popover.user-account-popover,
 .context-menu, .app-select-menu { border-radius: var(--surface-radius); }
 .btn, .input, .icon-btn, .record-icon-btn, .app-select-trigger,

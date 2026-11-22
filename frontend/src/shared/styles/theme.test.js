@@ -5,7 +5,8 @@ const themeCss = readFileSync('src/shared/styles/theme.css', 'utf8')
 
 describe('interactive focus styling', () => {
   it('keeps the dark login page and the space above its header on the same background', () => {
-    expect(themeCss).toMatch(/:root\[data-theme="dark"\]:has\(\.login-page\)\s*\{\s*--bg: #111214;/)
+    // The dark base is neutral now, so the login page needs no extra override.
+    expect(themeCss).toMatch(/:root\[data-theme="dark"\]\s*\{[^}]*--bg: #111214;/s)
     expect(themeCss).toMatch(/\.login-page\s*\{[^}]*display: flow-root;/)
   })
 

@@ -124,6 +124,24 @@ describe('directory watcher', () => {
     } finally { watcher.scope.stop() }
   })
 
+  it('gives a new directory a fresh reconnect budget', async () => {
+    const watcher = mountWatcher()
+    try {
+      await nextTick()
+      for (let attempt = 0; attempt < 4; attempt++) {
+        FakeEventSource.instances.at(-1)!.failClosed()
+        await vi.advanceTimersByTimeAsync(60_000)
+      }
+      expect(FakeEventSource.instances).toHaveLength(4)
+      watcher.path.value = '/other'
+      await nextTick()
+      expect(FakeEventSource.instances).toHaveLength(5)
+      FakeEventSource.instances[4]!.failClosed()
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(FakeEventSource.instances).toHaveLength(6)
+    } finally { watcher.scope.stop() }
+  })
+
   it('coalesces a burst of change signals into one refresh', async () => {
     const watcher = mountWatcher()
     try {

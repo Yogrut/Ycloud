@@ -22,8 +22,17 @@ const isBrowser = computed(() => route.value === '/browse')
 const isAdmin = computed(() => route.value === '/admin' || route.value.startsWith('/admin/'))
 const isPreview = computed(() => route.value === '/preview')
 
+// boot.js paints the first frame from this attribute; keep it current so a
+// client-side jump from the login page to the file browser keeps its colour.
+function applyShell(path: string): void {
+  document.documentElement.dataset.shell =
+    path === '/browse' || path.startsWith('/browse/') ? 'browser' : 'app'
+}
+applyShell(activePath.value)
+
 function syncRoute(): void {
   activePath.value = currentAppPath()
+  applyShell(activePath.value)
 }
 
 function suppressNativeContextMenu(event: MouseEvent): void {

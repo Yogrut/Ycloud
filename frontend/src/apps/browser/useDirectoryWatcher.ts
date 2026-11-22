@@ -114,7 +114,12 @@ export function useDirectoryWatcher(
     source = target
   }
 
-  watch([storageId, path], start, { immediate: true })
+  // A new directory deserves a fresh reconnect budget: a locked folder must not
+  // poison the next one.
+  watch([storageId, path], () => {
+    failures = 0
+    start()
+  }, { immediate: true })
   document.addEventListener('visibilitychange', handleVisibility)
   onScopeDispose(() => {
     disposed = true

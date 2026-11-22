@@ -27,8 +27,10 @@
   --workspace-gutter: 4.5vw;
 }
 
-/* Give the light file browser a softer surface hierarchy without changing dark mode. */
-:root:not([data-theme="dark"]):has(.browser-shell) {
+/* Give the light file browser a softer surface hierarchy without changing dark mode.
+   data-shell is set before the first paint (boot.js) and kept in sync by App.vue,
+   so this does not wait for the shell component to mount. */
+:root:not([data-theme="dark"])[data-shell="browser"] {
   --bg: #e9ecf1;
   --panel: #f7f8fa;
   --panel-soft: #eef1f5;
@@ -58,10 +60,6 @@
   --success: #52ca96;
   --selected-row: #1a2c47;
   --shadow: 0 12px 34px rgba(0, 0, 0, .18);
-}
-
-:root[data-theme="dark"]:has(.login-page) {
-  --bg: #111214;
 }
 
 /* Keep file and admin surfaces neutral in dark mode while preserving Ycloud blue

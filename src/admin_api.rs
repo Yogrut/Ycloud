@@ -499,9 +499,7 @@ async fn fill_test_credentials(
         && settings.prefix == saved.prefix
         && settings.addressing_style == saved.addressing_style;
     if !same_target {
-        return Err(AppError::BadRequest(
-            "修改连接地址后请重新填写密钥".into(),
-        ));
+        return Err(AppError::BadRequest("修改连接地址后请重新填写密钥".into()));
     }
     if blank_access {
         settings.access_key_id = saved.access_key_id;
@@ -1317,7 +1315,9 @@ mod tests {
     #[tokio::test]
     async fn test_connection_reuses_saved_credentials_only_for_the_same_target() {
         use super::*;
-        use crate::config::{ConfigFile, StorageBackendConfig, StorageInstanceConfig, S3StorageConfig};
+        use crate::config::{
+            ConfigFile, S3StorageConfig, StorageBackendConfig, StorageInstanceConfig,
+        };
         use crate::test_support::{app_state, TestDirectory};
 
         fn saved() -> S3StorageConfig {
@@ -1355,22 +1355,30 @@ mod tests {
             });
         }
 
-        let filled = fill_test_credentials(&state, form(), Some("s3")).await.unwrap();
+        let filled = fill_test_credentials(&state, form(), Some("s3"))
+            .await
+            .unwrap();
         assert_eq!(filled.access_key_id, "saved-access");
         assert_eq!(filled.secret_access_key, "saved-secret");
 
         let mut moved = form();
         moved.endpoint = "http://192.168.3.50:9000".into();
-        let error = fill_test_credentials(&state, moved, Some("s3")).await.unwrap_err();
+        let error = fill_test_credentials(&state, moved, Some("s3"))
+            .await
+            .unwrap_err();
         assert!(matches!(error, AppError::BadRequest(message) if message.contains("重新填写密钥")));
 
-        assert!(fill_test_credentials(&state, form(), Some("missing")).await.is_err());
+        assert!(fill_test_credentials(&state, form(), Some("missing"))
+            .await
+            .is_err());
         assert!(fill_test_credentials(&state, form(), None).await.is_err());
 
         let mut replaced = saved();
         replaced.access_key_id = "new-access".into();
         replaced.secret_access_key = "new-secret".into();
-        let passed = fill_test_credentials(&state, replaced, Some("s3")).await.unwrap();
+        let passed = fill_test_credentials(&state, replaced, Some("s3"))
+            .await
+            .unwrap();
         assert_eq!(passed.secret_access_key, "new-secret");
     }
 

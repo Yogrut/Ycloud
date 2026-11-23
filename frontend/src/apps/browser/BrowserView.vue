@@ -29,6 +29,7 @@ import { useBrowserAccess } from './useBrowserAccess'
 import { useBrowserPreviews } from './useBrowserPreviews'
 import { useDirectoryWatcher } from './useDirectoryWatcher'
 import { useScrollbarAutoHide } from './useScrollbarAutoHide'
+import { useScrollReset } from './useScrollReset'
 import { prefetchAdminPages } from '../admin/pages'
 import { formatBatchSummary } from './operationFeedback'
 import FilePreviewDialog from './FilePreviewDialog.vue'
@@ -239,6 +240,11 @@ const {
 } = useBrowserSelection({ entries, visibleEntries, loading, capabilities, filePanel, openEntry })
 resetListingSelection = clearSelection
 useScrollbarAutoHide(filePanel)
+// Only listing-defining state is watched, so a silent refresh keeps the reader's
+// position while a page, directory or storage change starts from the top.
+useScrollReset(filePanel, [
+  currentStorageId, path, appliedQuery, sort, ascending, pageSize, pageNumber, galleryMode,
+])
 
 const {
   batchResult,

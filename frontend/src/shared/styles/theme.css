@@ -6,6 +6,8 @@
   --field: #f9fafb;
   --line: #e4e7eb;
   --line-strong: #d9dde4;
+  /* Only the file list scrollbar uses this; it must stay visible on light panels. */
+  --scrollbar-thumb: rgb(92 104 120 / 55%);
   --text: #20252d;
   --muted: #586171;
   --muted-2: #727c8b;
@@ -47,6 +49,7 @@
   --field: #111722;
   --line: #2a3343;
   --line-strong: #344054;
+  --scrollbar-thumb: rgb(196 205 219 / 42%);
   --text: #e8edf7;
   --muted: #9ca8bb;
   --muted-2: #748095;
@@ -890,15 +893,23 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
    three idle seconds (data-scrolling comes from useScrollbarAutoHide). The
    margin keeps the bar inside the panel padding instead of over the time
    column. Firefox gets the standard properties; WebKit gets the pseudo rules. */
-.file-list-body { --scrollbar-w: 6px; margin-right: calc(-1 * var(--scrollbar-w)); scrollbar-gutter: stable; }
+.file-list-body {
+  --scrollbar-w: 6px;
+  --scrollbar-gap: 6px;
+  /* The extra negative margin moves the bar into the panel padding while the
+     matching padding keeps the content width and its alignment with the header. */
+  margin-right: calc(-1 * (var(--scrollbar-w) + var(--scrollbar-gap)));
+  padding-right: var(--scrollbar-gap);
+  scrollbar-gutter: stable;
+}
 @supports not selector(::-webkit-scrollbar) {
   .file-list-body { scrollbar-width: thin; scrollbar-color: transparent transparent; }
-  .file-list-body[data-scrolling] { scrollbar-color: var(--line) transparent; }
+  .file-list-body[data-scrolling] { scrollbar-color: var(--scrollbar-thumb) transparent; }
 }
 .file-list-body::-webkit-scrollbar { width: var(--scrollbar-w); }
 .file-list-body::-webkit-scrollbar-track { background: transparent; }
 .file-list-body::-webkit-scrollbar-thumb { background: transparent; border-radius: 3px; }
-.file-list-body[data-scrolling]::-webkit-scrollbar-thumb { background: var(--line); }
+.file-list-body[data-scrolling]::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); }
 .file-panel.drag-selecting { cursor: crosshair; }
 .file-panel.upload-drop-active { outline: 2px solid var(--accent); outline-offset: -2px; }
 .upload-drop-overlay {

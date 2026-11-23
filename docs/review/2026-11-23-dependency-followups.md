@@ -8,6 +8,9 @@ temporary exception does not become permanent.
 - Advisory: RUSTSEC-2026-0543, "chrono is unmaintained; all versions affected",
   no fixed release.
 - Current handling: `deny.toml` ignores this advisory with a comment.
+- Also marked in code: `Cargo.toml` above the `chrono` dependency and
+  `src/traffic.rs` above its only `use chrono` import (`TODO(chrono-migration)`),
+  so `grep -r TODO(chrono-migration)` finds every reminder.
 - Review trigger: before the next dependency sweep, or when a new advisory names
   chrono with a fixed version. Migrate the timestamp formatting, RFC 3339
   parsing and WebDAV date handling to `time` or `jiff` first, then delete the

@@ -13,6 +13,9 @@ use axum::{
     response::Response,
     Json,
 };
+// TODO(chrono-migration): RUSTSEC-2026-0543 — this timestamp handling moves to
+// `time` or `jiff` together with the Cargo.toml dependency; see
+// docs/review/2026-11-23-dependency-followups.md.
 use chrono::{DateTime, Datelike, Months, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Read, path::Path, sync::Arc};

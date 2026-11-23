@@ -14,6 +14,9 @@ tower-http = { version = "0.6", features = ["request-id", "sensitive-headers", "
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+# TODO(chrono-migration): RUSTSEC-2026-0543 — unmaintained, no fixed release.
+# Replace with `time` or `jiff`; deny.toml carries the temporary ignore and
+# docs/review/2026-11-23-dependency-followups.md the review trigger.
 chrono = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

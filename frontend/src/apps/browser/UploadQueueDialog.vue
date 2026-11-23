@@ -101,7 +101,6 @@ const visibleHasPausableTasks = computed(() => visibleTasks.value.some(task => c
 const visibleHasPausedTasks = computed(() => visibleTasks.value.some(task => canUploadTaskAction(task, 'resume')))
 const visibleHasTerminableTasks = computed(() => visibleTasks.value.some(task => canUploadTaskAction(task, 'terminate')))
 const visibleCanClearTasks = computed(() => visibleTasks.value.length > 0 && visibleTasks.value.every(task => canUploadTaskAction(task, 'clear')))
-const modalHeight = computed(() => Math.min(650, 390 + Math.min(visibleTasks.value.length, 5) * 52))
 const overallPercent = computed(() => summary.value.percent)
 const completionLabel = computed(() => {
   if (!props.tasks.length) return locale.text('尚无上传任务', 'No uploads yet')
@@ -164,7 +163,7 @@ function handleDrop(event: DragEvent): void {
 
 <template>
   <div class="overlay active upload-window-overlay" @click.self="emit('close')">
-    <section class="modal upload-queue-modal" :style="{ '--upload-modal-height': `${modalHeight}px` }" role="dialog" aria-modal="true" aria-labelledby="upload-title">
+    <section class="modal upload-queue-modal" role="dialog" aria-modal="true" aria-labelledby="upload-title">
       <header class="upload-window-head">
         <div><h2 id="upload-title">{{ locale.text('上传', 'Upload') }}</h2><p>{{ locale.text('查看每个文件的上传状态和异常原因', 'Review each file status and error') }}</p></div>
         <button class="icon-btn flat upload-window-close" type="button" :title="locale.t('common.close')" :aria-label="locale.t('common.close')" @click="emit('close')">×</button>

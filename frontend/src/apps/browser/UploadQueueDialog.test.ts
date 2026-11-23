@@ -296,7 +296,9 @@ describe('UploadQueueDialog', () => {
     await nextTick()
     expect(host.querySelectorAll('.upload-task')).toHaveLength(1)
     expect(host.querySelector('.upload-task')?.textContent).toContain('failed.txt')
-    expect(host.querySelector<HTMLElement>('.upload-queue-modal')?.style.getPropertyValue('--upload-modal-height')).toBe('442px')
+    // The dialog keeps one size while filtering, so a stable height must not be
+    // driven by the visible task count.
+    expect(host.querySelector<HTMLElement>('.upload-queue-modal')?.style.getPropertyValue('--upload-modal-height')).toBe('')
 
     host.querySelector<HTMLButtonElement>('.upload-batch-actions .danger')?.click()
     expect(clear).toHaveBeenCalledWith([2])

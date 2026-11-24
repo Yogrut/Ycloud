@@ -16,12 +16,13 @@ describe('upload dialog frame', () => {
     expect(modal[1]).toContain('transition: height')
   })
 
-  it('keeps the familiar width on ordinary screens and scales up on wide ones', () => {
+  it('keeps a consistent share of the viewport on wide screens', () => {
     const modal = css.match(/\.upload-queue-modal\s*\{([^}]*)\}/s)
     expect(modal).not.toBeNull()
-    // Floor 1280px keeps laptops unchanged; 65vw widens only on big screens,
-    // with 1800px as the cap and 100% preventing overflow on narrow ones.
-    expect(modal[1]).toMatch(/width:\s*min\(100%, 1800px, max\(1280px, 65vw\)\)/)
+    // 83vw matches the laptop proportion; the 1280px floor keeps narrow
+    // viewports unchanged, 2560px caps very large screens and 100% prevents
+    // overflow on small ones. Assert the formula, not a pixel result.
+    expect(modal[1]).toMatch(/width:\s*min\(100%, 2560px, max\(1280px, 83vw\)\)/)
   })
 
   it('still fills the screen in the narrow layout', () => {

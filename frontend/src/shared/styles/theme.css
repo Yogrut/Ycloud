@@ -1000,8 +1000,8 @@ input[type="password"]::placeholder { font-weight: 400; letter-spacing: normal; 
 .btn.secondary:hover { background: var(--panel-soft); border-color: var(--line-strong); }
 .btn.danger { color: #fff; background: var(--danger); border-color: var(--danger); }
 .btn.danger:hover:not(:disabled) { background: var(--danger); }
-.upload-window-overlay { place-items: center; padding: 38px 18px 18px; }
-.upload-queue-modal { width: min(1280px, 100%); height: min(70dvh, 620px); max-height: calc(100dvh - 56px); display: flex; flex-direction: column; padding: 0; overflow: auto; }
+.upload-window-overlay { place-items: start center; padding: 38px 18px 18px; }
+.upload-queue-modal { width: min(100%, 1800px, max(1280px, 65vw)); height: min(var(--upload-modal-height, 390px), calc(100dvh - 56px)); max-height: calc(100dvh - 56px); display: flex; flex-direction: column; padding: 0; overflow: auto; transition: height 160ms ease; }
 /* Controls keep their content height; only the task viewport uses remaining space. */
 .upload-window-head,
 .upload-add-zone,

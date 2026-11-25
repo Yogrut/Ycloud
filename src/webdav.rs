@@ -765,4 +765,86 @@ mod response_contract_tests {
             assert_eq!(traffic.total.download, transferred_bytes);
         }
     }
+
+    #[tokio::test]
+    async fn concurrent_put_keeps_one_whole_body_and_if_none_match_lets_one_win() {
+        let directory = crate::test_support::TestDirectory::new("dav-concurrent-put");
+        let state = crate::test_support::app_state(
+            &directory,
+            crate::config::ConfigFile {
+                shares: vec![Share {
+                    id: "race-share".into(),
+                    storage_id: "primary".into(),
+                    name: "race".into(),
+                    path: String::new(),
+                    username: Some("writer".into()),
+                    webdav_enabled: true,
+                    password_hash: Some(crate::config::hash_password("race-password")),
+                    readonly: false,
+                }],
+                ..crate::config::ConfigFile::with_test_storage()
+            },
+        )
+        .await;
+        let root = state.config.storage_path.clone();
+        let app = crate::app::build_router(state);
+        let put = |name: &str, body: Vec<u8>, if_none_match: bool| {
+            let length = body.len();
+            let mut request = axum::http::Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/dav/race/{}", percent_encode(name)))
+                .header(header::HOST, "127.0.0.1:18473")
+                .header(
+                    header::AUTHORIZATION,
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD.encode("writer:race-password")
+                    ),
+                )
+                .header(header::CONTENT_LENGTH, length)
+                .extension(axum::extract::ConnectInfo(
+                    "127.0.0.1:50001".parse::<std::net::SocketAddr>().unwrap(),
+                ));
+            if if_none_match {
+                request = request.header("if-none-match", "*");
+            }
+            app.clone().oneshot(request.body(Body::from(body)).unwrap())
+        };
+
+        // Different lengths make a truncated or interleaved result visible.
+        let long = vec![b'B'; 8192];
+        let short = vec![b'A'; 1024];
+        let (first, second) = tokio::join!(
+            put("shared.bin", long.clone(), false),
+            put("shared.bin", short.clone(), false)
+        );
+        assert!(first.unwrap().status().is_success(), "first PUT failed");
+        assert!(second.unwrap().status().is_success(), "second PUT failed");
+        let bytes = tokio::fs::read(root.join("shared.bin")).await.unwrap();
+        assert!(
+            bytes == long || bytes == short,
+            "final file is neither complete body: {} bytes",
+            bytes.len()
+        );
+
+        // If-None-Match: * is create-only, so exactly one concurrent writer wins.
+        let long2 = vec![b'D'; 7000];
+        let short2 = vec![b'C'; 900];
+        let (first, second) = tokio::join!(
+            put("guarded.bin", long2.clone(), true),
+            put("guarded.bin", short2.clone(), true)
+        );
+        let statuses = [first.unwrap().status(), second.unwrap().status()];
+        let created = statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count();
+        let precondition = statuses
+            .iter()
+            .filter(|status| **status == StatusCode::PRECONDITION_FAILED)
+            .count();
+        assert_eq!((created, precondition), (1, 1), "{statuses:?}");
+        let bytes = tokio::fs::read(root.join("guarded.bin")).await.unwrap();
+        assert!(bytes == long2 || bytes == short2);
+    }
 }

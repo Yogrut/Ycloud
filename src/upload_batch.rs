@@ -2966,6 +2966,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_name_taken_after_planning_fails_the_commit_without_overwriting() {
+        use crate::test_support::{app_state, TestDirectory};
+        use axum::{body::Body, http::header};
+
+        let directory = TestDirectory::new("plan-race");
+        let state = app_state(&directory, crate::config::ConfigFile::with_test_storage()).await;
+        let root = state.config.storage_path.clone();
+        let token = state.sessions.create().await;
+        let payload = b"planned-payload".to_vec();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("session={token}").parse().unwrap());
+        headers.insert(
+            header::CONTENT_LENGTH,
+            payload.len().to_string().parse().unwrap(),
+        );
+
+        let prepared = prepare_upload_batch(
+            State(state.clone()),
+            headers.clone(),
+            Query(FileQuery::default()),
+            Json(PrepareUploadBatchRequest {
+                items: vec![PrepareUploadItem {
+                    path: "fresh.txt".into(),
+                    size: payload.len() as u64,
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let planned = prepared.items[0].path.clone();
+        assert_eq!(planned, "fresh.txt");
+
+        // No timing window: the intruder writes after planning and before the
+        // commit starts, so publication must lose to rename(RENAME_NOREPLACE).
+        tokio::fs::write(root.join(&planned), b"intruder")
+            .await
+            .unwrap();
+
+        let result = crate::api::upload_file(
+            State(state),
+            headers,
+            Query(FileQuery {
+                path: Some(planned.clone()),
+                storage_id: Some("primary".into()),
+                batch: Some(prepared.ticket),
+            }),
+            Body::from(payload),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the commit must not replace a file created after planning"),
+        };
+        assert!(
+            matches!(error, crate::error::AppError::Conflict(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(root.join(&planned)).await.unwrap(),
+            b"intruder"
+        );
+    }
+
     fn subject(value: &str) -> RequestSubject {
         RequestSubject::Session(value.into())
     }

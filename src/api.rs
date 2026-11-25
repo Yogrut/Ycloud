@@ -1355,3 +1355,174 @@ mod response_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod permission_matrix_tests {
+    use axum::{
+        body::Body,
+        http::{header, Request, StatusCode},
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use crate::{
+        config::{ConfigFile, FolderLock, StoragePermission, UserAccount},
+        test_support::{app_state, TestDirectory},
+    };
+
+    // The router validates Host against the configured port before any handler.
+    const HOST: &str = "localhost:18473";
+
+    fn get(uri: &str, cookie: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().uri(uri).header(header::HOST, HOST);
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    fn mkdir(cookie: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/mkdir?storage_id=primary")
+            .header(header::HOST, HOST)
+            .header(header::CONTENT_TYPE, "application/json")
+            // A browser always sends Origin; CSRF requires it to match the host.
+            .header(header::ORIGIN, format!("http://{HOST}"));
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        // The empty name guarantees that even a misrouted request cannot create
+        // anything, so a 403 here proves the refusal happened before the handler.
+        builder.body(Body::from(r#"{"name":""}"#)).unwrap()
+    }
+
+    async fn fixture(
+        label: &str,
+        config: ConfigFile,
+    ) -> (TestDirectory, Router, crate::state::AppState) {
+        let directory = TestDirectory::new(label);
+        let state = app_state(&directory, config).await;
+        let router = crate::app::build_router(state.clone());
+        (directory, router, state)
+    }
+
+    #[tokio::test]
+    async fn anonymous_requests_are_rejected_before_any_handler_runs() {
+        let (_directory, app, _state) = fixture("perm-anon", ConfigFile::with_test_storage()).await;
+
+        let list = app
+            .clone()
+            .oneshot(get("/api/files?storage_id=primary", None))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::UNAUTHORIZED);
+
+        let write = app.oneshot(mkdir(None)).await.unwrap();
+        assert_eq!(write.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn gate_reads_but_cannot_write_or_enter_admin() {
+        let (_directory, app, state) = fixture("perm-gate", ConfigFile::with_test_storage()).await;
+        let token = state.gate_access.create("__gate__".into()).await;
+        let cookie = format!("gate_access={token}");
+
+        let list = app
+            .clone()
+            .oneshot(get("/api/files?storage_id=primary", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+
+        let write = app.clone().oneshot(mkdir(Some(&cookie))).await.unwrap();
+        assert_eq!(write.status(), StatusCode::FORBIDDEN);
+
+        let admin = app
+            .oneshot(get("/api/admin/info", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(admin.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn read_only_user_reads_but_cannot_write() {
+        let mut config = ConfigFile::with_test_storage();
+        config.user_accounts.push(UserAccount {
+            id: "reader".into(),
+            username: "reader".into(),
+            password_hash: crate::config::hash_password("reader-password"),
+            enabled: true,
+            permissions: vec![StoragePermission {
+                storage_id: "primary".into(),
+                browse: true,
+                download: true,
+                ..Default::default()
+            }],
+        });
+        let (_directory, app, state) = fixture("perm-read-only-user", config).await;
+        let token = state.sessions.create_user("reader".into()).await;
+        let cookie = format!("session={token}");
+
+        let list = app
+            .clone()
+            .oneshot(get("/api/files?storage_id=primary", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+
+        let write = app.oneshot(mkdir(Some(&cookie))).await.unwrap();
+        assert_eq!(write.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn folder_locks_match_equivalent_path_spellings_and_reject_traversal() {
+        let mut config = ConfigFile::with_test_storage();
+        config.folder_locks.push(FolderLock {
+            id: "lock-1".into(),
+            storage_id: "primary".into(),
+            path: "locked".into(),
+            password_hash: crate::config::hash_password("lock-password"),
+        });
+        let (directory, app, state) = fixture("perm-lock-paths", config).await;
+        std::fs::create_dir_all(directory.path().join("storage/locked/sub")).unwrap();
+        std::fs::create_dir_all(directory.path().join("storage/open")).unwrap();
+        let token = state.gate_access.create("__gate__".into()).await;
+        let cookie = format!("gate_access={token}");
+
+        // Dot segments and empty segments are not a way past a lock: the matcher
+        // normalizes them the same way the storage layer does.
+        for path in ["locked", "%2Flocked", "//locked", "./locked", "locked//sub"] {
+            let response = app
+                .clone()
+                .oneshot(get(
+                    &format!("/api/files?storage_id=primary&path={path}"),
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+
+        let open = app
+            .clone()
+            .oneshot(get(
+                "/api/files?storage_id=primary&path=open",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(open.status(), StatusCode::OK);
+
+        // Traversal never reaches the lock matcher as an equivalent path; the
+        // storage layer rejects it outright.
+        let traversal = app
+            .oneshot(get(
+                "/api/files?storage_id=primary&path=..%2Foutside",
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
+    }
+}

@@ -37,6 +37,9 @@ pub(super) async fn verify_share_access(
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok());
+    // The real server always supplies ConnectInfo; this fallback only keeps
+    // in-process tests and unusual embeddings from panicking. Such requests
+    // share one failure bucket, so they cannot be used to rotate lockout keys.
     let failure_key = client_ip.unwrap_or_else(|| IpAddr::from([127, 0, 0, 1]));
     let _attempt_guard = if headers.contains_key(header::AUTHORIZATION) {
         Some(

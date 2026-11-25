@@ -212,4 +212,40 @@ mod name_tests {
             assert!(StorageService::validate_name(name).is_err(), "{name:?}");
         }
     }
+
+    #[test]
+    fn relative_paths_are_normalized_without_resolving_traversal() {
+        for (input, expected) in [
+            ("a/b", "a/b"),
+            ("/a//b/", "a/b"),
+            ("./a", "a"),
+            ("a/./b", "a/b"),
+            ("a//b", "a/b"),
+            ("", ""),
+            ("/", ""),
+            ("//", ""),
+        ] {
+            assert_eq!(
+                StorageService::normalize_relative(input).unwrap(),
+                expected,
+                "{input:?}"
+            );
+        }
+        for input in [
+            "..",
+            "../x",
+            "a/../b",
+            "a\\b",
+            "a\0b",
+            "C:/x",
+            "a/b:c",
+            ".ycloud-system",
+            "a/.YCLOUD-SYSTEM/b",
+        ] {
+            assert!(
+                StorageService::normalize_relative(input).is_err(),
+                "{input:?}"
+            );
+        }
+    }
 }

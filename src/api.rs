@@ -1392,9 +1392,34 @@ mod permission_matrix_tests {
         if let Some(cookie) = cookie {
             builder = builder.header(header::COOKIE, cookie);
         }
-        // The empty name guarantees that even a misrouted request cannot create
-        // anything, so a 403 here proves the refusal happened before the handler.
+        // The empty name guarantees that a request which reaches the handler
+        // cannot create anything. A 403 therefore means an earlier layer refused
+        // it; the companion test with create_directory granted expects 400 and
+        // proves the difference comes from the permission, not the payload.
         builder.body(Body::from(r#"{"name":""}"#)).unwrap()
+    }
+
+    fn unlock(cookie: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/api/folder/unlock?storage_id=primary")
+            .header(header::HOST, HOST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, format!("http://{HOST}"))
+            .header(header::COOKIE, cookie)
+            .body(Body::from(
+                r#"{"path":"locked","password":"lock-password"}"#,
+            ))
+            .unwrap()
+    }
+
+    fn download(path: &str, cookie: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!("/api/download?storage_id=primary&path={path}"))
+            .header(header::HOST, HOST)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap()
     }
 
     async fn fixture(
@@ -1471,8 +1496,39 @@ mod permission_matrix_tests {
             .unwrap();
         assert_eq!(list.status(), StatusCode::OK);
 
-        let write = app.oneshot(mkdir(Some(&cookie))).await.unwrap();
+        let write = app.clone().oneshot(mkdir(Some(&cookie))).await.unwrap();
         assert_eq!(write.status(), StatusCode::FORBIDDEN);
+
+        let admin = app
+            .oneshot(get("/api/admin/info", Some(&cookie)))
+            .await
+            .unwrap();
+        assert_eq!(admin.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn write_refusal_comes_from_the_permission_not_the_payload() {
+        let mut config = ConfigFile::with_test_storage();
+        config.user_accounts.push(UserAccount {
+            id: "writer".into(),
+            username: "writer".into(),
+            password_hash: crate::config::hash_password("writer-password"),
+            enabled: true,
+            permissions: vec![StoragePermission {
+                storage_id: "primary".into(),
+                browse: true,
+                create_directory: true,
+                ..Default::default()
+            }],
+        });
+        let (_directory, app, state) = fixture("perm-writer", config).await;
+        let token = state.sessions.create_user("writer".into()).await;
+        let cookie = format!("session={token}");
+
+        // Same request as the read-only test, now allowed past the permission
+        // check: the empty name reaches validation and yields 400, not 403.
+        let response = app.oneshot(mkdir(Some(&cookie))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1487,12 +1543,24 @@ mod permission_matrix_tests {
         let (directory, app, state) = fixture("perm-lock-paths", config).await;
         std::fs::create_dir_all(directory.path().join("storage/locked/sub")).unwrap();
         std::fs::create_dir_all(directory.path().join("storage/open")).unwrap();
+        std::fs::write(
+            directory.path().join("storage/locked/file.txt"),
+            b"locked-content",
+        )
+        .unwrap();
         let token = state.gate_access.create("__gate__".into()).await;
         let cookie = format!("gate_access={token}");
 
         // Dot segments and empty segments are not a way past a lock: the matcher
         // normalizes them the same way the storage layer does.
-        for path in ["locked", "%2Flocked", "//locked", "./locked", "locked//sub"] {
+        for path in [
+            "locked",
+            "%2Flocked",
+            "//locked",
+            "./locked",
+            "locked//sub",
+            "locked/./sub",
+        ] {
             let response = app
                 .clone()
                 .oneshot(get(
@@ -1517,6 +1585,7 @@ mod permission_matrix_tests {
         // Traversal never reaches the lock matcher as an equivalent path; the
         // storage layer rejects it outright.
         let traversal = app
+            .clone()
             .oneshot(get(
                 "/api/files?storage_id=primary&path=..%2Foutside",
                 Some(&cookie),
@@ -1524,5 +1593,32 @@ mod permission_matrix_tests {
             .await
             .unwrap();
         assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
+
+        // Downloads take the shared file-read path, not the listing path.
+        let locked_file = app
+            .clone()
+            .oneshot(download("./locked/file.txt", &cookie))
+            .await
+            .unwrap();
+        assert_eq!(locked_file.status(), StatusCode::FORBIDDEN);
+
+        // The unlock endpoint issues the folder cookie that clears the lock.
+        let unlocked = app.clone().oneshot(unlock(&cookie)).await.unwrap();
+        assert_eq!(unlocked.status(), StatusCode::OK);
+        let folder_cookie = unlocked
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .expect("unlock must set a folder cookie")
+            .to_string();
+        let unlocked_file = app
+            .oneshot(download(
+                "./locked/file.txt",
+                &format!("{cookie}; {folder_cookie}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unlocked_file.status(), StatusCode::OK);
     }
 }

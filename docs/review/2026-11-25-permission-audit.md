@@ -35,8 +35,14 @@
 2. `gate_reads_but_cannot_write_or_enter_admin` —— gate 读 200、写 403、管理 401。
 3. `read_only_user_reads_but_cannot_write` —— 只读用户读 200、写 403。
 4. `folder_locks_match_equivalent_path_spellings_and_reject_traversal` ——
-   `locked`、`/locked`、`//locked`、`./locked`、`locked//sub` 均 403；
-   未锁定目录 200；`../outside` 400。
+   `locked`、`/locked`、`//locked`、`./locked`、`locked//sub`、`locked/./sub`
+   均 403；未锁定目录 200；`../outside` 400。下载路径单独覆盖：
+   `./locked/file.txt` 无钥匙 403，经 `/api/folder/unlock` 取到
+   `folder_key_<id>` 后同一请求 200。
+5. `write_refusal_comes_from_the_permission_not_the_payload` —— 对照实验：
+   同样的空名字请求，给用户 `create_directory` 权限后返回 400 而不是 403，
+   证明前一条的 403 来自权限检查，不是请求体校验。
+6. 只读用户访问 `/api/admin/info` 断言 401（与 gate 同一行）。
 
 ## 待补的运行时验证（部署机执行）
 

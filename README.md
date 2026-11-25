@@ -63,6 +63,12 @@ For development, run `cargo run --locked` from the repository root and `npm run 
 
 The gallery downloads only thumbnails until an image is opened. Completed uploads enqueue a private 640 px thumbnail; older images are queued in the background when first shown. One libvips subprocess generates thumbnails at a time. The disk cache lives beside the config file and is regenerated as needed. Docker includes libvips; standalone installs need `vipsheader` and `vipsthumbnail` on PATH (and `prlimit` on Linux).
 
+## Supported platforms
+
+Linux, including Docker, is the official and tested deployment target. Windows
+and macOS are for local development only: no hardening or support is provided
+for exposing them publicly. Fork and adjust if you need that.
+
 ## Docker Compose
 
 From the repository root:

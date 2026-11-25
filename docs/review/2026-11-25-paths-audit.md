@@ -84,12 +84,38 @@
 
 | 编号 | 类别 | 位置 | 触发条件 | 证据 | 建议 |
 | --- | --- | --- | --- | --- | --- |
-| R2-1 | 锁绕过（Windows） | `storage/path.rs:132-151`、`config.rs:157-205` | Windows 部署，请求 `path=locked.` 或 `locked%20` | 本机 PowerShell：`Test-Path "<root>\locked."`、`"<root>\locked "` 均为 True；代码不 trim | 规范化时拒绝或 trim 组件末尾的点/空格（Windows 上），并让锁比较使用同一形式 |
-| R2-2 | 测试缺口（已补） | `storage/path.rs:200+` | — | 新增规则表测试 | 保持 |
-| R2-3 | 行为限制 | `s3_backend/keyspace.rs:36,44` | 外部写入含 `..` 的 S3 键 | 代码路径 | 文档说明即可 |
-| R2-4 | 后台任务 | `bootstrap.rs:91` | 停用存储后 retire 任务仍在跑 | `backends.cached` 不检查 enabled | 确认停用时注册表移除；否则加 enabled 判断 |
-| R2-5 | 疑问 | `storage/linux_root.rs` | 逐操作符号链接矩阵 | 仅有单测 `root_handle_rejects_symlinks...` | 下一轮补 Linux-only 六操作测试 |
-| R2-6 | 疑问 | `storage/path.rs:132` | Windows 保留设备名 | 本机 `CON` 不可解析，未证实设备访问 | 如需保险，显式拒绝保留名 |
+| R2-1 | 锁绕过（Windows） | `storage/path.rs:132-151`、`config.rs:197-205` | 已修（见第 7 节） |
+| R2-2 | 测试缺口（已补） | `storage/path.rs:200+` | — |
+| R2-3 | 行为限制 | `s3_backend/keyspace.rs:36,44` | 文档说明即可 |
+| R2-4 | 后台任务 | `bootstrap.rs:91` | 已确认安全：停用时 `state.rs:722-730` 先失效再移除；`cached` 返回 None 时任务直接返回，进行中的恢复受 interrupt/Conflict 保护 |
+| R2-5 | 疑问 | `storage/linux_root.rs` | 待补 Linux-only 六操作测试 |
+| R2-6 | 疑问 | `storage/path.rs:132` | 保持疑问，已加 Windows 测试固定"当前接受设备名"的行为 |
 
-R2-1 是第二轮唯一确认的实质问题，且只在 Windows 部署上成立；Linux/容器部署
-（尾点、尾空格是不同文件名）不受影响。
+R2-1 只在 Windows 部署上成立；Linux/容器部署（尾点、尾空格是不同文件名）不受影响。
+
+## 7. R2-1 修复（Windows）
+
+修复内容：
+
+- `normalize_relative`：Windows 上组件以 `.` 或空格结尾 → **400**，到不了文件系统。
+- `validate_name`：Windows 上同样拒绝，避免"创建 `a.` 实际存成 `a`"的静默改名。
+- `path_component_eq`（Windows）：比较前去掉组件末尾的点/空格，并改用 Unicode
+  小写比较，`Ärzte` 与 `ärzte` 视为同一目录（锁返回 403，而不是绕过）。
+
+实测结果：
+
+- 非 ASCII 大小写：`Test-Path` 对 `Ärzte`、`ärzte`、`ÄRZTE` 均为 True，
+  旧的 `eq_ignore_ascii_case` 会绕锁，已改为 Unicode 折叠。
+- 8.3 短名：本机 `dir /x` 未生成短名（该卷关闭 8.3），`LOCKED~1` 无法复现，
+  不改代码；建议部署文档注明关闭 8.3（`fsutil 8dot3name query`）。
+- 设备名：`CON` 未观察到设备访问，新增测试固定当前行为。
+
+测试：`storage/path.rs` 两个 Windows 测试、`config.rs` 的
+`windows_folds_case_and_trailing_aliases_before_comparing`、
+`api.rs::permission_matrix_tests::windows_alias_spellings_cannot_bypass_folder_locks`
+（`locked.`/`locked%20` → 400；`LOCKED`/`ärzte`/`ÄRZTE` → 403）。
+
+Linux 与 Docker 部署不受影响：以上判断都在 `#[cfg(windows)]` 下。
+
+macOS 默认文件系统同样大小写不敏感，但 CI 与发布目标只有 Linux/Windows，
+暂不覆盖，本文档注明即可。

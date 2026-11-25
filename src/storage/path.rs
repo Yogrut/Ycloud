@@ -38,6 +38,7 @@ impl StorageService {
         if name.is_empty()
             || name.trim() != name
             || matches!(name, "." | "..")
+            || has_windows_alias_suffix(name)
             || name.chars().any(|c| {
                 c.is_control() || matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
             })
@@ -129,6 +130,18 @@ impl StorageService {
     }
 }
 
+#[cfg(windows)]
+fn has_windows_alias_suffix(component: &str) -> bool {
+    // Windows strips trailing dots and spaces when resolving a path, so
+    // `locked.` and `locked ` would otherwise reach `locked` past a lock check.
+    component.ends_with('.') || component.ends_with(' ')
+}
+
+#[cfg(not(windows))]
+fn has_windows_alias_suffix(_component: &str) -> bool {
+    false
+}
+
 fn normalize_relative(path: &str) -> AppResult<String> {
     if path.contains('\\') || path.contains('\0') {
         return Err(AppError::BadRequest("Invalid storage path".into()));
@@ -139,6 +152,9 @@ fn normalize_relative(path: &str) -> AppResult<String> {
         match component {
             "" | "." => {}
             ".." => return Err(AppError::BadRequest("Path traversal is not allowed".into())),
+            value if has_windows_alias_suffix(value) => {
+                return Err(AppError::BadRequest("Invalid storage path".into()));
+            }
             value if value.contains(':') || value.eq_ignore_ascii_case(SYSTEM_DIR) => {
                 return Err(AppError::BadRequest("Invalid storage path".into()));
             }
@@ -210,6 +226,36 @@ mod name_tests {
             "", ".", "..", " report ", "a/b", "a\\b", "a:b", "a?b", "a*b", "a\0b", "a\nb",
         ] {
             assert!(StorageService::validate_name(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_names_that_alias_another_entry() {
+        // Windows drops trailing dots and spaces before opening a path, so a
+        // name like `locked.` would silently become `locked`.
+        for name in ["a.", "a ", "report.", "locked."] {
+            assert!(StorageService::validate_name(name).is_err(), "{name:?}");
+            assert!(
+                StorageService::normalize_relative(name).is_err(),
+                "{name:?}"
+            );
+        }
+        for path in ["locked./x", "dir/name. ", "a/b."] {
+            assert!(
+                StorageService::normalize_relative(path).is_err(),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_device_names_are_currently_accepted() {
+        // No device access has been observed through the storage root, so this
+        // pins today's behaviour; tightening it must be a deliberate change.
+        for name in ["CON", "NUL", "COM1"] {
+            assert!(StorageService::validate_name(name).is_ok(), "{name:?}");
         }
     }
 

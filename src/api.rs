@@ -1621,4 +1621,50 @@ mod permission_matrix_tests {
             .unwrap();
         assert_eq!(unlocked_file.status(), StatusCode::OK);
     }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_alias_spellings_cannot_bypass_folder_locks() {
+        let mut config = ConfigFile::with_test_storage();
+        for (index, path) in ["locked", "Ärzte"].into_iter().enumerate() {
+            config.folder_locks.push(FolderLock {
+                id: format!("lock-{index}"),
+                storage_id: "primary".into(),
+                path: path.into(),
+                password_hash: crate::config::hash_password("lock-password"),
+            });
+        }
+        let (directory, app, state) = fixture("perm-windows-locks", config).await;
+        std::fs::create_dir_all(directory.path().join("storage/locked")).unwrap();
+        std::fs::create_dir_all(directory.path().join("storage/Ärzte")).unwrap();
+        let token = state.gate_access.create("__gate__".into()).await;
+        let cookie = format!("gate_access={token}");
+
+        // Windows would strip these suffixes when opening the path; reject them
+        // before the filesystem can resolve them onto the locked directory.
+        for path in ["locked.", "locked%20"] {
+            let response = app
+                .clone()
+                .oneshot(get(
+                    &format!("/api/files?storage_id=primary&path={path}"),
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+
+        // NTFS folds case across the whole character set: the lock must match.
+        for path in ["LOCKED", "%C3%A4rzte", "%C3%84RZTE"] {
+            let response = app
+                .clone()
+                .oneshot(get(
+                    &format!("/api/files?storage_id=primary&path={path}"),
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
 }

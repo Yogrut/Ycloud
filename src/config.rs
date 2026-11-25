@@ -196,7 +196,25 @@ pub fn paths_overlap(left: &str, right: &str) -> bool {
 
 #[cfg(windows)]
 fn path_component_eq(left: &str, right: &str) -> bool {
-    left.eq_ignore_ascii_case(right)
+    // NTFS folds case across the whole character set and ignores trailing dots
+    // and spaces; compare the same logical name Windows would resolve.
+    fn logical(component: &str) -> String {
+        component.trim_end_matches(['.', ' ']).to_lowercase()
+    }
+    logical(left) == logical(right)
+}
+
+#[cfg(all(windows, test))]
+mod windows_path_tests {
+    use super::path_is_same_or_descendant;
+
+    #[test]
+    fn windows_folds_case_and_trailing_aliases_before_comparing() {
+        assert!(path_is_same_or_descendant("ärzte/file", "Ärzte"));
+        assert!(path_is_same_or_descendant("locked./x", "locked"));
+        assert!(path_is_same_or_descendant("locked /x", "locked"));
+        assert!(!path_is_same_or_descendant("other/x", "locked"));
+    }
 }
 
 #[cfg(not(windows))]
